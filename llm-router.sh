@@ -13,8 +13,11 @@
 set -euo pipefail
 
 # Resources (server.py, .venv, logs/) live in the repo dir, not next to this
-# script, so cd there explicitly — StartupFolder may invoke us from /.
-REPO_DIR="${LLM_ROUTER_DIR:-$(cd "$(dirname "$0")" && pwd)}"
+# script, so cd there explicitly — StartupFolder may invoke us from / and
+# ~/Startup/llm-router.sh is a symlink to this file.
+SELF="$0"
+while [ -L "$SELF" ]; do SELF="$(readlink "$SELF")"; done
+REPO_DIR="${LLM_ROUTER_DIR:-$(cd "$(dirname "$SELF")" && pwd)}"
 if [ ! -d "$REPO_DIR" ]; then
   echo "ERROR: llm-router repo dir not found: $REPO_DIR" >&2
   exit 1
