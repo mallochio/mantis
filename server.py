@@ -1,31 +1,21 @@
 """RouteLLM coding-router server.
 
-Exposes one OpenAI-compatible model ("auto"). For each request it scores the
-last user message with the RouteLLM `mf` router (matrix factorization) and
-optionally ensembles with Supra-Router-51M (a 51M-param complexity classifier)
-to catch hard prompts the MF scorer underweights. A request goes expensive if
-MF score >= threshold OR Supra-Router complexity >= supra threshold.
-
-The mf router calls OpenAI text-embedding-3-small for each prompt (~$0.02/1M
-tokens). Supra-Router runs locally (~400ms CPU, no API). OPENAI_API_KEY must
-be set before the router loads. ~/Startup/llm-router.sh retrieves it from
-macOS Keychain.
+Exposes one OpenAI-compatible model ("auto"). Requests are scored by the
+RouteLLM MF+Supra router and forwarded through a local LiteLLM proxy, which
+handles provider normalization, Responses API translation, and retries.
 
 Config via env:
   ROUTELLM_HOST=127.0.0.1
   ROUTELLM_PORT=5500
   ROUTELLM_KEY=sk-route-local          # bearer token clients must present
-  ROUTELLM_THRESHOLD=0.156             # mf score >= threshold -> expensive
-  ROUTELLM_ROUTER=mf                   # mf|bert (mf needs OpenAI embeds)
-  ROUTELLM_USE_SUPRA=1                 # 1=ensemble MF+Supra, 0=MF only
-  ROUTELLM_SUPRA_THRESHOLD=3          # supra complexity >= threshold -> expensive
-  EXPENSIVE_BASE=http://127.0.0.1:41437/v1
-  EXPENSIVE_KEY=dummy
+  LITELLM_BASE=http://127.0.0.1:3001/v1
+  LITELLM_KEY=sk-mundial
+  ROUTELLM_THRESHOLD=0.156
+  ROUTELLM_ROUTER=mf
+  ROUTELLM_USE_SUPRA=1
+  ROUTELLM_SUPRA_THRESHOLD=3
   EXPENSIVE_MODEL=gpt-5.6-luna
-  EXPENSIVE_REASONING_EFFORT=ultra
-  CHEAP_BASE=https://opencode.ai/zen/go/v1
-  CHEAP_KEY=$OPENCODE_GO_API_KEY
-  CHEAP_MODEL=glm-5.2
+  CHEAP_MODEL=deepseek-v4-pro
   LOG_FILE=~/.config/llm-router/logs/decisions.log
 """
 from __future__ import annotations
@@ -47,20 +37,25 @@ THRESHOLD = float(os.environ.get("ROUTELLM_THRESHOLD", "0.45"))
 ROUTER_NAME = os.environ.get("ROUTELLM_ROUTER", "mf")
 SUPRA_ENABLED = os.environ.get("ROUTELLM_USE_SUPRA", "1") != "0"
 SUPRA_THRESHOLD = int(os.environ.get("ROUTELLM_SUPRA_THRESHOLD", "3"))
+ROUTELLM_CONTEXT_WINDOW = int(os.environ.get("ROUTELLM_CONTEXT_WINDOW", "1000000"))
+ROUTELLM_MAX_TOKENS = int(os.environ.get("ROUTELLM_MAX_TOKENS", "131072"))
 MODEL_ID = "auto"
 
+LITELLM_BASE = os.environ.get("LITELLM_BASE", "http://127.0.0.1:3001/v1")
+LITELLM_KEY = os.environ.get("LITELLM_KEY", "sk-mundial")
+
 EXPENSIVE = {
-    "base": os.environ.get("EXPENSIVE_BASE", "http://127.0.0.1:41437/v1"),
-    "key": os.environ.get("EXPENSIVE_KEY", "dummy"),
+    "base": os.environ.get("EXPENSIVE_BASE", LITELLM_BASE),
+    "key": os.environ.get("EXPENSIVE_KEY", LITELLM_KEY),
     "model": os.environ.get("EXPENSIVE_MODEL", "gpt-5.6-luna"),
-    "effort": os.environ.get("EXPENSIVE_REASONING_EFFORT", "ultra"),
+    "effort": os.environ.get("EXPENSIVE_REASONING_EFFORT", "xhigh"),
 }
 CHEAP = {
-    "base": os.environ.get("CHEAP_BASE", "https://opencode.ai/zen/go/v1"),
-    "key": os.environ.get("CHEAP_KEY", os.environ.get("OPENCODE_GO_API_KEY", "")),
-    "model": os.environ.get("CHEAP_MODEL", "glm-5.2"),
-    "effort": os.environ.get("CHEAP_REASONING_EFFORT"),  # None = don't send
-    "max_tokens": int(os.environ.get("CHEAP_MAX_TOKENS", "64000")),
+    "base": os.environ.get("CHEAP_BASE", LITELLM_BASE),
+    "key": os.environ.get("CHEAP_KEY", LITELLM_KEY),
+    "model": os.environ.get("CHEAP_MODEL", "deepseek-v4-pro"),
+    "effort": os.environ.get("CHEAP_REASONING_EFFORT", "xhigh"),
+    "max_tokens": int(os.environ.get("CHEAP_MAX_TOKENS", str(ROUTELLM_MAX_TOKENS))),
 }
 
 LOG_PATH = Path(os.environ.get("LOG_FILE", str(Path.home()/".config/llm-router/logs/decisions.log")))
@@ -201,14 +196,15 @@ app = FastAPI(title="RouteLLM coding-router")
 
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "router": ROUTER_NAME, "threshold": THRESHOLD}
+    return {"ok": True, "router": ROUTER_NAME, "threshold": THRESHOLD,
+            "backend": "litellm"}
 
 
 @app.get("/v1/models")
 async def list_models():
     return {"object": "list", "data": [{
         "id": MODEL_ID, "object": "model", "owned_by": "routellm",
-        "context_window": 262144, "max_tokens": 64000,
+        "context_window": ROUTELLM_CONTEXT_WINDOW, "max_tokens": ROUTELLM_MAX_TOKENS,
     }]}
 
 
@@ -229,12 +225,14 @@ async def chat_completions(request: Request, authorization: str | None = Header(
     if isinstance(out_body.get("messages"), list):
         out_body["messages"] = _normalize_messages_for_backend(out_body["messages"])
     out_body["model"] = backend["model"]
-    if backend.get("max_tokens"):
-        for key in ("max_tokens", "max_completion_tokens"):
-            if isinstance(out_body.get(key), int):
-                out_body[key] = min(out_body[key], backend["max_tokens"])
+    if isinstance(out_body.get("max_tokens"), int):
+        out_body["max_completion_tokens"] = out_body.pop("max_tokens")
+    if isinstance(out_body.get("max_completion_tokens"), int) and backend.get("max_tokens"):
+        out_body["max_completion_tokens"] = min(out_body["max_completion_tokens"], backend["max_tokens"])
+    out_body.pop("stop", None)
+    if backend["model"].startswith("gpt-5.6-") and out_body.get("temperature") not in (None, 1):
+        out_body.pop("temperature")
     if backend["effort"]:
-        out_body.setdefault("reasoning_effort", backend["effort"])
         out_body["reasoning_effort"] = backend["effort"]
 
     want_stream = bool(body.get("stream"))
