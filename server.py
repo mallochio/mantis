@@ -37,7 +37,7 @@ THRESHOLD = float(os.environ.get("ROUTELLM_THRESHOLD", "0.45"))
 ROUTER_NAME = os.environ.get("ROUTELLM_ROUTER", "mf")
 SUPRA_ENABLED = os.environ.get("ROUTELLM_USE_SUPRA", "1") != "0"
 SUPRA_THRESHOLD = int(os.environ.get("ROUTELLM_SUPRA_THRESHOLD", "3"))
-ROUTELLM_CONTEXT_WINDOW = int(os.environ.get("ROUTELLM_CONTEXT_WINDOW", "1000000"))
+ROUTELLM_CONTEXT_WINDOW = os.environ.get("ROUTELLM_CONTEXT_WINDOW", "auto")
 ROUTELLM_MAX_TOKENS = int(os.environ.get("ROUTELLM_MAX_TOKENS", "131072"))
 MODEL_ID = "auto"
 
@@ -60,6 +60,52 @@ CHEAP = {
 
 LOG_PATH = Path(os.environ.get("LOG_FILE", str(Path.home()/".config/llm-router/logs/decisions.log")))
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+_cached_context_window = None
+
+
+def _fetch_model_context_length(base: str, key: str, model_id: str) -> int | None:
+    try:
+        if "openrouter.ai" in base:
+            url = "https://openrouter.ai/api/v1/models"
+            resp = httpx.get(url, timeout=5.0)
+            if resp.status_code == 200:
+                for item in resp.json().get("data", []):
+                    if item.get("id") == model_id:
+                        return item.get("context_length")
+        else:
+            url = base.rstrip("/") + "/models"
+            headers = {"Authorization": f"Bearer {key}"} if key else {}
+            resp = httpx.get(url, headers=headers, timeout=5.0)
+            if resp.status_code == 200:
+                for item in resp.json().get("data", []):
+                    if item.get("id") == model_id or item.get("model_name") == model_id:
+                        return item.get("context_window") or item.get("context_length")
+    except Exception:
+        pass
+    return None
+
+
+def _get_context_window() -> int:
+    global _cached_context_window
+    if _cached_context_window is not None:
+        return _cached_context_window
+
+    env_val = os.environ.get("ROUTELLM_CONTEXT_WINDOW")
+    if env_val and env_val.isdigit() and int(env_val) > 0:
+        _cached_context_window = int(env_val)
+        return _cached_context_window
+
+    ctx_exp = _fetch_model_context_length(EXPENSIVE["base"], EXPENSIVE["key"], EXPENSIVE["model"])
+    ctx_cheap = _fetch_model_context_length(CHEAP["base"], CHEAP["key"], CHEAP["model"])
+
+    valid = [c for c in (ctx_exp, ctx_cheap) if isinstance(c, int) and c > 0]
+    if valid:
+        _cached_context_window = min(valid)
+        return _cached_context_window
+
+    _cached_context_window = 1000000
+    return _cached_context_window
 
 _router = None  # lazy global
 
@@ -140,16 +186,22 @@ def _supra_complexity(prompt: str) -> int:
 
 
 def _decide(prompt: str) -> tuple[str, float, int | None]:
-    r = _load_router()
-    score = float(r.calculate_strong_win_rate(prompt))
-    supra_complexity = None
-    if score >= THRESHOLD:
-        return "expensive", score, supra_complexity
-    if SUPRA_ENABLED:
-        supra_complexity = _supra_complexity(prompt)
-        if supra_complexity >= SUPRA_THRESHOLD:
+    # Take tail of prompt (~15k chars) so routing evaluates the latest user request & context
+    trimmed_prompt = prompt[-15000:] if len(prompt) > 15000 else prompt
+    try:
+        r = _load_router()
+        score = float(r.calculate_strong_win_rate(trimmed_prompt))
+        supra_complexity = None
+        if score >= THRESHOLD:
             return "expensive", score, supra_complexity
-    return "cheap", score, supra_complexity
+        if SUPRA_ENABLED:
+            supra_complexity = _supra_complexity(trimmed_prompt)
+            if supra_complexity >= SUPRA_THRESHOLD:
+                return "expensive", score, supra_complexity
+        return "cheap", score, supra_complexity
+    except Exception as err:
+        print(f"Router decision failed ({err}); defaulting to expensive", flush=True)
+        return "expensive", 1.0, None
 
 
 def _backend_for(decision: str) -> dict:
@@ -204,7 +256,7 @@ async def healthz():
 async def list_models():
     return {"object": "list", "data": [{
         "id": MODEL_ID, "object": "model", "owned_by": "routellm",
-        "context_window": ROUTELLM_CONTEXT_WINDOW, "max_tokens": ROUTELLM_MAX_TOKENS,
+        "context_window": _get_context_window(), "max_tokens": ROUTELLM_MAX_TOKENS,
     }]}
 
 
