@@ -1,0 +1,58 @@
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: fugu-litellm
+    ports: ["3001:4000"]
+    volumes:
+      - ./configs/litellm.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      LITELLM_KEY: ${LITELLM_KEY:-sk-fugu-local}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness')"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    networks: [fugu]
+
+  router:
+    build:
+      context: .
+      dockerfile: router/Dockerfile
+    container_name: fugu-router
+    ports: ["5500:5500"]
+    environment:
+      LITELLM_BASE: http://litellm:4000/v1
+      LITELLM_KEY: ${LITELLM_KEY:-sk-fugu-local}
+      ROUTELLM_KEY: ${LITELLM_KEY:-sk-fugu-local}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      EXPENSIVE_MODEL: ${EXPENSIVE_MODEL:-gpt-4o}
+      CHEAP_MODEL: ${CHEAP_MODEL:-gpt-4o-mini}
+      EXPENSIVE_REASONING_EFFORT: ""
+      CHEAP_REASONING_EFFORT: ""
+      ROUTELLM_USE_SUPRA: "1"
+    depends_on:
+      litellm:
+        condition: service_healthy
+    networks: [fugu]
+
+  openfugu:
+    build:
+      context: .
+      dockerfile: openfugu/Dockerfile
+    container_name: fugu-orchestrator
+    ports: ["8088:8088"]
+    environment:
+      FUGU_BASE_URL: http://litellm:4000/v1
+      FUGU_API_KEY: ${LITELLM_KEY:-sk-fugu-local}
+      CUDA_VISIBLE_DEVICES: ""   # force CPU on Mac
+      TOKENIZERS_PARALLELISM: "false"
+    depends_on:
+      litellm:
+        condition: service_healthy
+    networks: [fugu]
+
+networks:
+  fugu:
+    driver: bridge
