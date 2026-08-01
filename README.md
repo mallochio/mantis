@@ -84,6 +84,41 @@ After you approve the shortlist and cost estimate, run the same command without 
 
 By default the retrain picks the highest-scoring worker per task (`--label-mode quality`). For a cost-quality Pareto objective, use `--label-mode cost` and a `configs/worker-costs.json` table (OpenRouter prompt/completion prices, 2K-in/1K-out estimates). In cost mode the gold worker is `argmax(score_i / cost_i)`, so equal scores resolve to the cheaper model while a much better worker can still win despite a higher price.
 
+## Retraining for a new pool (cheap, two commands)
+
+When you change the worker pool, run both retrains. The router head is cheap; the Conductor acceptance smoke is also cheap and proves the real 3B checkpoint can retrain on the new pool. Skip the full Conductor run until acceptance passes.
+
+```bash
+# 1. Update aliases, cost table, and SkyPilot YAML pool defaults.
+#    --fetch-costs requires OPENROUTER_API_KEY and contacts the OpenRouter pricing API.
+python3 scripts/update_pool.py \
+  --pool "anthropic/claude-sonnet-5|medium,anthropic/claude-opus-5|medium,openai/gpt-5.6-sol|medium,openai/gpt-5.6-luna|max,openai/gpt-5.6-terra|xhigh,deepseek/deepseek-v4-flash|none,z-ai/glm-5.2|none" \
+  --fetch-costs \
+  --update-yamls \
+  --env-file .env
+
+# 2. Retrain the TRINITY router head (cheap, ~$5-15 incl. worker API calls).
+./scripts/sky_launch_retrain_router.sh
+
+# 3. One-step acceptance test for the real 3B Conductor (cheap, ~$0.15 GCP L4 spot).
+#    The run needs AWS keys because the TerminalBench mirror is in S3.
+export OPENROUTER_API_KEY="sk-or-v1-..."
+export HF_TOKEN="hf-..."
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_DEFAULT_REGION="us-east-1"
+sky launch -y --detach-run \
+  --env OPENROUTER_API_KEY --env HF_TOKEN \
+  --env AWS_ACCESS_KEY_ID --env AWS_SECRET_ACCESS_KEY --env AWS_DEFAULT_REGION \
+  launch/sky/retrain_fugu_conductor_real_3b_smoke_gcp.yaml
+
+# 4. (Optional, expensive) Full Conductor GRPO run on 4x A100-80GB spot.
+# sky launch -y --env OPENROUTER_API_KEY --env HF_TOKEN \
+#   launch/sky/retrain_fugu_conductor.yaml
+```
+
+`update_pool.py` edits `configs/litellm.yaml` (LiteLLM aliases for runtime), `configs/worker-costs.json` (used by `--label-mode cost`), the `RETRAIN_WORKER_MODELS` default in the three SkyPilot YAMLs, and optionally your `.env` file. If you skip `--fetch-costs`, the cost table is left untouched and you must add missing entries before using `--label-mode cost`.
+
 ## Retraining the Conductor on a new pool
 
 The Conductor is a GRPO-fine-tuned `Llama-3.2-3B-Instruct` policy (checkpoint `di-zhang-fdu/openfugu-conductor-3b`) that writes a workflow DAG (`model_id`, `subtasks`, `access_list`) over the 7-slot worker pool. The base checkpoint was trained on an older pool, so it should be retrained whenever the pool changes.

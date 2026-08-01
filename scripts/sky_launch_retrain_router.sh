@@ -22,4 +22,9 @@ ENV_ARGS=()
 [ -n "${OPENROUTER_API_KEY:-}" ] && ENV_ARGS+=(--env "OPENROUTER_API_KEY=$OPENROUTER_API_KEY")
 [ -n "${HF_TOKEN:-}" ] && ENV_ARGS+=(--env "HF_TOKEN=$HF_TOKEN")
 
+# Forward any RETRAIN_* env vars so a single pool change works across scripts.
+for var in $(compgen -e | grep '^RETRAIN_'); do
+  ENV_ARGS+=(--env "$var=${!var}")
+done
+
 exec "${CMD[@]}" "${ENV_ARGS[@]}" launch/sky/retrain_fugu_router.yaml "${EXTRA_ARGS[@]}"
