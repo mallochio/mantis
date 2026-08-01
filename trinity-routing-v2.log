@@ -1,0 +1,17 @@
+# TRINITY routing sanity probe on the new 7-slot pool
+# 2026-08-01
+
+## Query 1: 17+25 with reasoning
+POST /v1/chat/completions model=trinity
+{"messages":[{"role":"user","content":"Compute 17+25 and explain your reasoning."}],"max_tokens":128}
+
+Response:
+{"id": "chatcmpl-d3a9064a7dd341c585f4ec90", "object": "chat.completion", "created": 1785626105, "model": "trinity", "choices": [{"index": 0, "message": {"role": "assistant", "content": "17 + 25 = 42.\n\nReason:  \n- Add the ones: 7 + 5 = 12, so write 2 and carry over 1.  \n- Add the tens: 1 + 2 = 3, plus the carried 1 = 4.  \nSo the result is **42**."}, "finish_reason": "stop"}], "usage": {"fugu_turns": 2, "fugu_trace": "Worker(3)\u2192Verifier(1):verifier_accept"}}
+
+
+## Query 2: complex refactor
+POST /v1/chat/completions model=trinity
+{"messages":[{"role":"user","content":"Refactor this Python function to use list comprehensions and type hints, then check for bugs: def double(xs): out=[]; for x in xs: out.append(x*2); return out"}],"max_tokens":256}
+
+Response:
+{"id": "chatcmpl-9c99f0db25cd4627a66e9d6d", "object": "chat.completion", "created": 1785626197, "model": "trinity", "choices": [{"index": 0, "message": {"role": "assistant", "content": "```python\nfrom typing import Iterable, List\n\ndef double(xs: Iterable[float]) -> List[float]:\n    return [x * 2 for x in xs]\n```\n\n### Imports and Python version\n- `Iterable` and `List` come from the `typing` module.\n- This version works with Python 3.5+.\n- If you are using **Python 3.9+**, you can use built-in generics instead:\n\n```python\nfrom collections.abc import Iterable\n\ndef double(xs: Iterable[float]) -> list[float]:\n    return [x * 2 for x in xs]\n```\n\n### Bug check\nThe original logic is correct: it iterates over `xs` and multiplies each item by `2`. The list comprehension version behaves exactly the same way.\n\nHowever, type hints are **not enforced at runtime** in Python, so passing unusual values can still cause unexpected behavior:\n\n- `double(None)` \u2192 `TypeError` because `None` is not iterable.\n- `double([\"ab\"])` \u2192 `[\"abab\"]`, because strings support `*`, so you get string repetition rather than numeric doubling.\n- `double(\"ab\")` \u2192 `[\"aa\", \"bb\"]`, because iterating over a string yields characters.\n- If `xs` is a generator, it works fine, but the generator is consumed by the comprehension just like the original loop would consume it.\n\nFor normal numeric input \u2014 integers, floats, lists of numbers \u2014 the refactored function is safe and idiomatic."}, "finish_reason": "stop"}], "usage": {"fugu_turns": 5, "fugu_trace": "Thinker(3)\u2192Worker(3)\u2192Thinker(1)\u2192Verifier(1)\u2192Thinker(1):max_turns"}}

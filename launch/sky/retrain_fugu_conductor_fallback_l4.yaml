@@ -1,12 +1,11 @@
-name: retrain-fugu-conductor
+name: retrain-fugu-conductor-fallback-l4
 
 resources:
   cloud: gcp
-  region: europe-west4
-  accelerators: A100:1
-  memory: 85+
-  use_spot: true
-  job_recovery: FAILOVER
+  region: us-central1
+  accelerators: L4:1
+  memory: 32+
+  use_spot: false
 
 workdir: .
 
@@ -14,12 +13,12 @@ envs:
   RETRAIN_WORKER_MODELS: "google/gemini-3.6-flash|high,openai/gpt-5.6-luna|max,openai/gpt-5.6-sol|medium,deepseek/deepseek-v4-flash-0731|xhigh,anthropic/claude-opus-5|medium,anthropic/claude-sonnet-5|medium,google/gemini-3.1-pro-preview|high"
   RETRAIN_DATASET: "s3://external-datasets-archive/terminal-bench-2.1/"
   FUGU_BASE_MODEL: "di-zhang-fdu/openfugu-conductor-3b"
-  RETRAIN_STEPS: "500"
+  RETRAIN_STEPS: "300"
   RETRAIN_LIMIT: "100"
-  RETRAIN_NUM_GENERATIONS: "4"
-  RETRAIN_PER_DEVICE_BATCH: "4"
-  RETRAIN_MAX_PROMPT_LENGTH: "512"
-  RETRAIN_MAX_COMPLETION_LENGTH: "256"
+  RETRAIN_NUM_GENERATIONS: "2"
+  RETRAIN_PER_DEVICE_BATCH: "2"
+  RETRAIN_MAX_PROMPT_LENGTH: "128"
+  RETRAIN_MAX_COMPLETION_LENGTH: "128"
   RETRAIN_OPTIM: "adamw_bnb_8bit"
   FUGU_WORKER_TIMEOUT: "45"
   FUGU_WORKER_MAX_TOKENS: "256"
@@ -32,7 +31,6 @@ setup: |
   pip install --quiet torch==2.4.1 --extra-index-url https://download.pytorch.org/whl/cu121
   pip install --quiet -r requirements-conductor.txt
   pip install --quiet awscli boto3 bitsandbytes
-  # OpenFugu is .gitignored in fugu-local and not synced by SkyPilot.
   if [ ! -d "OpenFugu/openfugu" ]; then
     rm -rf OpenFugu
     git clone --depth 1 https://github.com/trotsky1997/OpenFugu.git OpenFugu
@@ -54,7 +52,7 @@ run: |
   fi
 
   TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-  RUN_ID="retrain-conductor-${TIMESTAMP}"
+  RUN_ID="retrain-conductor-${TIMESTAMP}-fallback-l4"
   export RETRAIN_OUTPUT_DIR="${OUTPUT_ROOT}/${RUN_ID}"
   mkdir -p "$RETRAIN_OUTPUT_DIR"
 
