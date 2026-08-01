@@ -150,7 +150,22 @@ class LocalPoolWorker:
         return str(tk.decode(out[0, ids["input_ids"].shape[1] :], skip_special_tokens=True))
 
 
-def _chat_response(text: str, model: str, usage_turns: int) -> dict:
+def _build_fugu_trace(result: Any) -> str:
+    """Render a compact orchestration trace from a coordinator result."""
+    turns = getattr(result, "turns", [])
+    if not turns:
+        return "steps:0:conductor"
+    if hasattr(turns[0], "role_name"):
+        parts = [f"{t.role_name}({t.agent_id})" for t in turns]
+        tb = getattr(result, "terminated_by", "")
+        return "→".join(parts) + (f":{tb}" if tb else "")
+    return f"steps:{len(turns)}:conductor"
+
+
+def _chat_response(result: Any, model: str) -> dict:
+    text = getattr(result, "final", "")
+    turns = getattr(result, "turns", [])
+    trace = _build_fugu_trace(result)
     return {
         "id": "chatcmpl-" + uuid.uuid4().hex[:24],
         "object": "chat.completion",
@@ -161,8 +176,10 @@ def _chat_response(text: str, model: str, usage_turns: int) -> dict:
             "message": {"role": "assistant", "content": text},
             "finish_reason": "stop",
         }],
-        # surface the orchestration depth without exposing which workers ran
-        "usage": {"fugu_turns": usage_turns},
+        "usage": {
+            "fugu_turns": len(turns),
+            "fugu_trace": trace,
+        },
     }
 
 
@@ -340,7 +357,7 @@ class Handler(BaseHTTPRequestHandler):
             coord = get_coordinator(coordinator_mode)
             res = coord.run(query, verbose=False)
             self._send(
-                200, _chat_response(res.final, req.get("model", MODEL_NAME), len(res.turns))
+                200, _chat_response(res, req.get("model", MODEL_NAME))
             )
         except (json.JSONDecodeError, ValueError, KeyError, RuntimeError) as e:
             self._send(500, {"error": str(e)})

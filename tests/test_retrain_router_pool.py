@@ -229,7 +229,9 @@ def test_load_terminalbench_s3(monkeypatch, tmp_path):
     fake_boto3.client = _fake_client
     monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
 
-    train, val = rp.load_terminalbench_tasks(f"s3://external/{prefix}/", limit=10, val_frac=0.0)
+    train, val = rp.load_terminalbench_tasks(
+        f"s3://external/{prefix}/", limit=10, val_frac=0.0, cache_dir=str(tmp_path / "cache")
+    )
     assert len(train) == 1
     assert train[0]["task"] == "task a"
 
@@ -673,3 +675,107 @@ def test_main_pad_pool(monkeypatch, tmp_path):
     rp.main(argv)
     report = json.loads((out_dir / "report.json").read_text())
     assert report["train_size"] == 1
+
+
+def test_load_cost_table_skips_comments(tmp_path):
+    p = tmp_path / "costs.json"
+    p.write_text(json.dumps({
+        "_note": "comment",
+        "model/a": 0.01,
+        "model/b": 0.02,
+    }))
+    costs = rp._load_cost_table(p)
+    assert costs == {"model/a": 0.01, "model/b": 0.02}
+
+
+def test_pick_best_worker_quality():
+    pool = ["expensive", "cheap"]
+    scores = [0.1, 0.9]
+    costs = {"expensive": 10.0, "cheap": 0.01}
+    # quality mode picks highest score regardless of cost
+    assert rp._pick_best_worker(scores, pool, "quality", costs) == 1
+
+
+def test_pick_best_worker_cost_equal_scores():
+    pool = ["openai/gpt-5.6-luna", "anthropic/claude-opus-5"]
+    scores = [0.5, 0.5]
+    costs = {
+        "openai/gpt-5.6-luna": 0.0008,
+        "anthropic/claude-opus-5": 0.035,
+    }
+    # equal scores -> cheaper model wins
+    assert rp._pick_best_worker(scores, pool, "cost", costs) == 0
+
+
+def test_pick_best_worker_quality_2x_score_wins_despite_price():
+    pool = ["openai/gpt-5.6-luna", "anthropic/claude-opus-5"]
+    # worker 1 is 2x better but 40x more expensive
+    scores = [0.5, 1.0]
+    costs = {
+        "openai/gpt-5.6-luna": 0.0008,
+        "anthropic/claude-opus-5": 0.035,
+    }
+    # quality mode ignores price
+    assert rp._pick_best_worker(scores, pool, "quality", costs) == 1
+
+
+def test_main_cost_mode(monkeypatch, tmp_path):
+    vec = tmp_path / "vec.npy"
+    np.save(vec, np.zeros(rp.VEC_LEN))
+
+    class FakeWorker:
+        def __init__(self, pool):
+            self.pool = pool
+
+        def __call__(self, role, messages, agent_id):
+            return f"reply-{agent_id}"
+
+    class FakeRouter:
+        head = torch.zeros(rp.HEAD_ROWS, rp.HIDDEN)
+        device = "cpu"
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def route(self, messages, sample=False):
+            return {"agent_id": 0, "role_id": 1}
+
+    monkeypatch.setattr(rp, "OpenRouterWorker", FakeWorker)
+    monkeypatch.setattr(rp, "FuguRouter", FakeRouter)
+    monkeypatch.setattr(
+        rp, "extract_hidden_states",
+        lambda router, tasks, batch_size=8: torch.zeros(len(tasks), rp.HIDDEN),
+    )
+    monkeypatch.setattr(
+        rp, "train_head",
+        lambda X, yw, yr, h0, **kwargs: (torch.zeros(rp.HEAD_ROWS, rp.HIDDEN), 0.5),
+    )
+    monkeypatch.setattr(rp, "tqdm", lambda x, **kw: x)
+
+    cost_table = tmp_path / "costs.json"
+    cost_table.write_text(json.dumps({
+        "openai/m0": 1.0,
+        "openai/m1": 0.01,
+    }))
+
+    dataset_dir = tmp_path / "terminal"
+    (dataset_dir / "task0" / "solution").mkdir(parents=True)
+    (dataset_dir / "task0" / "instruction.md").write_text("do x")
+    (dataset_dir / "task0" / "solution" / "solve.sh").write_text("echo x")
+
+    out_dir = tmp_path / "out"
+    argv = [
+        "--pool", "openai/m0,openai/m1",
+        "--dataset", str(dataset_dir),
+        "--label-mode", "cost",
+        "--cost-table", str(cost_table),
+        "--limit", "1",
+        "--epochs", "1",
+        "--fugu-vector", str(vec),
+        "--output-dir", str(out_dir),
+        "--val-frac", "0.0",
+    ]
+    rp.main(argv)
+    report = json.loads((out_dir / "report.json").read_text())
+    assert report["label_mode"] == "cost"
+    assert report["cost_table"] == str(cost_table)

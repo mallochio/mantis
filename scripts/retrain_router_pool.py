@@ -46,6 +46,8 @@ import json
 import os
 import re
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -415,6 +417,14 @@ def _parse_retrain_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--alpha", type=float, default=0.1, help="role-loss weight")
     ap.add_argument("--l2", type=float, default=0.01, help="L2 regularization toward original head")
+    default_cost_table = str(REPO_ROOT / "configs" / "worker-costs.json")
+    ap.add_argument("--label-mode", choices=["quality", "cost"],
+                    default=os.environ.get("RETRAIN_LABEL_MODE", "quality"),
+                    help="How to pick the gold worker per task (quality=argmax score, "
+                         "cost=argmax score/cost).")
+    ap.add_argument("--cost-table",
+                    default=os.environ.get("RETRAIN_COST_TABLE", default_cost_table),
+                    help="JSON mapping OpenRouter model id -> USD per task call.")
     ap.add_argument("--val-frac", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--cache", default="worker_outputs.jsonl",
@@ -462,6 +472,33 @@ def _load_retrain_data(args: argparse.Namespace):
     return train_ds, val_ds
 
 
+def _load_cost_table(path: str | Path) -> dict[str, float]:
+    """Load a cost table JSON, skipping comment keys that start with '_'."""
+    with open(path) as f:
+        data = json.load(f)
+    return {k: float(v) for k, v in data.items() if not k.startswith("_")}
+
+
+def _pick_best_worker(
+    scores: list[float],
+    pool: list[str],
+    label_mode: str,
+    costs: dict[str, float] | None,
+) -> int:
+    """Return the worker index that should be the gold label for this task."""
+    if label_mode == "cost":
+        if costs is None:
+            raise ValueError("cost mode requires a cost table")
+        ratios = []
+        for score, spec in zip(scores, pool, strict=True):
+            model, _ = split_model_spec(spec)
+            model_id = normalize_model_id(model)
+            cost = max(costs.get(model_id, 0.0), 1e-6)
+            ratios.append(score / cost)
+        return int(np.argmax(ratios))
+    return int(np.argmax(scores))
+
+
 def _load_worker_cache(cache_path: Path) -> dict[tuple[str, str], dict]:
     cache: dict[tuple[str, str], dict] = {}
     if cache_path.exists():
@@ -485,12 +522,18 @@ def _score_one_worker(
     agent_id: int,
     model: str,
     cache: dict[tuple[str, str], dict],
+    cache_lock: threading.Lock | None = None,
 ) -> str:
     key = (task, model)
     if key in cache:
         return str(cache[key]["completion"])
     completion = worker("Worker", worker_messages(task, system), agent_id)
-    cache[key] = {"task": task, "model": model, "completion": completion}
+    rec = {"task": task, "model": model, "completion": completion}
+    if cache_lock:
+        with cache_lock:
+            cache[key] = rec
+    else:
+        cache[key] = rec
     return completion
 
 
@@ -499,18 +542,29 @@ def _score_worker_pool(
     pool: list[str],
     train_ds: list[dict],
     cache_path: Path,
+    label_mode: str = "quality",
+    costs: dict[str, float] | None = None,
 ) -> list[dict]:
     cache = _load_worker_cache(cache_path)
+    cache_lock = threading.Lock()
     results = []
     for row in tqdm(train_ds, desc="scoring workers"):
         task = row["task"]
         gold = row["expected"]
         system = row.get("system")
-        scores = [
-            reward_for(_score_one_worker(worker, task, system, agent_id, model, cache), gold)
-            for agent_id, model in enumerate(pool)
-        ]
-        best = int(np.argmax(scores))
+        scores: list[float] = [0.0] * len(pool)
+        with ThreadPoolExecutor(max_workers=len(pool)) as ex:
+            futures = {
+                ex.submit(
+                    _score_one_worker, worker, task, system, agent_id, model, cache, cache_lock
+                ): agent_id
+                for agent_id, model in enumerate(pool)
+            }
+            for fut in as_completed(futures):
+                agent_id = futures[fut]
+                completion = fut.result()
+                scores[agent_id] = reward_for(completion, gold)
+        best = _pick_best_worker(scores, pool, label_mode, costs)
         results.append({"task": task, "gold_worker": best, "scores": scores, "gold": gold})
     _write_worker_cache(cache_path, cache)
     return results
@@ -597,10 +651,11 @@ def _build_report(
     vec_path: Path,
     head_path: Path,
 ) -> dict:
-    return {
+    report = {
         "pool": pool,
         "dataset": args.dataset,
         "limit": args.limit,
+        "label_mode": args.label_mode,
         "train_size": train_size,
         "val_size": val_size,
         "best_val_worker_acc": best_val_acc,
@@ -609,6 +664,9 @@ def _build_report(
         "vector": str(vec_path),
         "head": str(head_path),
     }
+    if args.label_mode == "cost":
+        report["cost_table"] = args.cost_table
+    return report
 
 
 def main(argv=None) -> None:
@@ -617,10 +675,19 @@ def main(argv=None) -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    costs = None
+    if args.label_mode == "cost":
+        if not Path(args.cost_table).exists():
+            raise FileNotFoundError(
+                f"cost mode requires --cost-table; not found: {args.cost_table}"
+            )
+        costs = _load_cost_table(args.cost_table)
+        print(f"[retrain] cost table: {len(costs)} models", flush=True)
+
     train_ds, val_ds = _load_retrain_data(args)
     cache_path = out_dir / args.cache
     worker = OpenRouterWorker(pool)
-    results = _score_worker_pool(worker, pool, train_ds, cache_path)
+    results = _score_worker_pool(worker, pool, train_ds, cache_path, args.label_mode, costs)
     _write_labels(out_dir, results)
 
     device = _resolve_device(args.device)

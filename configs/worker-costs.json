@@ -1,0 +1,11 @@
+{
+  "_note": "Per-task cost estimates for TRINITY router retraining label weighting, not billing.",
+  "_assumptions": "Prices fetched from OpenRouter /api/v1/models; per-task cost assumes 2000 input tokens + 1000 output tokens. OpenRouter prices drift; refresh this file before a production retrain.",
+  "anthropic/claude-sonnet-5": 0.014,
+  "anthropic/claude-opus-5": 0.035,
+  "openai/gpt-5.6-sol": 0.04,
+  "openai/gpt-5.6-luna": 0.0008,
+  "openai/gpt-5.6-terra": 0.008,
+  "deepseek/deepseek-v4-flash": 0.00056,
+  "z-ai/glm-5.2": 0.003909
+}

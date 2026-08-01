@@ -17,6 +17,8 @@ docker compose up -d
 
 The backend LLM calls are routed through **OpenRouter** via the LiteLLM proxy. `llm-router`'s internal `mf` scorer still needs an OpenAI key for `text-embedding-3-small`; `OPENAI_API_KEY` is only used for that embedding call.
 
+The Pi extension logs every routing decision to `~/.config/fugu/routing-log.jsonl` (one JSON line per turn with `score`, `coordinator`, and a `task_prefix`), and the OpenFugu response `usage` object now includes `fugu_trace` — a compact string such as `Worker(4)→Thinker(1)→Verifier(1):verifier_accept` for TRINITY or `steps:5:conductor` for Conductor.
+
 ## Model knobs (set in `.env` or your shell, e.g. `.zshrc`)
 
 All model selection is env-driven. Export the variables before `docker compose up` (or put them in `.zshrc`/`.bashrc` and run `set -a; source <file>; set +a` before compose).
@@ -70,13 +72,17 @@ export HF_TOKEN="hf-..."
 
 The default pool in `launch/sky/retrain_fugu_router.yaml` is the 7 requested frontier models: Anthropic Sonnet/Opus 5 (medium thinking), GPT-5.6 Sol/Luna/Terra with graded reasoning effort, and low-cost DeepSeek V4 Flash / GLM-5.2. Each retraining entry can append `|reasoning_effort` (e.g. `openai/gpt-5.6-terra|xhigh`) so the labels match the runtime LiteLLM aliases. The script:
 
-1. Loads `nvidia/ToolScale` tasks.
-2. Calls each worker in the pool through OpenRouter and scores each response against the expected tool-call plan.
+1. Loads `nvidia/ToolScale` or `s3://external-datasets-archive/terminal-bench-2.1/` tasks.
+2. Calls each worker in the pool through OpenRouter and scores each response.
 3. Extracts Qwen3-0.6B hidden states.
 4. Fine-tunes the 10x1024 TRINITY head (worker + role logits) with L2 regularization toward the original head.
 5. Writes `model_iter_60.npy` and `router_head.npy` to the S3 mount at `s3://sid-llm-runs/retrain-fugu-router/<timestamp>/`.
 
 After you approve the shortlist and cost estimate, run the same command without `--dry-run`.
+
+### Cost-aware router labels
+
+By default the retrain picks the highest-scoring worker per task (`--label-mode quality`). For a cost-quality Pareto objective, use `--label-mode cost` and a `configs/worker-costs.json` table (OpenRouter prompt/completion prices, 2K-in/1K-out estimates). In cost mode the gold worker is `argmax(score_i / cost_i)`, so equal scores resolve to the cheaper model while a much better worker can still win despite a higher price.
 
 ## Mac M5 2025 / Apple Silicon notes
 

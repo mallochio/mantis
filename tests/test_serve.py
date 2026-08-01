@@ -57,11 +57,28 @@ def test_resolve_conductor_model_default(monkeypatch):
 
 
 def test_chat_response():
-    resp = serve._chat_response("hello", "fugu", 3)
+    result = SimpleNamespace(final="hello", turns=[1, 2, 3])
+    resp = serve._chat_response(result, "fugu")
     assert resp["model"] == "fugu"
     assert resp["choices"][0]["message"]["content"] == "hello"
     assert resp["usage"]["fugu_turns"] == 3
+    assert resp["usage"]["fugu_trace"] == "steps:3:conductor"
     assert resp["id"].startswith("chatcmpl-")
+
+
+def test_build_fugu_trace_trinity():
+    turns = [
+        SimpleNamespace(role_name="Worker", agent_id=4),
+        SimpleNamespace(role_name="Thinker", agent_id=1),
+        SimpleNamespace(role_name="Verifier", agent_id=1),
+    ]
+    result = SimpleNamespace(final="ok", turns=turns, terminated_by="verifier_accept")
+    assert serve._build_fugu_trace(result) == "Worker(4)→Thinker(1)→Verifier(1):verifier_accept"
+
+
+def test_build_fugu_trace_empty():
+    result = SimpleNamespace(final="ok", turns=[])
+    assert serve._build_fugu_trace(result) == "steps:0:conductor"
 
 
 # ---------------------------------------------------------------------------
@@ -212,10 +229,20 @@ def _start_server(handler_cls, port: int = 0) -> tuple[Any, int]:
     return srv, port
 
 
-def _fake_get_coordinator(mode: str):
+def _fake_get_coordinator(mode: str = "trinity"):
     class FakeCoord:
         def run(self, query, verbose=False):
-            return SimpleNamespace(final="42", turns=[1, 2, 3])
+            if mode == "conductor":
+                return SimpleNamespace(final="42", turns=[1, 2, 3, 4, 5])
+            return SimpleNamespace(
+                final="42",
+                turns=[
+                    SimpleNamespace(role_name="Worker", agent_id=4),
+                    SimpleNamespace(role_name="Thinker", agent_id=1),
+                    SimpleNamespace(role_name="Verifier", agent_id=1),
+                ],
+                terminated_by="verifier_accept",
+            )
 
     return FakeCoord()
 
@@ -264,6 +291,7 @@ def test_handler_post_trinity():
         body = json.loads(resp.read().decode())
         assert body["choices"][0]["message"]["content"] == "42"
         assert body["usage"]["fugu_turns"] == 3
+        assert body["usage"]["fugu_trace"] == "Worker(4)→Thinker(1)→Verifier(1):verifier_accept"
     finally:
         serve.get_coordinator = old
         srv.shutdown()
@@ -284,6 +312,8 @@ def test_handler_post_conductor():
         resp = urlopen(req)
         body = json.loads(resp.read().decode())
         assert body["choices"][0]["message"]["content"] == "42"
+        assert body["usage"]["fugu_turns"] == 5
+        assert body["usage"]["fugu_trace"] == "steps:5:conductor"
     finally:
         serve.get_coordinator = old
         srv.shutdown()
