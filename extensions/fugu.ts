@@ -33,7 +33,7 @@ async function supraScore(text: string): Promise<number> {
 
 async function warm(coordinator: string, ctx: any) {
   if (warmed.has(coordinator)) return;
-  ctx.ui.notify(`fugu: warming ${coordinator} (first call may download weights)…`, "info");
+  ctx.ui.notify?.(`fugu: warming ${coordinator} (first call may download weights)…`, "info");
   try {
     await fetch(`${FUGU_URL}/chat/completions`, {
       method: "POST",
@@ -45,9 +45,9 @@ async function warm(coordinator: string, ctx: any) {
       }),
     });
     warmed.add(coordinator);
-    ctx.ui.notify(`fugu: ${coordinator} ready`, "info");
+    ctx.ui.notify?.(`fugu: ${coordinator} ready`, "info");
   } catch (e: any) {
-    ctx.ui.notify(`fugu: warm failed (${coordinator}): ${e.message}`, "warning");
+    ctx.ui.notify?.(`fugu: warm failed (${coordinator}): ${e.message}`, "warning");
   }
 }
 
@@ -72,12 +72,12 @@ export default function (pi: any) {
     handler: async (args: string, ctx: any) => {
       const m = args.trim().toLowerCase() as Mode;
       if (!["off", "trinity", "conductor", "auto"].includes(m)) {
-        ctx.ui.notify("Usage: /fugu off|trinity|conductor|auto", "error");
+        ctx.ui.notify?.("Usage: /fugu off|trinity|conductor|auto", "error");
         return;
       }
       mode = m;
-      ctx.ui.setStatus("fugu", m === "off" ? "" : `fugu:${m}`);
-      ctx.ui.notify(`fugu mode: ${m}`, "info");
+      ctx.ui.setStatus?.("fugu", m === "off" ? "" : `fugu:${m}`);
+      ctx.ui.notify?.(`fugu mode: ${m}`, "info");
       if (m === "trinity") await warm("trinity", ctx);
       if (m === "conductor") await warm("conductor", ctx);
       if (m === "auto") await warm("trinity", ctx);
@@ -85,28 +85,34 @@ export default function (pi: any) {
   });
 
   pi.on("input", async (event: any, ctx: any) => {
-    if (event.source !== "interactive" || mode === "off") return { action: "continue" };
+    // support both TUI (interactive) and headless RPC (rpc) sessions
+    if (
+      (event.source !== "interactive" && event.source !== "rpc") ||
+      mode === "off"
+    ) {
+      return { action: "continue" };
+    }
 
     let coordinator: "trinity" | "conductor";
     if (mode === "auto") {
       const score = await supraScore(event.text);
       if (score <= 2) return { action: "continue" };
       coordinator = score >= AUTO_THRESHOLD ? "conductor" : "trinity";
-      ctx.ui.setStatus("fugu", `fugu:auto→${coordinator} (c${score})`);
+      ctx.ui.setStatus?.("fugu", `fugu:auto→${coordinator} (c${score})`);
     } else {
       coordinator = mode;
     }
 
     try {
       const result = await orchestrate(coordinator, event.text, ctx);
-      pi.sendMessage(
+      await pi.sendMessage(
         { customType: "fugu-result", content: result, display: true },
         { triggerTurn: false },
       );
+      return { action: "handled" };
     } catch (e: any) {
-      ctx.ui.notify(`fugu error: ${e.message} — falling back to normal turn`, "error");
+      ctx.ui.notify?.(`fugu error: ${e.message} — falling back to normal turn`, "error");
       return { action: "continue" };
     }
-    return { action: "handled" };
   });
 }
