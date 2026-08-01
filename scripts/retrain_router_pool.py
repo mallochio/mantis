@@ -4,8 +4,12 @@
 Usage (local):
   export OPENROUTER_API_KEY=sk-or-v1-...
   python scripts/retrain_router_pool.py \
-    --pool "anthropic/claude-sonnet-5|medium,anthropic/claude-opus-5|medium,openai/gpt-5.6-sol|medium,openai/gpt-5.6-luna|max,openai/gpt-5.6-terra|xhigh,deepseek/deepseek-v4-flash|none,z-ai/glm-5.2|none" \
+    --pool "<7 model specs separated by commas, optional |reasoning_effort>" \
     --output-dir ./outputs/router_retrain
+
+  Example pool: anthropic/claude-sonnet-5|medium, anthropic/claude-opus-5|medium,
+  openai/gpt-5.6-sol|medium, openai/gpt-5.6-luna|max, openai/gpt-5.6-terra|xhigh,
+  deepseek/deepseek-v4-flash|none, z-ai/glm-5.2|none
 
 Usage (SkyPilot):
   sky launch launch/sky/retrain_fugu_router.yaml
@@ -35,16 +39,21 @@ Environment:
   RETRAIN_EPOCHS      optional override of --epochs
 """
 from __future__ import annotations
-import argparse, json, os, sys, time, re, difflib
-from collections import defaultdict
+
+import argparse
+import difflib
+import json
+import os
+import re
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch import nn
 from datasets import load_dataset
 from huggingface_hub import snapshot_download
+from torch import nn
 from tqdm.auto import tqdm
 
 # Make OpenFugu internals importable when this script lives in fugu-local/scripts.
@@ -52,11 +61,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "OpenFugu"))
 
 from openfugu.mini import (
-    FuguRouter, N_AGENTS, N_ROLES, HEAD_ROWS, HIDDEN, SVF_LEN, VEC_LEN,
-    ROUTER_SYSTEM_PROMPT, DEFAULT_SLOT_LABELS,
+    HEAD_ROWS,
+    HIDDEN,
+    N_AGENTS,
+    ROUTER_SYSTEM_PROMPT,
+    SVF_LEN,
+    VEC_LEN,
+    FuguRouter,
 )
-from train.toolscale_data import _parse_plan, _score, SYSTEM
-
+from train.toolscale_data import SYSTEM, _parse_plan, _score
 
 # ---------------------------------------------------------------------------
 # OpenRouter worker wrapper (explicit OpenAI-compatible provider)
@@ -137,16 +150,16 @@ class OpenRouterWorker:
     def __call__(self, role: str, messages: list[dict], agent_id: int) -> str:
         model = self.models[agent_id % len(self.models)]
         effort = self.efforts[agent_id % len(self.efforts)]
-        kw = dict(
-            model=f"openai/{model}",
-            messages=messages,
-            max_tokens=self.max_tokens,
-            custom_llm_provider="openai",
-            timeout=self.timeout,
+        kw = {
+            "model": f"openai/{model}",
+            "messages": messages,
+            "max_tokens": self.max_tokens,
+            "custom_llm_provider": "openai",
+            "timeout": self.timeout,
             # reasoning_effort is an extra param for LiteLLM's openai provider;
             # tell LiteLLM to allow it through to OpenRouter.
-            allowed_openai_params=["reasoning_effort"],
-        )
+            "allowed_openai_params": ["reasoning_effort"],
+        }
         # Reasoning models (claude-*, gpt-5.6-*) require temperature=1 or omitted.
         if not _is_reasoning_model(model):
             kw["temperature"] = self.temperature
@@ -158,8 +171,8 @@ class OpenRouterWorker:
             kw["api_base"] = self.api_base
         try:
             r = self.litellm.completion(**kw)
-            return r.choices[0].message.content or ""
-        except Exception as e:
+            return str(r.choices[0].message.content or "")
+        except Exception as e:  # noqa: BLE001
             print(f"[worker] call failed for {model}: {e}", flush=True)
             return ""
 
@@ -179,7 +192,7 @@ TERMINAL_PATTERNS = ("/instruction.md", "/task.toml", "/solution/solve.sh")
 
 def _sync_s3_to_local(s3_uri: str, local_dir: Path):
     """Mirror only the small TerminalBench metadata files from S3."""
-    import boto3, re
+    import boto3
     m = re.match(r"s3://([^/]+)/?(.*)", s3_uri)
     if not m:
         raise ValueError(f"invalid S3 URI: {s3_uri}")
@@ -198,27 +211,34 @@ def _sync_s3_to_local(s3_uri: str, local_dir: Path):
             client.download_file(bucket, key, str(dest))
 
 
-def load_terminalbench_tasks(dataset: str = "zai-org/terminal-bench-2-verified",
-                             limit: int | None = None, seed: int = 42,
-                             val_frac: float = 0.1, cache_dir: str | None = None):
+def load_terminalbench_tasks(
+    dataset: str = "zai-org/terminal-bench-2-verified",
+    limit: int | None = None,
+    seed: int = 42,
+    val_frac: float = 0.1,
+    cache_dir: str | Path | None = None,
+):
     """Load TerminalBench 2.1 task prompts and reference solution scripts.
 
     Only the small metadata files are downloaded (instruction.md, task.toml,
     solution/solve.sh); the heavy environment tarballs are skipped.
     """
-    cache_dir = Path(cache_dir or os.path.expanduser("~/.cache/terminal-bench-2.1"))
+    local_dir = Path(cache_dir or os.path.expanduser("~/.cache/terminal-bench-2.1"))
 
     if dataset.startswith("s3://"):
-        _sync_s3_to_local(dataset, cache_dir)
-        local = cache_dir
+        _sync_s3_to_local(dataset, local_dir)
+        local = local_dir
     elif Path(dataset).exists():
         local = Path(dataset)
     else:
-        local = Path(snapshot_download(
-            dataset, repo_type="dataset",
-            local_dir=str(cache_dir),
-            allow_patterns=[f"*{s}" for s in TERMINAL_PATTERNS],
-        ))
+        local = Path(
+            snapshot_download(
+                dataset,
+                repo_type="dataset",
+                local_dir=str(local_dir),
+                allow_patterns=[f"*{s}" for s in TERMINAL_PATTERNS],
+            )
+        )
 
     records = []
     for instr_path in sorted(local.glob("*/instruction.md")):
@@ -236,7 +256,7 @@ def load_terminalbench_tasks(dataset: str = "zai-org/terminal-bench-2-verified",
         })
 
     rng = np.random.default_rng(seed)
-    rng.shuffle(records)
+    rng.shuffle(records)  # type: ignore[arg-type]
     if limit:
         records = records[:limit]
     n_val = int(len(records) * val_frac)
@@ -260,7 +280,7 @@ def load_toolscale_tasks(limit: int, seed: int = 42, val_frac: float = 0.1):
             break
 
     rng = np.random.default_rng(seed)
-    rng.shuffle(records)
+    rng.shuffle(records)  # type: ignore[arg-type]
     n_val = int(len(records) * val_frac)
     return records[n_val:], records[:n_val]
 
@@ -274,17 +294,17 @@ def worker_messages(task: str, system: str | None = None) -> list[dict]:
     ]
 
 
-def reward_for(completion: str, gold) -> float:
+def reward_for(completion: str, gold: str | list) -> float:
     # TerminalBench gold is a reference shell script; use a cheap, deterministic
     # similarity as a routing reward. ToolScale gold is a list of tool-call dicts.
     if isinstance(gold, str):
         if not completion or not gold:
             return 0.0
-        return difflib.SequenceMatcher(None, completion, gold).ratio()
+        return float(difflib.SequenceMatcher(None, completion, gold).ratio())
     pred = _parse_plan(completion)
     if pred is None:
         return 0.0
-    return _score(pred, gold)
+    return float(_score(pred, gold))
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +335,7 @@ def extract_hidden_states(router: FuguRouter, tasks: list[str], batch_size: int 
 def train_head(X: torch.Tensor, y_worker: torch.Tensor, y_role: torch.Tensor,
                head0: torch.Tensor, epochs: int = 30, lr: float = 1e-3,
                alpha: float = 0.1, l2_lambda: float = 0.01,
-               device: str | None = None):
+               device: str | None = None) -> tuple[torch.Tensor, float]:
     """Fine-tune the shared 10x1024 head."""
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -337,7 +357,7 @@ def train_head(X: torch.Tensor, y_worker: torch.Tensor, y_role: torch.Tensor,
     val_idx = indices[n_train:]
 
     best_val = -1.0
-    best_weight = None
+    best_weight = head.weight.detach().cpu().clone()
     for epoch in range(epochs):
         head.train()
         perm = torch.randperm(len(train_idx))
@@ -357,12 +377,14 @@ def train_head(X: torch.Tensor, y_worker: torch.Tensor, y_role: torch.Tensor,
         with torch.no_grad():
             if len(val_idx) > 0:
                 logits = head(X[val_idx])
-                acc_w = (logits[:, :N_AGENTS].argmax(dim=1) == y_worker[val_idx]).float().mean().item()
-                acc_r = (logits[:, N_AGENTS:].argmax(dim=1) == y_role[val_idx]).float().mean().item()
+                acc_w = (logits[:, :N_AGENTS].argmax(dim=1) == y_worker[val_idx]).float().mean()
+                acc_r = (logits[:, N_AGENTS:].argmax(dim=1) == y_role[val_idx]).float().mean()
             else:
                 logits = head(X[train_idx])
-                acc_w = (logits[:, :N_AGENTS].argmax(dim=1) == y_worker[train_idx]).float().mean().item()
-                acc_r = (logits[:, N_AGENTS:].argmax(dim=1) == y_role[train_idx]).float().mean().item()
+                acc_w = (logits[:, :N_AGENTS].argmax(dim=1) == y_worker[train_idx]).float().mean()
+                acc_r = (logits[:, N_AGENTS:].argmax(dim=1) == y_role[train_idx]).float().mean()
+            acc_w = acc_w.item()
+            acc_r = acc_r.item()
         print(f"[epoch {epoch + 1}/{epochs}] loss={epoch_loss:.4f} "
               f"val_worker_acc={acc_w:.3f} val_role_acc={acc_r:.3f}", flush=True)
         if acc_w > best_val:
@@ -376,12 +398,15 @@ def train_head(X: torch.Tensor, y_worker: torch.Tensor, y_role: torch.Tensor,
 # Main
 # ---------------------------------------------------------------------------
 
-def main(argv=None):
+def _parse_retrain_args(argv=None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Retrain TRINITY router head on a new worker pool")
     ap.add_argument("--pool", default=os.environ.get("RETRAIN_WORKER_MODELS"), required=False,
                     help="Comma-separated OpenRouter worker model ids. "
                          "Append '|reasoning_effort' per model, e.g. openai/gpt-5.6-terra|xhigh")
-    ap.add_argument("--output-dir", default=os.environ.get("RETRAIN_OUTPUT_DIR", "outputs/router_retrain"))
+    ap.add_argument(
+        "--output-dir",
+        default=os.environ.get("RETRAIN_OUTPUT_DIR", "outputs/router_retrain"),
+    )
     ap.add_argument("--dataset", default="nvidia/ToolScale",
                     help="Dataset to train on. 'nvidia/ToolScale' (default) or a "
                          "TerminalBench 2.1 HF repo such as 'zai-org/terminal-bench-2-verified'.")
@@ -396,139 +421,224 @@ def main(argv=None):
                     help="Cache worker responses to avoid re-calling the API")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--fugu-model", default=os.environ.get("FUGU_MODEL", "Qwen/Qwen3-0.6B"))
-    ap.add_argument("--fugu-vector", default=os.environ.get("FUGU_VECTOR", str(REPO_ROOT / "artifacts" / "model_iter_60.npy")))
+    default_vec = str(REPO_ROOT / "artifacts" / "model_iter_60.npy")
+    ap.add_argument("--fugu-vector", default=os.environ.get("FUGU_VECTOR", default_vec))
     args = ap.parse_args(argv)
 
     if not args.pool:
         ap.error("--pool or RETRAIN_WORKER_MODELS is required")
-    pool = [m.strip() for m in args.pool.split(",") if m.strip()]
+    return args
+
+
+def _prepare_pool(pool_csv: str) -> list[str]:
+    pool = [m.strip() for m in pool_csv.split(",") if m.strip()]
     if len(pool) != N_AGENTS:
-        print(f"[warn] pool has {len(pool)} models; TRINITY expects {N_AGENTS}. Padding with the last model.", flush=True)
+        print(
+            f"[warn] pool has {len(pool)} models; TRINITY expects {N_AGENTS}. "
+            "Padding with the last model.",
+            flush=True,
+        )
         while len(pool) < N_AGENTS:
             pool.append(pool[-1])
     print(f"[retrain] worker pool: {pool}", flush=True)
+    return pool
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- load data ----------------------------------------------------------
+def _resolve_device(device_arg: str) -> str:
+    if device_arg == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return device_arg
+
+
+def _load_retrain_data(args: argparse.Namespace):
     print(f"[retrain] loading up to {args.limit} rows from {args.dataset}...", flush=True)
     if "terminal" in args.dataset.lower():
-        train_ds, val_ds = load_terminalbench_tasks(args.dataset, args.limit, args.seed, args.val_frac)
+        train_ds, val_ds = load_terminalbench_tasks(
+            args.dataset, args.limit, args.seed, args.val_frac
+        )
     else:
         train_ds, val_ds = load_toolscale_tasks(args.limit, args.seed, args.val_frac)
-    tasks = [row["task"] for row in train_ds]
-    val_rows = val_ds  # keep full rows for system prompts
-    print(f"[retrain] train={len(tasks)} val={len(val_rows)}", flush=True)
+    print(f"[retrain] train={len(train_ds)} val={len(val_ds)}", flush=True)
+    return train_ds, val_ds
 
-    # --- collect worker rewards --------------------------------------------
-    cache_path = out_dir / args.cache
-    worker = OpenRouterWorker(pool)
 
-    cache = {}
+def _load_worker_cache(cache_path: Path) -> dict[tuple[str, str], dict]:
+    cache: dict[tuple[str, str], dict] = {}
     if cache_path.exists():
         with open(cache_path) as f:
             for line in f:
                 rec = json.loads(line)
                 cache[(rec["task"], rec["model"])] = rec
         print(f"[retrain] loaded {len(cache)} cached worker responses", flush=True)
+    return cache
 
+
+def _write_worker_cache(cache_path: Path, cache: dict[tuple[str, str], dict]) -> None:
+    with open(cache_path, "w") as f:
+        f.writelines(json.dumps(rec) + "\n" for rec in cache.values())
+
+
+def _score_one_worker(
+    worker: OpenRouterWorker,
+    task: str,
+    system: str | None,
+    agent_id: int,
+    model: str,
+    cache: dict[tuple[str, str], dict],
+) -> str:
+    key = (task, model)
+    if key in cache:
+        return str(cache[key]["completion"])
+    completion = worker("Worker", worker_messages(task, system), agent_id)
+    cache[key] = {"task": task, "model": model, "completion": completion}
+    return completion
+
+
+def _score_worker_pool(
+    worker: OpenRouterWorker,
+    pool: list[str],
+    train_ds: list[dict],
+    cache_path: Path,
+) -> list[dict]:
+    cache = _load_worker_cache(cache_path)
     results = []
-    for idx, row in enumerate(tqdm(train_ds, desc="scoring workers")):
+    for row in tqdm(train_ds, desc="scoring workers"):
         task = row["task"]
         gold = row["expected"]
         system = row.get("system")
-        scores = []
-        for agent_id, model in enumerate(pool):
-            key = (task, model)
-            if key in cache:
-                completion = cache[key]["completion"]
-            else:
-                completion = worker("Worker", worker_messages(task, system), agent_id)
-                cache[key] = {"task": task, "model": model, "completion": completion}
-            scores.append(reward_for(completion, gold))
+        scores = [
+            reward_for(_score_one_worker(worker, task, system, agent_id, model, cache), gold)
+            for agent_id, model in enumerate(pool)
+        ]
         best = int(np.argmax(scores))
         results.append({"task": task, "gold_worker": best, "scores": scores, "gold": gold})
+    _write_worker_cache(cache_path, cache)
+    return results
 
-    with open(cache_path, "w") as f:
-        for rec in cache.values():
-            f.write(json.dumps(rec) + "\n")
 
-    # Save human-readable labels
+def _write_labels(out_dir: Path, results: list[dict]) -> None:
     with open(out_dir / "train_labels.jsonl", "w") as f:
-        for r in results:
-            f.write(json.dumps(r) + "\n")
+        f.writelines(json.dumps(r) + "\n" for r in results)
 
-    # --- load router backbone ----------------------------------------------
-    device = args.device
-    if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[retrain] loading TRINITY backbone {args.fugu_model} on {device}...", flush=True)
-    router = FuguRouter(args.fugu_model, args.fugu_vector, device=device, seed=args.seed)
 
-    # --- teacher role labels from current head -------------------------------
-    print("[retrain] extracting hidden states and teacher role labels...", flush=True)
-    X = extract_hidden_states(router, tasks)
-    y_worker = torch.tensor([r["gold_worker"] for r in results], dtype=torch.long)
-    y_role = torch.empty_like(y_worker)
+def _teacher_role_labels(router: FuguRouter, tasks: list[str]) -> torch.Tensor:
+    y_role = torch.empty(len(tasks), dtype=torch.long)
     for i, task in enumerate(tqdm(tasks, desc="role labels")):
         msgs = [
             {"role": "system", "content": ROUTER_SYSTEM_PROMPT.format(num_agents=N_AGENTS)},
             {"role": "user", "content": task},
         ]
-        r = router.route(msgs, sample=False)
-        y_role[i] = r["role_id"]
+        y_role[i] = router.route(msgs, sample=False)["role_id"]
+    return y_role
 
+
+def _train_router_head(
+    router: FuguRouter,
+    tasks: list[str],
+    results: list[dict],
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, float]:
+    print("[retrain] extracting hidden states and teacher role labels...", flush=True)
+    X = extract_hidden_states(router, tasks)
+    y_worker = torch.tensor([r["gold_worker"] for r in results], dtype=torch.long)
+    y_role = _teacher_role_labels(router, tasks)
     head0 = router.head.detach().cpu().clone()
-
-    # --- train ---------------------------------------------------------------
     print("[retrain] training head...", flush=True)
-    trained_weight, best_val_acc = train_head(
+    return train_head(
         X, y_worker, y_role, head0,
-        epochs=args.epochs, lr=args.lr, alpha=args.alpha, l2_lambda=args.l2, device=device,
+        epochs=args.epochs, lr=args.lr, alpha=args.alpha, l2_lambda=args.l2,
+        device=str(router.device),
     )
 
-    # --- assemble new vector -------------------------------------------------
-    original_vec = np.load(args.fugu_vector).astype(np.float64)
+
+def _write_trained_vector(
+    trained_weight: torch.Tensor,
+    original_vec: np.ndarray,
+    out_dir: Path,
+) -> tuple[Path, Path]:
     svf = original_vec[:SVF_LEN]
     new_head = trained_weight.numpy().astype(np.float64).reshape(-1)
     new_vec = np.concatenate([svf, new_head]).astype(np.float64)
     assert new_vec.shape == (VEC_LEN,), new_vec.shape
-
     vec_path = out_dir / "model_iter_60.npy"
     head_path = out_dir / "router_head.npy"
     np.save(vec_path, new_vec)
     np.save(head_path, new_head)
+    return vec_path, head_path
 
-    # --- quick validation ----------------------------------------------------
+
+def _validate_router(
+    router_val: FuguRouter,
+    val_rows: list[dict],
+    worker: OpenRouterWorker,
+) -> float:
     print("[retrain] running quick validation on held-out tasks...", flush=True)
-    router_val = FuguRouter(args.fugu_model, str(vec_path), device=device, seed=args.seed)
-    val_hits = 0
+    val_hits = 0.0
     for row in val_rows:
         task, gold, system = row["task"], row["expected"], row.get("system")
         msgs = [
             {"role": "system", "content": ROUTER_SYSTEM_PROMPT.format(num_agents=N_AGENTS)},
             {"role": "user", "content": task},
         ]
-        # greedy route
         pred_worker = router_val.route(msgs, sample=False)["agent_id"]
         completion = worker("Worker", worker_messages(task, system), pred_worker)
-        score = reward_for(completion, gold)
-        val_hits += score
-    avg_val_reward = val_hits / max(1, len(val_rows))
+        val_hits += reward_for(completion, gold)
+    return val_hits / max(1, len(val_rows))
 
-    report = {
+
+def _build_report(
+    args: argparse.Namespace,
+    pool: list[str],
+    train_size: int,
+    val_size: int,
+    best_val_acc: float,
+    avg_val_reward: float,
+    out_dir: Path,
+    vec_path: Path,
+    head_path: Path,
+) -> dict:
+    return {
         "pool": pool,
         "dataset": args.dataset,
         "limit": args.limit,
-        "train_size": len(tasks),
-        "val_size": len(val_rows),
+        "train_size": train_size,
+        "val_size": val_size,
         "best_val_worker_acc": best_val_acc,
         "avg_val_reward": avg_val_reward,
         "output": str(out_dir),
         "vector": str(vec_path),
         "head": str(head_path),
     }
+
+
+def main(argv=None) -> None:
+    args = _parse_retrain_args(argv)
+    pool = _prepare_pool(args.pool)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    train_ds, val_ds = _load_retrain_data(args)
+    cache_path = out_dir / args.cache
+    worker = OpenRouterWorker(pool)
+    results = _score_worker_pool(worker, pool, train_ds, cache_path)
+    _write_labels(out_dir, results)
+
+    device = _resolve_device(args.device)
+    print(f"[retrain] loading TRINITY backbone {args.fugu_model} on {device}...", flush=True)
+    router = FuguRouter(args.fugu_model, args.fugu_vector, device=device, seed=args.seed)
+    tasks = [r["task"] for r in results]
+    trained_weight, best_val_acc = _train_router_head(router, tasks, results, args)
+
+    original_vec = np.load(args.fugu_vector).astype(np.float64)
+    vec_path, head_path = _write_trained_vector(trained_weight, original_vec, out_dir)
+
+    router_val = FuguRouter(args.fugu_model, str(vec_path), device=device, seed=args.seed)
+    avg_val_reward = _validate_router(router_val, val_ds, worker)
+
+    report = _build_report(
+        args, pool, len(results), len(val_ds), best_val_acc, avg_val_reward,
+        out_dir, vec_path, head_path,
+    )
     with open(out_dir / "report.json", "w") as f:
         json.dump(report, f, indent=2)
     print("[retrain] done. Report:", json.dumps(report, indent=2), flush=True)

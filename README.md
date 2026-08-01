@@ -90,3 +90,19 @@ After you approve the shortlist and cost estimate, run the same command without 
 - `configs/litellm.yaml` and `docker-compose.yml` route all backend LLM calls through OpenRouter. `llm-router` still consumes `OPENAI_API_KEY` only for its internal `mf` embedding scorer.
 - `openfugu-patch/serve.py` wraps the OpenFugu `LiteLLMWorker` classes to pass `custom_llm_provider="openai"` so LiteLLM dispatches proxy aliases correctly.
 - `serve.py` was patched to select the TRINITY vs Conductor coordinator from the request `model` field, lazy-load the requested coordinator on first use, optionally load a local `transformers`-based Conductor checkpoint, and log each request's routed model/coordinator.
+
+## References
+
+Papers and checkpoints this repo relies on:
+
+- **Fugu / Fugu-Ultra** — *Sakana Fugu Technical Report* (arXiv:2606.21228). Describes the Fugu/Fugu-Ultra orchestration stack, latency-vs-quality routing, and the TRINITY/Conductor split.
+- **TRINITY** — Jinglue Xu et al., *"TRINITY: An Evolved LLM Coordinator"* (arXiv:2512.04695). Introduces the compact 0.6 B coordinator with a lightweight SVF+head that routes a pool of workers across Worker/Thinker/Verifier turns.
+- **Conductor** — Stefan Nielsen et al., *"Learning to Orchestrate Agents in Natural Language with the Conductor"* (arXiv:2512.04388). Describes the RL-trained Conductor LM that writes multi-step agent workflows (`model_id`, `subtasks`, `access_list`).
+- **Qwen3-0.6B** — `Qwen/Qwen3-0.6B`: TRINITY router backbone.
+- **TRINITY adapted head** — `nshkrdotcom/trinity-coordinator-adapted-qwen3-0.6b`: provides `router_head.safetensors` used by `scripts/make_vec.py` to build `artifacts/model_iter_60.npy`.
+- **OpenFugu Conductor** — `di-zhang-fdu/openfugu-conductor-3b`: the GRPO-fine-tuned Llama-3.2-3B-Instruct conductor checkpoint; set `FUGU_LOCAL_CONDUCTOR` to load it locally.
+- **Llama-3.2-3B-Instruct** — `meta-llama/Llama-3.2-3B-Instruct`: base model for the Conductor checkpoint.
+- **Supra complexity router** — `SupraLabs/Supra-Router-51M`: the 51 M-parameter complexity/scoring model used inside `llm-router`.
+- **TerminalBench 2.1** — `zai-org/terminal-bench-2-verified`: the benchmark used for router retraining/evaluation.
+- **ToolScale** — `nvidia/ToolScale`: the tool-call planning dataset used as an alternative retraining signal.
+- **OpenAI embedding** — `text-embedding-3-small`: used by `llm-router`’s `mf` scorer; requires `OPENAI_API_KEY`.

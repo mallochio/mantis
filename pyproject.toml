@@ -1,0 +1,111 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fugu-local"
+version = "0.2.0"
+description = "Local OpenFugu orchestration stack routed through OpenRouter"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.5",
+    "mypy>=1.11",
+    "pytest>=8",
+    "pytest-cov>=5",
+    "coverage>=7",
+]
+
+[tool.setuptools]
+py-modules = []
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+exclude = [
+    "OpenFugu",
+    "llm-router",
+    "__pycache__",
+    ".git",
+    "*.egg-info",
+    "build",
+    "dist",
+    ".env*",
+    "*.yml",
+    "*.yaml",
+    "*.sh",
+    "*.md",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # Pyflakes
+    "I",   # isort
+    "W",   # pycodestyle warnings
+    "C4",  # comprehensions
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # simplify
+    "FURB",# refurb
+    "BLE", # blind except
+    "S",   # bandit (security)
+    "TRY", # try/except style
+    "PERF",# performance
+]
+ignore = [
+    "S101",  # assert in tests
+    "S311",  # random pseudo-crypto
+    "S603",  # subprocess without shell
+    "S607",  # start process with partial path
+    "TRY003",# long messages outside exception class
+    "EM101", # raw string in exception
+    "EM102", # f-string in exception
+]
+
+[tool.ruff.lint.per-file-ignores]
+"openfugu-patch/serve.py" = ["E402", "S104"]
+"scripts/retrain_router_pool.py" = ["E402"]
+"tests/test_serve.py" = ["E501", "S310", "S104"]
+"tests/test_retrain_router_pool.py" = ["E501"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_ignores = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+exclude = [
+    "OpenFugu",
+    "llm-router",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["scripts", "openfugu-patch", "OpenFugu/openfugu", "OpenFugu"]
+addopts = "--cov=scripts --cov=openfugu-patch --cov-report=term-missing --cov-report=xml --cov-fail-under=90"
+
+[tool.coverage.run]
+source = ["scripts", "openfugu-patch"]
+omit = [
+    "*/tests/*",
+    "OpenFugu/*",
+    "llm-router/*",
+    "scripts/make_vec.py",
+    "scripts/sky_launch_retrain_router.sh",
+    "scripts/verify.sh",
+]
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "if __name__ == .__main__.:",
+    "pragma: no cover",
+    "raise NotImplementedError",
+]

@@ -10,3 +10,7 @@ build/
 !artifacts/*.npy
 llm-router/
 OpenFugu/
+.coverage
+coverage.xml
+.pytest_cache/
+outputs/
