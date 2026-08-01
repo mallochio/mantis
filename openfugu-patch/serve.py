@@ -29,6 +29,36 @@ ROUTER: FuguRouter | None = None
 MODEL_NAME = "fugu"
 MAX_TURNS = 5
 
+
+# LiteLLM needs an explicit OpenAI-compatible provider when the model name is a
+# LiteLLM proxy alias (not a provider-prefixed id). This keeps fugu-local routing
+# through the internal LiteLLM proxy and, ultimately, OpenRouter.
+class TrinityLiteLLMWorker(TrinityLiteLLMWorker):
+    def __call__(self, role_name: str, messages: list, agent_id: int) -> str:
+        import litellm
+        model = self.slot_models[agent_id % len(self.slot_models)]
+        msgs = [{"role": m["role"], "content": m["content"]} for m in messages]
+        kw = dict(model=model, messages=msgs,
+                  max_tokens=self.max_tokens, temperature=self.temperature,
+                  custom_llm_provider="openai")
+        if self.api_key:
+            kw["api_key"] = self.api_key
+        if self.api_base:
+            kw["api_base"] = self.api_base
+        return litellm.completion(**kw).choices[0].message.content or ""
+
+
+class ConductorLiteLLMWorker(ConductorLiteLLMWorker):
+    def _call(self, model, messages):
+        kw = dict(model=model, messages=messages,
+                  max_tokens=self.max_tokens, temperature=self.temperature,
+                  custom_llm_provider="openai")
+        if self.api_key:
+            kw["api_key"] = self.api_key
+        if self.api_base:
+            kw["api_base"] = self.api_base
+        return self.litellm.completion(**kw).choices[0].message.content or ""
+
 _args = None
 _coordinators: dict[str, object] = {}
 

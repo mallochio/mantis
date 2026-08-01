@@ -8,7 +8,7 @@ services:
     command: ["--config", "/app/config.yaml", "--port", "4000"]
     environment:
       LITELLM_KEY: ${LITELLM_KEY:-sk-fugu-local}
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness')"]
       interval: 10s
@@ -26,9 +26,11 @@ services:
       LITELLM_BASE: http://litellm:4000/v1
       LITELLM_KEY: ${LITELLM_KEY:-sk-fugu-local}
       ROUTELLM_KEY: ${LITELLM_KEY:-sk-fugu-local}
+      # llm-router's mf scorer still needs an OpenAI key for text-embedding-3-small.
+      # The backend LLM calls go through the LiteLLM proxy / OpenRouter.
       OPENAI_API_KEY: ${OPENAI_API_KEY}
-      EXPENSIVE_MODEL: ${EXPENSIVE_MODEL:-gpt-4o}
-      CHEAP_MODEL: ${CHEAP_MODEL:-gpt-4o-mini}
+      EXPENSIVE_MODEL: ${EXPENSIVE_MODEL:-claude-opus-4.8}
+      CHEAP_MODEL: ${CHEAP_MODEL:-claude-sonnet-5}
       EXPENSIVE_REASONING_EFFORT: ""
       CHEAP_REASONING_EFFORT: ""
       ROUTELLM_USE_SUPRA: "1"
@@ -49,10 +51,10 @@ services:
       FUGU_MODEL: ${FUGU_MODEL:-Qwen/Qwen3-0.6B}
       FUGU_VECTOR: ${FUGU_VECTOR:-/app/artifacts/model_iter_60.npy}
       FUGU_HEAD: ${FUGU_HEAD:-}
-      FUGU_WORKER_MODEL: ${FUGU_WORKER_MODEL:-openai/gpt-4o-mini}
-      FUGU_WORKER_MODELS: ${FUGU_WORKER_MODELS:-${FUGU_WORKER_MODEL:-openai/gpt-4o-mini}}
+      FUGU_WORKER_MODEL: ${FUGU_WORKER_MODEL:-claude-sonnet-5}
+      FUGU_WORKER_MODELS: ${FUGU_WORKER_MODELS:-${FUGU_WORKER_MODEL:-claude-sonnet-5}}
       FUGU_LOCAL_MODELS: ${FUGU_LOCAL_MODELS:-}
-      FUGU_CONDUCTOR_MODEL: ${FUGU_CONDUCTOR_MODEL:-openai/gpt-4o-mini}
+      FUGU_CONDUCTOR_MODEL: ${FUGU_CONDUCTOR_MODEL:-claude-opus-4.8}
       FUGU_LOCAL_CONDUCTOR: ${FUGU_LOCAL_CONDUCTOR:-}
       FUGU_CONDUCTOR_DEVICE: ${FUGU_CONDUCTOR_DEVICE:-cpu}
       FUGU_CONDUCTOR_DTYPE: ${FUGU_CONDUCTOR_DTYPE:-float32}

@@ -1,0 +1,65 @@
+name: retrain-fugu-router
+
+resources:
+  # Router head training is cheap (only 10x1024 params), but extracting hidden
+  # states from Qwen3-0.6B is much faster on GPU. L4 is enough; bump to A100 if
+  # you add Conductor GRPO in the same run.
+  cloud: gcp
+  region: us-central1
+  accelerators: L4:1
+  memory: 8+
+  use_spot: true
+  job_recovery: FAILOVER
+
+workdir: .
+
+file_mounts:
+  /outputs:
+    source: s3://sid-llm-runs/
+    mode: MOUNT
+
+envs:
+  # Full OpenRouter model ids (no openrouter/ prefix; custom_llm_provider=openai).
+  RETRAIN_WORKER_MODELS: "anthropic/claude-haiku-4.5,anthropic/claude-sonnet-5,anthropic/claude-sonnet-4.6,anthropic/claude-sonnet-4.5,anthropic/claude-opus-4.8,anthropic/claude-opus-5,anthropic/claude-fable-5"
+  RETRAIN_LIMIT: "200"
+  RETRAIN_EPOCHS: "30"
+  FUGU_MODEL: "Qwen/Qwen3-0.6B"
+  FUGU_VECTOR: "/tmp/model_iter_60.npy"
+  OUTPUT_ROOT: "/outputs/retrain-fugu-router"
+
+setup: |
+  set -euo pipefail
+  # Install CUDA-enabled torch first so OpenFugu requirements don't pull CPU torch.
+  pip install --quiet torch==2.4.1 --extra-index-url https://download.pytorch.org/whl/cu121
+  pip install --quiet -r OpenFugu/requirements.txt
+  mkdir -p "$OUTPUT_ROOT"
+
+run: |
+  set -euo pipefail
+  if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+    echo "ERROR: pass --env OPENROUTER_API_KEY=... to sky launch" >&2
+    exit 1
+  fi
+  if [ -z "${HF_TOKEN:-}" ]; then
+    echo "WARN: HF_TOKEN not set; HuggingFace downloads may be rate-limited" >&2
+  fi
+
+  TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+  RUN_ID="retrain-router-${TIMESTAMP}"
+  export RETRAIN_OUTPUT_DIR="${OUTPUT_ROOT}/${RUN_ID}"
+  mkdir -p "$RETRAIN_OUTPUT_DIR"
+
+  # Copy the starting vector into the container (workdir is read-only source).
+  cp artifacts/model_iter_60.npy "$FUGU_VECTOR"
+
+  python3 scripts/retrain_router_pool.py \
+    --pool "$RETRAIN_WORKER_MODELS" \
+    --output-dir "$RETRAIN_OUTPUT_DIR" \
+    --limit "$RETRAIN_LIMIT" \
+    --epochs "$RETRAIN_EPOCHS" \
+    --fugu-model "$FUGU_MODEL" \
+    --fugu-vector "$FUGU_VECTOR" \
+    --device auto
+
+  echo "Router retraining complete. Outputs in $RETRAIN_OUTPUT_DIR"
+  ls -la "$RETRAIN_OUTPUT_DIR"

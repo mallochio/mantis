@@ -9,11 +9,13 @@ Local orchestration stack wiring:
 ## Quickstart
 
 ```bash
-cp .env.example .env          # add a real OPENAI_API_KEY and optional HF_TOKEN
+cp .env.example .env          # add OPENROUTER_API_KEY and OPENAI_API_KEY; optional HF_TOKEN
 docker compose build
 docker compose up -d
 ./scripts/verify.sh
 ```
+
+The backend LLM calls are routed through **OpenRouter** via the LiteLLM proxy. `llm-router`'s internal `mf` scorer still needs an OpenAI key for `text-embedding-3-small`; `OPENAI_API_KEY` is only used for that embedding call.
 
 ## Model knobs (set in `.env` or your shell, e.g. `.zshrc`)
 
@@ -21,15 +23,16 @@ All model selection is env-driven. Export the variables before `docker compose u
 
 | Variable | What it controls | Default |
 |---|---|---|
-| `OPENAI_API_KEY` | API key the LiteLLM proxy uses for workers | required |
+| `OPENROUTER_API_KEY` | API key LiteLLM uses to call OpenRouter | required |
+| `OPENAI_API_KEY` | OpenAI key for `llm-router` embeddings only | required for router |
 | `LITELLM_KEY` | Internal bearer token for router/openfugu | `sk-fugu-local` |
-| `EXPENSIVE_MODEL` / `CHEAP_MODEL` | Router cheap/expensive targets | `gpt-4o` / `gpt-4o-mini` |
+| `EXPENSIVE_MODEL` / `CHEAP_MODEL` | Router cheap/expensive targets (LiteLLM aliases) | `claude-opus-4.8` / `claude-sonnet-5` |
 | `FUGU_MODEL` | TRINITY router backbone (Qwen3-0.6B) | `Qwen/Qwen3-0.6B` |
 | `FUGU_VECTOR` | TRINITY SVF+head vector | `/app/artifacts/model_iter_60.npy` |
 | `FUGU_HEAD` | Optional per-step head override | unset |
-| `FUGU_WORKER_MODEL` / `FUGU_WORKER_MODELS` | Worker pool CSV for TRINITY/Conductor | `openai/gpt-4o-mini` |
+| `FUGU_WORKER_MODEL` / `FUGU_WORKER_MODELS` | Worker pool CSV for TRINITY/Conductor (LiteLLM aliases) | `claude-sonnet-5` |
 | `FUGU_LOCAL_MODELS` | Local HF worker models CSV (overrides LiteLLM pool) | unset |
-| `FUGU_CONDUCTOR_MODEL` | Conductor planning model via LiteLLM | `openai/gpt-4o-mini` |
+| `FUGU_CONDUCTOR_MODEL` | Conductor planning model via LiteLLM | `claude-opus-4.8` |
 | `FUGU_LOCAL_CONDUCTOR` | HF id/path to load a local Conductor (e.g. `di-zhang-fdu/openfugu-conductor-3b`) | unset |
 | `FUGU_CONDUCTOR_DEVICE` | Device for local Conductor (`cpu`, `mps`, `cuda:0`) | `cpu` |
 | `FUGU_CONDUCTOR_DTYPE` | Torch dtype for local Conductor | `float32` |
@@ -40,17 +43,36 @@ All model selection is env-driven. Export the variables before `docker compose u
 ### Example `.zshrc` snippet
 
 ```zsh
-export OPENAI_API_KEY="sk-..."
-export HF_TOKEN="hf-..."  # optional, helps avoid HF rate limits
+export OPENROUTER_API_KEY="sk-or-v1-..."
+export OPENAI_API_KEY="sk-..."            # only for llm-router embeddings
+export HF_TOKEN="hf-..."                  # optional, helps avoid HF rate limits
+
+# 7-slot worker pool: must match aliases in configs/litellm.yaml
+export FUGU_WORKER_MODELS="claude-haiku-4.5,claude-sonnet-5,claude-sonnet-4.6,claude-sonnet-4.5,claude-opus-4.8,claude-opus-5,claude-fable-5"
 
 # Use the real OpenFugu Llama-3.2-3B Conductor inside Docker (CPU)
-export FUGU_LOCAL_CONDUCTOR="di-zhang-fdu/openfugu-conductor-3b"
-export FUGU_CONDUCTOR_DEVICE="cpu"
-export FUGU_CONDUCTOR_DTYPE="float32"
-
-# Worker pool: first slot used for quick TRINITY/Conductor steps when no CSV is given
-export FUGU_WORKER_MODELS="openai/gpt-4o-mini"
+# export FUGU_LOCAL_CONDUCTOR="di-zhang-fdu/openfugu-conductor-3b"
 ```
+
+## Retraining the router head on a new model pool
+
+The included TRINITY router head was trained on an older 7-slot pool. To retrain it on the current Pareto-frontier pool, launch a SkyPilot job:
+
+```bash
+export OPENROUTER_API_KEY="sk-or-v1-..."
+export HF_TOKEN="hf-..."
+./scripts/sky_launch_retrain_router.sh --dry-run
+```
+
+The default pool in `launch/sky/retrain_fugu_router.yaml` is the 7 Anthropic models on the code/cost Pareto frontier that are available on AWS Bedrock, GCP, and Azure through OpenRouter. The script:
+
+1. Loads `nvidia/ToolScale` tasks.
+2. Calls each worker in the pool through OpenRouter and scores each response against the expected tool-call plan.
+3. Extracts Qwen3-0.6B hidden states.
+4. Fine-tunes the 10x1024 TRINITY head (worker + role logits) with L2 regularization toward the original head.
+5. Writes `model_iter_60.npy` and `router_head.npy` to the S3 mount at `s3://sid-llm-runs/retrain-fugu-router/<timestamp>/`.
+
+After you approve the shortlist and cost estimate, run the same command without `--dry-run`.
 
 ## Mac M5 2025 / Apple Silicon notes
 
@@ -61,5 +83,6 @@ export FUGU_WORKER_MODELS="openai/gpt-4o-mini"
 ## Deviation notes
 
 - The upstream `trotsky1997/OpenFugu` `fetch_artifacts.py` cannot locate the `model_iter_60.npy` vector. `fugu-local` includes the public `router_head.safetensors` from `nshkrdotcom/trinity-coordinator-adapted-qwen3-0.6b` and `scripts/make_vec.py` builds `artifacts/model_iter_60.npy` from it (zero SVF offsets + real head).
-- `litellm` and `llm-router` required small env/auth alignment tweaks in `docker-compose.yml` and `configs/litellm.yaml`.
+- `configs/litellm.yaml` and `docker-compose.yml` route all backend LLM calls through OpenRouter. `llm-router` still consumes `OPENAI_API_KEY` only for its internal `mf` embedding scorer.
+- `openfugu-patch/serve.py` wraps the OpenFugu `LiteLLMWorker` classes to pass `custom_llm_provider="openai"` so LiteLLM dispatches proxy aliases correctly.
 - `serve.py` was patched to select the TRINITY vs Conductor coordinator from the request `model` field, lazy-load the requested coordinator on first use, optionally load a local `transformers`-based Conductor checkpoint, and log each request's routed model/coordinator.

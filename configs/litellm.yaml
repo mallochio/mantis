@@ -1,20 +1,60 @@
 model_list:
+  # Default llm-router cheap/expensive targets — all routed through OpenRouter
   - model_name: expensive
     litellm_params:
-      model: openai/gpt-4o
-      api_key: os.environ/OPENAI_API_KEY
+      model: openai/anthropic/claude-opus-4.8
+      api_base: https://openrouter.ai/api/v1
+      api_key: os.environ/OPENROUTER_API_KEY
   - model_name: cheap
     litellm_params:
-      model: openai/gpt-4o-mini
-      api_key: os.environ/OPENAI_API_KEY
-  - model_name: gpt-4o
+      model: openai/anthropic/claude-sonnet-5
+      api_base: https://openrouter.ai/api/v1
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # 7-slot fugu worker pool. All are on the code/cost Pareto frontier and are
+  # available on AWS Bedrock, GCP, and Azure through OpenRouter.
+  - model_name: claude-haiku-4.5
     litellm_params:
-      model: openai/gpt-4o
-      api_key: os.environ/OPENAI_API_KEY
-  - model_name: gpt-4o-mini
+      model: openai/anthropic/claude-haiku-4.5
+      api_base: https://openrouter.ai/api/v1
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: claude-sonnet-5
     litellm_params:
-      model: openai/gpt-4o-mini
-      api_key: os.environ/OPENAI_API_KEY
+      model: openai/anthropic/claude-sonnet-5
+      api_base: https://openrouter.ai/api/v1
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: claude-sonnet-4.6
+    litellm_params:
+      model: openai/anthropic/claude-sonnet-4.6
+      api_base: https://openrouter.ai/api/v1
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: claude-sonnet-4.5
+    litellm_params:
+      model: openai/anthropic/claude-sonnet-4.5
+      api_base: https://openrouter.ai/api/v1
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: claude-opus-4.8
+    litellm_params:
+      model: openai/anthropic/claude-opus-4.8
+      api_base: https://openrouter.ai/api/v1
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: claude-opus-5
+    litellm_params:
+      model: openai/anthropic/claude-opus-5
+      api_base: https://openrouter.ai/api/v1
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: claude-fable-5
+    litellm_params:
+      model: openai/anthropic/claude-fable-5
+      api_base: https://openrouter.ai/api/v1
+      api_key: os.environ/OPENROUTER_API_KEY
+
+  # Free-tier fallback for smoke tests (OpenRouter free tier)
+  - model_name: gpt-oss-20b-free
+    litellm_params:
+      model: openai/openai/gpt-oss-20b:free
+      api_base: https://openrouter.ai/api/v1
+      api_key: os.environ/OPENROUTER_API_KEY
 
 general_settings:
   master_key: os.environ/LITELLM_KEY
