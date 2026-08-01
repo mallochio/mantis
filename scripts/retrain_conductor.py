@@ -9,6 +9,11 @@ Usage (smoke test):
     --dataset s3://external-datasets-archive/terminal-bench-2.1/ \
     --steps 20 --limit 8 --base di-zhang-fdu/openfugu-conductor-3b
 
+Real-3B one-step acceptance test:
+  python scripts/retrain_conductor.py \
+    --pool "..." --dataset s3://external-datasets-archive/terminal-bench-2.1/ \
+    --real-checkpoint-smoke --base di-zhang-fdu/openfugu-conductor-3b
+
 The pool format is identical to scripts/retrain_router_pool.py. Worker calls during
 rollout DAG execution reuse retrain_router_pool.OpenRouterWorker, so the same
 OpenRouter key and routing aliases apply.
@@ -20,6 +25,7 @@ import datetime
 import difflib
 import json
 import os
+import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -49,6 +55,48 @@ from train.toolscale_data import _parse_plan, _score  # noqa: E402
 
 DEFAULT_BASE = "di-zhang-fdu/openfugu-conductor-3b"
 DEFAULT_DATASET = "s3://external-datasets-archive/terminal-bench-2.1/"
+REAL_CHECKPOINT = DEFAULT_BASE
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _get_git_commit() -> str:
+    """Return the current git commit hash, or 'unknown' if not in a repo."""
+    try:
+        return (
+            subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, stderr=subprocess.DEVNULL
+            )
+            .decode()
+            .strip()
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return "unknown"
+
+
+def _gpu_info() -> tuple[str, int]:
+    """Return (gpu_type, gpu_count) as strings/int, or ('none', 0) if no GPU."""
+    try:
+        import torch
+    except ImportError:
+        return "unknown", 0
+
+    if not torch.cuda.is_available():
+        return "none", 0
+    count = torch.cuda.device_count()
+    name = torch.cuda.get_device_name(0) if count else "none"
+    return name, count
+
+
+def _is_real_checkpoint(base: str) -> bool:
+    """True if the requested base is the real OpenFugu Conductor checkpoint."""
+    base_path = Path(base).name
+    return (
+        base == REAL_CHECKPOINT
+        or base_path == REAL_CHECKPOINT
+        or base.endswith("openfugu-conductor-3b")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -322,12 +370,92 @@ def _write_configs(
     )
 
 
+def _write_manifest(
+    out: Path,
+    args: argparse.Namespace,
+    pool_specs: list[str],
+    device: str,
+    dtype: str,
+    gpu_type: str,
+    gpu_count: int,
+    git_commit: str,
+    real_checkpoint_loaded: bool,
+    valid_for_runtime: bool,
+    acceptance_passed: bool,
+    checkpoint_path: str,
+    run_id: str,
+) -> None:
+    """Write a manifest.json describing the run and its validity."""
+    manifest = {
+        "run_id": run_id,
+        "timestamp": datetime.datetime.now().isoformat(),
+        "git_commit": git_commit,
+        "base_model": args.base,
+        "real_checkpoint_loaded": real_checkpoint_loaded,
+        "device": device,
+        "gpu_type": gpu_type,
+        "gpu_count": gpu_count,
+        "dtype": str(dtype),
+        "dataset": args.dataset,
+        "task_limit": args.limit,
+        "steps": args.steps,
+        "generations": args.num_generations,
+        "per_device_batch": args.per_device_batch,
+        "pool": pool_specs,
+        "output_checkpoint_path": checkpoint_path,
+        "acceptance_passed": acceptance_passed,
+        "valid_for_runtime": valid_for_runtime,
+    }
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
+
+
+def _acceptance_generation(
+    checkpoint_dir: Path,
+    tokenizer: Any,
+    slot_labels: list[str],
+    prompt: str,
+    max_completion_length: int,
+    temperature: float,
+) -> tuple[str, float]:
+    """Reload the saved checkpoint and run one inference generation.
+
+    Returns the generated text and its format reward.
+    """
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    model = AutoModelForCausalLM.from_pretrained(
+        str(checkpoint_dir), torch_dtype=dtype, trust_remote_code=True
+    )
+    model = model.to(torch.device(device))  # type: ignore[arg-type]
+    model.eval()
+
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_completion_length,
+            do_sample=True,
+            temperature=max(temperature, 0.01),
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    completion_ids = outputs[0, inputs["input_ids"].shape[1]:]
+    completion = tokenizer.decode(completion_ids, skip_special_tokens=True)
+    reward = _format_reward_one(completion)
+    return completion, reward
+
+
 def _env_int(key: str, default: str) -> int:
     return int(os.environ.get(key, default))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="GRPO retraining for OpenFugu Conductor")
+
+    # Defaults that can be overridden by --real-checkpoint-smoke.
     steps = _env_int("RETRAIN_STEPS", "20")
     limit = _env_int("RETRAIN_LIMIT", "50")
     num_gen = _env_int("RETRAIN_NUM_GENERATIONS", "2")
@@ -342,20 +470,51 @@ def main() -> None:
     parser.add_argument("--pool", required=True, help="model|effort CSV (same as router retrain)")
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
     parser.add_argument("--base", default=os.environ.get("FUGU_BASE_MODEL", DEFAULT_BASE))
-    parser.add_argument("--steps", type=int, default=steps)
-    parser.add_argument("--limit", type=int, default=limit)
-    parser.add_argument("--num-generations", type=int, default=num_gen)
+    parser.add_argument("--steps", type=int, default=None)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--num-generations", type=int, default=None)
     parser.add_argument("--per-device-batch", type=int, default=per_dev)
     parser.add_argument("--max-prompt-length", type=int, default=max_prompt)
     parser.add_argument("--max-completion-length", type=int, default=max_comp)
     parser.add_argument("--output-dir", default=os.environ.get("RETRAIN_OUTPUT_DIR"))
+    parser.add_argument("--run-id", default=os.environ.get("RETRAIN_RUN_ID"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--worker-timeout", type=int, default=worker_timeout)
     parser.add_argument("--worker-max-tokens", type=int, default=worker_max_tokens)
     parser.add_argument("--mock-worker", action="store_true", default=mock_worker)
     parser.add_argument("--temperature", type=float, default=temperature)
     parser.add_argument("--reward", default="verifiable", choices=["verifiable"])
+    parser.add_argument(
+        "--real-checkpoint-smoke",
+        action="store_true",
+        help="One-step acceptance test for the real 3B checkpoint. Requires CUDA.",
+    )
     args = parser.parse_args()
+
+    # Apply mode-specific defaults; explicit CLI flags take precedence.
+    if args.real_checkpoint_smoke:
+        if args.steps is None:
+            args.steps = 1
+        if args.limit is None:
+            args.limit = 1
+        if args.num_generations is None:
+            args.num_generations = 2
+    else:
+        if args.steps is None:
+            args.steps = steps
+        if args.limit is None:
+            args.limit = limit
+        if args.num_generations is None:
+            args.num_generations = num_gen
+
+    # num_generations must divide per_device_train_batch_size for GRPO grouping.
+    if args.num_generations < 2:
+        parser.error("--num-generations must be at least 2 for GRPO")
+    if args.per_device_batch % args.num_generations != 0:
+        parser.error(
+            f"--per-device-batch ({args.per_device_batch}) must be a multiple of "
+            f"--num-generations ({args.num_generations})"
+        )
 
     raw_specs = [s.strip() for s in args.pool.split(",") if s.strip()]
     if len(raw_specs) != N_AGENTS:
@@ -367,6 +526,7 @@ def main() -> None:
     pool_specs = [f"{m}|{e}" if e else m for m, e in zip(models, efforts, strict=True)]
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_id = args.run_id or f"conductor-retrain-{timestamp}"
     out = Path(args.output_dir or f"outputs/conductor_retrain/{timestamp}")
     out.mkdir(parents=True, exist_ok=True)
 
@@ -383,6 +543,12 @@ def main() -> None:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    if args.real_checkpoint_smoke and not torch.cuda.is_available():
+        raise SystemExit(
+            "--real-checkpoint-smoke requires a CUDA GPU. "
+            "CPU/MPS is not supported for the real 3B checkpoint acceptance test."
+        )
+
     tok = AutoTokenizer.from_pretrained(args.base, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -390,7 +556,9 @@ def main() -> None:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(args.base, torch_dtype=dtype)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.base, torch_dtype=dtype, trust_remote_code=True
+    )
     model = model.to(torch.device(device))  # type: ignore[arg-type]
     model.config.use_cache = False
 
@@ -447,12 +615,70 @@ def main() -> None:
     )
 
     print(
-        f"[retrain_conductor] starting GRPO smoke: base={args.base} "
-        f"steps={args.steps} limit={args.limit} pool={pool_specs}",
+        f"[retrain_conductor] starting GRPO: base={args.base} "
+        f"steps={args.steps} limit={args.limit} generations={args.num_generations} "
+        f"per_device_batch={args.per_device_batch} pool={pool_specs}",
         flush=True,
     )
     trainer.train()
     trainer.save_model(str(out / "checkpoint"))
+    print(f"[retrain_conductor] checkpoint saved to {out / 'checkpoint'}", flush=True)
+
+    # Acceptance test for the real checkpoint smoke.
+    gpu_type, gpu_count = _gpu_info()
+    git_commit = _get_git_commit()
+    real_checkpoint_loaded = _is_real_checkpoint(args.base)
+    valid_for_runtime = False
+    acceptance_passed = False
+    checkpoint_path = str(out / "checkpoint")
+
+    if args.real_checkpoint_smoke:
+        test_prompt = _build_prompt(records[0]["task"], tok, slot_labels, args.max_prompt_length)
+        completion, format_reward = _acceptance_generation(
+            out / "checkpoint",
+            tok,
+            slot_labels,
+            test_prompt,
+            args.max_completion_length,
+            args.temperature,
+        )
+        acceptance_passed = bool(format_reward > 0.0)
+        print(
+            f"[retrain_conductor] acceptance generation: "
+            f"format_reward={format_reward} completion={completion[:200]!r}",
+            flush=True,
+        )
+        if not acceptance_passed:
+            raise RuntimeError(
+                "Real-checkpoint acceptance test failed: generated completion is not a "
+                f"parseable Conductor DAG. Reward={format_reward}"
+            )
+        valid_for_runtime = real_checkpoint_loaded and device == "cuda" and acceptance_passed
+    else:
+        # Non-smoke/regular run: valid only if it actually trained the real checkpoint on GPU.
+        valid_for_runtime = real_checkpoint_loaded and device == "cuda"
+
+    _write_manifest(
+        out=out,
+        args=args,
+        pool_specs=pool_specs,
+        device=device,
+        dtype=str(dtype).replace("torch.", ""),
+        gpu_type=gpu_type,
+        gpu_count=gpu_count,
+        git_commit=git_commit,
+        real_checkpoint_loaded=real_checkpoint_loaded,
+        valid_for_runtime=valid_for_runtime,
+        acceptance_passed=acceptance_passed,
+        checkpoint_path=checkpoint_path,
+        run_id=run_id,
+    )
+    print(
+        f"[retrain_conductor] manifest written. "
+        f"real_checkpoint_loaded={real_checkpoint_loaded} "
+        f"valid_for_runtime={valid_for_runtime}",
+        flush=True,
+    )
     print(f"[retrain_conductor] DONE: {out}", flush=True)
 
 

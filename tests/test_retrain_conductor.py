@@ -212,3 +212,39 @@ def test_load_records_dispatches_to_toolscale(monkeypatch):
     assert records == [{"task": "t2", "expected": json.dumps([{"name": "x"}])}]
     assert called["toolscale"] == (5, 42, 0.0)
     assert "terminal" not in called
+
+
+# ---------------------------------------------------------------------------
+# Real checkpoint / manifest helpers
+# ---------------------------------------------------------------------------
+def test_is_real_checkpoint_recognizes_default_id():
+    assert rc._is_real_checkpoint("di-zhang-fdu/openfugu-conductor-3b") is True
+    assert rc._is_real_checkpoint("/data/checkpoints/openfugu-conductor-3b") is True
+    assert rc._is_real_checkpoint("HuggingFaceTB/SmolLM2-135M-Instruct") is False
+
+
+def test_real_checkpoint_smoke_rejects_cpu(monkeypatch):
+    """--real-checkpoint-smoke must fail fast on CPU/MPS."""
+    called = {}
+
+    def _fake_load_records(dataset, limit, seed):
+        called["loaded"] = True
+        return [{"task": "t", "expected": "e"}]
+
+    monkeypatch.setattr(rc, "_load_records", _fake_load_records)
+    monkeypatch.setattr(rc.sys, "argv", [
+        "retrain_conductor.py",
+        "--pool",
+        ",".join(["openai/gpt-5.6-sol|none"] * rc.N_AGENTS),
+        "--real-checkpoint-smoke",
+        "--base",
+        rc.DEFAULT_BASE,
+    ])
+
+    # Simulate CPU even if tests run on GPU.
+    import torch
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    with pytest.raises(SystemExit):
+        rc.main()
+    assert called.get("loaded") is True

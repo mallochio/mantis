@@ -122,6 +122,30 @@ sky launch --env OPENROUTER_API_KEY --env HF_TOKEN \
   launch/sky/retrain_fugu_conductor.yaml
 ```
 
+### Real 3B checkpoint one-step acceptance smoke
+
+Before a full retrain, validate that `di-zhang-fdu/openfugu-conductor-3b` loads,
+trains for one GRPO step, saves a checkpoint, reloads it, and emits a parseable
+Conductor DAG. This uses a single L4 or A10G (cheaper than A100 for a one-step
+acceptance test):
+
+```bash
+export OPENROUTER_API_KEY="sk-or-v1-..."
+export HF_TOKEN="hf-..."
+
+# Try spot first (cheapest).
+sky launch -y --env OPENROUTER_API_KEY --env HF_TOKEN \
+  launch/sky/retrain_fugu_conductor_real_3b_smoke.yaml
+
+# If spot is unavailable/exhausted, use on-demand:
+sky launch -y --no-use-spot --env OPENROUTER_API_KEY --env HF_TOKEN \
+  launch/sky/retrain_fugu_conductor_real_3b_smoke.yaml
+```
+
+`--real-checkpoint-smoke` aborts immediately on CPU/MPS, never substitutes a
+smaller model, and writes `manifest.json` with `valid_for_runtime=true` only when
+the real 3B checkpoint runs on GPU and the acceptance generation is parseable.
+
 `launch/sky/retrain_fugu_conductor.yaml` defaults to a smoke:
 - `RETRAIN_STEPS=20`, `RETRAIN_LIMIT=8`, `RETRAIN_NUM_GENERATIONS=2`, `RETRAIN_PER_DEVICE_BATCH=2`
 - `FUGU_WORKER_TIMEOUT=30`, `FUGU_WORKER_MAX_TOKENS=256` to keep wall-clock/cost bounded
