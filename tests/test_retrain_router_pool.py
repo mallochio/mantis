@@ -116,36 +116,46 @@ def test_is_reasoning_model():
 # ---------------------------------------------------------------------------
 # Worker wrapper
 # ---------------------------------------------------------------------------
+def _make_fake_requests(captured: dict[str, Any] | None = None, side_effect=None):
+    """Return a mock requests module that records the JSON body and returns ok."""
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+
+    def _post(*args, **kwargs):
+        body = kwargs.get("json") or (args[1] if len(args) > 1 else {})
+        if captured is not None:
+            captured.update(body)
+        if side_effect is not None:
+            if isinstance(side_effect, Exception):
+                raise side_effect
+            return side_effect(*args, **kwargs)
+        return resp
+
+    session = MagicMock()
+    session.post.side_effect = _post
+    fake = MagicMock()
+    fake.Session.return_value = session
+    return fake
+
+
 def test_openrouter_worker_reasoning(monkeypatch):
     captured: dict[str, Any] = {}
-
-    def _fake_completion(**kw):
-        captured.update(kw)
-        return MagicMock(choices=[MagicMock(message=MagicMock(content="ok"))])
-
-    fake_litellm = MagicMock(completion=_fake_completion)
-    monkeypatch.setitem(sys.modules, "litellm", fake_litellm)
+    monkeypatch.setattr(rp, "requests", _make_fake_requests(captured))
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
 
     worker = rp.OpenRouterWorker(["claude-sonnet-5|medium"])
     result = worker("Worker", [{"role": "user", "content": "hi"}], 0)
 
     assert result == "ok"
-    assert captured["model"] == "openai/anthropic/claude-sonnet-5"
+    assert captured["model"] == "anthropic/claude-sonnet-5"
     assert captured["reasoning_effort"] == "medium"
-    assert captured["custom_llm_provider"] == "openai"
     assert "temperature" not in captured
 
 
 def test_openrouter_worker_non_reasoning(monkeypatch):
     captured: dict[str, Any] = {}
-
-    def _fake_completion(**kw):
-        captured.update(kw)
-        return MagicMock(choices=[MagicMock(message=MagicMock(content="ok"))])
-
-    fake_litellm = MagicMock(completion=_fake_completion)
-    monkeypatch.setitem(sys.modules, "litellm", fake_litellm)
+    monkeypatch.setattr(rp, "requests", _make_fake_requests(captured))
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
 
     worker = rp.OpenRouterWorker(["deepseek-v4-flash|none"])
@@ -153,15 +163,11 @@ def test_openrouter_worker_non_reasoning(monkeypatch):
 
     assert result == "ok"
     assert captured["temperature"] == 0.2
-    assert captured["reasoning_effort"] == "none"
+    assert "reasoning_effort" not in captured
 
 
 def test_openrouter_worker_failure(monkeypatch):
-    def _boom(**kw):
-        raise RuntimeError("api down")
-
-    fake_litellm = MagicMock(completion=_boom)
-    monkeypatch.setitem(sys.modules, "litellm", fake_litellm)
+    monkeypatch.setattr(rp, "requests", _make_fake_requests(side_effect=RuntimeError("api down")))
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
 
     worker = rp.OpenRouterWorker(["glm-5.2"])
@@ -303,8 +309,9 @@ def test_main_smoke(monkeypatch, tmp_path):
     np.save(vec, np.zeros(rp.VEC_LEN))
 
     class FakeWorker:
-        def __init__(self, pool):
+        def __init__(self, pool, **kwargs):
             self.pool = pool
+            self.max_worker_concurrency = 3
 
         def __call__(self, role, messages, agent_id):
             return f"reply-{agent_id}"
@@ -369,24 +376,30 @@ def test_normalize_unsupported_alias():
 
 
 def test_openrouter_worker_api_base(monkeypatch):
-    captured: dict[str, Any] = {}
+    captured_url: list[str] = []
 
-    def _fake_completion(**kw):
-        captured.update(kw)
-        return MagicMock(choices=[MagicMock(message=MagicMock(content="ok"))])
+    def _post(url, **kwargs):
+        captured_url.append(url)
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        return resp
 
-    fake_litellm = MagicMock(completion=_fake_completion)
-    monkeypatch.setitem(sys.modules, "litellm", fake_litellm)
+    session = MagicMock()
+    session.post.side_effect = _post
+    fake_requests = MagicMock()
+    fake_requests.Session.return_value = session
+    monkeypatch.setattr(rp, "requests", fake_requests)
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
 
     worker = rp.OpenRouterWorker(["claude-sonnet-5|medium"], api_base="http://custom/")
     worker("Worker", [{"role": "user", "content": "hi"}], 0)
-    assert captured["api_base"] == "http://custom/"
+    assert captured_url == ["http://custom/chat/completions"]
 
 
 def test_openrouter_worker_missing_key(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    monkeypatch.setitem(sys.modules, "litellm", MagicMock())
+    monkeypatch.setattr(rp, "requests", MagicMock())
     with pytest.raises(ValueError):
         rp.OpenRouterWorker(["claude-sonnet-5"])
 
@@ -474,8 +487,9 @@ def test_main_toolscale(monkeypatch, tmp_path):
     np.save(vec, np.zeros(rp.VEC_LEN))
 
     class FakeWorker:
-        def __init__(self, pool):
+        def __init__(self, pool, **kwargs):
             self.pool = pool
+            self.max_worker_concurrency = 3
 
         def __call__(self, role, messages, agent_id):
             return f"reply-{agent_id}"
@@ -544,15 +558,16 @@ def test_main_uses_cache(monkeypatch, tmp_path):
     out_dir.mkdir()
     cache_path = out_dir / "worker_outputs.jsonl"
     cache_lines = [
-        json.dumps({"task": f"task-{t}", "model": f"m{i}", "completion": "cached"})
+        json.dumps({"task": f"task-{t}", "model": f"openai/m{i}", "completion": "cached"})
         for t in ("a", "b")
         for i in range(7)
     ]
     cache_path.write_text("\n".join(cache_lines) + "\n")
 
     class FakeWorker:
-        def __init__(self, pool):
+        def __init__(self, pool, **kwargs):
             self.pool = pool
+            self.max_worker_concurrency = 3
 
         def __call__(self, role, messages, agent_id):
             raise AssertionError("worker should not be called when cache hit")
@@ -590,7 +605,7 @@ def test_main_uses_cache(monkeypatch, tmp_path):
         ),
     )
 
-    pool = "m0,m1,m2,m3,m4,m5,m6"
+    pool = "openai/m0,openai/m1,openai/m2,openai/m3,openai/m4,openai/m5,openai/m6"
     argv = [
         "--pool", pool,
         "--dataset", "terminal",
@@ -629,8 +644,9 @@ def test_main_pad_pool(monkeypatch, tmp_path):
     np.save(vec, np.zeros(rp.VEC_LEN))
 
     class FakeWorker:
-        def __init__(self, pool):
+        def __init__(self, pool, **kwargs):
             self.pool = pool
+            self.max_worker_concurrency = 3
 
         def __call__(self, role, messages, agent_id):
             return f"reply-{agent_id}"
@@ -664,7 +680,7 @@ def test_main_pad_pool(monkeypatch, tmp_path):
 
     out_dir = tmp_path / "out"
     argv = [
-        "--pool", "m0,m1",
+        "--pool", "openai/m0,openai/m1",
         "--dataset", str(dataset_dir),
         "--limit", "1",
         "--epochs", "1",
@@ -719,13 +735,168 @@ def test_pick_best_worker_quality_2x_score_wins_despite_price():
     assert rp._pick_best_worker(scores, pool, "quality", costs) == 1
 
 
+def test_pick_budgeted_worker_equal_scores_cheaper_wins():
+    pool = ["openai/gpt-5.6-luna|max", "anthropic/claude-opus-5|medium"]
+    scores = [0.9, 0.9]
+    costs = {
+        "openai/gpt-5.6-luna": 0.0008,
+        "anthropic/claude-opus-5": 0.035,
+    }
+    gold, reason = rp._pick_budgeted_worker(scores, pool, costs, 0.05, "echo hi")
+    assert reason is None
+    assert gold == 0
+
+
+def test_pick_budgeted_worker_gap_beyond_tolerance_best_wins():
+    pool = ["openai/gpt-5.6-luna|max", "anthropic/claude-opus-5|medium"]
+    # worker 1 is much better and outside tolerance; it wins despite being expensive
+    scores = [0.5, 1.0]
+    costs = {
+        "openai/gpt-5.6-luna": 0.0008,
+        "anthropic/claude-opus-5": 0.035,
+    }
+    gold, reason = rp._pick_budgeted_worker(scores, pool, costs, 0.05, "echo hi")
+    assert reason is None
+    assert gold == 1
+
+
+def test_pick_budgeted_worker_missing_cannot_win():
+    pool = [
+        "openai/gpt-5.6-luna|max",
+        "anthropic/claude-opus-5|medium",
+        "google/gemini-3.6-flash|high",
+    ]
+    scores = [0.9, None, 0.85]
+    costs = {
+        "openai/gpt-5.6-luna": 0.0008,
+        "anthropic/claude-opus-5": 0.035,
+        "google/gemini-3.6-flash": 0.0105,
+    }
+    gold, reason = rp._pick_budgeted_worker(scores, pool, costs, 0.05, "echo hi")
+    assert reason is None
+    assert gold == 0
+
+
+def test_pick_budgeted_worker_insufficient_workers():
+    pool = ["openai/gpt-5.6-luna|max", "anthropic/claude-opus-5|medium"]
+    scores = [0.9, None]
+    gold, reason = rp._pick_budgeted_worker(scores, pool, None, 0.05, "echo hi")
+    assert reason == "insufficient_workers"
+    assert gold == -1
+
+
+def test_pick_budgeted_worker_no_passing_binary():
+    pool = ["openai/gpt-5.6-luna|max", "anthropic/claude-opus-5|medium"]
+    # Binary outcome (expected is a list): no worker gets a passing score
+    scores = [0.8, 0.7]
+    gold, reason = rp._pick_budgeted_worker(scores, pool, None, 0.05, [{"name": "x"}])
+    assert reason == "no_verified_worker_passed"
+    assert gold == -1
+
+
+def test_openrouter_worker_retry_success(monkeypatch):
+    """Transient failure on first attempt should be retried and then succeed."""
+    calls: list[int] = []
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+
+    class Transient(Exception):
+        status_code = 429
+
+    def _post(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise Transient("rate limited")
+        return resp
+
+    session = MagicMock()
+    session.post.side_effect = _post
+    fake_requests = MagicMock()
+    fake_requests.Session.return_value = session
+    monkeypatch.setattr(rp, "requests", fake_requests)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+
+    worker = rp.OpenRouterWorker(["gpt-5.6-luna|max"], retry_backoff=0.0)
+    completion, event = worker.call_with_retry(
+        "Worker", [{"role": "user", "content": "hi"}], 0, task_id=1
+    )
+    assert completion == "ok"
+    assert event["attempt"] == 2
+    assert event["status"] == "success"
+    assert event["task_id"] == 1
+
+
+def test_openrouter_worker_non_transient_no_retry(monkeypatch):
+    def _post(*args, **kwargs):
+        raise ValueError("bad request")
+
+    session = MagicMock()
+    session.post.side_effect = _post
+    fake_requests = MagicMock()
+    fake_requests.Session.return_value = session
+    monkeypatch.setattr(rp, "requests", fake_requests)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+
+    worker = rp.OpenRouterWorker(["gpt-5.6-luna|max"], retry_backoff=0.0)
+    completion, event = worker.call_with_retry(
+        "Worker", [{"role": "user", "content": "hi"}], 0
+    )
+    assert completion == ""
+    assert event["attempt"] == 1
+    assert event["status"] == "error"
+
+
+def test_resolve_costs_live(monkeypatch, tmp_path):
+    live_costs = {"openai/gpt-5.6-luna": 0.0008}
+    monkeypatch.setattr(rp, "_fetch_live_pricing", lambda pool: (live_costs, live_costs))
+    out = tmp_path / "out"
+    out.mkdir()
+    costs, source = rp._resolve_costs(
+        ["openai/gpt-5.6-luna|max"], str(tmp_path / "fallback.json"), out
+    )
+    assert source == "live"
+    assert costs["openai/gpt-5.6-luna"] == 0.0008
+    snapshot = json.loads((out / "pricing_snapshot.json").read_text())
+    assert snapshot["source"] == "live"
+
+
+def test_resolve_costs_fallback(monkeypatch, tmp_path):
+    fallback = tmp_path / "costs.json"
+    fallback.write_text(json.dumps({"openai/m0": 0.5, "openai/m1": 0.05}))
+    monkeypatch.setattr(rp, "_fetch_live_pricing", lambda pool: (None, None))
+    out = tmp_path / "out"
+    out.mkdir()
+    costs, source = rp._resolve_costs(
+        ["openai/m0", "openai/m1"], str(fallback), out
+    )
+    assert source == "fallback"
+    assert costs["openai/m0"] == 0.5
+
+
+def test_label_distribution_computes_three_modes():
+    pool = ["openai/m0", "openai/m1"]
+    costs = {"openai/m0": 1.0, "openai/m1": 0.01}
+    final = [
+        {"gold_worker": 0, "gold": "x", "scores": [0.9, 0.85]},
+        {"gold_worker": 1, "gold": "y", "scores": [0.5, 1.0]},
+    ]
+    dist = rp._label_distribution(final, pool, costs, 0.05)
+    assert dist["quality"] == {0: 1, 1: 1}
+    # cost mode heavily favors the much cheaper m1 because both tasks have positive scores
+    assert dist["cost"] == {1: 2}
+    # budgeted mode: first task is within tolerance so cheapest (m1) wins; second task only m1 is eligible
+    assert dist["budgeted"] == {1: 2}
+
+
 def test_main_cost_mode(monkeypatch, tmp_path):
     vec = tmp_path / "vec.npy"
     np.save(vec, np.zeros(rp.VEC_LEN))
 
     class FakeWorker:
-        def __init__(self, pool):
+        def __init__(self, pool, **kwargs):
             self.pool = pool
+            self.max_worker_concurrency = 3
 
         def __call__(self, role, messages, agent_id):
             return f"reply-{agent_id}"

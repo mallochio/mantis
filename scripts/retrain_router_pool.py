@@ -7,19 +7,20 @@ Usage (local):
     --pool "<7 model specs separated by commas, optional |reasoning_effort>" \
     --output-dir ./outputs/router_retrain
 
-  Example pool: anthropic/claude-sonnet-5|medium, anthropic/claude-opus-5|medium,
-  openai/gpt-5.6-sol|medium, openai/gpt-5.6-luna|max, openai/gpt-5.6-terra|xhigh,
-  deepseek/deepseek-v4-flash|none, z-ai/glm-5.2|none
+  Example pool: google/gemini-3.6-flash|high,openai/gpt-5.6-luna|max,
+  openai/gpt-5.6-sol|medium,deepseek/deepseek-v4-flash-0731|max,
+  anthropic/claude-opus-5|medium,anthropic/claude-sonnet-5|medium,
+  google/gemini-3.1-pro-preview|high
 
 Usage (SkyPilot):
   sky launch launch/sky/retrain_fugu_router.yaml
 
 What it does:
-  1. Downloads a task dataset (default nvidia/ToolScale) and a small validation split.
-  2. Calls each worker in the pool for each task through OpenRouter (LiteLLM
-     OpenAI-compatible endpoint). Responses are scored against the expected
-     tool-call plan from ToolScale; the highest-scoring worker becomes the
-     gold worker label for that task.
+  1. Downloads a task dataset (default TerminalBench 2.1 mirror) and a small
+     validation split.
+  2. Calls each worker in the pool for each task through OpenRouter. Responses
+     are scored against the reference solution; the best worker becomes the gold
+     worker label for that task.
   3. Runs the Qwen3-0.6B TRINITY backbone to extract penultimate-token hidden
      states for each task.
   4. Fine-tunes the 10x1024 linear head (7 worker logits + 3 role logits) with
@@ -27,6 +28,14 @@ What it does:
      original head (L2).
   5. Writes a new model_iter_60.npy (SVF offsets + trained head) and a
      router_head.npy (head only) to the output directory.
+
+Label modes:
+  quality  - pick the worker with the highest reward score.
+  cost     - pick the worker with the best reward / cost ratio.
+  budgeted - pick the cheapest worker whose score is within
+             --quality-tolerance of the best successful score. For binary
+             outcome tasks, a worker must pass (score ~1) or the task is
+             skipped.
 
 Environment:
   OPENROUTER_API_KEY  required for worker calls
@@ -37,6 +46,9 @@ Environment:
                          '|reasoning_effort' (e.g. 'openai/gpt-5.6-terra|xhigh').
   RETRAIN_LIMIT       optional override of --limit
   RETRAIN_EPOCHS      optional override of --epochs
+  RETRAIN_LABEL_MODE  default "budgeted"
+  RETRAIN_QUALITY_TOLERANCE  default 0.05
+  RETRAIN_MAX_WORKER_CONCURRENCY  default 3
 """
 from __future__ import annotations
 
@@ -47,12 +59,18 @@ import os
 import re
 import sys
 import threading
+import time
+import urllib.request
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any
 
 import numpy as np
+import requests
 import torch
 import torch.nn.functional as F
+import urllib3
 from datasets import load_dataset
 from huggingface_hub import snapshot_download
 from torch import nn
@@ -90,6 +108,8 @@ KNOWN_PREFIXES = {
     "gemma-": "google/",
 }
 
+REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+
 
 def split_model_spec(spec: str):
     """Parse 'model_id|reasoning_effort' into (model_id, effort).
@@ -123,60 +143,209 @@ def normalize_model_id(model: str) -> str:
 
 
 def _is_reasoning_model(model: str) -> bool:
-    """Heuristic for models configured with reasoning_effort != none.
+    """Heuristic for legacy reasoning models.
 
-    OpenRouter/LiteLLM reject temperature != 1 for these reasoning models.
+    Kept for backward-compatible tests; runtime reasoning detection uses the
+    configured reasoning_effort value.
     """
     return "claude-" in model or "gpt-5.6-" in model
 
 
+def _error_status_code(exc: Exception) -> int | None:
+    """Best-effort HTTP status code extraction from common exception types."""
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status = getattr(response, "status_code", None)
+        if isinstance(status, int):
+            return status
+    return None
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    """Return True if the exception is a retryable transient failure."""
+    status = _error_status_code(exc)
+    if isinstance(status, int) and status in (408, 409, 429, 500, 502, 503, 504):
+        return True
+    name = type(exc).__name__.lower()
+    if "timeout" in name or ("rate" in name and "limit" in name):
+        return True
+    msg = str(exc).lower()
+    for token in (
+        "timeout",
+        "408",
+        "409",
+        "429",
+        "502",
+        "503",
+        "504",
+        "rate limit",
+        "too many requests",
+        "service unavailable",
+    ):
+        if token in msg:
+            return True
+    return False
+
+
+def _error_status(exc: Exception) -> str:
+    """Classify an exception into a short status string."""
+    status = _error_status_code(exc)
+    if isinstance(status, int):
+        return f"http_{status}"
+    name = type(exc).__name__.lower()
+    if "timeout" in name:
+        return "timeout"
+    if "rate" in name and "limit" in name:
+        return "rate_limit"
+    return "error"
+
+
 class OpenRouterWorker:
-    """Call a heterogeneous pool through OpenRouter with litellm."""
-    def __init__(self, models: list[str], api_key: str | None = None,
-                 api_base: str = "https://openrouter.ai/api/v1",
-                 max_tokens: int = 1024, temperature: float = 0.2,
-                 timeout: int = 120):
-        import litellm
-        self.litellm = litellm
+    """Call a heterogeneous worker pool through the OpenRouter REST API."""
+
+    def __init__(
+        self,
+        models: list[str],
+        api_key: str | None = None,
+        api_base: str = "https://openrouter.ai/api/v1",
+        max_tokens: int = 256,
+        temperature: float = 0.2,
+        timeout: int = 60,
+        max_attempts: int = 2,
+        retry_backoff: float = 2.0,
+        max_worker_concurrency: int = 3,
+        per_model_concurrency: dict[str, int] | str | None = None,
+    ):
         specs = [split_model_spec(m) for m in models]
         self.models = [normalize_model_id(m) for m, _ in specs]
         self.efforts = [e for _, e in specs]
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
         if not self.api_key:
             raise ValueError("OPENROUTER_API_KEY is required")
-        self.api_base = api_base
+        self.api_base = api_base.rstrip("/")
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.timeout = timeout
+        self.max_attempts = max(1, max_attempts)
+        self.retry_backoff = retry_backoff
+        self.max_worker_concurrency = max(1, max_worker_concurrency)
+        self._session = requests.Session()
+        self._global_sem = threading.Semaphore(self.max_worker_concurrency)
 
-    def __call__(self, role: str, messages: list[dict], agent_id: int) -> str:
-        model = self.models[agent_id % len(self.models)]
-        effort = self.efforts[agent_id % len(self.efforts)]
-        kw = {
-            "model": f"openai/{model}",
+        parsed_limits: dict[str, int] = {}
+        if isinstance(per_model_concurrency, str):
+            parsed_limits = json.loads(per_model_concurrency)
+        elif per_model_concurrency:
+            parsed_limits = dict(per_model_concurrency)
+        self._per_model_sem = []
+        for i, model in enumerate(self.models):
+            effort = self.efforts[i]
+            is_reasoning = effort is not None and effort != "none"
+            default_limit = 1 if is_reasoning else 2
+            limit = parsed_limits.get(model, parsed_limits.get(f"{model}|{effort}", default_limit))
+            self._per_model_sem.append(threading.Semaphore(limit))
+
+    def _single_call(self, model: str, effort: str | None, messages: list[dict]) -> str:
+        body: dict[str, Any] = {
+            "model": model,
             "messages": messages,
             "max_tokens": self.max_tokens,
-            "custom_llm_provider": "openai",
-            "timeout": self.timeout,
-            # reasoning_effort is an extra param for LiteLLM's openai provider;
-            # tell LiteLLM to allow it through to OpenRouter.
-            "allowed_openai_params": ["reasoning_effort"],
         }
-        # Reasoning models (claude-*, gpt-5.6-*) require temperature=1 or omitted.
-        if not _is_reasoning_model(model):
-            kw["temperature"] = self.temperature
-        if effort:
-            kw["reasoning_effort"] = effort
-        if self.api_key:
-            kw["api_key"] = self.api_key
-        if self.api_base:
-            kw["api_base"] = self.api_base
+        # Only set temperature when no reasoning effort is requested.
+        if effort is None or effort == "none":
+            body["temperature"] = self.temperature
+        else:
+            body["reasoning_effort"] = effort
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://fugu.local",
+            "X-Title": "Fugu Retrain",
+        }
+        url = f"{self.api_base}/chat/completions"
+        # Enforce a hard total wall-clock ceiling per call (including chunked reads).
+        timeout = urllib3.Timeout(connect=10, total=self.timeout)
+        resp = self._session.post(url, json=body, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        return str(data["choices"][0]["message"].get("content") or "")
+
+    def call_with_retry(
+        self,
+        role: str,
+        messages: list[dict],
+        agent_id: int,
+        task_id: int | None = None,
+    ) -> tuple[str, dict]:
+        """Call one worker with retries and return (completion, event_dict)."""
+        model = self.models[agent_id % len(self.models)]
+        effort = self.efforts[agent_id % len(self.efforts)]
+        per_model_sem = self._per_model_sem[agent_id % len(self._per_model_sem)]
+        event: dict[str, object] = {
+            "task_id": task_id,
+            "model": model,
+            "agent_id": agent_id,
+            "reasoning_effort": effort,
+        }
+        start_total = time.perf_counter()
+        completion = ""
+        attempts = 0
+        status = "success"
+        http_code: int | None = 200
+        error: str | None = None
+        call_elapsed = 0.0
+        queue_wait = 0.0
+
+        per_model_sem.acquire()
         try:
-            r = self.litellm.completion(**kw)
-            return str(r.choices[0].message.content or "")
-        except Exception as e:  # noqa: BLE001
-            print(f"[worker] call failed for {model}: {e}", flush=True)
-            return ""
+            self._global_sem.acquire()
+            try:
+                queue_wait = time.perf_counter() - start_total
+                for attempt in range(1, self.max_attempts + 1):
+                    attempts = attempt
+                    call_start = time.perf_counter()
+                    try:
+                        completion = self._single_call(model, effort, messages)
+                        call_elapsed = time.perf_counter() - call_start
+                        status = "success"
+                        http_code = 200
+                        error = None
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        call_elapsed = time.perf_counter() - call_start
+                        status = _error_status(exc)
+                        http_code = getattr(exc, "status_code", None)
+                        error = str(exc)
+                        if attempt < self.max_attempts and _is_transient_error(exc):
+                            time.sleep(self.retry_backoff)
+                            continue
+                        break
+            finally:
+                self._global_sem.release()
+        finally:
+            per_model_sem.release()
+
+        elapsed = time.perf_counter() - start_total
+        event.update(
+            {
+                "attempt": attempts,
+                "status": status,
+                "http_code": http_code,
+                "error": error,
+                "queue_wait": round(queue_wait, 6),
+                "call_elapsed": round(call_elapsed, 6),
+                "elapsed": round(elapsed, 6),
+            }
+        )
+        return completion, event
+
+    def __call__(self, role: str, messages: list[dict], agent_id: int) -> str:
+        """Legacy string-only interface."""
+        return self.call_with_retry(role, messages, agent_id)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +364,7 @@ TERMINAL_PATTERNS = ("/instruction.md", "/task.toml", "/solution/solve.sh")
 def _sync_s3_to_local(s3_uri: str, local_dir: Path):
     """Mirror only the small TerminalBench metadata files from S3."""
     import boto3
+
     m = re.match(r"s3://([^/]+)/?(.*)", s3_uri)
     if not m:
         raise ValueError(f"invalid S3 URI: {s3_uri}")
@@ -250,12 +420,14 @@ def load_terminalbench_tasks(
             continue
         instruction = instr_path.read_text().strip()
         reference = solve_path.read_text().strip()
-        records.append({
-            "task": instruction,
-            "expected": reference,
-            "system": TERMINAL_SYSTEM,
-            "name": task_dir.name,
-        })
+        records.append(
+            {
+                "task": instruction,
+                "expected": reference,
+                "system": TERMINAL_SYSTEM,
+                "name": task_dir.name,
+            }
+        )
 
     rng = np.random.default_rng(seed)
     rng.shuffle(records)  # type: ignore[arg-type]
@@ -313,6 +485,7 @@ def reward_for(completion: str, gold: str | list) -> float:
 # Hidden-state extraction
 # ---------------------------------------------------------------------------
 
+
 def extract_hidden_states(router: FuguRouter, tasks: list[str], batch_size: int = 8):
     """Return (H,)-shaped hidden-state tensors for each task, no gradient."""
     router.model.eval()
@@ -334,10 +507,18 @@ def extract_hidden_states(router: FuguRouter, tasks: list[str], batch_size: int 
 # Training
 # ---------------------------------------------------------------------------
 
-def train_head(X: torch.Tensor, y_worker: torch.Tensor, y_role: torch.Tensor,
-               head0: torch.Tensor, epochs: int = 30, lr: float = 1e-3,
-               alpha: float = 0.1, l2_lambda: float = 0.01,
-               device: str | None = None) -> tuple[torch.Tensor, float]:
+
+def train_head(
+    X: torch.Tensor,
+    y_worker: torch.Tensor,
+    y_role: torch.Tensor,
+    head0: torch.Tensor,
+    epochs: int = 30,
+    lr: float = 1e-3,
+    alpha: float = 0.1,
+    l2_lambda: float = 0.01,
+    device: str | None = None,
+) -> tuple[torch.Tensor, float]:
     """Fine-tune the shared 10x1024 head."""
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -365,7 +546,7 @@ def train_head(X: torch.Tensor, y_worker: torch.Tensor, y_role: torch.Tensor,
         perm = torch.randperm(len(train_idx))
         epoch_loss = 0.0
         for i in range(0, len(train_idx), 32):
-            idx = train_idx[perm[i:i + 32]]
+            idx = train_idx[perm[i : i + 32]]
             logits = head(X[idx])
             loss_w = F.cross_entropy(logits[:, :N_AGENTS], y_worker[idx])
             loss_r = F.cross_entropy(logits[:, N_AGENTS:], y_role[idx])
@@ -387,8 +568,11 @@ def train_head(X: torch.Tensor, y_worker: torch.Tensor, y_role: torch.Tensor,
                 acc_r = (logits[:, N_AGENTS:].argmax(dim=1) == y_role[train_idx]).float().mean()
             acc_w = acc_w.item()
             acc_r = acc_r.item()
-        print(f"[epoch {epoch + 1}/{epochs}] loss={epoch_loss:.4f} "
-              f"val_worker_acc={acc_w:.3f} val_role_acc={acc_r:.3f}", flush=True)
+        print(
+            f"[epoch {epoch + 1}/{epochs}] loss={epoch_loss:.4f} "
+            f"val_worker_acc={acc_w:.3f} val_role_acc={acc_r:.3f}",
+            flush=True,
+        )
         if acc_w > best_val:
             best_val = acc_w
             best_weight = head.weight.detach().cpu().clone()
@@ -397,38 +581,451 @@ def train_head(X: torch.Tensor, y_worker: torch.Tensor, y_role: torch.Tensor,
 
 
 # ---------------------------------------------------------------------------
+# Worker scoring and label selection
+# ---------------------------------------------------------------------------
+
+
+def _load_worker_cache(cache_path: Path) -> dict[tuple[str, str], dict]:
+    cache: dict[tuple[str, str], dict] = {}
+    if cache_path.exists():
+        with open(cache_path) as f:
+            for line in f:
+                rec = json.loads(line)
+                cache[(rec["task"], rec["model"])] = rec
+        print(f"[retrain] loaded {len(cache)} cached worker responses", flush=True)
+    return cache
+
+
+def _write_worker_cache(cache_path: Path, cache: dict[tuple[str, str], dict]) -> None:
+    with open(cache_path, "w") as f:
+        f.writelines(json.dumps(rec) + "\n" for rec in cache.values())
+
+
+def _write_events(events_path: Path, events: list[dict]) -> None:
+    with open(events_path, "w") as f:
+        f.writelines(json.dumps(e) + "\n" for e in events)
+
+
+def _score_one_worker(
+    worker: OpenRouterWorker,
+    task_idx: int,
+    task: str,
+    expected: str | list,
+    system: str | None,
+    agent_id: int,
+    model: str,
+    cache: dict[tuple[str, str], dict],
+    cache_lock: threading.Lock,
+) -> tuple[str, float, dict]:
+    """Return (completion, score, event) for one (task, worker) pair."""
+    key = (task, model)
+    if key in cache:
+        completion = str(cache[key]["completion"])
+        score = reward_for(completion, expected)
+        event = {
+            "task_id": task_idx,
+            "model": model,
+            "agent_id": agent_id,
+            "status": "cached",
+            "attempt": 0,
+            "score": score,
+        }
+        return completion, score, event
+
+    if hasattr(worker, "call_with_retry"):
+        completion, event = worker.call_with_retry(
+            "Worker", worker_messages(task, system), agent_id, task_id=task_idx
+        )
+    else:
+        # Fallback for unmocked / legacy worker interfaces in tests.
+        completion = worker("Worker", worker_messages(task, system), agent_id)
+        event = {
+            "task_id": task_idx,
+            "model": model,
+            "agent_id": agent_id,
+            "status": "mock",
+            "attempt": 1,
+        }
+
+    score = reward_for(completion, expected)
+    event["score"] = score
+    print(
+        f"[worker] task={task_idx} model={model} status={event.get('status', 'unknown')} "
+        f"attempt={event.get('attempt', 0)} score={score:.3f} "
+        f"elapsed={event.get('elapsed', 0.0):.2f}s",
+        flush=True,
+    )
+    with cache_lock:
+        cache[key] = {"task": task, "model": model, "completion": completion}
+    return completion, score, event
+
+
+def _model_cost(model: str, costs: dict[str, float] | None) -> float:
+    if not costs:
+        return float("inf")
+    return costs.get(model, float("inf"))
+
+
+def _cheapest_eligible(
+    eligible: list[tuple[int, float]],
+    pool: list[str],
+    costs: dict[str, float] | None,
+) -> int:
+    def sort_key(item: tuple[int, float]) -> tuple[float, float, int]:
+        i, score = item
+        model, _ = split_model_spec(pool[i])
+        model_id = normalize_model_id(model)
+        return (_model_cost(model_id, costs), -score, i)
+
+    return min(eligible, key=sort_key)[0]
+
+
+def _pick_best_worker(
+    scores: list[float | None],
+    pool: list[str],
+    label_mode: str,
+    costs: dict[str, float] | None,
+) -> int:
+    """Return the worker index that should be the gold label for this task.
+
+    Returns -1 if no usable worker is present.
+    """
+    usable = [(i, s) for i, s in enumerate(scores) if s is not None]
+    if not usable:
+        return -1
+    if label_mode == "quality":
+        return max(usable, key=lambda x: (x[1], -x[0]))[0]
+
+    # cost mode
+    if costs is None:
+        raise ValueError("cost mode requires a cost table")
+    ratios: list[tuple[int, float]] = []
+    for i, s in usable:
+        model, _ = split_model_spec(pool[i])
+        model_id = normalize_model_id(model)
+        cost = max(_model_cost(model_id, costs), 1e-6)
+        ratios.append((i, s / cost))
+    if not ratios:
+        return -1
+    return max(ratios, key=lambda x: (x[1], scores[x[0]], -x[0]))[0]
+
+
+def _pick_budgeted_worker(
+    scores: list[float | None],
+    pool: list[str],
+    costs: dict[str, float] | None,
+    tolerance: float,
+    expected: str | list,
+) -> tuple[int, str | None]:
+    """Budgeted label selection.
+
+    Returns (agent_id, skip_reason). skip_reason is None when a gold worker
+    was selected.
+    """
+    usable = [(i, s) for i, s in enumerate(scores) if s is not None]
+    if len(usable) < 2:
+        return -1, "insufficient_workers"
+
+    if isinstance(expected, list):
+        # Binary outcome: worker must fully pass.
+        passing = [(i, s) for i, s in usable if s >= 1.0 - 1e-6]
+        if not passing:
+            return -1, "no_verified_worker_passed"
+        return _cheapest_eligible(passing, pool, costs), None
+
+    s_max = max(s for _, s in usable)
+    eligible = [(i, s) for i, s in usable if s >= s_max - tolerance]
+    return _cheapest_eligible(eligible, pool, costs), None
+
+
+def _process_task_scores(
+    task_idx: int,
+    task: str,
+    expected: str | list,
+    scores: list[float | None],
+    pool: list[str],
+    label_mode: str,
+    costs: dict[str, float] | None,
+    quality_tolerance: float,
+) -> dict:
+    if label_mode == "budgeted":
+        gold, reason = _pick_budgeted_worker(scores, pool, costs, quality_tolerance, expected)
+    elif label_mode == "cost":
+        gold = _pick_best_worker(scores, pool, "cost", costs)
+        reason = "insufficient_workers" if gold < 0 else None
+    else:
+        gold = _pick_best_worker(scores, pool, "quality", costs)
+        reason = "insufficient_workers" if gold < 0 else None
+
+    if reason:
+        return {
+            "task_idx": task_idx,
+            "task": task,
+            "gold": expected,
+            "scores": scores,
+            "gold_worker": None,
+            "skip_reason": reason,
+        }
+    return {
+        "task_idx": task_idx,
+        "task": task,
+        "gold": expected,
+        "scores": scores,
+        "gold_worker": gold,
+        "skip_reason": None,
+    }
+
+
+def _score_worker_pool(
+    worker: OpenRouterWorker,
+    pool: list[str],
+    train_ds: list[dict],
+    out_dir: Path,
+    label_mode: str,
+    costs: dict[str, float] | None,
+    quality_tolerance: float,
+    cache_path: Path,
+) -> tuple[list[dict], list[dict], dict[str, dict[int, int]], list[dict]]:
+    """Score every worker on every task and return (results, skipped, label_dist, events)."""
+    cache = _load_worker_cache(cache_path)
+    cache_lock = threading.Lock()
+    events: list[dict] = []
+    n_agents = len(pool)
+    max_concurrency = getattr(worker, "max_worker_concurrency", 3)
+    partial = [
+        {"scores": [None] * n_agents, "completions": [""] * n_agents, "remaining": n_agents}
+        for _ in train_ds
+    ]
+    final: list[dict | None] = [None] * len(train_ds)
+
+    max_workers = max_concurrency + n_agents
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures: dict = {}
+        for i, row in enumerate(train_ds):
+            task = row["task"]
+            expected = row["expected"]
+            system = row.get("system")
+            for agent_id, spec in enumerate(pool):
+                model, _ = split_model_spec(spec)
+                model_id = normalize_model_id(model)
+                fut = executor.submit(
+                    _score_one_worker,
+                    worker,
+                    i,
+                    task,
+                    expected,
+                    system,
+                    agent_id,
+                    model_id,
+                    cache,
+                    cache_lock,
+                )
+                futures[fut] = (i, agent_id)
+
+        for fut in as_completed(futures):
+            i, agent_id = futures[fut]
+            completion, score, event = fut.result()
+            events.append(event)
+            partial[i]["scores"][agent_id] = score
+            partial[i]["completions"][agent_id] = completion
+            partial[i]["remaining"] -= 1
+            if partial[i]["remaining"] == 0:
+                row = train_ds[i]
+                final[i] = _process_task_scores(
+                    i,
+                    row["task"],
+                    row["expected"],
+                    partial[i]["scores"],
+                    pool,
+                    label_mode,
+                    costs,
+                    quality_tolerance,
+                )
+
+    _write_worker_cache(cache_path, cache)
+    _write_events(out_dir / "events.jsonl", events)
+
+    results = [r for r in final if r is not None and r.get("gold_worker") is not None]
+    skipped = [r for r in final if r is not None and r.get("gold_worker") is None]
+    label_dist = _label_distribution(final, pool, costs, quality_tolerance)
+    return results, skipped, label_dist, events
+
+
+def _label_distribution(
+    final: list[dict | None],
+    pool: list[str],
+    costs: dict[str, float] | None,
+    quality_tolerance: float,
+) -> dict[str, dict[int, int]]:
+    """Compute quality/cost/budgeted label distributions on the same scored data."""
+    dist: dict[str, dict[int, int]] = {"quality": {}, "cost": {}, "budgeted": {}}
+    for r in final:
+        if r is None or r.get("gold_worker") is None:
+            continue
+        scores = r["scores"]
+        expected = r["gold"]
+        for mode in ("quality", "cost"):
+            label = _pick_best_worker(scores, pool, mode, costs)
+            if label >= 0:
+                dist[mode][label] = dist[mode].get(label, 0) + 1
+        label, _ = _pick_budgeted_worker(scores, pool, costs, quality_tolerance, expected)
+        if label >= 0:
+            dist["budgeted"][label] = dist["budgeted"].get(label, 0) + 1
+    return dist
+
+
+# ---------------------------------------------------------------------------
+# Pricing / cost helpers
+# ---------------------------------------------------------------------------
+
+
+def _fetch_live_pricing(pool: list[str]) -> tuple[dict[str, float] | None, dict | None]:
+    """Fetch OpenRouter per-token pricing and return (costs, pricing_snapshot_data)."""
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/models",
+        headers={"Accept": "application/json"},
+    )
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if api_key:
+        req.add_header("Authorization", f"Bearer {api_key}")
+    with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310
+        data = json.load(resp)
+    by_id = {m["id"]: m for m in data.get("data", [])}
+    costs: dict[str, float] = {}
+    pricing: dict[str, dict] = {}
+    for spec in pool:
+        model, _ = split_model_spec(spec)
+        model_id = normalize_model_id(model)
+        entry = by_id.get(model_id)
+        if not entry:
+            return None, None
+        pr = entry.get("pricing", {})
+        prompt = float(pr.get("prompt", 0.0))
+        completion_price = float(pr.get("completion", 0.0))
+        per_task = prompt * 2000 + completion_price * 1000
+        costs[model_id] = per_task
+        pricing[model_id] = {
+            "prompt": prompt,
+            "completion": completion_price,
+            "per_task_estimate": per_task,
+        }
+    return costs, pricing
+
+
+def _resolve_costs(
+    pool: list[str], fallback_path: str | Path, out_dir: Path
+) -> tuple[dict[str, float], str]:
+    """Resolve per-task costs from live OpenRouter pricing, with fallback table."""
+    try:
+        costs, pricing = _fetch_live_pricing(pool)
+        if costs and len(costs) == len(pool):
+            snapshot = {"source": "live", "pool": pool, "pricing": pricing}
+            (out_dir / "pricing_snapshot.json").write_text(json.dumps(snapshot, indent=2))
+            print(f"[retrain] live pricing for {len(costs)} models", flush=True)
+            return costs, "live"
+    except Exception as exc:  # noqa: BLE001
+        print(f"[retrain] live pricing fetch failed: {exc}", flush=True)
+
+    print("[retrain] falling back to cost table", flush=True)
+    costs = _load_cost_table(fallback_path)
+    snapshot = {
+        "source": "fallback",
+        "warning": "Live pricing unavailable; using fallback cost table.",
+        "pool": pool,
+        "costs": costs,
+    }
+    (out_dir / "pricing_snapshot.json").write_text(json.dumps(snapshot, indent=2))
+    return costs, "fallback"
+
+
+def _load_cost_table(path: str | Path) -> dict[str, float]:
+    """Load a cost table JSON, skipping comment keys that start with '_'."""
+    with open(path) as f:
+        data = json.load(f)
+    return {k: float(v) for k, v in data.items() if not k.startswith("_")}
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+
 def _parse_retrain_args(argv=None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Retrain TRINITY router head on a new worker pool")
-    ap.add_argument("--pool", default=os.environ.get("RETRAIN_WORKER_MODELS"), required=False,
-                    help="Comma-separated OpenRouter worker model ids. "
-                         "Append '|reasoning_effort' per model, e.g. openai/gpt-5.6-terra|xhigh")
+    ap.add_argument(
+        "--pool",
+        default=os.environ.get("RETRAIN_WORKER_MODELS"),
+        required=False,
+        help="Comma-separated OpenRouter worker model ids. "
+        "Append '|reasoning_effort' per model, e.g. openai/gpt-5.6-terra|xhigh",
+    )
     ap.add_argument(
         "--output-dir",
         default=os.environ.get("RETRAIN_OUTPUT_DIR", "outputs/router_retrain"),
     )
-    ap.add_argument("--dataset", default="nvidia/ToolScale",
-                    help="Dataset to train on. 'nvidia/ToolScale' (default) or a "
-                         "TerminalBench 2.1 HF repo such as 'zai-org/terminal-bench-2-verified'.")
-    ap.add_argument("--limit", type=int, default=int(os.environ.get("RETRAIN_LIMIT", "200")))
-    ap.add_argument("--epochs", type=int, default=int(os.environ.get("RETRAIN_EPOCHS", "30")))
+    ap.add_argument(
+        "--dataset",
+        default="s3://external-datasets-archive/terminal-bench-2.1/",
+        help="Dataset to train on. 'nvidia/ToolScale' or a TerminalBench 2.1 source.",
+    )
+    ap.add_argument(
+        "--limit", type=int, default=int(os.environ.get("RETRAIN_LIMIT", "200"))
+    )
+    ap.add_argument(
+        "--epochs", type=int, default=int(os.environ.get("RETRAIN_EPOCHS", "30"))
+    )
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--alpha", type=float, default=0.1, help="role-loss weight")
     ap.add_argument("--l2", type=float, default=0.01, help="L2 regularization toward original head")
     default_cost_table = str(REPO_ROOT / "configs" / "worker-costs.json")
-    ap.add_argument("--label-mode", choices=["quality", "cost"],
-                    default=os.environ.get("RETRAIN_LABEL_MODE", "quality"),
-                    help="How to pick the gold worker per task (quality=argmax score, "
-                         "cost=argmax score/cost).")
-    ap.add_argument("--cost-table",
-                    default=os.environ.get("RETRAIN_COST_TABLE", default_cost_table),
-                    help="JSON mapping OpenRouter model id -> USD per task call.")
+    ap.add_argument(
+        "--label-mode",
+        choices=["quality", "cost", "budgeted"],
+        default=os.environ.get("RETRAIN_LABEL_MODE", "budgeted"),
+        help="How to pick the gold worker per task (quality=argmax score, "
+        "cost=argmax score/cost, budgeted=cheapest within tolerance).",
+    )
+    ap.add_argument(
+        "--quality-tolerance",
+        type=float,
+        default=float(os.environ.get("RETRAIN_QUALITY_TOLERANCE", "0.05")),
+        help="Budgeted-mode tolerance below the max successful score.",
+    )
+    ap.add_argument(
+        "--cost-table",
+        default=os.environ.get("RETRAIN_COST_TABLE", default_cost_table),
+        help="JSON mapping OpenRouter model id -> USD per task call.",
+    )
+    ap.add_argument(
+        "--max-worker-concurrency",
+        type=int,
+        default=int(os.environ.get("RETRAIN_MAX_WORKER_CONCURRENCY", "3")),
+        help="Global cap on concurrent worker API calls.",
+    )
+    ap.add_argument(
+        "--per-model-concurrency",
+        default=os.environ.get("RETRAIN_PER_MODEL_CONCURRENCY"),
+        help="JSON dict of model id -> max concurrent calls (default 1 reasoning, 2 else).",
+    )
+    ap.add_argument(
+        "--max-tokens",
+        type=int,
+        default=int(os.environ.get("RETRAIN_MAX_TOKENS", "256")),
+        help="Max tokens per worker completion (reduces cost/hang time for short outputs).",
+    )
+    ap.add_argument(
+        "--timeout",
+        type=int,
+        default=int(os.environ.get("RETRAIN_TIMEOUT", "60")),
+        help="Per-call read timeout in seconds (connect timeout is fixed at 10s).",
+    )
     ap.add_argument("--val-frac", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--cache", default="worker_outputs.jsonl",
-                    help="Cache worker responses to avoid re-calling the API")
+    ap.add_argument(
+        "--cache",
+        default="worker_outputs.jsonl",
+        help="Cache worker responses to avoid re-calling the API",
+    )
     ap.add_argument("--device", default="auto")
     ap.add_argument("--fugu-model", default=os.environ.get("FUGU_MODEL", "Qwen/Qwen3-0.6B"))
     default_vec = str(REPO_ROOT / "artifacts" / "model_iter_60.npy")
@@ -462,7 +1059,12 @@ def _resolve_device(device_arg: str) -> str:
 
 def _load_retrain_data(args: argparse.Namespace):
     print(f"[retrain] loading up to {args.limit} rows from {args.dataset}...", flush=True)
-    if "terminal" in args.dataset.lower():
+    is_terminal = (
+        Path(args.dataset).exists()
+        or "terminal" in args.dataset.lower()
+        or args.dataset.startswith("s3://")
+    )
+    if is_terminal:
         train_ds, val_ds = load_terminalbench_tasks(
             args.dataset, args.limit, args.seed, args.val_frac
         )
@@ -470,104 +1072,6 @@ def _load_retrain_data(args: argparse.Namespace):
         train_ds, val_ds = load_toolscale_tasks(args.limit, args.seed, args.val_frac)
     print(f"[retrain] train={len(train_ds)} val={len(val_ds)}", flush=True)
     return train_ds, val_ds
-
-
-def _load_cost_table(path: str | Path) -> dict[str, float]:
-    """Load a cost table JSON, skipping comment keys that start with '_'."""
-    with open(path) as f:
-        data = json.load(f)
-    return {k: float(v) for k, v in data.items() if not k.startswith("_")}
-
-
-def _pick_best_worker(
-    scores: list[float],
-    pool: list[str],
-    label_mode: str,
-    costs: dict[str, float] | None,
-) -> int:
-    """Return the worker index that should be the gold label for this task."""
-    if label_mode == "cost":
-        if costs is None:
-            raise ValueError("cost mode requires a cost table")
-        ratios = []
-        for score, spec in zip(scores, pool, strict=True):
-            model, _ = split_model_spec(spec)
-            model_id = normalize_model_id(model)
-            cost = max(costs.get(model_id, 0.0), 1e-6)
-            ratios.append(score / cost)
-        return int(np.argmax(ratios))
-    return int(np.argmax(scores))
-
-
-def _load_worker_cache(cache_path: Path) -> dict[tuple[str, str], dict]:
-    cache: dict[tuple[str, str], dict] = {}
-    if cache_path.exists():
-        with open(cache_path) as f:
-            for line in f:
-                rec = json.loads(line)
-                cache[(rec["task"], rec["model"])] = rec
-        print(f"[retrain] loaded {len(cache)} cached worker responses", flush=True)
-    return cache
-
-
-def _write_worker_cache(cache_path: Path, cache: dict[tuple[str, str], dict]) -> None:
-    with open(cache_path, "w") as f:
-        f.writelines(json.dumps(rec) + "\n" for rec in cache.values())
-
-
-def _score_one_worker(
-    worker: OpenRouterWorker,
-    task: str,
-    system: str | None,
-    agent_id: int,
-    model: str,
-    cache: dict[tuple[str, str], dict],
-    cache_lock: threading.Lock | None = None,
-) -> str:
-    key = (task, model)
-    if key in cache:
-        return str(cache[key]["completion"])
-    completion = worker("Worker", worker_messages(task, system), agent_id)
-    rec = {"task": task, "model": model, "completion": completion}
-    if cache_lock:
-        with cache_lock:
-            cache[key] = rec
-    else:
-        cache[key] = rec
-    return completion
-
-
-def _score_worker_pool(
-    worker: OpenRouterWorker,
-    pool: list[str],
-    train_ds: list[dict],
-    cache_path: Path,
-    label_mode: str = "quality",
-    costs: dict[str, float] | None = None,
-) -> list[dict]:
-    cache = _load_worker_cache(cache_path)
-    cache_lock = threading.Lock()
-    results = []
-    for row in tqdm(train_ds, desc="scoring workers"):
-        task = row["task"]
-        gold = row["expected"]
-        system = row.get("system")
-        scores: list[float] = [0.0] * len(pool)
-        with ThreadPoolExecutor(max_workers=len(pool)) as ex:
-            futures = {
-                ex.submit(
-                    _score_one_worker, worker, task, system, agent_id, model, cache, cache_lock
-                ): agent_id
-                for agent_id, model in enumerate(pool)
-            }
-            for fut in as_completed(futures):
-                agent_id = futures[fut]
-                completion = fut.result()
-                scores[agent_id] = reward_for(completion, gold)
-        best = _pick_best_worker(scores, pool, label_mode, costs)
-        results.append({"task": task, "gold_worker": best, "scores": scores, "gold": gold})
-    _write_worker_cache(cache_path, cache)
-    return results
 
 
 def _write_labels(out_dir: Path, results: list[dict]) -> None:
@@ -599,8 +1103,14 @@ def _train_router_head(
     head0 = router.head.detach().cpu().clone()
     print("[retrain] training head...", flush=True)
     return train_head(
-        X, y_worker, y_role, head0,
-        epochs=args.epochs, lr=args.lr, alpha=args.alpha, l2_lambda=args.l2,
+        X,
+        y_worker,
+        y_role,
+        head0,
+        epochs=args.epochs,
+        lr=args.lr,
+        alpha=args.alpha,
+        l2_lambda=args.l2,
         device=str(router.device),
     )
 
@@ -643,6 +1153,10 @@ def _validate_router(
 def _build_report(
     args: argparse.Namespace,
     pool: list[str],
+    results: list[dict],
+    skipped: list[dict],
+    label_distribution: dict,
+    pricing_source: str,
     train_size: int,
     val_size: int,
     best_val_acc: float,
@@ -651,20 +1165,30 @@ def _build_report(
     vec_path: Path,
     head_path: Path,
 ) -> dict:
+    total_tasks = train_size + len(skipped)
+    retention = len(results) / total_tasks if total_tasks else 0.0
+    skipped_reasons = Counter(s.get("skip_reason") for s in skipped)
     report = {
         "pool": pool,
         "dataset": args.dataset,
         "limit": args.limit,
         "label_mode": args.label_mode,
-        "train_size": train_size,
+        "quality_tolerance": args.quality_tolerance,
+        "max_worker_concurrency": args.max_worker_concurrency,
+        "train_size": len(results),
+        "skipped_count": len(skipped),
+        "retention": retention,
+        "skipped_reasons": dict(skipped_reasons),
         "val_size": val_size,
         "best_val_worker_acc": best_val_acc,
         "avg_val_reward": avg_val_reward,
         "output": str(out_dir),
         "vector": str(vec_path),
         "head": str(head_path),
+        "label_distribution": label_distribution,
+        "pricing_source": pricing_source,
     }
-    if args.label_mode == "cost":
+    if args.label_mode in ("cost", "budgeted"):
         report["cost_table"] = args.cost_table
     return report
 
@@ -675,20 +1199,57 @@ def main(argv=None) -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    costs = None
-    if args.label_mode == "cost":
-        if not Path(args.cost_table).exists():
-            raise FileNotFoundError(
-                f"cost mode requires --cost-table; not found: {args.cost_table}"
-            )
-        costs = _load_cost_table(args.cost_table)
-        print(f"[retrain] cost table: {len(costs)} models", flush=True)
-
+    costs, pricing_source = _resolve_costs(pool, args.cost_table, out_dir)
     train_ds, val_ds = _load_retrain_data(args)
     cache_path = out_dir / args.cache
-    worker = OpenRouterWorker(pool)
-    results = _score_worker_pool(worker, pool, train_ds, cache_path, args.label_mode, costs)
+
+    per_model_concurrency = None
+    if args.per_model_concurrency:
+        per_model_concurrency = json.loads(args.per_model_concurrency)
+
+    worker = OpenRouterWorker(
+        pool,
+        max_worker_concurrency=args.max_worker_concurrency,
+        per_model_concurrency=per_model_concurrency,
+        max_tokens=args.max_tokens,
+        timeout=args.timeout,
+    )
+    results, skipped, label_distribution, events = _score_worker_pool(
+        worker,
+        pool,
+        train_ds,
+        out_dir,
+        args.label_mode,
+        costs,
+        args.quality_tolerance,
+        cache_path,
+    )
+
+    if not results:
+        print("[retrain] all tasks skipped; cannot train.", flush=True)
+        report = _build_report(
+            args,
+            pool,
+            results,
+            skipped,
+            label_distribution,
+            pricing_source,
+            len(train_ds),
+            len(val_ds),
+            0.0,
+            0.0,
+            out_dir,
+            out_dir / "model_iter_60.npy",
+            out_dir / "router_head.npy",
+        )
+        with open(out_dir / "report.json", "w") as f:
+            json.dump(report, f, indent=2)
+        print(json.dumps(report, indent=2), flush=True)
+        return
+
     _write_labels(out_dir, results)
+    with open(out_dir / "skipped_tasks.jsonl", "w") as f:
+        f.writelines(json.dumps(s) + "\n" for s in skipped)
 
     device = _resolve_device(args.device)
     print(f"[retrain] loading TRINITY backbone {args.fugu_model} on {device}...", flush=True)
@@ -703,8 +1264,19 @@ def main(argv=None) -> None:
     avg_val_reward = _validate_router(router_val, val_ds, worker)
 
     report = _build_report(
-        args, pool, len(results), len(val_ds), best_val_acc, avg_val_reward,
-        out_dir, vec_path, head_path,
+        args,
+        pool,
+        results,
+        skipped,
+        label_distribution,
+        pricing_source,
+        len(train_ds),
+        len(val_ds),
+        best_val_acc,
+        avg_val_reward,
+        out_dir,
+        vec_path,
+        head_path,
     )
     with open(out_dir / "report.json", "w") as f:
         json.dump(report, f, indent=2)

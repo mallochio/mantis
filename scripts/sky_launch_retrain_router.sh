@@ -27,4 +27,9 @@ for var in $(compgen -e | grep '^RETRAIN_'); do
   ENV_ARGS+=(--env "$var=${!var}")
 done
 
+# Forward AWS credentials for the S3 file_mounts.
+for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION AWS_PROFILE; do
+  [ -n "${!var:-}" ] && ENV_ARGS+=(--env "$var=${!var}")
+done
+
 exec "${CMD[@]}" "${ENV_ARGS[@]}" launch/sky/retrain_fugu_router.yaml "${EXTRA_ARGS[@]}"
