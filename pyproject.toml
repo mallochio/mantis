@@ -69,6 +69,7 @@ ignore = [
 "openfugu-patch/serve.py" = ["E402", "S104"]
 "scripts/retrain_router_pool.py" = ["E402"]
 "scripts/retrain_conductor.py" = ["E402", "I001"]
+"scripts/update_pool.py" = ["S310"]
 "tests/test_serve.py" = ["E501", "S310", "S104"]
 "tests/test_retrain_router_pool.py" = ["E501"]
 "tests/test_retrain_conductor.py" = ["S105"]

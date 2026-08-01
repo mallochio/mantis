@@ -182,24 +182,28 @@ def _build_dataset(
 # ---------------------------------------------------------------------------
 # Reward helpers
 # ---------------------------------------------------------------------------
-def _parse_dag(completion: str) -> Any:
-    """Parse a Conductor completion into (model_id, subtasks, access_list)."""
+def _parse_dag(completion: str) -> tuple[list, list, list] | None:
+    """Parse and structurally validate a Conductor completion into (model_ids, subtasks, access)."""
     try:
-        return parse_workflow(completion)
+        parsed = parse_workflow(completion)
     except (ValueError, TypeError):
         return None
+    if not parsed:
+        return None
+    model_ids, subtasks, access = parsed
+    if not (model_ids and subtasks and access):
+        return None
+    if len(model_ids) != len(subtasks) or len(subtasks) != len(access):
+        return None
+    return model_ids, subtasks, access
 
 
 def _format_reward_one(completion: str) -> float:
     """1.0 if the completion parses into three equal-length non-empty lists."""
-    parsed = _parse_dag(completion)
-    if parsed is None:
+    dag = _parse_dag(completion)
+    if dag is None:
         return 0.0
-    model_ids, subtasks, access = parsed
-    if not (model_ids and subtasks and access):
-        return 0.0
-    if len(model_ids) != len(subtasks) or len(subtasks) != len(access):
-        return 0.0
+    model_ids, subtasks, _ = dag
     if not (1 <= len(model_ids) <= MAX_STEPS):
         return 0.0
     if not all(isinstance(s, str) and s.strip() for s in subtasks):
@@ -209,18 +213,14 @@ def _format_reward_one(completion: str) -> float:
 
 def _action_reward_one(completion: str, slot_labels: list[str]) -> float:
     """Fraction of steps with valid worker ids and DAG-legal access lists."""
-    parsed = _parse_dag(completion)
-    if parsed is None:
+    dag = _parse_dag(completion)
+    if dag is None:
         return 0.0
-    model_ids, subtasks, access = parsed
-    n = len(slot_labels)
-    if not (model_ids and subtasks and access):
-        return 0.0
-    if len(model_ids) != len(subtasks) or len(subtasks) != len(access):
-        return 0.0
+    model_ids, subtasks, access = dag
     if len(model_ids) > MAX_STEPS:
         return 0.0
 
+    n = len(slot_labels)
     score = 0.0
     for i, raw in enumerate(model_ids):
         try:
@@ -243,14 +243,10 @@ def _outcome_reward_one(
     completion: str, expected: Any, worker: Any, slot_labels: list[str]
 ) -> float:
     """Execute the parsed DAG and compare the final worker output to `expected`."""
-    parsed = _parse_dag(completion)
-    if parsed is None:
+    dag = _parse_dag(completion)
+    if dag is None:
         return 0.0
-    model_ids, subtasks, access = parsed
-    if not (model_ids and subtasks and access):
-        return 0.0
-    if len(model_ids) != len(subtasks) or len(subtasks) != len(access):
-        return 0.0
+    model_ids, subtasks, access = dag
     try:
         result = ConductorExecutor(worker, slot_labels=slot_labels).execute(
             model_ids, subtasks, access

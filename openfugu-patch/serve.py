@@ -443,23 +443,25 @@ def _worker_from_args(args: argparse.Namespace, mode: str) -> Any:
     slot_models = args.slot_models.split(",") if args.slot_models else None
     if mode == "conductor":
         return OpenRouterConductorWorker(slot_models=slot_models, max_tokens=4096)
-    return OpenRouterTrinityWorker(slot_models=slot_models, max_tokens=4096)
+    if mode == "trinity":
+        return OpenRouterTrinityWorker(slot_models=slot_models, max_tokens=4096)
+    raise ValueError(f"unknown coordinator mode: {mode}")
 
 
 def load_coordinator(mode: str):
     global MAX_TURNS
+    if mode not in ("trinity", "conductor"):
+        raise ValueError(f"unknown coordinator mode: {mode}")
     args = _parse_args()
     MAX_TURNS = args.max_turns
     worker = _worker_from_args(args, mode)
     if mode == "trinity":
         return Coordinator(get_router(), worker, max_turns=args.max_turns, sample=True)
-    if mode == "conductor":
-        local_ckpt = os.environ.get("FUGU_LOCAL_CONDUCTOR")
-        conductor = EnvLocalConductor(local_ckpt) if local_ckpt else None
-        return EnvConductorCoordinator(
-            worker, conductor=conductor, slot_labels=getattr(worker, "slot_models", None)
-        )
-    raise ValueError(f"unknown coordinator mode: {mode}")
+    local_ckpt = os.environ.get("FUGU_LOCAL_CONDUCTOR")
+    conductor = EnvLocalConductor(local_ckpt) if local_ckpt else None
+    return EnvConductorCoordinator(
+        worker, conductor=conductor, slot_labels=getattr(worker, "slot_models", None)
+    )
 
 
 def get_coordinator(mode: str):

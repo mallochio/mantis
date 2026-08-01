@@ -19,7 +19,7 @@ services:
   router:
     build:
       context: .
-      dockerfile: router/Dockerfile
+      dockerfile: docker/router/Dockerfile
     container_name: fugu-router
     ports: ["5500:5500"]
     environment:
@@ -42,7 +42,7 @@ services:
   openfugu:
     build:
       context: .
-      dockerfile: openfugu/Dockerfile
+      dockerfile: docker/openfugu/Dockerfile
     container_name: fugu-orchestrator
     ports: ["8088:8088"]
     environment:
