@@ -401,6 +401,7 @@ def _write_manifest(
         "steps": args.steps,
         "generations": args.num_generations,
         "per_device_batch": args.per_device_batch,
+        "optim": args.optim,
         "pool": pool_specs,
         "output_checkpoint_path": checkpoint_path,
         "acceptance_passed": acceptance_passed,
@@ -466,6 +467,7 @@ def main() -> None:
     worker_max_tokens = _env_int("FUGU_WORKER_MAX_TOKENS", "512")
     mock_worker = os.environ.get("FUGU_CONDUCTOR_MOCK_WORKER") == "1"
     temperature = float(os.environ.get("RETRAIN_TEMPERATURE", "1.0"))
+    optim = os.environ.get("RETRAIN_OPTIM", "adamw_torch")
 
     parser.add_argument("--pool", required=True, help="model|effort CSV (same as router retrain)")
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
@@ -483,6 +485,11 @@ def main() -> None:
     parser.add_argument("--worker-max-tokens", type=int, default=worker_max_tokens)
     parser.add_argument("--mock-worker", action="store_true", default=mock_worker)
     parser.add_argument("--temperature", type=float, default=temperature)
+    parser.add_argument(
+        "--optim",
+        default=optim,
+        help="Optimizer name for GRPOConfig (e.g. adamw_torch, adamw_bnb_8bit)",
+    )
     parser.add_argument("--reward", default="verifiable", choices=["verifiable"])
     parser.add_argument(
         "--real-checkpoint-smoke",
@@ -601,6 +608,7 @@ def main() -> None:
         bf16=torch.cuda.is_available(),
         fp16=False,
         gradient_checkpointing=torch.cuda.is_available(),
+        optim=args.optim,
         temperature=args.temperature,
         beta=0.0,  # no KL — matches Fugu-Ultra report
     )

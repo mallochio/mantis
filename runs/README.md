@@ -38,3 +38,4 @@ runs with a substituted smaller base model are always `valid_for_runtime=false`.
 ## Run reports
 
 - [`20260801-135M-smoke.md`](reports/20260801-135M-smoke.md) — pipeline-only CPU smoke with a 135M proxy model. Not valid for runtime.
+- [`20260801-real-3b-gcp.md`](reports/20260801-real-3b-gcp.md) — real-3B acceptance smoke on GCP L4 spot. `valid_for_runtime=true`.

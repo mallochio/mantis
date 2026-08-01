@@ -126,25 +126,36 @@ sky launch --env OPENROUTER_API_KEY --env HF_TOKEN \
 
 Before a full retrain, validate that `di-zhang-fdu/openfugu-conductor-3b` loads,
 trains for one GRPO step, saves a checkpoint, reloads it, and emits a parseable
-Conductor DAG. This uses a single L4 or A10G (cheaper than A100 for a one-step
-acceptance test):
+Conductor DAG. The smoke fits on a single L4/A10G (24 GB) by using 8-bit AdamW and
+a short `max_completion_length`:
 
 ```bash
+# GCP: authenticate and point GOOGLE_APPLICATION_CREDENTIALS at a file.
+# AWS keys are only needed because the TerminalBench mirror lives in S3.
 export OPENROUTER_API_KEY="sk-or-v1-..."
 export HF_TOKEN="hf-..."
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+export AWS_DEFAULT_REGION="us-east-1"
 
 # Try spot first (cheapest).
-sky launch -y --env OPENROUTER_API_KEY --env HF_TOKEN \
-  launch/sky/retrain_fugu_conductor_real_3b_smoke.yaml
+sky launch -y --detach-run \
+  --env OPENROUTER_API_KEY --env HF_TOKEN \
+  --env AWS_ACCESS_KEY_ID --env AWS_SECRET_ACCESS_KEY --env AWS_DEFAULT_REGION \
+  launch/sky/retrain_fugu_conductor_real_3b_smoke_gcp.yaml
 
 # If spot is unavailable/exhausted, use on-demand:
-sky launch -y --no-use-spot --env OPENROUTER_API_KEY --env HF_TOKEN \
-  launch/sky/retrain_fugu_conductor_real_3b_smoke.yaml
+sky launch -y --no-use-spot --detach-run \
+  --env OPENROUTER_API_KEY --env HF_TOKEN \
+  --env AWS_ACCESS_KEY_ID --env AWS_SECRET_ACCESS_KEY --env AWS_DEFAULT_REGION \
+  launch/sky/retrain_fugu_conductor_real_3b_smoke_gcp.yaml
 ```
 
 `--real-checkpoint-smoke` aborts immediately on CPU/MPS, never substitutes a
 smaller model, and writes `manifest.json` with `valid_for_runtime=true` only when
 the real 3B checkpoint runs on GPU and the acceptance generation is parseable.
+A real-3B acceptance smoke on a GCP L4 spot completed successfully (see
+`runs/reports/20260801-real-3b-gcp.md`).
 
 `launch/sky/retrain_fugu_conductor.yaml` defaults to a smoke:
 - `RETRAIN_STEPS=20`, `RETRAIN_LIMIT=8`, `RETRAIN_NUM_GENERATIONS=2`, `RETRAIN_PER_DEVICE_BATCH=2`
