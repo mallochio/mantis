@@ -14,6 +14,7 @@ stdlib http.server only — no FastAPI/uvicorn.
 from __future__ import annotations
 import argparse, glob, json, os, sys, time, uuid
 import numpy as np
+import torch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # reuse the faithful implementation
@@ -21,7 +22,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mini import (FuguRouter, Coordinator, LiteLLMWorker as TrinityLiteLLMWorker,
                   MockWorker, DEFAULT_SLOT_LABELS, HEAD_ROWS, HIDDEN)
 from ultra import (LiteLLMWorker as ConductorLiteLLMWorker, ConductorExecutor,
-                   conductor_prompt, parse_workflow, N_AGENTS as CONDUCTOR_N_AGENTS)
+                   conductor_prompt, parse_workflow,
+                   DEFAULT_SLOT_LABELS as CONDUCTOR_DEFAULT_SLOT_LABELS)
 
 ROUTER: FuguRouter | None = None
 MODEL_NAME = "fugu"
@@ -167,16 +169,18 @@ def _parse_args():
                     help="Qwen3-0.6B dir or HF id")
     ap.add_argument("--vector", default=os.environ.get("FUGU_VECTOR", "model_iter_60.npy"),
                     help="base vector (19456) — SVF + head")
-    ap.add_argument("--head", default=None,
-                    help="optional trained head-only vector (10240); overrides the "
+    ap.add_argument("--head", default=os.environ.get("FUGU_HEAD"),
+                    help="optional trained head-only vector/safetensors; overrides the "
                          "head from --vector after SVF is applied")
-    ap.add_argument("--slot-models", metavar="CSV", help="litellm worker ids; omit for mock")
-    ap.add_argument("--local-models", metavar="CSV",
-                    help="local HF worker model paths (real per-step pool, no API). "
-                         "Optional 'path@device' per entry; default round-robin GPUs.")
-    ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--port", type=int, default=8088)
-    ap.add_argument("--max-turns", type=int, default=5)
+    ap.add_argument("--slot-models", metavar="CSV",
+                    default=os.environ.get("FUGU_WORKER_MODELS", os.environ.get("FUGU_WORKER_MODEL")),
+                    help="litellm worker ids (CSV); also FUGU_WORKER_MODELS")
+    ap.add_argument("--local-models", metavar="CSV", default=os.environ.get("FUGU_LOCAL_MODELS"),
+                    help="local HF worker model paths (CSV). "
+                         "Optional 'path@device' per entry; also FUGU_LOCAL_MODELS")
+    ap.add_argument("--host", default=os.environ.get("FUGU_HOST", "0.0.0.0"))
+    ap.add_argument("--port", type=int, default=int(os.environ.get("FUGU_PORT", "8088")))
+    ap.add_argument("--max-turns", type=int, default=int(os.environ.get("FUGU_MAX_TURNS", "5")))
     _args = ap.parse_args()
     return _args
 
@@ -185,16 +189,108 @@ def get_router():
     global ROUTER
     if ROUTER is None:
         args = _parse_args()
+        device = os.environ.get("FUGU_DEVICE")
         print(f"[serve] loading TRINITY router ({args.model}) ...", flush=True)
-        ROUTER = FuguRouter(args.model, args.vector, seed=0)
+        ROUTER = FuguRouter(args.model, args.vector, device=device, seed=0)
         if args.head:                                  # layer a trained head over base SVF
-            h = np.load(args.head).astype(np.float64)
-            if h.shape != (HEAD_ROWS * HIDDEN,):
-                raise ValueError(f"--head must be {HEAD_ROWS * HIDDEN} floats, got {h.shape}")
-            ROUTER.head = ROUTER.torch.from_numpy(h.copy()).float().reshape(
+            head = _load_head(args.head)
+            ROUTER.head = ROUTER.torch.from_numpy(head.copy()).float().reshape(
                 HEAD_ROWS, HIDDEN).to(ROUTER.device)
             print(f"[serve] applied trained head from {args.head}", flush=True)
     return ROUTER
+
+
+def _load_head(path: str):
+    """Load a 10240-float head from .npy or from a safetensors file."""
+    if path.endswith(".safetensors"):
+        from safetensors import safe_open
+        with safe_open(path, framework="pt") as f:
+            head = f.get_tensor("trinity_router_head")
+        head = head.to(torch.float32).numpy().reshape(-1)
+    else:
+        head = np.load(path).astype(np.float64)
+    if head.shape != (HEAD_ROWS * HIDDEN,):
+        raise ValueError(f"head must be {HEAD_ROWS * HIDDEN} floats, got {head.shape}")
+    return head
+
+
+class EnvLocalConductor:
+    """Load a GRPO-trained Conductor checkpoint locally with transformers.
+
+    Env overrides: FUGU_CONDUCTOR_DEVICE (cpu/cuda:0/mps/auto),
+                    FUGU_CONDUCTOR_DTYPE (float32/bfloat16/float16),
+                    FUGU_CONDUCTOR_MAX_NEW.
+    Falls back to float32 on CPU/MPS; bfloat16 only on CUDA."""
+    def __init__(self, ckpt: str, device: str | None = None, max_new: int | None = None):
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        self.torch = torch
+        self.ckpt = ckpt
+        if device is None:
+            device = os.environ.get("FUGU_CONDUCTOR_DEVICE")
+        if device is None or device == "auto":
+            if torch.cuda.is_available(): device = "cuda:0"
+            elif torch.backends.mps.is_available(): device = "mps"
+            else: device = "cpu"
+        self.device = device
+        self.max_new = max_new or int(os.environ.get("FUGU_CONDUCTOR_MAX_NEW", "512"))
+        dtype_env = os.environ.get("FUGU_CONDUCTOR_DTYPE")
+        if dtype_env:
+            self.dtype = getattr(torch, dtype_env)
+        else:
+            self.dtype = torch.bfloat16 if self.device.startswith("cuda") else torch.float32
+        print(f"[serve] loading local Conductor ({ckpt}) on {self.device} dtype={self.dtype} ...", flush=True)
+        self.tok = AutoTokenizer.from_pretrained(ckpt)
+        if self.tok.pad_token is None:
+            self.tok.pad_token = self.tok.eos_token
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(ckpt, dtype=self.dtype)
+        except TypeError:
+            self.model = AutoModelForCausalLM.from_pretrained(ckpt, torch_dtype=self.dtype)
+        if self.device == "auto" and torch.cuda.device_count() > 1:
+            pass  # leave device_map behavior to from_pretrained
+        else:
+            self.model = self.model.to(self.device)
+        self.model.eval()
+        print(f"[serve] Conductor ready", flush=True)
+
+    def conduct(self, messages):
+        torch = self.torch
+        try:
+            text = self.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        except Exception:
+            text = "\n".join(m["content"] for m in messages)
+        ids = self.tok(text, return_tensors="pt", truncation=True, max_length=2048).to(self.device)
+        with torch.no_grad():
+            out = self.model.generate(**ids, max_new_tokens=self.max_new, do_sample=False,
+                                      pad_token_id=self.tok.pad_token_id)
+        return self.tok.decode(out[0, ids["input_ids"].shape[1]:], skip_special_tokens=True)
+
+
+class EnvConductorCoordinator(ConductorCoordinator):
+    """ConductorCoordinator that can use a local transformers checkpoint
+    (Llama-3.2-3B Conductor) or LiteLLM for the planning call."""
+    def __init__(self, worker, conductor=None, slot_labels=None):
+        self.worker = worker
+        self.conductor = conductor
+        self.slot_labels = slot_labels or getattr(worker, "slot_models", None) or CONDUCTOR_DEFAULT_SLOT_LABELS
+
+    def run(self, query: str, verbose: bool = False):
+        if self.conductor is not None:
+            completion = self.conductor.conduct(conductor_prompt(query, self.slot_labels))
+        else:
+            conductor_model = os.environ.get("FUGU_CONDUCTOR_MODEL")
+            if conductor_model is None and hasattr(self.worker, "slot_models") and self.worker.slot_models:
+                conductor_model = self.worker.slot_models[0]
+            if conductor_model is None:
+                conductor_model = "openai/gpt-4o-mini"
+            completion = self.worker.conduct(conductor_model, conductor_prompt(query, self.slot_labels))
+        mids, subs, acc = parse_workflow(completion)
+        if not subs:
+            raise ValueError(f"Conductor did not emit a parseable workflow. Raw: {completion[:200]}")
+        res = ConductorExecutor(self.worker, slot_labels=self.slot_labels).execute(mids, subs, acc, verbose=verbose)
+        res.turns = res.steps
+        return res
 
 
 def _worker_from_args(args, mode: str):
@@ -229,7 +325,9 @@ def load_coordinator(mode: str):
     if mode == "trinity":
         return Coordinator(get_router(), worker, max_turns=args.max_turns, sample=True)
     if mode == "conductor":
-        return ConductorCoordinator(worker)
+        local_ckpt = os.environ.get("FUGU_LOCAL_CONDUCTOR")
+        conductor = EnvLocalConductor(local_ckpt) if local_ckpt else None
+        return EnvConductorCoordinator(worker, conductor=conductor, slot_labels=getattr(worker, "slot_models", None))
     raise ValueError(f"unknown coordinator mode: {mode}")
 
 

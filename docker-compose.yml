@@ -46,8 +46,25 @@ services:
     environment:
       FUGU_BASE_URL: http://litellm:4000/v1
       FUGU_API_KEY: ${LITELLM_KEY:-sk-fugu-local}
-      CUDA_VISIBLE_DEVICES: ""   # force CPU on Mac
+      FUGU_MODEL: ${FUGU_MODEL:-Qwen/Qwen3-0.6B}
+      FUGU_VECTOR: ${FUGU_VECTOR:-/app/artifacts/model_iter_60.npy}
+      FUGU_HEAD: ${FUGU_HEAD:-}
+      FUGU_WORKER_MODEL: ${FUGU_WORKER_MODEL:-openai/gpt-4o-mini}
+      FUGU_WORKER_MODELS: ${FUGU_WORKER_MODELS:-${FUGU_WORKER_MODEL:-openai/gpt-4o-mini}}
+      FUGU_LOCAL_MODELS: ${FUGU_LOCAL_MODELS:-}
+      FUGU_CONDUCTOR_MODEL: ${FUGU_CONDUCTOR_MODEL:-openai/gpt-4o-mini}
+      FUGU_LOCAL_CONDUCTOR: ${FUGU_LOCAL_CONDUCTOR:-}
+      FUGU_CONDUCTOR_DEVICE: ${FUGU_CONDUCTOR_DEVICE:-cpu}
+      FUGU_CONDUCTOR_DTYPE: ${FUGU_CONDUCTOR_DTYPE:-float32}
+      FUGU_CONDUCTOR_MAX_NEW: ${FUGU_CONDUCTOR_MAX_NEW:-512}
+      FUGU_MAX_TURNS: ${FUGU_MAX_TURNS:-5}
+      HF_HOME: /root/.cache/huggingface
+      HF_TOKEN: ${HF_TOKEN:-}
+      CUDA_VISIBLE_DEVICES: ""   # CPU on Mac
       TOKENIZERS_PARALLELISM: "false"
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+      - ./artifacts:/app/artifacts:ro
     depends_on:
       litellm:
         condition: service_healthy
@@ -56,3 +73,6 @@ services:
 networks:
   fugu:
     driver: bridge
+
+volumes:
+  hf-cache:
