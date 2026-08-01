@@ -174,6 +174,30 @@ TERMINAL_SYSTEM = (
 )
 
 
+TERMINAL_PATTERNS = ("/instruction.md", "/task.toml", "/solution/solve.sh")
+
+
+def _sync_s3_to_local(s3_uri: str, local_dir: Path):
+    """Mirror only the small TerminalBench metadata files from S3."""
+    import boto3, re
+    m = re.match(r"s3://([^/]+)/?(.*)", s3_uri)
+    if not m:
+        raise ValueError(f"invalid S3 URI: {s3_uri}")
+    bucket, prefix = m.group(1), m.group(2).rstrip("/")
+    client = boto3.client("s3")
+    paginator = client.get_paginator("list_objects_v2")
+    local_dir.mkdir(parents=True, exist_ok=True)
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if not any(key.endswith(s) for s in TERMINAL_PATTERNS):
+                continue
+            rel = Path(key).relative_to(prefix)
+            dest = local_dir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            client.download_file(bucket, key, str(dest))
+
+
 def load_terminalbench_tasks(dataset: str = "zai-org/terminal-bench-2-verified",
                              limit: int | None = None, seed: int = 42,
                              val_frac: float = 0.1, cache_dir: str | None = None):
@@ -182,12 +206,19 @@ def load_terminalbench_tasks(dataset: str = "zai-org/terminal-bench-2-verified",
     Only the small metadata files are downloaded (instruction.md, task.toml,
     solution/solve.sh); the heavy environment tarballs are skipped.
     """
-    cache_dir = cache_dir or os.path.expanduser("~/.cache/terminal-bench-2.1")
-    local = Path(snapshot_download(
-        dataset, repo_type="dataset",
-        local_dir=cache_dir,
-        allow_patterns=["*/instruction.md", "*/task.toml", "*/solution/solve.sh"],
-    ))
+    cache_dir = Path(cache_dir or os.path.expanduser("~/.cache/terminal-bench-2.1"))
+
+    if dataset.startswith("s3://"):
+        _sync_s3_to_local(dataset, cache_dir)
+        local = cache_dir
+    elif Path(dataset).exists():
+        local = Path(dataset)
+    else:
+        local = Path(snapshot_download(
+            dataset, repo_type="dataset",
+            local_dir=str(cache_dir),
+            allow_patterns=[f"*{s}" for s in TERMINAL_PATTERNS],
+        ))
 
     records = []
     for instr_path in sorted(local.glob("*/instruction.md")):
