@@ -24,15 +24,16 @@ All model selection is env-driven. Export the variables before `docker compose u
 | Variable | What it controls | Default |
 |---|---|---|
 | `OPENROUTER_API_KEY` | API key LiteLLM uses to call OpenRouter | required |
+| `OPENCODE_GO_API_KEY` | API key for optional opencode-* LiteLLM aliases | optional |
 | `OPENAI_API_KEY` | OpenAI key for `llm-router` embeddings only | required for router |
 | `LITELLM_KEY` | Internal bearer token for router/openfugu | `sk-fugu-local` |
-| `EXPENSIVE_MODEL` / `CHEAP_MODEL` | Router cheap/expensive targets (LiteLLM aliases) | `claude-opus-4.8` / `claude-sonnet-5` |
+| `EXPENSIVE_MODEL` / `CHEAP_MODEL` | Router cheap/expensive targets (LiteLLM aliases) | `claude-opus-5` / `gpt-5.6-luna-max` |
 | `FUGU_MODEL` | TRINITY router backbone (Qwen3-0.6B) | `Qwen/Qwen3-0.6B` |
 | `FUGU_VECTOR` | TRINITY SVF+head vector | `/app/artifacts/model_iter_60.npy` |
 | `FUGU_HEAD` | Optional per-step head override | unset |
-| `FUGU_WORKER_MODEL` / `FUGU_WORKER_MODELS` | Worker pool CSV for TRINITY/Conductor (LiteLLM aliases) | `claude-sonnet-5` |
+| `FUGU_WORKER_MODEL` / `FUGU_WORKER_MODELS` | Worker pool CSV for TRINITY/Conductor (LiteLLM aliases) | `claude-sonnet-5,claude-opus-5,gpt-5.6-sol-medium,gpt-5.6-luna-max,gpt-5.6-terra-xhigh,deepseek-v4-flash,glm-5.2` |
 | `FUGU_LOCAL_MODELS` | Local HF worker models CSV (overrides LiteLLM pool) | unset |
-| `FUGU_CONDUCTOR_MODEL` | Conductor planning model via LiteLLM | `claude-opus-4.8` |
+| `FUGU_CONDUCTOR_MODEL` | Conductor planning model via LiteLLM | `claude-opus-5` |
 | `FUGU_LOCAL_CONDUCTOR` | HF id/path to load a local Conductor (e.g. `di-zhang-fdu/openfugu-conductor-3b`) | unset |
 | `FUGU_CONDUCTOR_DEVICE` | Device for local Conductor (`cpu`, `mps`, `cuda:0`) | `cpu` |
 | `FUGU_CONDUCTOR_DTYPE` | Torch dtype for local Conductor | `float32` |
@@ -48,7 +49,10 @@ export OPENAI_API_KEY="sk-..."            # only for llm-router embeddings
 export HF_TOKEN="hf-..."                  # optional, helps avoid HF rate limits
 
 # 7-slot worker pool: must match aliases in configs/litellm.yaml
-export FUGU_WORKER_MODELS="claude-haiku-4.5,claude-sonnet-5,claude-sonnet-4.6,claude-sonnet-4.5,claude-opus-4.8,claude-opus-5,claude-fable-5"
+export FUGU_WORKER_MODELS="claude-sonnet-5,claude-opus-5,gpt-5.6-sol-medium,gpt-5.6-luna-max,gpt-5.6-terra-xhigh,deepseek-v4-flash,glm-5.2"
+
+# Optional: swap deepseek/glm to the OpenCode Go endpoint by setting OPENCODE_GO_API_KEY
+# export FUGU_WORKER_MODELS="claude-sonnet-5,claude-opus-5,gpt-5.6-sol-medium,gpt-5.6-luna-max,gpt-5.6-terra-xhigh,opencode-deepseek-v4-flash,opencode-glm-5.2"
 
 # Use the real OpenFugu Llama-3.2-3B Conductor inside Docker (CPU)
 # export FUGU_LOCAL_CONDUCTOR="di-zhang-fdu/openfugu-conductor-3b"
@@ -64,7 +68,7 @@ export HF_TOKEN="hf-..."
 ./scripts/sky_launch_retrain_router.sh --dry-run
 ```
 
-The default pool in `launch/sky/retrain_fugu_router.yaml` is the 7 Anthropic models on the code/cost Pareto frontier that are available on AWS Bedrock, GCP, and Azure through OpenRouter. The script:
+The default pool in `launch/sky/retrain_fugu_router.yaml` is the 7 requested frontier models: Anthropic Sonnet/Opus 5 (medium thinking), GPT-5.6 Sol/Luna/Terra with graded reasoning effort, and low-cost DeepSeek V4 Flash / GLM-5.2. Each retraining entry can append `|reasoning_effort` (e.g. `openai/gpt-5.6-terra|xhigh`) so the labels match the runtime LiteLLM aliases. The script:
 
 1. Loads `nvidia/ToolScale` tasks.
 2. Calls each worker in the pool through OpenRouter and scores each response against the expected tool-call plan.

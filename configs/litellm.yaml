@@ -1,53 +1,93 @@
 model_list:
-  # Default llm-router cheap/expensive targets — all routed through OpenRouter
+  # Default llm-router cheap/expensive targets — all routed through OpenRouter.
+  # The "expensive" gate gets the strongest worker; the "cheap" gate gets the
+  # most cost-effective one. Reasoning effort is fixed per alias so it does not
+  # have to be set in the router environment.
   - model_name: expensive
     litellm_params:
-      model: openai/anthropic/claude-opus-4.8
+      model: openai/anthropic/claude-opus-5
       api_base: https://openrouter.ai/api/v1
       api_key: os.environ/OPENROUTER_API_KEY
+      reasoning_effort: medium
+      allowed_openai_params: ["reasoning_effort"]
   - model_name: cheap
     litellm_params:
-      model: openai/anthropic/claude-sonnet-5
+      model: openai/openai/gpt-5.6-luna
       api_base: https://openrouter.ai/api/v1
       api_key: os.environ/OPENROUTER_API_KEY
+      reasoning_effort: max
+      allowed_openai_params: ["reasoning_effort"]
 
-  # 7-slot fugu worker pool. All are on the code/cost Pareto frontier and are
-  # available on AWS Bedrock, GCP, and Azure through OpenRouter.
-  - model_name: claude-haiku-4.5
-    litellm_params:
-      model: openai/anthropic/claude-haiku-4.5
-      api_base: https://openrouter.ai/api/v1
-      api_key: os.environ/OPENROUTER_API_KEY
+  # 7-slot fugu worker pool. Order becomes slot ids 0..6 for TRINITY/Conductor.
+  # Reasoning effort is baked into the LiteLLM alias so the OpenFugu workers
+  # only need to call the alias.
   - model_name: claude-sonnet-5
     litellm_params:
       model: openai/anthropic/claude-sonnet-5
       api_base: https://openrouter.ai/api/v1
       api_key: os.environ/OPENROUTER_API_KEY
-  - model_name: claude-sonnet-4.6
-    litellm_params:
-      model: openai/anthropic/claude-sonnet-4.6
-      api_base: https://openrouter.ai/api/v1
-      api_key: os.environ/OPENROUTER_API_KEY
-  - model_name: claude-sonnet-4.5
-    litellm_params:
-      model: openai/anthropic/claude-sonnet-4.5
-      api_base: https://openrouter.ai/api/v1
-      api_key: os.environ/OPENROUTER_API_KEY
-  - model_name: claude-opus-4.8
-    litellm_params:
-      model: openai/anthropic/claude-opus-4.8
-      api_base: https://openrouter.ai/api/v1
-      api_key: os.environ/OPENROUTER_API_KEY
+      reasoning_effort: medium
+      allowed_openai_params: ["reasoning_effort"]
   - model_name: claude-opus-5
     litellm_params:
       model: openai/anthropic/claude-opus-5
       api_base: https://openrouter.ai/api/v1
       api_key: os.environ/OPENROUTER_API_KEY
-  - model_name: claude-fable-5
+      reasoning_effort: medium
+      allowed_openai_params: ["reasoning_effort"]
+  - model_name: gpt-5.6-sol-medium
     litellm_params:
-      model: openai/anthropic/claude-fable-5
+      model: openai/openai/gpt-5.6-sol
       api_base: https://openrouter.ai/api/v1
       api_key: os.environ/OPENROUTER_API_KEY
+      reasoning_effort: medium
+      allowed_openai_params: ["reasoning_effort"]
+  - model_name: gpt-5.6-luna-max
+    litellm_params:
+      model: openai/openai/gpt-5.6-luna
+      api_base: https://openrouter.ai/api/v1
+      api_key: os.environ/OPENROUTER_API_KEY
+      reasoning_effort: max
+      allowed_openai_params: ["reasoning_effort"]
+  - model_name: gpt-5.6-terra-xhigh
+    litellm_params:
+      model: openai/openai/gpt-5.6-terra
+      api_base: https://openrouter.ai/api/v1
+      api_key: os.environ/OPENROUTER_API_KEY
+      reasoning_effort: xhigh
+      allowed_openai_params: ["reasoning_effort"]
+  - model_name: deepseek-v4-flash
+    litellm_params:
+      model: openai/deepseek/deepseek-v4-flash
+      api_base: https://openrouter.ai/api/v1
+      api_key: os.environ/OPENROUTER_API_KEY
+      reasoning_effort: none
+      allowed_openai_params: ["reasoning_effort"]
+  - model_name: glm-5.2
+    litellm_params:
+      model: openai/z-ai/glm-5.2
+      api_base: https://openrouter.ai/api/v1
+      api_key: os.environ/OPENROUTER_API_KEY
+      reasoning_effort: none
+      allowed_openai_params: ["reasoning_effort"]
+
+  # Optional: the same two low-cost workers via the OpenCode Go endpoint.
+  # To use them, set OPENCODE_GO_API_KEY and change FUGU_WORKER_MODELS to
+  # opencode-deepseek-v4-flash,opencode-glm-5.2.
+  - model_name: opencode-deepseek-v4-flash
+    litellm_params:
+      model: openai/deepseek-v4-flash
+      api_base: https://opencode.ai/zen/go/v1
+      api_key: os.environ/OPENCODE_GO_API_KEY
+      reasoning_effort: none
+      allowed_openai_params: ["reasoning_effort"]
+  - model_name: opencode-glm-5.2
+    litellm_params:
+      model: openai/glm-5.2
+      api_base: https://opencode.ai/zen/go/v1
+      api_key: os.environ/OPENCODE_GO_API_KEY
+      reasoning_effort: none
+      allowed_openai_params: ["reasoning_effort"]
 
   # Free-tier fallback for smoke tests (OpenRouter free tier)
   - model_name: gpt-oss-20b-free
@@ -55,6 +95,13 @@ model_list:
       model: openai/openai/gpt-oss-20b:free
       api_base: https://openrouter.ai/api/v1
       api_key: os.environ/OPENROUTER_API_KEY
+      allowed_openai_params: ["reasoning_effort"]
+
+litellm_settings:
+  # OpenRouter's reasoning models reject temperature != 1 when reasoning_effort
+  # is set. Dropping unsupported params lets the alias-configured reasoning_effort
+  # pass through while temperature is removed for those models.
+  drop_params: true
 
 general_settings:
   master_key: os.environ/LITELLM_KEY

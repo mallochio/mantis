@@ -4,7 +4,7 @@
 Usage (local):
   export OPENROUTER_API_KEY=sk-or-v1-...
   python scripts/retrain_router_pool.py \
-    --pool "anthropic/claude-haiku-4.5,anthropic/claude-sonnet-5,anthropic/claude-sonnet-4.6,anthropic/claude-sonnet-4.5,anthropic/claude-opus-4.8,anthropic/claude-opus-5,anthropic/claude-fable-5" \
+    --pool "anthropic/claude-sonnet-5|medium,anthropic/claude-opus-5|medium,openai/gpt-5.6-sol|medium,openai/gpt-5.6-luna|max,openai/gpt-5.6-terra|xhigh,deepseek/deepseek-v4-flash|none,z-ai/glm-5.2|none" \
     --output-dir ./outputs/router_retrain
 
 Usage (SkyPilot):
@@ -29,7 +29,8 @@ Environment:
   HF_TOKEN            optional, avoids HF rate limits / gates Qwen3-0.6B
   FUGU_MODEL          Qwen3-0.6B dir or HF id (default Qwen/Qwen3-0.6B)
   FUGU_VECTOR         existing TRINITY vector (default ./artifacts/model_iter_60.npy)
-  RETRAIN_WORKER_MODELS  optional override of --pool
+  RETRAIN_WORKER_MODELS  optional override of --pool. Each entry can append
+                         '|reasoning_effort' (e.g. 'openai/gpt-5.6-terra|xhigh').
   RETRAIN_LIMIT       optional override of --limit
   RETRAIN_EPOCHS      optional override of --epochs
 """
@@ -74,6 +75,21 @@ KNOWN_PREFIXES = {
 }
 
 
+def split_model_spec(spec: str):
+    """Parse 'model_id|reasoning_effort' into (model_id, effort).
+
+    Full OpenRouter ids like 'openai/gpt-5.6-sol|medium' are supported.
+    Effort is optional; None means no reasoning_effort is sent.
+    """
+    spec = spec.strip()
+    effort: str | None = None
+    if "|" in spec:
+        spec, effort = spec.rsplit("|", 1)
+        effort = effort.strip() or None
+    model = spec.strip()
+    return model, effort
+
+
 def normalize_model_id(model: str) -> str:
     """Turn an alias or openrouter/... id into a full OpenRouter model id."""
     model = model.strip()
@@ -90,6 +106,14 @@ def normalize_model_id(model: str) -> str:
     )
 
 
+def _is_reasoning_model(model: str) -> bool:
+    """Heuristic for models configured with reasoning_effort != none.
+
+    OpenRouter/LiteLLM reject temperature != 1 for these reasoning models.
+    """
+    return "claude-" in model or "gpt-5.6-" in model
+
+
 class OpenRouterWorker:
     """Call a heterogeneous pool through OpenRouter with litellm."""
     def __init__(self, models: list[str], api_key: str | None = None,
@@ -98,7 +122,9 @@ class OpenRouterWorker:
                  timeout: int = 120):
         import litellm
         self.litellm = litellm
-        self.models = [normalize_model_id(m) for m in models]
+        specs = [split_model_spec(m) for m in models]
+        self.models = [normalize_model_id(m) for m, _ in specs]
+        self.efforts = [e for _, e in specs]
         self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
         if not self.api_key:
             raise ValueError("OPENROUTER_API_KEY is required")
@@ -109,14 +135,22 @@ class OpenRouterWorker:
 
     def __call__(self, role: str, messages: list[dict], agent_id: int) -> str:
         model = self.models[agent_id % len(self.models)]
+        effort = self.efforts[agent_id % len(self.efforts)]
         kw = dict(
-            model=model,
+            model=f"openai/{model}",
             messages=messages,
             max_tokens=self.max_tokens,
-            temperature=self.temperature,
             custom_llm_provider="openai",
             timeout=self.timeout,
+            # reasoning_effort is an extra param for LiteLLM's openai provider;
+            # tell LiteLLM to allow it through to OpenRouter.
+            allowed_openai_params=["reasoning_effort"],
         )
+        # Reasoning models (claude-*, gpt-5.6-*) require temperature=1 or omitted.
+        if not _is_reasoning_model(model):
+            kw["temperature"] = self.temperature
+        if effort:
+            kw["reasoning_effort"] = effort
         if self.api_key:
             kw["api_key"] = self.api_key
         if self.api_base:
@@ -263,7 +297,8 @@ def train_head(X: torch.Tensor, y_worker: torch.Tensor, y_role: torch.Tensor,
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Retrain TRINITY router head on a new worker pool")
     ap.add_argument("--pool", default=os.environ.get("RETRAIN_WORKER_MODELS"), required=False,
-                    help="Comma-separated OpenRouter worker model ids")
+                    help="Comma-separated OpenRouter worker model ids. "
+                         "Append '|reasoning_effort' per model, e.g. openai/gpt-5.6-terra|xhigh")
     ap.add_argument("--output-dir", default=os.environ.get("RETRAIN_OUTPUT_DIR", "outputs/router_retrain"))
     ap.add_argument("--dataset", default="nvidia/ToolScale")
     ap.add_argument("--limit", type=int, default=int(os.environ.get("RETRAIN_LIMIT", "200")))

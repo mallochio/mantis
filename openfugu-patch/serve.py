@@ -29,6 +29,14 @@ ROUTER: FuguRouter | None = None
 MODEL_NAME = "fugu"
 MAX_TURNS = 5
 
+# Aliases that carry a LiteLLM reasoning_effort parameter. OpenRouter/LiteLLM
+# reject temperature != 1 for these models.
+REASONING_ALIASES = ("claude-", "gpt-5.6-", "expensive", "cheap")
+
+
+def _is_reasoning_model(model: str) -> bool:
+    return any(model.startswith(p) for p in REASONING_ALIASES)
+
 
 # LiteLLM needs an explicit OpenAI-compatible provider when the model name is a
 # LiteLLM proxy alias (not a provider-prefixed id). This keeps fugu-local routing
@@ -38,9 +46,14 @@ class TrinityLiteLLMWorker(TrinityLiteLLMWorker):
         import litellm
         model = self.slot_models[agent_id % len(self.slot_models)]
         msgs = [{"role": m["role"], "content": m["content"]} for m in messages]
+        # LiteLLM's openai provider rejects temperature != 1 when reasoning_effort
+        # is enabled (claude-*, gpt-5.6-*). Drop it for those models while keeping
+        # it for the low-cost non-reasoning workers (deepseek/glm/opencode).
         kw = dict(model=model, messages=msgs,
-                  max_tokens=self.max_tokens, temperature=self.temperature,
+                  max_tokens=self.max_tokens,
                   custom_llm_provider="openai")
+        if not _is_reasoning_model(model):
+            kw["temperature"] = self.temperature
         if self.api_key:
             kw["api_key"] = self.api_key
         if self.api_base:
@@ -51,8 +64,10 @@ class TrinityLiteLLMWorker(TrinityLiteLLMWorker):
 class ConductorLiteLLMWorker(ConductorLiteLLMWorker):
     def _call(self, model, messages):
         kw = dict(model=model, messages=messages,
-                  max_tokens=self.max_tokens, temperature=self.temperature,
+                  max_tokens=self.max_tokens,
                   custom_llm_provider="openai")
+        if not _is_reasoning_model(model):
+            kw["temperature"] = self.temperature
         if self.api_key:
             kw["api_key"] = self.api_key
         if self.api_base:
@@ -341,10 +356,12 @@ def _worker_from_args(args, mode: str):
             specs.append((os.path.basename(path.rstrip("/")) or f"w{i}", path, dev))
         return LocalPoolWorker(specs)
 
+    # 4096 tokens to leave room for high reasoning effort (max/xhigh) while still
+    # capping cost on long code outputs.
     slot_models = args.slot_models.split(",") if args.slot_models else None
     if mode == "conductor":
-        return ConductorLiteLLMWorker(slot_models=slot_models)
-    return TrinityLiteLLMWorker(slot_models=slot_models)
+        return ConductorLiteLLMWorker(slot_models=slot_models, max_tokens=4096)
+    return TrinityLiteLLMWorker(slot_models=slot_models, max_tokens=4096)
 
 
 def load_coordinator(mode: str):
