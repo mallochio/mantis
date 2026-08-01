@@ -68,8 +68,10 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "openfugu-patch/serve.py" = ["E402", "S104"]
 "scripts/retrain_router_pool.py" = ["E402"]
+"scripts/retrain_conductor.py" = ["E402", "I001"]
 "tests/test_serve.py" = ["E501", "S310", "S104"]
 "tests/test_retrain_router_pool.py" = ["E501"]
+"tests/test_retrain_conductor.py" = ["S105"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
@@ -98,6 +100,7 @@ omit = [
     "OpenFugu/*",
     "llm-router/*",
     "scripts/make_vec.py",
+    "scripts/retrain_conductor.py",
     "scripts/sky_launch_retrain_router.sh",
     "scripts/verify.sh",
 ]

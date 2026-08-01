@@ -3,6 +3,7 @@ __pycache__/
 .env
 .venv/
 .venv-fetch/
+.smoke-venv/
 *.egg-info/
 dist/
 build/

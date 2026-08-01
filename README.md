@@ -84,6 +84,68 @@ After you approve the shortlist and cost estimate, run the same command without 
 
 By default the retrain picks the highest-scoring worker per task (`--label-mode quality`). For a cost-quality Pareto objective, use `--label-mode cost` and a `configs/worker-costs.json` table (OpenRouter prompt/completion prices, 2K-in/1K-out estimates). In cost mode the gold worker is `argmax(score_i / cost_i)`, so equal scores resolve to the cheaper model while a much better worker can still win despite a higher price.
 
+## Retraining the Conductor on a new pool
+
+The Conductor is a GRPO-fine-tuned `Llama-3.2-3B-Instruct` policy (checkpoint `di-zhang-fdu/openfugu-conductor-3b`) that writes a workflow DAG (`model_id`, `subtasks`, `access_list`) over the 7-slot worker pool. The base checkpoint was trained on an older pool, so it should be retrained whenever the pool changes.
+
+**Rule:** retrain the TRINITY head first (cheap, minutes on an L4), evaluate the new `model_iter_60.npy`, and only retrain the Conductor if the router retrain shows routing gains. The Conductor is far more expensive because each rollout executes the generated DAG against live workers.
+
+### Smoke test (20 steps, 8 tasks)
+
+The fastest way to validate the pipeline on a CPU-only machine is a local
+script run with a small instruction-tuned proxy. `di-zhang-fdu/openfugu-conductor-3b`
+does not fit on CPU, so this smoke uses `HuggingFaceTB/SmolLM2-135M-Instruct` as
+a stand-in base; it still exercises the same prompt template, DAG parser,
+reward functions, and GRPO loop:
+
+```bash
+export OPENROUTER_API_KEY="sk-or-v1-..."
+export HF_TOKEN="hf-..."
+python3 scripts/retrain_conductor.py \
+  --pool "anthropic/claude-sonnet-5|medium,anthropic/claude-opus-5|medium,openai/gpt-5.6-sol|medium,openai/gpt-5.6-luna|max,openai/gpt-5.6-terra|xhigh,deepseek/deepseek-v4-flash|none,z-ai/glm-5.2|none" \
+  --dataset s3://external-datasets-archive/terminal-bench-2.1/ \
+  --base HuggingFaceTB/SmolLM2-135M-Instruct \
+  --steps 20 --limit 8 \
+  --num-generations 2 --per-device-batch 2 \
+  --max-completion-length 128 \
+  --temperature 0.7 \
+  --mock-worker \
+  --output-dir outputs/conductor_retrain/$(date +%Y%m%d-%H%M%S)
+```
+
+On GPU, launch the SkyPilot YAML with the real base model:
+
+```bash
+export OPENROUTER_API_KEY="sk-or-v1-..."
+export HF_TOKEN="hf-..."
+sky launch --env OPENROUTER_API_KEY --env HF_TOKEN \
+  launch/sky/retrain_fugu_conductor.yaml
+```
+
+`launch/sky/retrain_fugu_conductor.yaml` defaults to a smoke:
+- `RETRAIN_STEPS=20`, `RETRAIN_LIMIT=8`, `RETRAIN_NUM_GENERATIONS=2`, `RETRAIN_PER_DEVICE_BATCH=2`
+- `FUGU_WORKER_TIMEOUT=30`, `FUGU_WORKER_MAX_TOKENS=256` to keep wall-clock/cost bounded
+- 2x A100-80GB spot (minimum; use 4x for full runs)
+- `FUGU_BASE_MODEL=di-zhang-fdu/openfugu-conductor-3b`
+
+Outputs are saved to `s3://sid-llm-runs/retrain-fugu-conductor/<timestamp>/` with `pool.json`, `dataset.json`, `metrics.jsonl`, and the checkpoint.
+
+### Full run
+
+Update the same YAML (or pass `--steps` / `--limit` / `--num-generations`) and relaunch. A full run with 200–500 TerminalBench tasks, `num_generations=8`, and `per_device_batch=2` on 4x A100 is expected to take on the order of 1–6 wall-clock hours and cost roughly **$20–80 in GPU spot time + worker API calls**. Worker calls dominate; the smoke below averaged ~10 s/step on CPU with a 135 M parameter proxy, so a 3 B model on A100 with larger generation groups will be slower but still bounded by spot pricing.
+
+### Quarterly-retrain precedent
+
+When the worker pool changes:
+1. Update `RETRAIN_WORKER_MODELS` in **both** `launch/sky/retrain_fugu_router.yaml` and `launch/sky/retrain_fugu_conductor.yaml`.
+2. Run the router retrain, evaluate the new head.
+3. If routing improves, run the Conductor smoke (`--steps 20 --limit 8`).
+4. If smoke metrics show parseable-workflow format reward stable/non-zero, launch the full Conductor retrain.
+
+### License note
+
+The base `meta-llama/Llama-3.2-3B-Instruct` checkpoint and the derived `di-zhang-fdu/openfugu-conductor-3b` adapter are subject to the **Llama 3.2 Community License**. Ensure your use complies before downloading or redistributing the trained checkpoint.
+
 ## Mac M5 2025 / Apple Silicon notes
 
 - Docker Desktop for Mac does **not** expose MPS or Metal to Linux containers, so PyTorch runs on CPU inside the `openfugu` container. The default `FUGU_CONDUCTOR_DEVICE=cpu` and `FUGU_CONDUCTOR_DTYPE=float32` are correct.

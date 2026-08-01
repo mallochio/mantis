@@ -1,0 +1,83 @@
+name: retrain-fugu-conductor
+
+resources:
+  # Conductor is Llama-3.2-3B (3B params) loaded in bfloat16 for GRPO rollouts.
+  # 2x A100-80GB is the minimum for the model + rollout activations; use 4x for
+  # full runs to increase per-step batch size and reduce wall-clock time.
+  # AWS is enabled in this environment; adjust cloud/region to your credentials.
+  cloud: aws
+  region: us-east-1
+  accelerators: A100-80GB:2
+  memory: 64+
+  use_spot: true
+  job_recovery: FAILOVER
+
+workdir: .
+
+file_mounts:
+  /outputs:
+    source: s3://sid-llm-runs/
+    mode: MOUNT
+
+envs:
+  # Pool must be exactly 7 model specs in the same format as retrain_router_pool.py.
+  RETRAIN_WORKER_MODELS: "anthropic/claude-sonnet-5|medium,anthropic/claude-opus-5|medium,openai/gpt-5.6-sol|medium,openai/gpt-5.6-luna|max,openai/gpt-5.6-terra|xhigh,deepseek/deepseek-v4-flash|none,z-ai/glm-5.2|none"
+  # Dataset can be any source supported by retrain_conductor.py:
+  #   - s3://external-datasets-archive/terminal-bench-2.1/
+  #   - nvidia/ToolScale
+  RETRAIN_DATASET: "s3://external-datasets-archive/terminal-bench-2.1/"
+  # Base Conductor checkpoint. Override with --base or FUGU_BASE_MODEL for ablations.
+  FUGU_BASE_MODEL: "di-zhang-fdu/openfugu-conductor-3b"
+  # Smoke-test defaults: 8 tasks, 20 optimizer steps, tiny GRPO group size.
+  RETRAIN_STEPS: "20"
+  RETRAIN_LIMIT: "8"
+  RETRAIN_NUM_GENERATIONS: "2"
+  # per_device_batch must be a multiple of num_generations for GRPO grouping.
+  RETRAIN_PER_DEVICE_BATCH: "2"
+  RETRAIN_MAX_PROMPT_LENGTH: "1024"
+  RETRAIN_MAX_COMPLETION_LENGTH: "384"
+  # Short worker calls during smoke rollouts keep cost and wall-clock bounded.
+  FUGU_WORKER_TIMEOUT: "30"
+  FUGU_WORKER_MAX_TOKENS: "256"
+  # Set to 1 to bypass live worker calls and use MockWorker (faster, zero-cost smoke).
+  FUGU_CONDUCTOR_MOCK_WORKER: "0"
+  OUTPUT_ROOT: "/outputs/retrain-fugu-conductor"
+
+setup: |
+  set -euo pipefail
+  # Install CUDA-enabled torch first so OpenFugu requirements don't pull CPU torch.
+  pip install --quiet torch==2.4.1 --extra-index-url https://download.pytorch.org/whl/cu121
+  pip install --quiet -r requirements-conductor.txt
+  mkdir -p "$OUTPUT_ROOT"
+
+run: |
+  set -euo pipefail
+  if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+    echo "ERROR: pass --env OPENROUTER_API_KEY=... to sky launch" >&2
+    exit 1
+  fi
+  if [ -z "${HF_TOKEN:-}" ]; then
+    echo "WARN: HF_TOKEN not set; HuggingFace downloads may be rate-limited" >&2
+  fi
+
+  TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+  RUN_ID="retrain-conductor-${TIMESTAMP}"
+  export RETRAIN_OUTPUT_DIR="${OUTPUT_ROOT}/${RUN_ID}"
+  mkdir -p "$RETRAIN_OUTPUT_DIR"
+
+  python3 scripts/retrain_conductor.py \
+    --pool "$RETRAIN_WORKER_MODELS" \
+    --dataset "$RETRAIN_DATASET" \
+    --base "$FUGU_BASE_MODEL" \
+    --steps "$RETRAIN_STEPS" \
+    --limit "$RETRAIN_LIMIT" \
+    --num-generations "$RETRAIN_NUM_GENERATIONS" \
+    --per-device-batch "$RETRAIN_PER_DEVICE_BATCH" \
+    --max-prompt-length "$RETRAIN_MAX_PROMPT_LENGTH" \
+    --max-completion-length "$RETRAIN_MAX_COMPLETION_LENGTH" \
+    --worker-timeout "$FUGU_WORKER_TIMEOUT" \
+    --worker-max-tokens "$FUGU_WORKER_MAX_TOKENS" \
+    --output-dir "$RETRAIN_OUTPUT_DIR"
+
+  echo "Conductor retraining complete. Outputs in $RETRAIN_OUTPUT_DIR"
+  ls -la "$RETRAIN_OUTPUT_DIR"
