@@ -86,6 +86,7 @@ class Handler(BaseHTTPRequestHandler):
             # the user query = last user message; coordinator runs the full loop
             query = next((m["content"] for m in reversed(messages)
                           if m.get("role") == "user"), "")
+            print(f"[serve] route request model={requested} -> coordinator={coordinator_mode}", flush=True)
             coord = get_coordinator(coordinator_mode)
             res = coord.run(query, verbose=False)
             self._send(200, _chat_response(res.final, req.get("model", MODEL_NAME),
