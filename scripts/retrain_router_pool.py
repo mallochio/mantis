@@ -35,7 +35,7 @@ Environment:
   RETRAIN_EPOCHS      optional override of --epochs
 """
 from __future__ import annotations
-import argparse, json, os, sys, time, re
+import argparse, json, os, sys, time, re, difflib
 from collections import defaultdict
 from pathlib import Path
 
@@ -44,6 +44,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from datasets import load_dataset
+from huggingface_hub import snapshot_download
 from tqdm.auto import tqdm
 
 # Make OpenFugu internals importable when this script lives in fugu-local/scripts.
@@ -167,6 +168,50 @@ class OpenRouterWorker:
 # Dataset and reward helpers
 # ---------------------------------------------------------------------------
 
+TERMINAL_SYSTEM = (
+    "You are an autonomous terminal agent. Given a task instruction, output the "
+    "shell commands and minimal explanation needed to solve it. Be concise."
+)
+
+
+def load_terminalbench_tasks(dataset: str = "zai-org/terminal-bench-2-verified",
+                             limit: int | None = None, seed: int = 42,
+                             val_frac: float = 0.1, cache_dir: str | None = None):
+    """Load TerminalBench 2.1 task prompts and reference solution scripts.
+
+    Only the small metadata files are downloaded (instruction.md, task.toml,
+    solution/solve.sh); the heavy environment tarballs are skipped.
+    """
+    cache_dir = cache_dir or os.path.expanduser("~/.cache/terminal-bench-2.1")
+    local = Path(snapshot_download(
+        dataset, repo_type="dataset",
+        local_dir=cache_dir,
+        allow_patterns=["*/instruction.md", "*/task.toml", "*/solution/solve.sh"],
+    ))
+
+    records = []
+    for instr_path in sorted(local.glob("*/instruction.md")):
+        task_dir = instr_path.parent
+        solve_path = task_dir / "solution" / "solve.sh"
+        if not solve_path.exists():
+            continue
+        instruction = instr_path.read_text().strip()
+        reference = solve_path.read_text().strip()
+        records.append({
+            "task": instruction,
+            "expected": reference,
+            "system": TERMINAL_SYSTEM,
+            "name": task_dir.name,
+        })
+
+    rng = np.random.default_rng(seed)
+    rng.shuffle(records)
+    if limit:
+        records = records[:limit]
+    n_val = int(len(records) * val_frac)
+    return records[n_val:], records[:n_val]
+
+
 def load_toolscale_tasks(limit: int, seed: int = 42, val_frac: float = 0.1):
     ds = load_dataset("nvidia/ToolScale", split="train")
     ds = ds.shuffle(seed=seed)
@@ -179,7 +224,7 @@ def load_toolscale_tasks(limit: int, seed: int = 42, val_frac: float = 0.1):
         ec = row.get("evaluation_criteria") or {}
         expected = ec.get("actions") or []
         if task and expected:
-            records.append({"task": task, "expected": list(expected)})
+            records.append({"task": task, "expected": list(expected), "system": SYSTEM})
         if limit and len(records) >= limit:
             break
 
@@ -189,16 +234,22 @@ def load_toolscale_tasks(limit: int, seed: int = 42, val_frac: float = 0.1):
     return records[n_val:], records[:n_val]
 
 
-def worker_messages(task: str) -> list[dict]:
+def worker_messages(task: str, system: str | None = None) -> list[dict]:
     # Anthropic models on OpenRouter do not allow an assistant-message prefill,
     # so we end with a user message and rely on the system prompt for the format.
     return [
-        {"role": "system", "content": SYSTEM},
+        {"role": "system", "content": system or SYSTEM},
         {"role": "user", "content": task},
     ]
 
 
-def reward_for(completion: str, gold: list[dict]) -> float:
+def reward_for(completion: str, gold) -> float:
+    # TerminalBench gold is a reference shell script; use a cheap, deterministic
+    # similarity as a routing reward. ToolScale gold is a list of tool-call dicts.
+    if isinstance(gold, str):
+        if not completion or not gold:
+            return 0.0
+        return difflib.SequenceMatcher(None, completion, gold).ratio()
     pred = _parse_plan(completion)
     if pred is None:
         return 0.0
@@ -300,7 +351,9 @@ def main(argv=None):
                     help="Comma-separated OpenRouter worker model ids. "
                          "Append '|reasoning_effort' per model, e.g. openai/gpt-5.6-terra|xhigh")
     ap.add_argument("--output-dir", default=os.environ.get("RETRAIN_OUTPUT_DIR", "outputs/router_retrain"))
-    ap.add_argument("--dataset", default="nvidia/ToolScale")
+    ap.add_argument("--dataset", default="nvidia/ToolScale",
+                    help="Dataset to train on. 'nvidia/ToolScale' (default) or a "
+                         "TerminalBench 2.1 HF repo such as 'zai-org/terminal-bench-2-verified'.")
     ap.add_argument("--limit", type=int, default=int(os.environ.get("RETRAIN_LIMIT", "200")))
     ap.add_argument("--epochs", type=int, default=int(os.environ.get("RETRAIN_EPOCHS", "30")))
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -329,11 +382,13 @@ def main(argv=None):
 
     # --- load data ----------------------------------------------------------
     print(f"[retrain] loading up to {args.limit} rows from {args.dataset}...", flush=True)
-    train_ds, val_ds = load_toolscale_tasks(args.limit, args.seed, args.val_frac)
+    if "terminal" in args.dataset.lower():
+        train_ds, val_ds = load_terminalbench_tasks(args.dataset, args.limit, args.seed, args.val_frac)
+    else:
+        train_ds, val_ds = load_toolscale_tasks(args.limit, args.seed, args.val_frac)
     tasks = [row["task"] for row in train_ds]
-    val_tasks = [row["task"] for row in val_ds]
-    val_golds = [row["expected"] for row in val_ds]
-    print(f"[retrain] train={len(tasks)} val={len(val_tasks)}", flush=True)
+    val_rows = val_ds  # keep full rows for system prompts
+    print(f"[retrain] train={len(tasks)} val={len(val_rows)}", flush=True)
 
     # --- collect worker rewards --------------------------------------------
     cache_path = out_dir / args.cache
@@ -351,13 +406,14 @@ def main(argv=None):
     for idx, row in enumerate(tqdm(train_ds, desc="scoring workers")):
         task = row["task"]
         gold = row["expected"]
+        system = row.get("system")
         scores = []
         for agent_id, model in enumerate(pool):
             key = (task, model)
             if key in cache:
                 completion = cache[key]["completion"]
             else:
-                completion = worker("Worker", worker_messages(task), agent_id)
+                completion = worker("Worker", worker_messages(task, system), agent_id)
                 cache[key] = {"task": task, "model": model, "completion": completion}
             scores.append(reward_for(completion, gold))
         best = int(np.argmax(scores))
@@ -417,24 +473,25 @@ def main(argv=None):
     print("[retrain] running quick validation on held-out tasks...", flush=True)
     router_val = FuguRouter(args.fugu_model, str(vec_path), device=device, seed=args.seed)
     val_hits = 0
-    for task, gold in zip(val_tasks, val_golds):
+    for row in val_rows:
+        task, gold, system = row["task"], row["expected"], row.get("system")
         msgs = [
             {"role": "system", "content": ROUTER_SYSTEM_PROMPT.format(num_agents=N_AGENTS)},
             {"role": "user", "content": task},
         ]
         # greedy route
         pred_worker = router_val.route(msgs, sample=False)["agent_id"]
-        completion = worker("Worker", worker_messages(task), pred_worker)
+        completion = worker("Worker", worker_messages(task, system), pred_worker)
         score = reward_for(completion, gold)
         val_hits += score
-    avg_val_reward = val_hits / max(1, len(val_tasks))
+    avg_val_reward = val_hits / max(1, len(val_rows))
 
     report = {
         "pool": pool,
         "dataset": args.dataset,
         "limit": args.limit,
         "train_size": len(tasks),
-        "val_size": len(val_tasks),
+        "val_size": len(val_rows),
         "best_val_worker_acc": best_val_acc,
         "avg_val_reward": avg_val_reward,
         "output": str(out_dir),
