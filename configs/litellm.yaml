@@ -18,8 +18,8 @@ model_list:
       reasoning_effort: max
       allowed_openai_params: ["reasoning_effort"]
 
-  # 7-slot fugu worker pool. Order becomes slot ids 0..n-1 for TRINITY/Conductor.
-  # Reasoning effort is baked into the LiteLLM alias so the OpenFugu workers
+  # 7-slot mantis worker pool. Order becomes slot ids 0..n-1 for TRINITY/Conductor.
+  # Reasoning effort is baked into the LiteLLM alias so the Mantis workers
   # only need to call the alias.
   - model_name: gemini-3.6-flash-high
     litellm_params:
@@ -72,7 +72,7 @@ model_list:
       allowed_openai_params: ["reasoning_effort"]
 
   # Optional: the same two low-cost workers via the OpenCode Go endpoint.
-  # To use them, set OPENCODE_GO_API_KEY and change FUGU_WORKER_MODELS to
+  # To use them, set OPENCODE_GO_API_KEY and change MANTIS_WORKER_MODELS to
   # opencode-deepseek-v4-flash,opencode-glm-5.2.
   - model_name: opencode-deepseek-v4-flash
     litellm_params:
