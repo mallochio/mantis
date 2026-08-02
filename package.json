@@ -1,0 +1,10 @@
+{
+  "name": "fugu-local",
+  "version": "0.2.0",
+  "description": "Local OpenFugu orchestration stack routed through OpenRouter",
+  "pi": {
+    "extensions": [
+      "./extensions/fugu.ts"
+    ]
+  }
+}
