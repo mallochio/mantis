@@ -127,10 +127,10 @@ def main() -> None:
         return statistics.mean(vals) if vals else 0.0
 
     def sum_cost(rows: list[dict[str, Any]]) -> float:
-        return sum(r.get("est_cost_usd", 0) for r in rows)
+        return sum(float(r.get("est_cost_usd", 0) or 0) for r in rows)
 
     def sum_latency(rows: list[dict[str, Any]]) -> float:
-        return sum(r.get("latency_s", 0) for r in rows)
+        return sum(float(r.get("latency_s", 0) or 0) for r in rows)
 
     def tier_rows(rows: list[dict[str, Any]], tier: str) -> list[dict[str, Any]]:
         return [r for r in rows if r.get("tier") == tier]
@@ -158,8 +158,8 @@ def main() -> None:
         fid = fx["id"]
         row_cells = [fid, fx["tier"]]
         for c in configs:
-            r = next((x for x in by_config.get(c, []) if x["id"] == fid), None)
-            if r is None:
+            r = next((x for x in by_config.get(c, []) if x["id"] == fid), {})
+            if not r:
                 row_cells.append("-")
             elif r.get("error"):
                 row_cells.append(f"error: {r['error']}")

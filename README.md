@@ -10,12 +10,16 @@ Local orchestration stack for Fugu-Ultra-style LLM routing:
 
 **TRINITY** is a tiny per-turn dispatcher (Qwen3-0.6B with a learned SVF+head). For each turn it picks one worker from the 7-slot pool plus a role — `Worker` (answer), `Thinker` (reason), or `Verifier` (check) — then returns the verifier-approved response.
 
-**Conductor** is a larger planner (Llama-3.2-3B) that writes an entire multi-step workflow up front as three Python lists: `model_id`, `subtasks`, and `access_list`. The access list is a DAG — later steps may only read strictly earlier steps. The last step's output becomes the final answer.
+**Conductor** is a planner that emits an entire multi-step workflow up front as three Python lists: `model_id`, `subtasks`, and `access_list`. The access list is a DAG — later steps may only read strictly earlier steps — and the last step's output becomes the final answer. There are two ways to power the planner today:
+- **LiteLLM planner (default, works today):** set `FUGU_CONDUCTOR_MODEL=gpt-5.6-luna-max` and do **not** set `FUGU_LOCAL_CONDUCTOR`. The planner call goes through the LiteLLM proxy, and the orchestrator executes the generated DAG against the worker pool.
+- **Local 3B planner (archived):** `FUGU_LOCAL_CONDUCTOR` loads a Llama-3.2-3B checkpoint. Both the public `di-zhang-fdu/openfugu-conductor-3b` base checkpoint and the retrained `outputs/conductor_retrain/retrain-conductor-20260802_003213/checkpoint` failed format validation in this repo: one emits invalid DAG topology (self/forward references), the other collapses to plain text instead of the required three-list format. These are model-overfit / format-collapse issues, not infra/memory issues. The checkpoints remain in S3 for future SFT+GRPO work but are not wired in by default.
 
 **Auto mode** asks the router for a complexity score and picks the cheapest coordinator that should still succeed:
 - simple / low-complexity prompts → direct single-call (`/fugu direct`)
 - moderate complexity prompts → TRINITY (`/fugu trinity`)
 - high complexity prompts → Conductor (`/fugu conductor`)
+
+`FUGU_AUTO_THRESHOLD` defaults to **6** because the current LiteLLM-planned Conductor still underperforms TRINITY on hard prompts; a Supra complexity score of 6 is never emitted by the router in practice, so auto mode stays in TRINITY/direct.
 
 ```text
                     ┌─────────────────┐
@@ -93,8 +97,8 @@ All model selection is env-driven. Export the variables before `docker compose u
 | `FUGU_HEAD` | Optional per-step head override | unset |
 | `FUGU_WORKER_MODEL` / `FUGU_WORKER_MODELS` | Worker pool CSV for TRINITY/Conductor (LiteLLM aliases) | `gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-medium,deepseek-v4-flash-0731-xhigh,claude-opus-5-medium,claude-sonnet-5-medium,gemini-3.1-pro-preview-high` |
 | `FUGU_LOCAL_MODELS` | Local HF worker models CSV (overrides LiteLLM pool) | unset |
-| `FUGU_CONDUCTOR_MODEL` | Conductor planning model via LiteLLM | `gpt-5.6-luna-max` |
-| `FUGU_LOCAL_CONDUCTOR` | HF id/path to load a local Conductor (e.g. `di-zhang-fdu/openfugu-conductor-3b`) | unset |
+| `FUGU_CONDUCTOR_MODEL` | Conductor planning model via LiteLLM. `gpt-5.6-luna-max` follows the three-list DAG format; `claude-opus-5-medium` tends to answer directly instead. | `gpt-5.6-luna-max` |
+| `FUGU_LOCAL_CONDUCTOR` | HF id/path to a local Llama-3.2-3B Conductor. **Archived/experimental** — both the public base and retrained checkpoints failed format validation in this repo. | unset |
 | `FUGU_CONDUCTOR_DEVICE` | Device for local Conductor (`cpu`, `mps`, `cuda:0`) | auto-detected; `cpu` fallback |
 | `FUGU_CONDUCTOR_DTYPE` | Torch dtype for local Conductor | `bfloat16` on mps/cuda, `float32` on cpu |
 | `FUGU_CONDUCTOR_MAX_NEW` | Max new tokens for local Conductor | `512` |
@@ -114,7 +118,8 @@ export FUGU_WORKER_MODELS="gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-me
 # Optional: swap deepseek/glm to the OpenCode Go endpoint by setting OPENCODE_GO_API_KEY
 # export FUGU_WORKER_MODELS="gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-medium,opencode-deepseek-v4-flash,claude-opus-5-medium,claude-sonnet-5-medium,gemini-3.1-pro-preview-high"
 
-# Use the real OpenFugu Llama-3.2-3B Conductor (works in both Docker CPU and native GPU modes)
+# Local 3B Conductor (archived/experimental; both base and retrained checkpoints
+# failed DAG-format validation in this repo — see eval/conductor-500-diagnosis.md)
 # export FUGU_LOCAL_CONDUCTOR="di-zhang-fdu/openfugu-conductor-3b"
 ```
 
@@ -180,6 +185,18 @@ A second run using native `openfugu-patch/serve.py` (no Docker openfugu) with `F
 | conductor-new | 0.073 | 95.7 | $0.2298 |
 
 Both local Conductor checkpoints still fail to parse/execute on most prompts under CPU/float32 serving (13/16 for old, 13/16 for new). The retrained checkpoint is not yet a net win over the base public checkpoint. Native GPU (MPS/CUDA) with `bfloat16` may change latency and success rate, but the parse/execution failures are primarily model-output issues, not memory.
+
+### Conductor with LiteLLM planner (`gpt-5.6-luna-max`)
+
+A third run using the hosted `gpt-5.6-luna-max` as the Conductor planner (no local 3B checkpoint, no Docker openfugu rebuild needed):
+
+| config | auto_score_mean | latency_sum_s | cost_sum_usd |
+|---|---|---|---|
+| direct | 0.568 | 125.5 | $0.0128 |
+| trinity | 0.890 | 1023.0 | $0.4563 |
+| conductor-luna | 0.626 | 1331.2 | $0.8628 |
+
+Conductor-luna had a **0% HTTP failure rate**, but its overall auto-score (**0.626**) was well below TRINITY (**0.890**) and its hard-tier score (**0.250**) was far below TRINITY's **0.714**. It was also roughly **2× the cost** of TRINITY. Per the decision rule in `eval/report-luna-conductor.md`, `FUGU_AUTO_THRESHOLD` stays at **6** — the Supra router never emits a score that high in practice, so `/fugu auto` remains on TRINITY/direct. Users can still invoke `/fugu conductor` manually for experimentation.
 
 ## Retraining the router head
 
@@ -355,7 +372,8 @@ Common causes:
 
 1. **Docker Desktop memory limit (Mac)** — the Llama-3.2-3B Conductor checkpoint needs ~12 GB of RAM at `float32`. If Docker Desktop's VM is capped at ~7.7 GB the container may OOM during load or generation. Increase the VM memory limit or switch to **hybrid native-GPU mode** (`./scripts/run_openfugu_native.sh`), which runs PyTorch directly on the host.
 2. **Invalid Conductor DAG** — the local checkpoint sometimes emits workflows with self/forward references, unequal-length lists, or direct answers instead of the three required lists. This is a model-output issue. Native path with `bfloat16`/GPU and an assistant `Plan:\n` prefill helps, but a checkpoint that reliably emits valid DAGs is required. See `eval/conductor-500-diagnosis.md` for the exact errors observed.
-3. **Litellm proxy not reachable** — in hybrid mode, the native `openfugu` process needs `FUGU_BASE_URL=http://127.0.0.1:3001/v1` (set by `run_openfugu_native.sh` automatically). Confirm `curl http://localhost:3001/health` responds.
+3. **Conductor returns a plain answer instead of a DAG** — the planner model is not following the workflow format. If `FUGU_CONDUCTOR_MODEL=claude-opus-5-medium`, switch it to `gpt-5.6-luna-max`, which reliably emits the three-list `model_id / subtasks / access_list` structure. Do not set `FUGU_LOCAL_CONDUCTOR` unless you are testing the archived 3B checkpoints.
+4. **Litellm proxy not reachable** — in hybrid mode, the native `openfugu` process needs `FUGU_BASE_URL=http://127.0.0.1:3001/v1` (set by `run_openfugu_native.sh` automatically). Confirm `curl http://localhost:3001/health` responds.
 
 ### TRINITY is slow on first call
 

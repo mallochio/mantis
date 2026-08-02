@@ -2,7 +2,7 @@
 """Comparative eval harness for fugu-local.
 
 Usage:
-    python3 eval/run_eval.py --config {direct,trinity,conductor-old,conductor-new} \
+    python3 eval/run_eval.py --config {direct,trinity,conductor-old,conductor-new,conductor-luna} \
         --fixtures eval/fixtures.jsonl --output eval/results.jsonl
 
 Cost estimation method:
@@ -15,10 +15,11 @@ Cost estimation method:
 - "direct": one call at the requested model's cost.
 - "trinity": parse fugu_trace (e.g. "Worker(3)->Thinker(1)->Verifier(1):...").
   Every "Role(slot)" arrow is one worker call; cost = sum(slot model cost).
-- "conductor": fugu_trace is "steps:N:conductor". Add 1 planning call at
-  FUGU_CONDUCTOR_MODEL cost plus N step calls at the average pool worker cost.
-  This is an upper-bound estimate; the actual DAG may call multiple workers
-  per step. If the trace cannot be parsed we fall back to usage.fugu_turns.
+- "conductor", "conductor-old", "conductor-new", "conductor-luna": fugu_trace
+  is "steps:N:conductor". Cost = 1 planning call at FUGU_CONDUCTOR_MODEL cost
+  plus N step calls at the average pool worker cost. This is an upper-bound;
+  the actual DAG may call multiple workers per step. If the trace cannot be
+  parsed we fall back to usage.fugu_turns.
 """
 
 from __future__ import annotations
@@ -138,7 +139,7 @@ def post_chat(
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    payload = {
+    payload: dict[str, Any] = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
@@ -150,7 +151,8 @@ def post_chat(
         payload.pop("temperature", None)
     r = requests.post(url, json=payload, headers=headers, timeout=timeout)
     r.raise_for_status()
-    return r.json()
+    data: dict[str, Any] = r.json()
+    return data
 
 
 def main() -> None:
@@ -158,7 +160,7 @@ def main() -> None:
     parser.add_argument(
         "--config",
         required=True,
-        choices=["direct", "trinity", "conductor-old", "conductor-new"],
+        choices=["direct", "trinity", "conductor-old", "conductor-new", "conductor-luna"],
     )
     parser.add_argument("--fixtures", default=str(REPO / "eval" / "fixtures.jsonl"))
     parser.add_argument("--output", default=str(REPO / "eval" / "results.jsonl"))
