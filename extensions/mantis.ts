@@ -10,9 +10,48 @@ import * as path from "node:path";
 
 type Mode = "off" | "trinity" | "conductor" | "auto";
 
-const MANTIS_URL = process.env.MANTIS_URL ?? process.env.FUGU_URL ?? "http://127.0.0.1:8088/v1";
-const ROUTER_URL = process.env.MANTIS_ROUTER_URL ?? process.env.FUGU_ROUTER_URL ?? "http://127.0.0.1:5500/v1";
-const API_KEY = process.env.MANTIS_API_KEY ?? process.env.FUGU_API_KEY ?? "";
+function getApiKey(): string {
+  if (process.env.MANTIS_API_KEY) return process.env.MANTIS_API_KEY;
+  if (process.env.FUGU_API_KEY) return process.env.FUGU_API_KEY;
+  if (process.env.LITELLM_KEY) return process.env.LITELLM_KEY;
+
+  const envPaths = [
+    path.join(process.cwd(), ".env"),
+    path.join(os.homedir(), ".config", "mantis", ".env"),
+    path.join(os.homedir(), ".env"),
+  ];
+
+  for (const envPath of envPaths) {
+    try {
+      if (fs.existsSync(envPath)) {
+        const content = fs.readFileSync(envPath, "utf-8");
+        for (const line of content.split("\n")) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith("#") || !trimmed.includes("=")) continue;
+          const [key, ...valParts] = trimmed.split("=");
+          const k = key.trim();
+          const v = valParts.join("=").trim().replace(/^["']|["']$/g, "");
+          if (k === "MANTIS_API_KEY" || k === "FUGU_API_KEY" || k === "LITELLM_KEY") {
+            if (v) return v;
+          }
+        }
+      }
+    } catch {
+      // ignore read errors
+    }
+  }
+
+  return "";
+}
+
+function getMantisUrl(): string {
+  return process.env.MANTIS_URL ?? process.env.FUGU_URL ?? "http://127.0.0.1:8088/v1";
+}
+
+function getRouterUrl(): string {
+  return process.env.MANTIS_ROUTER_URL ?? process.env.FUGU_ROUTER_URL ?? "http://127.0.0.1:5500/v1";
+}
+
 const AUTO_THRESHOLD = parseInt(process.env.MANTIS_AUTO_THRESHOLD ?? process.env.FUGU_AUTO_THRESHOLD ?? "6", 10);
 
 const ROUTING_LOG_DIR = path.join(os.homedir(), ".config", "mantis");
@@ -37,12 +76,14 @@ function logRouting(score: number, coordinator: string, text: string) {
 }
 
 async function supraScore(text: string): Promise<number> {
+  const apiKey = getApiKey();
+  const routerUrl = getRouterUrl();
   try {
     // Supra scores task type; the full prompt is often much longer than needed.
     const probeText = text.slice(0, 500);
-    const res = await fetch(`${ROUTER_URL}/chat/completions`, {
+    const res = await fetch(`${routerUrl}/chat/completions`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${API_KEY}` },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({
         model: "auto",
         messages: [{ role: "user", content: probeText }],
@@ -57,12 +98,19 @@ async function supraScore(text: string): Promise<number> {
 
 async function warm(coordinator: string, ctx: any) {
   if (warmed.has(coordinator)) return;
+  const apiKey = getApiKey();
+  const mantisUrl = getMantisUrl();
+
+  if (!apiKey) {
+    ctx.ui.notify?.("mantis: API key not set. Set MANTIS_API_KEY or LITELLM_KEY in environment or .env", "warning");
+  }
+
   ctx.ui.notify?.(`mantis: warming ${coordinator} (first call may download weights)…`, "info");
 
   // Try a cheap health check first; skip the paid ping if the server is alive.
   try {
-    const health = await fetch(`${MANTIS_URL}/models`, {
-      headers: { Authorization: `Bearer ${API_KEY}` },
+    const health = await fetch(`${mantisUrl}/models`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
     });
     if (health.ok) {
       warmed.add(coordinator);
@@ -74,9 +122,9 @@ async function warm(coordinator: string, ctx: any) {
   }
 
   try {
-    await fetch(`${MANTIS_URL}/chat/completions`, {
+    await fetch(`${mantisUrl}/chat/completions`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${API_KEY}` },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({
         model: coordinator,
         messages: [{ role: "user", content: "ping" }],
@@ -92,9 +140,16 @@ async function warm(coordinator: string, ctx: any) {
 
 async function orchestrate(coordinator: string, task: string, ctx: any): Promise<string> {
   await warm(coordinator, ctx);
-  const res = await fetch(`${MANTIS_URL}/chat/completions`, {
+  const apiKey = getApiKey();
+  const mantisUrl = getMantisUrl();
+
+  if (!apiKey) {
+    throw new Error("MANTIS_API_KEY / LITELLM_KEY is not set in environment or .env file");
+  }
+
+  const res = await fetch(`${mantisUrl}/chat/completions`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${API_KEY}` },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
     body: JSON.stringify({
       model: coordinator,
       messages: [{ role: "user", content: task }],
