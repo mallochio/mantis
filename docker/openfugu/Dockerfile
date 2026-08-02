@@ -8,5 +8,8 @@ COPY ./OpenFugu /app
 COPY ./openfugu-patch/serve.py /app/openfugu/serve.py
 # Router head artifact used to build the TRINITY SVF+head vector.
 COPY ./artifacts /app/artifacts
+COPY ./scripts/make_vec.py /app/scripts/make_vec.py
+# Build the TRINITY base vector from the committed small safetensors head.
+RUN python /app/scripts/make_vec.py
 EXPOSE 8088
 CMD ["python", "openfugu/serve.py", "--host", "0.0.0.0", "--port", "8088"]

@@ -22,10 +22,15 @@ fi
 # shellcheck source=/dev/null
 source "$VENV/bin/activate"
 
-# Install/upgrade conductor serving dependencies. This is lighter than the full
-# GRPO retrain environment but enough for TRINITY + local Conductor serving.
+# Install/upgrade core orchestrator dependencies.
 python3 -m pip install --quiet --upgrade pip
-python3 -m pip install --quiet -r "$REPO_ROOT/requirements-conductor.txt"
+python3 -m pip install --quiet -e "$REPO_ROOT"
+
+# Build the TRINITY base vector from the committed small safetensors head if needed.
+if [[ ! -f "$REPO_ROOT/artifacts/model_iter_60.npy" ]]; then
+    echo "[native-openfugu] building artifacts/model_iter_60.npy from router_head.safetensors ..."
+    python3 "$REPO_ROOT/scripts/make_vec.py"
+fi
 
 # Load .env so native process gets the same config as the Docker stack.
 # shellcheck source=/dev/null

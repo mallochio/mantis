@@ -36,12 +36,8 @@ envs:
 
 setup: |
   set -euo pipefail
-  # OpenFugu is a nested upstream repo; clone it on the remote so patched fugu-local
-  # files and upstream OpenFugu internals are both present.
-  if [ ! -f OpenFugu/requirements.txt ]; then
-    rm -rf OpenFugu
-    git clone --depth 1 https://github.com/trotsky1997/OpenFugu.git OpenFugu
-  fi
+  # OpenFugu is a pinned upstream submodule; fetch it if SkyPilot did not sync it.
+  bash scripts/fetch_openfugu.sh
   # Install CUDA-enabled torch first so OpenFugu requirements don't pull CPU torch.
   pip install --quiet torch==2.4.1 --extra-index-url https://download.pytorch.org/whl/cu121
   pip install --quiet -r OpenFugu/requirements.txt

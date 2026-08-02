@@ -42,6 +42,8 @@ from ultra import LiteLLMWorker as _ConductorLiteLLMWorker
 ROUTER: FuguRouter | None = None
 MODEL_NAME = "fugu"
 MAX_TURNS = 5
+# Reject bodies larger than this many bytes.
+MAX_BODY_BYTES = int(os.environ.get("FUGU_MAX_BODY_BYTES", str(5 * 1024 * 1024)))
 
 # Aliases that carry a LiteLLM reasoning_effort parameter. OpenRouter/LiteLLM
 # reject temperature != 1 for these models.
@@ -363,8 +365,24 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _auth_token(self) -> str | None:
+        return os.environ.get("FUGU_API_KEY") or os.environ.get("LITELLM_KEY")
+
+    def _check_auth(self) -> bool:
+        expected = self._auth_token()
+        if not expected:
+            self._send(500, {"error": "FUGU_API_KEY (or LITELLM_KEY) is not configured"})
+            return False
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Bearer ") or auth[7:] != expected:
+            self._send(401, {"error": "unauthorized"})
+            return False
+        return True
+
     def do_GET(self) -> None:
         if self.path == "/v1/models":
+            if not self._check_auth():
+                return
             self._send(200, {"object": "list", "data": [
                 {"id": MODEL_NAME, "object": "model", "owned_by": "openfugu"}]})
         elif self.path in ("/health", "/"):
@@ -376,8 +394,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.rstrip("/") != "/v1/chat/completions":
             self._send(404, {"error": "not found"})
             return
+        if not self._check_auth():
+            return
         try:
             n = int(self.headers.get("Content-Length", 0))
+            if n > MAX_BODY_BYTES:
+                self._send(413, {"error": f"request body exceeds {MAX_BODY_BYTES} bytes"})
+                return
             req = json.loads(self.rfile.read(n) or b"{}")
             messages = req.get("messages", [])
             if not messages:
@@ -425,7 +448,7 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--local-models", metavar="CSV", default=os.environ.get("FUGU_LOCAL_MODELS"),
                     help="local HF worker model paths (CSV). "
                          "Optional 'path@device' per entry; also FUGU_LOCAL_MODELS")
-    ap.add_argument("--host", default=os.environ.get("FUGU_HOST", "0.0.0.0"))
+    ap.add_argument("--host", default=os.environ.get("FUGU_HOST", "0.0.0.0"))  # noqa: S104
     ap.add_argument("--port", type=int, default=int(os.environ.get("FUGU_PORT", "8088")))
     ap.add_argument("--max-turns", type=int, default=int(os.environ.get("FUGU_MAX_TURNS", "5")))
     _args = ap.parse_args()
@@ -513,6 +536,13 @@ def get_coordinator(mode: str):
 
 def main() -> None:
     args = _parse_args()
+    token = os.environ.get("FUGU_API_KEY") or os.environ.get("LITELLM_KEY")
+    if not token:
+        print(
+            "[serve] FATAL: set FUGU_API_KEY (or LITELLM_KEY) before starting the server",
+            flush=True,
+        )
+        raise SystemExit(1)
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(
         f"[serve] Fugu listening on {args.host}:{args.port} — POST /v1/chat/completions",

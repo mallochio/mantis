@@ -167,8 +167,13 @@ def main() -> None:
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--litellm-url", default="http://localhost:3001/v1/chat/completions")
     parser.add_argument("--openfugu-url", default="http://localhost:8088/v1/chat/completions")
-    parser.add_argument("--api-key", default=os.environ.get("LITELLM_KEY", "sk-fugu-local"))
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("LITELLM_KEY") or os.environ.get("FUGU_API_KEY"),
+    )
     args = parser.parse_args()
+    if not args.api_key:
+        parser.error("set LITELLM_KEY or FUGU_API_KEY in the environment")
 
     costs = load_worker_costs(REPO / "configs" / "worker-costs.json")
     alias_map = load_litellm_alias_map(REPO / "configs" / "litellm.yaml")

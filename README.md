@@ -42,7 +42,7 @@ Local orchestration stack for Fugu-Ultra-style LLM routing:
 Best for Linux with no local GPU or when you only want TRINITY/direct calls. The 3B Conductor runs on CPU inside the container and is slow.
 
 ```bash
-cp .env.example .env          # add OPENROUTER_API_KEY and OPENAI_API_KEY; optional HF_TOKEN
+cp .env.example .env          # add OPENROUTER_API_KEY, OPENAI_API_KEY, LITELLM_KEY; optional HF_TOKEN
 docker compose build
 docker compose up -d
 ./scripts/verify.sh
@@ -63,7 +63,7 @@ docker compose -f docker-compose.yml -f docker-compose.native-openfugu.yml up -d
 ./scripts/verify.sh
 ```
 
-`run_openfugu_native.sh` creates a dedicated venv, installs `requirements-conductor.txt`, auto-detects the best PyTorch backend, and launches `openfugu-patch/serve.py` on `0.0.0.0:8088`.
+`run_openfugu_native.sh` creates a dedicated venv, installs the core orchestrator package (`pip install -e .`), builds the TRINITY base vector from `artifacts/router_head.safetensors`, auto-detects the best PyTorch backend, and launches `openfugu-patch/serve.py` on `0.0.0.0:8088`.
 
 ## Platform / device table
 
@@ -90,10 +90,11 @@ All model selection is env-driven. Export the variables before `docker compose u
 | `OPENROUTER_API_KEY` | API key LiteLLM uses to call OpenRouter | required |
 | `OPENCODE_GO_API_KEY` | API key for optional opencode-* LiteLLM aliases | optional |
 | `OPENAI_API_KEY` | OpenAI key for `llm-router` embeddings only | required for router |
-| `LITELLM_KEY` | Internal bearer token for router/openfugu | `sk-fugu-local` |
+| `LITELLM_KEY` | Shared internal bearer token for router/openfugu | `change-me` |
+| `FUGU_API_KEY` | Same token, used by the pi extension and `serve.py` auth | `${LITELLM_KEY}` |
 | `EXPENSIVE_MODEL` / `CHEAP_MODEL` | Router cheap/expensive targets (LiteLLM aliases) | `gpt-5.6-sol-medium` / `gpt-5.6-luna-max` |
 | `FUGU_MODEL` | TRINITY router backbone (Qwen3-0.6B) | `Qwen/Qwen3-0.6B` |
-| `FUGU_VECTOR` | TRINITY SVF+head vector | `/app/artifacts/model_iter_60.npy` in Docker; repo `artifacts/` in native |
+| `FUGU_VECTOR` | TRINITY SVF+head vector (built from `router_head.safetensors` at build time) | `/app/artifacts/model_iter_60.npy` in Docker; `artifacts/model_iter_60.npy` in native |
 | `FUGU_HEAD` | Optional per-step head override | unset |
 | `FUGU_WORKER_MODEL` / `FUGU_WORKER_MODELS` | Worker pool CSV for TRINITY/Conductor (LiteLLM aliases) | `gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-medium,deepseek-v4-flash-0731-xhigh,claude-opus-5-medium,claude-sonnet-5-medium,gemini-3.1-pro-preview-high` |
 | `FUGU_LOCAL_MODELS` | Local HF worker models CSV (overrides LiteLLM pool) | unset |
@@ -125,25 +126,28 @@ export FUGU_WORKER_MODELS="gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-me
 
 ## Artifacts: where the trained TRINITY/Conductor models live
 
-The repo never stores large model binaries in Git. Trained artifacts are in S3 (and mirrored locally in `outputs/`):
+The repo does not store large model binaries in Git. The only tracked model artifact
+is the small baseline `artifacts/router_head.safetensors` (~44 KB). The full
+`model_iter_60.npy` TRINITY vector is built from it at Docker/build time by
+`scripts/make_vec.py`.
 
 | Artifact | Local path | S3 path |
 |---|---|---|
-| TRINITY `model_iter_60.npy` | `artifacts/model_iter_60.npy` | `s3://sid-llm-runs/retrain-fugu-router/retrain-router-20260801_214418/model_iter_60.npy` |
-| TRINITY `router_head.npy` | `artifacts/router_head.npy` | `s3://sid-llm-runs/retrain-fugu-router/retrain-router-20260801_214418/router_head.npy` |
+| TRINITY `router_head.safetensors` (baseline, tracked) | `artifacts/router_head.safetensors` | `s3://sid-llm-runs/retrain-fugu-router/retrain-router-20260801_214418/router_head.safetensors` |
+| TRINITY `model_iter_60.npy` (generated) | `artifacts/model_iter_60.npy` | `s3://sid-llm-runs/retrain-fugu-router/retrain-router-20260801_214418/model_iter_60.npy` |
+| TRINITY `router_head.npy` (generated/downloaded) | `artifacts/router_head.npy` | `s3://sid-llm-runs/retrain-fugu-router/retrain-router-20260801_214418/router_head.npy` |
 | Conductor checkpoint | `outputs/conductor_retrain/retrain-conductor-20260802_003213/checkpoint/` | `s3://sid-llm-runs/retrain-fugu-conductor/retrain-conductor-20260802_003213/checkpoint/` |
 
 ### Download and use them
 
 ```bash
-# One-shot download of both TRINITY head and Conductor checkpoint
+# One-shot download (or fall back to building the baseline vector locally)
 ./scripts/download_artifacts.sh
 
-# Or manually:
-# TRINITY router head (small, ~150 KB / 80 KB)
+# Or manually from S3:
 mkdir -p artifacts
-aws s3 cp s3://sid-llm-runs/retrain-fugu-router/retrain-router-20260801_214418/model_iter_60.npy artifacts/
-aws s3 cp s3://sid-llm-runs/retrain-fugu-router/retrain-router-20260801_214418/router_head.npy artifacts/
+aws s3 cp s3://sid-llm-runs/retrain-fugu-router/retrain-router-20260801_214418/router_head.safetensors artifacts/
+python3 scripts/make_vec.py
 
 # Conductor checkpoint (~34 GB)
 mkdir -p outputs/conductor_retrain/retrain-conductor-20260802_003213
@@ -155,7 +159,7 @@ Set the env vars before `docker compose up` or `run_openfugu_native.sh`:
 
 ```bash
 export FUGU_VECTOR="/app/artifacts/model_iter_60.npy"        # Docker path
-export FUGU_HEAD="/app/artifacts/router_head.npy"            # Docker path
+export FUGU_HEAD="/app/artifacts/router_head.safetensors"    # optional override
 # To use the retrained Conductor instead of the base HF checkpoint:
 export FUGU_LOCAL_CONDUCTOR="/app/outputs/conductor_retrain/retrain-conductor-20260802_003213/checkpoint"
 ```
@@ -364,7 +368,33 @@ When the worker pool changes:
 
 The base `meta-llama/Llama-3.2-3B-Instruct` checkpoint and the derived `di-zhang-fdu/openfugu-conductor-3b` adapter are subject to the **Llama 3.2 Community License**. Ensure your use complies before downloading or redistributing the trained checkpoint.
 
+## Security / exposure model
+
+`openfugu-patch/serve.py` binds `0.0.0.0:8088` by default and **requires a Bearer token** on `/v1/models` and `/v1/chat/completions`. The token is read from `FUGU_API_KEY` (or `LITELLM_KEY` for backward compatibility). `serve.py` refuses to start if neither is set, rejects requests with an incorrect or missing `Authorization` header (HTTP 401), and rejects request bodies larger than `FUGU_MAX_BODY_BYTES` (default 5 MiB, HTTP 413). Health endpoints (`/health`, `/`) remain public for Docker/container probes.
+
+All inter-service traffic in the Docker stack uses the same `LITELLM_KEY` value. Treat `0.0.0.0:8088` as an internal service: do not expose it to untrusted networks without an additional reverse proxy/mTLS layer.
+
+## Building and type checking the pi extension
+
+The TypeScript extension is in `extensions/`:
+
+```bash
+cd extensions
+npm install
+npm run typecheck
+```
+
+See `extensions/README.md` for how to load `fugu.ts` into pi and smoke test `/fugu auto`.
+
 ## Troubleshooting
+
+### `serve.py` exits with "FATAL: set FUGU_API_KEY"
+
+The openfugu orchestrator now refuses to start without a bearer token. Copy `.env.example` to `.env` and set both `LITELLM_KEY` and `FUGU_API_KEY` to the same value, or just set `LITELLM_KEY` and use `FUGU_API_KEY=${LITELLM_KEY}`. `scripts/verify.sh` and the pi extension also read `FUGU_API_KEY`.
+
+### `verify.sh` fails with HTTP 401
+
+The orchestrator requires an `Authorization: Bearer <token>` header. `scripts/verify.sh` sources `.env` and uses `FUGU_API_KEY`/`LITELLM_KEY`. Make sure the token you pass to `curl` matches the value set in the openfugu container/process.
 
 ### Conductor returns HTTP 500 or empty response
 

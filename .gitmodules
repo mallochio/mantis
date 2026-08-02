@@ -1,0 +1,3 @@
+[submodule "OpenFugu"]
+	path = OpenFugu
+	url = https://github.com/trotsky1997/OpenFugu.git

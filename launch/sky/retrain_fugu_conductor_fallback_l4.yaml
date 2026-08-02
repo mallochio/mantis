@@ -31,10 +31,8 @@ setup: |
   pip install --quiet torch==2.4.1 --extra-index-url https://download.pytorch.org/whl/cu121
   pip install --quiet -r requirements-conductor.txt
   pip install --quiet awscli boto3 bitsandbytes
-  if [ ! -d "OpenFugu/openfugu" ]; then
-    rm -rf OpenFugu
-    git clone --depth 1 https://github.com/trotsky1997/OpenFugu.git OpenFugu
-  fi
+  # OpenFugu is a pinned upstream submodule; fetch it if SkyPilot did not sync it.
+  bash scripts/fetch_openfugu.sh
   mkdir -p "$OUTPUT_ROOT"
 
 run: |
@@ -46,10 +44,8 @@ run: |
   if [ -z "${HF_TOKEN:-}" ]; then
     echo "WARN: HF_TOKEN not set; HuggingFace downloads may be rate-limited" >&2
   fi
-  if [ ! -d "OpenFugu/openfugu" ]; then
-    rm -rf OpenFugu
-    git clone --depth 1 https://github.com/trotsky1997/OpenFugu.git OpenFugu
-  fi
+  # Ensure OpenFugu is present even if setup was skipped on cluster reuse.
+  bash scripts/fetch_openfugu.sh
 
   TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
   RUN_ID="retrain-conductor-${TIMESTAMP}-fallback-l4"

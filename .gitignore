@@ -86,20 +86,19 @@ Thumbs.db
 
 # Logs & Temporary Run Outputs
 *.log
-!pi-check-v3.log
+!runs/logs/*.log
 outputs/
 /tmp/
 
-# Model Weights & Binary Data (ignore by default, allow tracked artifacts)
+# Model Weights & Binary Data (ignore by default; only the baseline router head is tracked)
 *.safetensors
 *.bin
 *.pt
 *.pth
 *.onnx
 *.npy
-!artifacts/*.npy
-!artifacts/*.safetensors
+*.bak
+!artifacts/router_head.safetensors
 
 # External Dependencies & Cloned Sub-repos
 llm-router/
-OpenFugu/

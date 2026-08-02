@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -15,6 +16,8 @@ import numpy as np
 import pytest
 import serve
 import torch
+
+os.environ.setdefault("FUGU_API_KEY", "test-key")
 
 
 # ---------------------------------------------------------------------------
@@ -267,11 +270,49 @@ def test_handler_models():
         serve.get_coordinator = _fake_get_coordinator
         srv, port = _start_server(serve.Handler)
         time.sleep(0.1)
-        resp = urlopen(f"http://127.0.0.1:{port}/v1/models")
+        req = Request(
+            f"http://127.0.0.1:{port}/v1/models",
+            headers={"Authorization": "Bearer test-key"},
+        )
+        resp = urlopen(req)
         body = json.loads(resp.read().decode())
         assert body["data"][0]["id"] == "fugu"
     finally:
         serve.get_coordinator = old
+        srv.shutdown()
+
+
+def test_handler_missing_auth():
+    srv, port = _start_server(serve.Handler)
+    try:
+        time.sleep(0.1)
+        req = Request(
+            f"http://127.0.0.1:{port}/v1/models",
+        )
+        with pytest.raises(HTTPError) as exc:
+            urlopen(req)
+        assert exc.value.code == 401
+    finally:
+        srv.shutdown()
+
+
+def test_handler_post_too_large():
+    old_max = serve.MAX_BODY_BYTES
+    try:
+        serve.MAX_BODY_BYTES = 16
+        srv, port = _start_server(serve.Handler)
+        time.sleep(0.1)
+        payload = json.dumps({"model": "trinity", "messages": [{"role": "user", "content": "hello world"}]}).encode()
+        req = Request(
+            f"http://127.0.0.1:{port}/v1/chat/completions",
+            data=payload,
+            headers={"Content-Type": "application/json", "Authorization": "Bearer test-key"},
+        )
+        with pytest.raises(HTTPError) as exc:
+            urlopen(req)
+        assert exc.value.code == 413
+    finally:
+        serve.MAX_BODY_BYTES = old_max
         srv.shutdown()
 
 
@@ -285,7 +326,7 @@ def test_handler_post_trinity():
         req = Request(
             f"http://127.0.0.1:{port}/v1/chat/completions",
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "Authorization": "Bearer test-key"},
         )
         resp = urlopen(req)
         body = json.loads(resp.read().decode())
@@ -307,7 +348,7 @@ def test_handler_post_conductor():
         req = Request(
             f"http://127.0.0.1:{port}/v1/chat/completions",
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "Authorization": "Bearer test-key"},
         )
         resp = urlopen(req)
         body = json.loads(resp.read().decode())
@@ -336,7 +377,7 @@ def test_handler_post_not_chat_completions():
         req = Request(
             f"http://127.0.0.1:{port}/v1/chat/completions/extra",
             data=b"{}",
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "Authorization": "Bearer test-key"},
         )
         with pytest.raises(HTTPError):
             urlopen(req)
@@ -364,7 +405,7 @@ def test_handler_post_empty_messages():
         req = Request(
             f"http://127.0.0.1:{port}/v1/chat/completions",
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "Authorization": "Bearer test-key"},
         )
         with pytest.raises(HTTPError):
             urlopen(req)
@@ -382,7 +423,7 @@ def test_handler_post_invalid_json():
         req = Request(
             f"http://127.0.0.1:{port}/v1/chat/completions",
             data=b"not json",
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "Authorization": "Bearer test-key"},
         )
         with pytest.raises(HTTPError):
             urlopen(req)
@@ -407,7 +448,7 @@ def test_handler_post_coordinator_error():
         req = Request(
             f"http://127.0.0.1:{port}/v1/chat/completions",
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "Authorization": "Bearer test-key"},
         )
         with pytest.raises(HTTPError):
             urlopen(req)
@@ -718,7 +759,7 @@ def test_main_serve(monkeypatch):
         monkeypatch.setattr(serve, "ThreadingHTTPServer", FakeServer)
         serve.main()
         assert len(FakeServer.calls) == 1
-        assert FakeServer.calls[0][0] == ("0.0.0.0", 0)
+        assert FakeServer.calls[0][0] == ("0.0.0.0", 0)  # noqa: S104
     finally:
         serve._args = old_args
 

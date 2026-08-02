@@ -12,7 +12,7 @@ type Mode = "off" | "trinity" | "conductor" | "auto";
 
 const FUGU_URL = process.env.FUGU_URL ?? "http://127.0.0.1:8088/v1";
 const ROUTER_URL = process.env.FUGU_ROUTER_URL ?? "http://127.0.0.1:5500/v1";
-const API_KEY = process.env.FUGU_API_KEY ?? "sk-fugu-local";
+const API_KEY = process.env.FUGU_API_KEY ?? "";
 const AUTO_THRESHOLD = parseInt(process.env.FUGU_AUTO_THRESHOLD ?? "4", 10);
 
 const ROUTING_LOG_DIR = path.join(os.homedir(), ".config", "fugu");
