@@ -29,13 +29,13 @@ All model selection is env-driven. Export the variables before `docker compose u
 | `OPENCODE_GO_API_KEY` | API key for optional opencode-* LiteLLM aliases | optional |
 | `OPENAI_API_KEY` | OpenAI key for `llm-router` embeddings only | required for router |
 | `LITELLM_KEY` | Internal bearer token for router/openfugu | `sk-fugu-local` |
-| `EXPENSIVE_MODEL` / `CHEAP_MODEL` | Router cheap/expensive targets (LiteLLM aliases) | `claude-opus-5` / `gpt-5.6-luna-max` |
+| `EXPENSIVE_MODEL` / `CHEAP_MODEL` | Router cheap/expensive targets (LiteLLM aliases) | `gpt-5.6-sol-medium` / `gpt-5.6-luna-max` |
 | `FUGU_MODEL` | TRINITY router backbone (Qwen3-0.6B) | `Qwen/Qwen3-0.6B` |
 | `FUGU_VECTOR` | TRINITY SVF+head vector | `/app/artifacts/model_iter_60.npy` |
 | `FUGU_HEAD` | Optional per-step head override | unset |
-| `FUGU_WORKER_MODEL` / `FUGU_WORKER_MODELS` | Worker pool CSV for TRINITY/Conductor (LiteLLM aliases) | `claude-sonnet-5,claude-opus-5,gpt-5.6-sol-medium,gpt-5.6-luna-max,gpt-5.6-terra-xhigh,deepseek-v4-flash,glm-5.2` |
+| `FUGU_WORKER_MODEL` / `FUGU_WORKER_MODELS` | Worker pool CSV for TRINITY/Conductor (LiteLLM aliases) | `gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-medium,deepseek-v4-flash-0731-xhigh,claude-opus-5-medium,claude-sonnet-5-medium,gemini-3.1-pro-preview-high` |
 | `FUGU_LOCAL_MODELS` | Local HF worker models CSV (overrides LiteLLM pool) | unset |
-| `FUGU_CONDUCTOR_MODEL` | Conductor planning model via LiteLLM | `claude-opus-5` |
+| `FUGU_CONDUCTOR_MODEL` | Conductor planning model via LiteLLM | `claude-opus-5-medium` |
 | `FUGU_LOCAL_CONDUCTOR` | HF id/path to load a local Conductor (e.g. `di-zhang-fdu/openfugu-conductor-3b`) | unset |
 | `FUGU_CONDUCTOR_DEVICE` | Device for local Conductor (`cpu`, `mps`, `cuda:0`) | `cpu` |
 | `FUGU_CONDUCTOR_DTYPE` | Torch dtype for local Conductor | `float32` |
@@ -51,14 +51,68 @@ export OPENAI_API_KEY="sk-..."            # only for llm-router embeddings
 export HF_TOKEN="hf-..."                  # optional, helps avoid HF rate limits
 
 # 7-slot worker pool: must match aliases in configs/litellm.yaml
-export FUGU_WORKER_MODELS="claude-sonnet-5,claude-opus-5,gpt-5.6-sol-medium,gpt-5.6-luna-max,gpt-5.6-terra-xhigh,deepseek-v4-flash,glm-5.2"
+export FUGU_WORKER_MODELS="gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-medium,deepseek-v4-flash-0731-xhigh,claude-opus-5-medium,claude-sonnet-5-medium,gemini-3.1-pro-preview-high"
 
 # Optional: swap deepseek/glm to the OpenCode Go endpoint by setting OPENCODE_GO_API_KEY
-# export FUGU_WORKER_MODELS="claude-sonnet-5,claude-opus-5,gpt-5.6-sol-medium,gpt-5.6-luna-max,gpt-5.6-terra-xhigh,opencode-deepseek-v4-flash,opencode-glm-5.2"
+# export FUGU_WORKER_MODELS="gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-medium,opencode-deepseek-v4-flash,claude-opus-5-medium,claude-sonnet-5-medium,gemini-3.1-pro-preview-high"
 
 # Use the real OpenFugu Llama-3.2-3B Conductor inside Docker (CPU)
 # export FUGU_LOCAL_CONDUCTOR="di-zhang-fdu/openfugu-conductor-3b"
 ```
+
+## Artifacts: where the trained TRINITY/Conductor models live
+
+The repo never stores large model binaries in Git. All trained artifacts are in S3 (and mirrored locally in `outputs/`):
+
+| Artifact | Local path | S3 path |
+|---|---|---|
+| TRINITY `model_iter_60.npy` | `artifacts/model_iter_60.npy` | `s3://sid-llm-runs/retrain-fugu-router/retrain-router-20260801_214418/model_iter_60.npy` |
+| TRINITY `router_head.npy` | `artifacts/router_head.npy` | `s3://sid-llm-runs/retrain-fugu-router/retrain-router-20260801_214418/router_head.npy` |
+| Conductor checkpoint | `outputs/conductor_retrain/retrain-conductor-20260802_003213/checkpoint/` | `s3://sid-llm-runs/retrain-fugu-conductor/retrain-conductor-20260802_003213/checkpoint/` |
+
+### Download and use them
+
+```bash
+# One-shot download of both TRINITY head and Conductor checkpoint
+./scripts/download_artifacts.sh
+
+# Or manually:
+# TRINITY router head (small, ~150 KB / 80 KB)
+mkdir -p artifacts
+aws s3 cp s3://sid-llm-runs/retrain-fugu-router/retrain-router-20260801_214418/model_iter_60.npy artifacts/
+aws s3 cp s3://sid-llm-runs/retrain-fugu-router/retrain-router-20260801_214418/router_head.npy artifacts/
+
+# Conductor checkpoint (~34 GB)
+mkdir -p outputs/conductor_retrain/retrain-conductor-20260802_003213
+aws s3 sync s3://sid-llm-runs/retrain-fugu-conductor/retrain-conductor-20260802_003213/checkpoint/ \
+            outputs/conductor_retrain/retrain-conductor-20260802_003213/checkpoint/
+```
+
+Set the env vars before `docker compose up`:
+
+```bash
+export FUGU_VECTOR="/app/artifacts/model_iter_60.npy"
+export FUGU_HEAD="/app/artifacts/router_head.npy"
+# To use the retrained Conductor instead of the base HF checkpoint:
+export FUGU_LOCAL_CONDUCTOR="/app/outputs/conductor_retrain/retrain-conductor-20260802_003213/checkpoint"
+```
+
+In the `openfugu` container, `/app` is the repo root, so the paths above map to the local files if you copy them into `artifacts/` / `outputs/` before `docker compose build` (or use a Docker bind/volume). For Kubernetes or a bare-metal run, point the env vars at wherever you copied the files.
+
+### Quality evidence from the latest retrain
+
+On the 81 TerminalBench training tasks, the per-worker average verifiable reward was:
+- `anthropic/claude-sonnet-5-medium`: 0.0334
+- `anthropic/claude-opus-5-medium`: 0.0285
+- `openai/gpt-5.6-luna-max`: 0.0162
+- `openai/gpt-5.6-sol-medium`: 0.0154
+- `google/gemini-3.1-pro-preview-high`: 0.0117
+- `deepseek/deepseek-v4-flash-0731-xhigh`: 0.0113
+- `google/gemini-3.6-flash-high`: 0.0022
+
+The budgeted router's chosen worker averaged **0.0437**, i.e. **2.5× the average across all individual workers** and higher than any single model's average. On the held-out 8-task validation set the TRINITY head matched the budgeted gold label **77.8%** of the time (`best_val_worker_acc=0.7778`).
+
+The full Conductor GRPO run (500 steps, A100 40GB spot) finished with `format_reward=1.0` and `action_reward=1.0` but `outcome_reward≈0.012`, so the policy now reliably emits valid DAGs but its final answer quality is still close to the direct-worker baseline; more steps / larger `num_generations` / outcome-reward tuning would be the next levers.
 
 ## Retraining the router head on a new model pool
 
@@ -92,7 +146,7 @@ When you change the worker pool, run both retrains. The router head is cheap; th
 # 1. Update aliases, cost table, and SkyPilot YAML pool defaults.
 #    --fetch-costs requires OPENROUTER_API_KEY and contacts the OpenRouter pricing API.
 python3 scripts/update_pool.py \
-  --pool "anthropic/claude-sonnet-5|medium,anthropic/claude-opus-5|medium,openai/gpt-5.6-sol|medium,openai/gpt-5.6-luna|max,openai/gpt-5.6-terra|xhigh,deepseek/deepseek-v4-flash|none,z-ai/glm-5.2|none" \
+  --pool "google/gemini-3.6-flash|high,openai/gpt-5.6-luna|max,openai/gpt-5.6-sol|medium,deepseek/deepseek-v4-flash-0731|xhigh,anthropic/claude-opus-5|medium,anthropic/claude-sonnet-5|medium,google/gemini-3.1-pro-preview|high" \
   --fetch-costs \
   --update-yamls \
   --env-file .env
@@ -137,7 +191,7 @@ reward functions, and GRPO loop:
 export OPENROUTER_API_KEY="sk-or-v1-..."
 export HF_TOKEN="hf-..."
 python3 scripts/retrain_conductor.py \
-  --pool "anthropic/claude-sonnet-5|medium,anthropic/claude-opus-5|medium,openai/gpt-5.6-sol|medium,openai/gpt-5.6-luna|max,openai/gpt-5.6-terra|xhigh,deepseek/deepseek-v4-flash|none,z-ai/glm-5.2|none" \
+  --pool "google/gemini-3.6-flash|high,openai/gpt-5.6-luna|max,openai/gpt-5.6-sol|medium,deepseek/deepseek-v4-flash-0731|xhigh,anthropic/claude-opus-5|medium,anthropic/claude-sonnet-5|medium,google/gemini-3.1-pro-preview|high" \
   --dataset s3://external-datasets-archive/terminal-bench-2.1/ \
   --base HuggingFaceTB/SmolLM2-135M-Instruct \
   --steps 20 --limit 8 \
