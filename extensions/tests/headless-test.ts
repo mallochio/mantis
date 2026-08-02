@@ -4,10 +4,9 @@
  * Tests:
  * 1. Extension loading via discoverAndLoadExtensions
  * 2. Slash command registration (/mantis, /fugu)
- * 3. Mode switching handlers and UI status updates
- * 4. Message renderer registration for mantis-prompt & mantis-result
- * 5. Multi-turn conversation history construction from sessionManager.getBranch()
- * 6. Input event interception and custom message emission
+ * 3. Mode switching handlers, model resolution & UI status updates
+ * 4. Native tool registration for mantis_step (Worker, Thinker, Verifier background turns)
+ * 5. Input event interception and multi-turn message history building
  *
  * Usage: bun run extensions/tests/headless-test.ts
  */
@@ -37,7 +36,7 @@ if (!ext) {
   process.exit(1);
 }
 
-// 1. Verify commands
+// 1. Verify slash commands
 const mantisCmd = ext.commands.get("mantis");
 const fuguCmd = ext.commands.get("fugu");
 
@@ -53,7 +52,15 @@ if (!fuguCmd) {
 }
 console.log("✓ Registered command /fugu:", fuguCmd.description);
 
-// 2. Mock UI and Context
+// 2. Verify native tool registration (mantis_step for worker turns)
+const mantisStepTool = ext.tools.get("mantis_step");
+if (!mantisStepTool) {
+  console.error("FAIL: native tool mantis_step not registered");
+  process.exit(1);
+}
+console.log("✓ Registered native tool mantis_step:", mantisStepTool.definition.description);
+
+// 3. Mock UI and Context
 const statusMap = new Map<string, string | undefined>();
 const notifications: string[] = [];
 let workingMessage: string | undefined;
@@ -73,6 +80,10 @@ const mockContext = {
     },
     setWorkingIndicator: () => {},
   },
+  modelRegistry: {
+    find: (provider: string, id: string) => ({ provider, id, name: `${provider}/${id}` }),
+  },
+  setModel: async (_model: any) => true,
   sessionManager: {
     getBranch: () => [
       {
@@ -91,27 +102,13 @@ const mockContext = {
   },
 } as unknown as ExtensionContext;
 
-// 3. Test Mode Switching
+// 4. Test Mode Switching & Model Setting
 await mantisCmd.handler("trinity", mockContext as any);
 if (statusMap.get("mantis") !== "mantis:trinity") {
   console.error("FAIL: status not set to mantis:trinity, got:", statusMap.get("mantis"));
   process.exit(1);
 }
 console.log("✓ Command /mantis trinity correctly updated UI status to:", statusMap.get("mantis"));
-
-// 4. Test Message Renderers
-const renderers = ext.messageRenderers;
-if (!renderers.has("mantis-result")) {
-  console.error("FAIL: message renderer for mantis-result not registered");
-  process.exit(1);
-}
-console.log("✓ Message renderer for mantis-result registered");
-
-if (!renderers.has("mantis-prompt")) {
-  console.error("FAIL: message renderer for mantis-prompt not registered");
-  process.exit(1);
-}
-console.log("✓ Message renderer for mantis-prompt registered");
 
 // 5. Test Input Event Handler
 const inputHandlers = ext.handlers.get("input");
@@ -121,7 +118,7 @@ if (!inputHandlers || inputHandlers.length === 0) {
 }
 console.log("✓ Input event handler registered");
 
-// Test input handling
+// Test input handler execution
 const inputResult = await inputHandlers[0](
   { type: "input", text: "Please list the Ts files", source: "interactive" },
   mockContext,

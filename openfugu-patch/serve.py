@@ -173,6 +173,14 @@ def _chat_response(result: Any, model: str) -> dict:
     text = getattr(result, "final", "")
     turns = getattr(result, "turns", [])
     trace = _build_fugu_trace(result)
+    step_details = []
+    for turn in turns:
+        step_details.append({
+            "turn": getattr(turn, "t", getattr(turn, "step", 0)),
+            "agent_id": getattr(turn, "agent_id", 0),
+            "role": getattr(turn, "role", getattr(turn, "role_name", "Worker")),
+            "reply": getattr(turn, "reply", getattr(turn, "text", "")),
+        })
     return {
         "id": "chatcmpl-" + uuid.uuid4().hex[:24],
         "object": "chat.completion",
@@ -180,15 +188,21 @@ def _chat_response(result: Any, model: str) -> dict:
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": text},
+            "message": {
+                "role": "assistant",
+                "content": text,
+                "mantis_steps": step_details,
+            },
             "finish_reason": "stop",
         }],
         "usage": {
             "mantis_turns": len(turns),
             "mantis_trace": trace,
+            "mantis_steps": step_details,
             "fugu_turns": len(turns),
             "fugu_trace": trace,
         },
+        "mantis_steps": step_details,
     }
 
 

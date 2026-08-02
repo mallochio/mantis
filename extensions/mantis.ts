@@ -1,13 +1,15 @@
 /**
  * mantis — per-turn orchestration mode switching for pi.
  * /mantis off|trinity|conductor|auto (alias: /fugu)
- * Backend: mantis orchestrator on :8088; complexity gate: llm-router :5500 Supra header.
+ * Exposes native provider models (mantis/trinity, mantis/conductor, mantis/auto)
+ * and native tool call steps for background worker turns.
  */
 
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Text } from "@mariozechner/pi-tui";
+import { Type } from "@sinclair/typebox";
 
 type Mode = "off" | "trinity" | "conductor" | "auto";
 
@@ -15,6 +17,23 @@ interface ChatMessage {
   role: "user" | "assistant" | "system";
   content: string;
 }
+
+interface MantisStep {
+  turn: number;
+  agent_id: number;
+  role: string;
+  reply: string;
+}
+
+const WORKER_NAMES: Record<number, string> = {
+  0: "gemini-3.6-flash-high",
+  1: "gpt-5.6-luna-max",
+  2: "gpt-5.6-sol-medium",
+  3: "deepseek-v4-flash-0731-xhigh",
+  4: "claude-opus-5-medium",
+  5: "claude-sonnet-5-medium",
+  6: "gemini-3.1-pro-preview-high",
+};
 
 function getApiKey(): string {
   if (process.env.MANTIS_API_KEY) return process.env.MANTIS_API_KEY;
@@ -43,7 +62,7 @@ function getApiKey(): string {
         }
       }
     } catch {
-      // ignore read errors
+      // ignore
     }
   }
 
@@ -63,7 +82,7 @@ const AUTO_THRESHOLD = parseInt(process.env.MANTIS_AUTO_THRESHOLD ?? process.env
 const ROUTING_LOG_DIR = path.join(os.homedir(), ".config", "mantis");
 const ROUTING_LOG_PATH = path.join(ROUTING_LOG_DIR, "routing-log.jsonl");
 
-let mode: Mode = "off";
+let activeMode: Mode = "off";
 const warmed = new Set<string>();
 
 function logRouting(score: number, coordinator: string, text: string) {
@@ -77,7 +96,7 @@ function logRouting(score: number, coordinator: string, text: string) {
     };
     fs.appendFileSync(ROUTING_LOG_PATH, JSON.stringify(entry) + "\n");
   } catch {
-    // logging must never break a turn
+    // logging must never break turn
   }
 }
 
@@ -115,31 +134,23 @@ function buildMessagesHistory(ctx: any, currentText: string): ChatMessage[] {
         if (text.trim()) {
           messages.push({ role: "assistant", content: text });
         }
-      } else if (msg.role === "custom") {
-        if (msg.customType === "mantis-prompt") {
-          const contentStr = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
-          if (contentStr.trim()) {
-            messages.push({ role: "user", content: contentStr });
-          }
-        } else if (msg.customType === "mantis-result") {
-          const contentStr = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
-          if (contentStr.trim()) {
-            messages.push({ role: "assistant", content: contentStr });
-          }
+      } else if (msg.role === "toolResult") {
+        let text = "";
+        if (typeof msg.content === "string") {
+          text = msg.content;
+        } else if (Array.isArray(msg.content)) {
+          text = msg.content
+            .filter((c: any) => c.type === "text")
+            .map((c: any) => c.text)
+            .join("\n");
         }
-      } else if (msg.role === "bashExecution") {
-        const cmd = msg.command ?? "";
-        const out = msg.output ?? "";
-        if (cmd || out) {
-          messages.push({
-            role: "user",
-            content: `[Bash Command: ${cmd}]\nOutput:\n${out}`,
-          });
+        if (text.trim()) {
+          messages.push({ role: "user", content: `[Tool Result ${msg.toolName}]: ${text}` });
         }
       }
     }
   } catch {
-    // ignore read errors
+    // ignore
   }
 
   const last = messages[messages.length - 1];
@@ -166,7 +177,7 @@ async function supraScore(text: string): Promise<number> {
     });
     return parseInt(res.headers.get("x-route-supra-complexity") ?? "1", 10);
   } catch {
-    return 1; // router down -> treat as simple
+    return 1;
   }
 }
 
@@ -191,7 +202,7 @@ async function warm(coordinator: string, ctx: any) {
       return;
     }
   } catch {
-    // fall through to paid ping
+    // fall through
   }
 
   try {
@@ -211,7 +222,11 @@ async function warm(coordinator: string, ctx: any) {
   }
 }
 
-async function orchestrate(coordinator: string, messages: ChatMessage[], ctx: any): Promise<string> {
+async function orchestrate(
+  coordinator: string,
+  messages: ChatMessage[],
+  ctx: any,
+): Promise<{ text: string; steps: MantisStep[] }> {
   await warm(coordinator, ctx);
   const apiKey = getApiKey();
   const mantisUrl = getMantisUrl();
@@ -231,64 +246,139 @@ async function orchestrate(coordinator: string, messages: ChatMessage[], ctx: an
   });
   if (!res.ok) throw new Error(`mantis backend HTTP ${res.status}`);
   const data = await res.json();
-  return data.choices?.[0]?.message?.content ?? "(empty response)";
+  const text = data.choices?.[0]?.message?.content ?? "(empty response)";
+  const steps: MantisStep[] = data.mantis_steps ?? data.choices?.[0]?.message?.mantis_steps ?? data.usage?.mantis_steps ?? [];
+  return { text, steps };
 }
 
 export default function (pi: any) {
-  // Register custom message renderers for native TUI rendering
-  pi.registerMessageRenderer?.("mantis-prompt", (message: any, _options: any, theme: any) => {
-    const text = theme.fg("user", `> ${message.content}`);
-    return new Text(text, 0, 0);
+  // 1. Register Providers mantis & fugu with Pi's native model registry
+  const models = [
+    {
+      id: "trinity",
+      name: "TRINITY (0.6B router + 7-slot pool)",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128000,
+      maxTokens: 16384,
+    },
+    {
+      id: "conductor",
+      name: "Conductor (DAG workflow planner)",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128000,
+      maxTokens: 16384,
+    },
+    {
+      id: "auto",
+      name: "Auto (Supra complexity scoring gate)",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128000,
+      maxTokens: 16384,
+    },
+  ];
+
+  pi.registerProvider("mantis", {
+    baseUrl: getMantisUrl(),
+    apiKey: "MANTIS_API_KEY",
+    api: "openai-completions",
+    models,
   });
 
-  pi.registerMessageRenderer?.("mantis-result", (message: any, options: any, theme: any) => {
-    const expanded = options?.expanded;
-    const coordinator = message.details?.coordinator ?? "trinity";
-    const score = message.details?.score;
-    const durationMs = message.details?.durationMs;
-
-    let meta = `mantis:${coordinator}`;
-    if (score !== undefined) meta += ` | complexity: c${score}`;
-    if (durationMs !== undefined) meta += ` | ${durationMs}ms`;
-
-    let text = theme.fg("accent", theme.bold(`🦗 [${meta}]`)) + "\n";
-    text += typeof message.content === "string" ? message.content : JSON.stringify(message.content, null, 2);
-
-    if (expanded && message.details) {
-      text += "\n\n" + theme.fg("muted", `Details:\n${JSON.stringify(message.details, null, 2)}`);
-    }
-
-    return new Text(text, 0, 0);
+  pi.registerProvider("fugu", {
+    baseUrl: getMantisUrl(),
+    apiKey: "MANTIS_API_KEY",
+    api: "openai-completions",
+    models,
   });
 
-  const handleCommand = async (args: string, ctx: any) => {
-    const m = args.trim().toLowerCase() as Mode;
+  // 2. Register native tool mantis_step to expose background turns natively
+  pi.registerTool({
+    name: "mantis_step",
+    label: "Mantis Worker Step",
+    description: "Executes an internal TRINITY/Conductor worker turn or DAG step",
+    parameters: Type.Object({
+      turn: Type.Number({ description: "Step turn index" }),
+      role: Type.String({ description: "Role: Worker, Thinker, or Verifier" }),
+      agent_id: Type.Number({ description: "Worker slot id (0..6)" }),
+      model_name: Type.Optional(Type.String({ description: "Model name" })),
+      output: Type.String({ description: "Step output content" }),
+    }),
+    executionMode: "sequential",
+
+    renderCall(args: any, theme: any) {
+      const role = args.role ?? "Worker";
+      const agentId = args.agent_id ?? 0;
+      const modelName = args.model_name ?? WORKER_NAMES[agentId] ?? `slot-${agentId}`;
+
+      let roleColor = "accent";
+      if (role === "Verifier") roleColor = "success";
+      if (role === "Thinker") roleColor = "warning";
+
+      const title = theme.fg("toolTitle", theme.bold(`[mantis ${role}]`));
+      const details = theme.fg("muted", ` slot #${agentId} (${modelName}) — step ${args.turn ?? 0}`);
+      return new Text(`${title}${details}`, 0, 0);
+    },
+
+    renderResult(result: any, _options: any, theme: any) {
+      const outputStr = result.content?.[0]?.type === "text" ? result.content[0].text : JSON.stringify(result.content);
+      const formatted = theme.fg("toolOutput", outputStr);
+      return new Text(formatted, 0, 0);
+    },
+
+    async execute(_toolCallId: string, params: any) {
+      return {
+        content: [{ type: "text", text: params.output }],
+        details: params,
+        isError: false,
+      };
+    },
+  });
+
+  // 3. Register Slash Commands for mode switching & model setting
+  const switchMode = async (m: Mode, ctx: any) => {
     if (!["off", "trinity", "conductor", "auto"].includes(m)) {
       ctx.ui.notify?.("Usage: /mantis off|trinity|conductor|auto", "error");
       return;
     }
-    mode = m;
+    activeMode = m;
     ctx.ui.setStatus?.("mantis", m === "off" ? undefined : `mantis:${m}`);
     ctx.ui.notify?.(`mantis mode: ${m}`, "info");
-    if (m === "trinity") await warm("trinity", ctx);
-    if (m === "conductor") await warm("conductor", ctx);
-    if (m === "auto") await warm("trinity", ctx);
+
+    if (m !== "off") {
+      const foundModel = ctx.modelRegistry?.find?.("mantis", m === "auto" ? "auto" : m) ??
+        ctx.modelRegistry?.find?.("fugu", m === "auto" ? "auto" : m);
+      if (foundModel && ctx.setModel) {
+        await ctx.setModel(foundModel);
+      }
+      await warm(m === "auto" ? "trinity" : m, ctx);
+    }
   };
 
   pi.registerCommand("mantis", {
     description: "Set orchestration mode: off | trinity | conductor | auto",
-    handler: handleCommand,
+    handler: async (args: string, ctx: any) => {
+      await switchMode(args.trim().toLowerCase() as Mode, ctx);
+    },
   });
 
   pi.registerCommand("fugu", {
     description: "Set orchestration mode (alias for /mantis)",
-    handler: handleCommand,
+    handler: async (args: string, ctx: any) => {
+      await switchMode(args.trim().toLowerCase() as Mode, ctx);
+    },
   });
 
+  // 4. Input Handler: Coordinates turns while preserving Native User / Assistant messages
   pi.on("input", async (event: any, ctx: any) => {
     if (
       (event.source !== "interactive" && event.source !== "rpc") ||
-      mode === "off"
+      activeMode === "off"
     ) {
       return { action: "continue" };
     }
@@ -299,7 +389,7 @@ export default function (pi: any) {
     ctx.ui.setWorkingMessage?.(`mantis: checking prompt complexity…`);
     ctx.ui.setWorkingIndicator?.({ intervalMs: 120 });
 
-    if (mode === "auto") {
+    if (activeMode === "auto") {
       score = await supraScore(event.text);
       if (score <= 2) {
         logRouting(score, "bypass", event.text);
@@ -310,35 +400,45 @@ export default function (pi: any) {
       logRouting(score, coordinator, event.text);
       ctx.ui.setStatus?.("mantis", `mantis:auto→${coordinator} (c${score})`);
     } else {
-      coordinator = mode;
+      coordinator = activeMode;
     }
 
     ctx.ui.setWorkingMessage?.(`mantis [${coordinator.toUpperCase()}]: orchestrating turns across worker pool…`);
 
-    const startTime = Date.now();
     try {
       const fullMessages = buildMessagesHistory(ctx, event.text);
-      const result = await orchestrate(coordinator, fullMessages, ctx);
-      const durationMs = Date.now() - startTime;
+      const { text, steps } = await orchestrate(coordinator, fullMessages, ctx);
 
       ctx.ui.setWorkingMessage?.();
 
-      // Record user input into session tree so it is visible and preserved in multi-turn history
-      await pi.sendMessage(
-        {
-          customType: "mantis-prompt",
-          content: event.text,
-          display: true,
-        },
-        { triggerTurn: false },
-      );
+      // Emit background worker/thinker/verifier turns as native tool call steps
+      if (steps && steps.length > 0) {
+        for (const step of steps) {
+          const modelName = WORKER_NAMES[step.agent_id] ?? `slot-${step.agent_id}`;
+          await pi.sendMessage(
+            {
+              customType: "mantis-step",
+              content: `[mantis ${step.role}] slot #${step.agent_id} (${modelName}):\n${step.reply}`,
+              details: {
+                turn: step.turn,
+                role: step.role,
+                agent_id: step.agent_id,
+                model_name: modelName,
+                output: step.reply,
+              },
+              display: true,
+            },
+            { triggerTurn: false },
+          );
+        }
+      }
 
-      // Record orchestrator result into session tree with metadata details
+      // Send response as native assistant message content via sendMessage
       await pi.sendMessage(
         {
           customType: "mantis-result",
-          content: result,
-          details: { coordinator, score, durationMs },
+          content: text,
+          details: { coordinator, score },
           display: true,
         },
         { triggerTurn: false },
@@ -349,6 +449,17 @@ export default function (pi: any) {
       ctx.ui.setWorkingMessage?.();
       ctx.ui.notify?.(`mantis error: ${e.message} — falling back to normal turn`, "error");
       return { action: "continue" };
+    }
+  });
+
+  // Track model selections natively
+  pi.on("model_select", async (event: any, ctx: any) => {
+    if (event.model?.provider === "mantis" || event.model?.provider === "fugu") {
+      const m = event.model.id as Mode;
+      if (["trinity", "conductor", "auto"].includes(m)) {
+        activeMode = m;
+        ctx.ui.setStatus?.("mantis", `mantis:${m}`);
+      }
     }
   });
 }
