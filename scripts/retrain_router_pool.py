@@ -56,6 +56,7 @@ import argparse
 import difflib
 import json
 import os
+import random
 import re
 import sys
 import threading
@@ -70,7 +71,6 @@ import numpy as np
 import requests
 import torch
 import torch.nn.functional as F
-import urllib3
 from datasets import load_dataset
 from huggingface_hub import snapshot_download
 from torch import nn
@@ -267,9 +267,8 @@ class OpenRouterWorker:
             "X-Title": "Fugu Retrain",
         }
         url = f"{self.api_base}/chat/completions"
-        # Enforce a hard total wall-clock ceiling per call (including chunked reads).
-        timeout = urllib3.Timeout(connect=10, total=self.timeout)
-        resp = self._session.post(url, json=body, headers=headers, timeout=timeout)
+        # Enforce a hard per-call ceiling: 10 s connect, then read up to self.timeout.
+        resp = self._session.post(url, json=body, headers=headers, timeout=(10, self.timeout))
         resp.raise_for_status()
         data = resp.json()
         return str(data["choices"][0]["message"].get("content") or "")
@@ -429,8 +428,7 @@ def load_terminalbench_tasks(
             }
         )
 
-    rng = np.random.default_rng(seed)
-    rng.shuffle(records)  # type: ignore[arg-type]
+    random.Random(seed).shuffle(records)
     if limit:
         records = records[:limit]
     n_val = int(len(records) * val_frac)
@@ -453,8 +451,7 @@ def load_toolscale_tasks(limit: int, seed: int = 42, val_frac: float = 0.1):
         if limit and len(records) >= limit:
             break
 
-    rng = np.random.default_rng(seed)
-    rng.shuffle(records)  # type: ignore[arg-type]
+    random.Random(seed).shuffle(records)
     n_val = int(len(records) * val_frac)
     return records[n_val:], records[:n_val]
 
