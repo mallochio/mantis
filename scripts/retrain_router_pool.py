@@ -76,7 +76,7 @@ from huggingface_hub import snapshot_download
 from torch import nn
 from tqdm.auto import tqdm
 
-# Make OpenFugu internals importable when this script lives in fugu-local/scripts.
+# Make OpenFugu internals importable when this script lives in mantis/scripts.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "OpenFugu"))
 

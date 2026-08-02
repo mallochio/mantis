@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Comparative eval harness for fugu-local.
+"""Comparative eval harness for mantis.
 
 Usage:
     python3 eval/run_eval.py --config {direct,trinity,conductor-old,conductor-new,conductor-luna} \

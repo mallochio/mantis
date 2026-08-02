@@ -18,5 +18,5 @@
   "output": "outputs/pilot_terminal_cost_50",
   "vector": "outputs/pilot_terminal_cost_50/model_iter_60.npy",
   "head": "outputs/pilot_terminal_cost_50/router_head.npy",
-  "cost_table": "/home/ubuntu/fugu-local/configs/worker-costs.json"
+  "cost_table": "/home/ubuntu/mantis/configs/worker-costs.json"
 }

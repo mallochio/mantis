@@ -1,7 +1,7 @@
 # Conductor 500 Diagnosis
 
 Date: 2026-08-02
-Environment: fugu-local Docker stack on Linux x86_64, no GPU
+Environment: mantis Docker stack on Linux x86_64, no GPU
 Conductor device: `cpu`, dtype: `float32` (from `.env`)
 
 ## Method

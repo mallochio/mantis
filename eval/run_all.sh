@@ -47,7 +47,7 @@ wait_for http://localhost:8088/health 180
 for i in $(seq 1 120); do
   if curl -sD - -o /dev/null http://127.0.0.1:5500/v1/chat/completions \
        -H "Content-Type: application/json" \
-       -H "Authorization: Bearer ${LITELLM_KEY:-sk-fugu-local}" \
+       -H "Authorization: Bearer ${LITELLM_KEY:-sk-mantis}" \
        -d '{"model":"auto","messages":[{"role":"user","content":"hi"}],"max_tokens":1}' 2>/dev/null | grep -qi "x-route-supra-complexity"; then
     break
   fi

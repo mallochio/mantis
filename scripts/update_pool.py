@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Update fugu-local pool configuration for a new 7-slot worker pool.
+"""Update mantis pool configuration for a new 7-slot worker pool.
 
 Usage:
     python3 scripts/update_pool.py \

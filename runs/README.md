@@ -1,7 +1,7 @@
 # Conductor retrain run reports
 
 This directory contains human-readable run reports and manifest copies for
-`mallochio/fugu-local` Conductor retraining jobs. The actual checkpoints and
+`mallochio/mantis` Conductor retraining jobs. The actual checkpoints and
 metrics live in `outputs/conductor_retrain/<timestamp>/`, which is `gitignore`d.
 
 ## Manifest schema
@@ -12,7 +12,7 @@ Every Conductor retrain output now writes `manifest.json` with these fields:
 |---|---|
 | `run_id` | Unique run identifier |
 | `timestamp` | ISO-8601 start/end timestamp |
-| `git_commit` | `git rev-parse HEAD` of `fugu-local` at run time |
+| `git_commit` | `git rev-parse HEAD` of `mantis` at run time |
 | `base_model` | HuggingFace id or local path used as the GRPO base |
 | `real_checkpoint_loaded` | `true` only if `base_model` is `di-zhang-fdu/openfugu-conductor-3b` |
 | `device` | `cuda` or `cpu` |

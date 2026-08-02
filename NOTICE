@@ -1,4 +1,4 @@
-fugu-local
+mantis
 Copyright 2026 Mallochio
 
 This project is an independent local-orchestration wrapper around upstream
@@ -7,7 +7,7 @@ research from Sakana AI. It is not affiliated with, endorsed by, or sponsored
 by Sakana AI.
 
 The Apache-2.0 licensed source files in this repository were written by the
-fugu-local maintainers unless otherwise noted in individual file headers.
+mantis maintainers unless otherwise noted in individual file headers.
 
 Third-party components used at runtime include (but are not limited to):
 - OpenFugu (https://github.com/trotsky1997/OpenFugu) — incorporated as a pinned

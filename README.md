@@ -1,4 +1,4 @@
-# mantis-local
+# mantis
 
 Local orchestration stack for multi-tiered LLM routing:
 - **LiteLLM proxy** (:3001) — translates LiteLLM aliases to OpenRouter models.
@@ -415,7 +415,7 @@ The Qwen3-0.6B router and any local worker models download from HuggingFace on f
 
 ## Deviation notes
 
-- The upstream `trotsky1997/OpenFugu` `fetch_artifacts.py` cannot locate the `model_iter_60.npy` vector. `fugu-local` includes the public `router_head.safetensors` from `nshkrdotcom/trinity-coordinator-adapted-qwen3-0.6b` and `scripts/make_vec.py` builds `artifacts/model_iter_60.npy` from it (zero SVF offsets + real head).
+- The upstream `trotsky1997/OpenFugu` `fetch_artifacts.py` cannot locate the `model_iter_60.npy` vector. `mantis` includes the public `router_head.safetensors` from `nshkrdotcom/trinity-coordinator-adapted-qwen3-0.6b` and `scripts/make_vec.py` builds `artifacts/model_iter_60.npy` from it (zero SVF offsets + real head).
 - `configs/litellm.yaml` and `docker-compose.yml` route all backend LLM calls through OpenRouter. `llm-router` still consumes `OPENAI_API_KEY` only for its internal `mf` embedding scorer.
 - `openfugu-patch/serve.py` wraps the OpenFugu `LiteLLMWorker` classes to pass `custom_llm_provider="openai"` so LiteLLM dispatches proxy aliases correctly.
 - `serve.py` was patched to select the TRINITY vs Conductor coordinator from the request `model` field, lazy-load the requested coordinator on first use, optionally load a local `transformers`-based Conductor checkpoint, auto-detect `mps`/`cuda`/`cpu`, log device/dtype at startup, and add an assistant `Plan:\n` prefill to nudge local Conductor checkpoints into the required three-list format.
