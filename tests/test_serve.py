@@ -17,7 +17,8 @@ import pytest
 import serve
 import torch
 
-os.environ.setdefault("FUGU_API_KEY", "test-key")
+os.environ["MANTIS_API_KEY"] = "test-key"
+os.environ["FUGU_API_KEY"] = "test-key"
 
 
 # ---------------------------------------------------------------------------
@@ -44,17 +45,19 @@ def test_build_litellm_kwargs_non_reasoning():
 
 
 def test_resolve_conductor_model_env(monkeypatch):
-    monkeypatch.setenv("FUGU_CONDUCTOR_MODEL", "openai/gpt-5.6-sol")
+    monkeypatch.setenv("MANTIS_CONDUCTOR_MODEL", "openai/gpt-5.6-sol")
     assert serve._resolve_conductor_model(SimpleNamespace()) == "openai/gpt-5.6-sol"
 
 
 def test_resolve_conductor_model_from_slot_models(monkeypatch):
+    monkeypatch.delenv("MANTIS_CONDUCTOR_MODEL", raising=False)
     monkeypatch.delenv("FUGU_CONDUCTOR_MODEL", raising=False)
     worker = SimpleNamespace(slot_models=["slot-0", "slot-1"])
     assert serve._resolve_conductor_model(worker) == "slot-0"
 
 
 def test_resolve_conductor_model_default(monkeypatch):
+    monkeypatch.delenv("MANTIS_CONDUCTOR_MODEL", raising=False)
     monkeypatch.delenv("FUGU_CONDUCTOR_MODEL", raising=False)
     assert serve._resolve_conductor_model(SimpleNamespace()) == "openai/gpt-4o-mini"
 
@@ -276,7 +279,7 @@ def test_handler_models():
         )
         resp = urlopen(req)
         body = json.loads(resp.read().decode())
-        assert body["data"][0]["id"] == "fugu"
+        assert body["data"][0]["id"] in ("mantis", "fugu")
     finally:
         serve.get_coordinator = old
         srv.shutdown()

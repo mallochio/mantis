@@ -1,12 +1,12 @@
 {
-  "name": "fugu-pi-extension",
+  "name": "mantis-pi-extension",
   "version": "0.2.0",
-  "description": "pi extension that routes turns through the local fugu orchestrator",
-  "main": "fugu.ts",
+  "description": "pi extension that routes turns through the local mantis orchestrator",
+  "main": "mantis.ts",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build": "tsc fugu.ts --outDir dist",
-    "test": "echo 'no automated tests yet; load fugu.ts into pi and run /fugu auto'"
+    "build": "tsc mantis.ts --outDir dist",
+    "test": "echo 'no automated tests yet; load mantis.ts into pi and run /mantis auto'"
   },
   "devDependencies": {
     "@types/node": "^20",

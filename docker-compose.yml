@@ -1,7 +1,7 @@
 services:
   litellm:
     image: ghcr.io/berriai/litellm:main-stable
-    container_name: fugu-litellm
+    container_name: mantis-litellm
     ports: ["3001:4000"]
     volumes:
       - ./configs/litellm.yaml:/app/config.yaml:ro
@@ -14,13 +14,13 @@ services:
       interval: 10s
       timeout: 5s
       retries: 30
-    networks: [fugu]
+    networks: [mantis]
 
   router:
     build:
       context: .
       dockerfile: docker/router/Dockerfile
-    container_name: fugu-router
+    container_name: mantis-router
     ports: ["5500:5500"]
     environment:
       LITELLM_BASE: http://litellm:4000/v1
@@ -29,7 +29,7 @@ services:
       # llm-router's mf scorer still needs an OpenAI key for text-embedding-3-small.
       # The backend LLM calls go through the LiteLLM proxy / OpenRouter.
       OPENAI_API_KEY: ${OPENAI_API_KEY}
-      EXPENSIVE_MODEL: ${EXPENSIVE_MODEL:-claude-opus-5}
+      EXPENSIVE_MODEL: ${EXPENSIVE_MODEL:-gpt-5.6-sol-medium}
       CHEAP_MODEL: ${CHEAP_MODEL:-gpt-5.6-luna-max}
       EXPENSIVE_REASONING_EFFORT: ""
       CHEAP_REASONING_EFFORT: ""
@@ -37,29 +37,43 @@ services:
     depends_on:
       litellm:
         condition: service_healthy
-    networks: [fugu]
+    networks: [mantis]
 
   openfugu:
     build:
       context: .
       dockerfile: docker/openfugu/Dockerfile
-    container_name: fugu-orchestrator
+    container_name: mantis-orchestrator
     ports: ["8088:8088"]
     environment:
+      MANTIS_BASE_URL: http://litellm:4000/v1
       FUGU_BASE_URL: http://litellm:4000/v1
-      FUGU_API_KEY: ${LITELLM_KEY}
-      FUGU_MODEL: ${FUGU_MODEL:-Qwen/Qwen3-0.6B}
-      FUGU_VECTOR: ${FUGU_VECTOR:-/app/artifacts/model_iter_60.npy}
-      FUGU_HEAD: ${FUGU_HEAD:-}
-      FUGU_WORKER_MODEL: ${FUGU_WORKER_MODEL:-claude-sonnet-5-medium}
-      FUGU_WORKER_MODELS: ${FUGU_WORKER_MODELS:-gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-medium,deepseek-v4-flash-0731-xhigh,claude-opus-5-medium,claude-sonnet-5-medium,gemini-3.1-pro-preview-high}
-      FUGU_LOCAL_MODELS: ${FUGU_LOCAL_MODELS:-}
-      FUGU_CONDUCTOR_MODEL: ${FUGU_CONDUCTOR_MODEL:-gpt-5.6-luna-max}
-      FUGU_LOCAL_CONDUCTOR: ${FUGU_LOCAL_CONDUCTOR:-}
-      FUGU_CONDUCTOR_DEVICE: ${FUGU_CONDUCTOR_DEVICE:-cpu}
-      FUGU_CONDUCTOR_DTYPE: ${FUGU_CONDUCTOR_DTYPE:-float32}
-      FUGU_CONDUCTOR_MAX_NEW: ${FUGU_CONDUCTOR_MAX_NEW:-512}
-      FUGU_MAX_TURNS: ${FUGU_MAX_TURNS:-5}
+      MANTIS_API_KEY: ${MANTIS_API_KEY:-${LITELLM_KEY}}
+      FUGU_API_KEY: ${FUGU_API_KEY:-${LITELLM_KEY}}
+      MANTIS_MODEL: ${MANTIS_MODEL:-${FUGU_MODEL:-Qwen/Qwen3-0.6B}}
+      FUGU_MODEL: ${FUGU_MODEL:-${MANTIS_MODEL:-Qwen/Qwen3-0.6B}}
+      MANTIS_VECTOR: ${MANTIS_VECTOR:-${FUGU_VECTOR:-/app/artifacts/model_iter_60.npy}}
+      FUGU_VECTOR: ${FUGU_VECTOR:-${MANTIS_VECTOR:-/app/artifacts/model_iter_60.npy}}
+      MANTIS_HEAD: ${MANTIS_HEAD:-${FUGU_HEAD:-}}
+      FUGU_HEAD: ${FUGU_HEAD:-${MANTIS_HEAD:-}}
+      MANTIS_WORKER_MODEL: ${MANTIS_WORKER_MODEL:-${FUGU_WORKER_MODEL:-claude-sonnet-5-medium}}
+      FUGU_WORKER_MODEL: ${FUGU_WORKER_MODEL:-${MANTIS_WORKER_MODEL:-claude-sonnet-5-medium}}
+      MANTIS_WORKER_MODELS: ${MANTIS_WORKER_MODELS:-${FUGU_WORKER_MODELS:-gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-medium,deepseek-v4-flash-0731-xhigh,claude-opus-5-medium,claude-sonnet-5-medium,gemini-3.1-pro-preview-high}}
+      FUGU_WORKER_MODELS: ${FUGU_WORKER_MODELS:-${MANTIS_WORKER_MODELS:-gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-medium,deepseek-v4-flash-0731-xhigh,claude-opus-5-medium,claude-sonnet-5-medium,gemini-3.1-pro-preview-high}}
+      MANTIS_LOCAL_MODELS: ${MANTIS_LOCAL_MODELS:-${FUGU_LOCAL_MODELS:-}}
+      FUGU_LOCAL_MODELS: ${FUGU_LOCAL_MODELS:-${MANTIS_LOCAL_MODELS:-}}
+      MANTIS_CONDUCTOR_MODEL: ${MANTIS_CONDUCTOR_MODEL:-${FUGU_CONDUCTOR_MODEL:-gpt-5.6-luna-max}}
+      FUGU_CONDUCTOR_MODEL: ${FUGU_CONDUCTOR_MODEL:-${MANTIS_CONDUCTOR_MODEL:-gpt-5.6-luna-max}}
+      MANTIS_LOCAL_CONDUCTOR: ${MANTIS_LOCAL_CONDUCTOR:-${FUGU_LOCAL_CONDUCTOR:-}}
+      FUGU_LOCAL_CONDUCTOR: ${FUGU_LOCAL_CONDUCTOR:-${MANTIS_LOCAL_CONDUCTOR:-}}
+      MANTIS_CONDUCTOR_DEVICE: ${MANTIS_CONDUCTOR_DEVICE:-${FUGU_CONDUCTOR_DEVICE:-cpu}}
+      FUGU_CONDUCTOR_DEVICE: ${FUGU_CONDUCTOR_DEVICE:-${MANTIS_CONDUCTOR_DEVICE:-cpu}}
+      MANTIS_CONDUCTOR_DTYPE: ${MANTIS_CONDUCTOR_DTYPE:-${FUGU_CONDUCTOR_DTYPE:-float32}}
+      FUGU_CONDUCTOR_DTYPE: ${FUGU_CONDUCTOR_DTYPE:-${MANTIS_CONDUCTOR_DTYPE:-float32}}
+      MANTIS_CONDUCTOR_MAX_NEW: ${MANTIS_CONDUCTOR_MAX_NEW:-${FUGU_CONDUCTOR_MAX_NEW:-512}}
+      FUGU_CONDUCTOR_MAX_NEW: ${FUGU_CONDUCTOR_MAX_NEW:-${MANTIS_CONDUCTOR_MAX_NEW:-512}}
+      MANTIS_MAX_TURNS: ${MANTIS_MAX_TURNS:-${FUGU_MAX_TURNS:-5}}
+      FUGU_MAX_TURNS: ${FUGU_MAX_TURNS:-${MANTIS_MAX_TURNS:-5}}
       HF_HOME: /root/.cache/huggingface
       HF_TOKEN: ${HF_TOKEN:-}
       CUDA_VISIBLE_DEVICES: ""   # CPU on Mac
@@ -70,10 +84,10 @@ services:
     depends_on:
       litellm:
         condition: service_healthy
-    networks: [fugu]
+    networks: [mantis]
 
 networks:
-  fugu:
+  mantis:
     driver: bridge
 
 volumes:

@@ -40,10 +40,15 @@ from ultra import ConductorExecutor, conductor_prompt, parse_workflow
 from ultra import LiteLLMWorker as _ConductorLiteLLMWorker
 
 ROUTER: FuguRouter | None = None
-MODEL_NAME = "fugu"
+MODEL_NAME = os.environ.get("MANTIS_MODEL_NAME", os.environ.get("FUGU_MODEL_NAME", "mantis"))
 MAX_TURNS = 5
 # Reject bodies larger than this many bytes.
-MAX_BODY_BYTES = int(os.environ.get("FUGU_MAX_BODY_BYTES", str(5 * 1024 * 1024)))
+MAX_BODY_BYTES = int(
+    os.environ.get(
+        "MANTIS_MAX_BODY_BYTES",
+        os.environ.get("FUGU_MAX_BODY_BYTES", str(5 * 1024 * 1024)),
+    )
+)
 
 # Aliases that carry a LiteLLM reasoning_effort parameter. OpenRouter/LiteLLM
 # reject temperature != 1 for these models.
@@ -179,6 +184,8 @@ def _chat_response(result: Any, model: str) -> dict:
             "finish_reason": "stop",
         }],
         "usage": {
+            "mantis_turns": len(turns),
+            "mantis_trace": trace,
             "fugu_turns": len(turns),
             "fugu_trace": trace,
         },
@@ -187,7 +194,9 @@ def _chat_response(result: Any, model: str) -> dict:
 
 def _resolve_conductor_model(worker) -> str:
     """Pick the model used for the Conductor planning call."""
-    conductor_model = os.environ.get("FUGU_CONDUCTOR_MODEL")
+    conductor_model = os.environ.get(
+        "MANTIS_CONDUCTOR_MODEL", os.environ.get("FUGU_CONDUCTOR_MODEL")
+    )
     if conductor_model is None and getattr(worker, "slot_models", None):
         conductor_model = worker.slot_models[0]
     if conductor_model is None:
@@ -366,12 +375,19 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _auth_token(self) -> str | None:
-        return os.environ.get("FUGU_API_KEY") or os.environ.get("LITELLM_KEY")
+        return (
+            os.environ.get("MANTIS_API_KEY")
+            or os.environ.get("FUGU_API_KEY")
+            or os.environ.get("LITELLM_KEY")
+        )
 
     def _check_auth(self) -> bool:
         expected = self._auth_token()
         if not expected:
-            self._send(500, {"error": "FUGU_API_KEY (or LITELLM_KEY) is not configured"})
+            self._send(
+                500,
+                {"error": "MANTIS_API_KEY (or FUGU_API_KEY / LITELLM_KEY) is not configured"},
+            )
             return False
         auth = self.headers.get("Authorization", "")
         if not auth.startswith("Bearer ") or auth[7:] != expected:
@@ -384,7 +400,7 @@ class Handler(BaseHTTPRequestHandler):
             if not self._check_auth():
                 return
             self._send(200, {"object": "list", "data": [
-                {"id": MODEL_NAME, "object": "model", "owned_by": "openfugu"}]})
+                {"id": MODEL_NAME, "object": "model", "owned_by": "mantis"}]})
         elif self.path in ("/health", "/"):
             self._send(200, {"status": "ok", "model": MODEL_NAME})
         else:
@@ -434,23 +450,57 @@ def _parse_args() -> argparse.Namespace:
     global _args
     if _args is not None:
         return _args
-    ap = argparse.ArgumentParser(description="Serve Fugu as one OpenAI-compatible model.")
-    ap.add_argument("--model", default=os.environ.get("FUGU_MODEL", "Qwen/Qwen3-0.6B"),
-                  help="Qwen3-0.6B dir or HF id")
-    ap.add_argument("--vector", default=os.environ.get("FUGU_VECTOR", "model_iter_60.npy"),
-                  help="base vector (19456) — SVF + head")
-    ap.add_argument("--head", default=os.environ.get("FUGU_HEAD"),
-                    help="optional trained head-only vector/safetensors; overrides the "
-                         "head from --vector after SVF is applied")
-    default_workers = os.environ.get("FUGU_WORKER_MODELS", os.environ.get("FUGU_WORKER_MODEL"))
-    ap.add_argument("--slot-models", metavar="CSV", default=default_workers,
-                    help="litellm worker ids (CSV); also FUGU_WORKER_MODELS")
-    ap.add_argument("--local-models", metavar="CSV", default=os.environ.get("FUGU_LOCAL_MODELS"),
-                    help="local HF worker model paths (CSV). "
-                         "Optional 'path@device' per entry; also FUGU_LOCAL_MODELS")
-    ap.add_argument("--host", default=os.environ.get("FUGU_HOST", "0.0.0.0"))  # noqa: S104
-    ap.add_argument("--port", type=int, default=int(os.environ.get("FUGU_PORT", "8088")))
-    ap.add_argument("--max-turns", type=int, default=int(os.environ.get("FUGU_MAX_TURNS", "5")))
+    ap = argparse.ArgumentParser(description="Serve Mantis as one OpenAI-compatible model.")
+    ap.add_argument(
+        "--model",
+        default=os.environ.get("MANTIS_MODEL", os.environ.get("FUGU_MODEL", "Qwen/Qwen3-0.6B")),
+        help="Qwen3-0.6B dir or HF id",
+    )
+    ap.add_argument(
+        "--vector",
+        default=os.environ.get("MANTIS_VECTOR", os.environ.get("FUGU_VECTOR", "model_iter_60.npy")),
+        help="base vector (19456) — SVF + head",
+    )
+    ap.add_argument(
+        "--head",
+        default=os.environ.get("MANTIS_HEAD", os.environ.get("FUGU_HEAD")),
+        help="optional trained head-only vector/safetensors; overrides the "
+        "head from --vector after SVF is applied",
+    )
+    default_workers = os.environ.get(
+        "MANTIS_WORKER_MODELS",
+        os.environ.get(
+            "FUGU_WORKER_MODELS",
+            os.environ.get("MANTIS_WORKER_MODEL", os.environ.get("FUGU_WORKER_MODEL")),
+        ),
+    )
+    ap.add_argument(
+        "--slot-models",
+        metavar="CSV",
+        default=default_workers,
+        help="litellm worker ids (CSV); also MANTIS_WORKER_MODELS",
+    )
+    ap.add_argument(
+        "--local-models",
+        metavar="CSV",
+        default=os.environ.get("MANTIS_LOCAL_MODELS", os.environ.get("FUGU_LOCAL_MODELS")),
+        help="local HF worker model paths (CSV). "
+        "Optional 'path@device' per entry; also MANTIS_LOCAL_MODELS",
+    )
+    ap.add_argument(
+        "--host",
+        default=os.environ.get("MANTIS_HOST", os.environ.get("FUGU_HOST", "0.0.0.0")),  # noqa: S104
+    )
+    ap.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("MANTIS_PORT", os.environ.get("FUGU_PORT", "8088"))),
+    )
+    ap.add_argument(
+        "--max-turns",
+        type=int,
+        default=int(os.environ.get("MANTIS_MAX_TURNS", os.environ.get("FUGU_MAX_TURNS", "5"))),
+    )
     _args = ap.parse_args()
     return _args
 
@@ -459,7 +509,7 @@ def get_router() -> FuguRouter:
     global ROUTER
     if ROUTER is None:
         args = _parse_args()
-        device = os.environ.get("FUGU_DEVICE")
+        device = os.environ.get("MANTIS_DEVICE", os.environ.get("FUGU_DEVICE"))
         print(f"[serve] loading TRINITY router ({args.model}) ...", flush=True)
         ROUTER = FuguRouter(args.model, args.vector, device=device, seed=0)
         if args.head:  # layer a trained head over base SVF
@@ -521,7 +571,7 @@ def load_coordinator(mode: str):
     worker = _worker_from_args(args, mode)
     if mode == "trinity":
         return Coordinator(get_router(), worker, max_turns=args.max_turns, sample=True)
-    local_ckpt = os.environ.get("FUGU_LOCAL_CONDUCTOR")
+    local_ckpt = os.environ.get("MANTIS_LOCAL_CONDUCTOR", os.environ.get("FUGU_LOCAL_CONDUCTOR"))
     conductor = EnvLocalConductor(local_ckpt) if local_ckpt else None
     return EnvConductorCoordinator(
         worker, conductor=conductor, slot_labels=getattr(worker, "slot_models", None)
@@ -536,18 +586,24 @@ def get_coordinator(mode: str):
 
 def main() -> None:
     args = _parse_args()
-    token = os.environ.get("FUGU_API_KEY") or os.environ.get("LITELLM_KEY")
+    token = (
+        os.environ.get("MANTIS_API_KEY")
+        or os.environ.get("FUGU_API_KEY")
+        or os.environ.get("LITELLM_KEY")
+    )
     if not token:
         print(
-            "[serve] FATAL: set FUGU_API_KEY (or LITELLM_KEY) before starting the server",
+            "[serve] FATAL: set MANTIS_API_KEY (or FUGU_API_KEY / LITELLM_KEY)"
+            " before starting the server",
             flush=True,
         )
         raise SystemExit(1)
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(
-        f"[serve] Fugu listening on {args.host}:{args.port} — POST /v1/chat/completions",
+        f"[serve] Mantis listening on {args.host}:{args.port} — POST /v1/chat/completions",
         flush=True,
     )
+    srv.serve_forever()
     srv.serve_forever()
 
 

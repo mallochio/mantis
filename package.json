@@ -1,10 +1,10 @@
 {
-  "name": "fugu-local",
+  "name": "mantis-local",
   "version": "0.2.0",
-  "description": "Local OpenFugu orchestration stack routed through OpenRouter",
+  "description": "Local Mantis orchestration stack routed through OpenRouter",
   "pi": {
     "extensions": [
-      "./extensions/fugu.ts"
+      "./extensions/mantis.ts"
     ]
   }
 }

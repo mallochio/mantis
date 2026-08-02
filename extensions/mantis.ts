@@ -1,7 +1,7 @@
 /**
- * fugu — per-turn orchestration mode switching for pi.
- * /fugu off|trinity|conductor|auto
- * Backend: OpenFugu on :8088; complexity gate: llm-router :5500 Supra header.
+ * mantis — per-turn orchestration mode switching for pi.
+ * /mantis off|trinity|conductor|auto (alias: /fugu)
+ * Backend: mantis orchestrator on :8088; complexity gate: llm-router :5500 Supra header.
  */
 
 import * as fs from "node:fs";
@@ -10,12 +10,12 @@ import * as path from "node:path";
 
 type Mode = "off" | "trinity" | "conductor" | "auto";
 
-const FUGU_URL = process.env.FUGU_URL ?? "http://127.0.0.1:8088/v1";
-const ROUTER_URL = process.env.FUGU_ROUTER_URL ?? "http://127.0.0.1:5500/v1";
-const API_KEY = process.env.FUGU_API_KEY ?? "";
-const AUTO_THRESHOLD = parseInt(process.env.FUGU_AUTO_THRESHOLD ?? "4", 10);
+const MANTIS_URL = process.env.MANTIS_URL ?? process.env.FUGU_URL ?? "http://127.0.0.1:8088/v1";
+const ROUTER_URL = process.env.MANTIS_ROUTER_URL ?? process.env.FUGU_ROUTER_URL ?? "http://127.0.0.1:5500/v1";
+const API_KEY = process.env.MANTIS_API_KEY ?? process.env.FUGU_API_KEY ?? "";
+const AUTO_THRESHOLD = parseInt(process.env.MANTIS_AUTO_THRESHOLD ?? process.env.FUGU_AUTO_THRESHOLD ?? "6", 10);
 
-const ROUTING_LOG_DIR = path.join(os.homedir(), ".config", "fugu");
+const ROUTING_LOG_DIR = path.join(os.homedir(), ".config", "mantis");
 const ROUTING_LOG_PATH = path.join(ROUTING_LOG_DIR, "routing-log.jsonl");
 
 let mode: Mode = "off";
@@ -57,16 +57,16 @@ async function supraScore(text: string): Promise<number> {
 
 async function warm(coordinator: string, ctx: any) {
   if (warmed.has(coordinator)) return;
-  ctx.ui.notify?.(`fugu: warming ${coordinator} (first call may download weights)…`, "info");
+  ctx.ui.notify?.(`mantis: warming ${coordinator} (first call may download weights)…`, "info");
 
   // Try a cheap health check first; skip the paid ping if the server is alive.
   try {
-    const health = await fetch(`${FUGU_URL}/models`, {
+    const health = await fetch(`${MANTIS_URL}/models`, {
       headers: { Authorization: `Bearer ${API_KEY}` },
     });
     if (health.ok) {
       warmed.add(coordinator);
-      ctx.ui.notify?.(`fugu: ${coordinator} ready`, "info");
+      ctx.ui.notify?.(`mantis: ${coordinator} ready`, "info");
       return;
     }
   } catch {
@@ -74,7 +74,7 @@ async function warm(coordinator: string, ctx: any) {
   }
 
   try {
-    await fetch(`${FUGU_URL}/chat/completions`, {
+    await fetch(`${MANTIS_URL}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${API_KEY}` },
       body: JSON.stringify({
@@ -84,15 +84,15 @@ async function warm(coordinator: string, ctx: any) {
       }),
     });
     warmed.add(coordinator);
-    ctx.ui.notify?.(`fugu: ${coordinator} ready`, "info");
+    ctx.ui.notify?.(`mantis: ${coordinator} ready`, "info");
   } catch (e: any) {
-    ctx.ui.notify?.(`fugu: warm failed (${coordinator}): ${e.message}`, "warning");
+    ctx.ui.notify?.(`mantis: warm failed (${coordinator}): ${e.message}`, "warning");
   }
 }
 
 async function orchestrate(coordinator: string, task: string, ctx: any): Promise<string> {
   await warm(coordinator, ctx);
-  const res = await fetch(`${FUGU_URL}/chat/completions`, {
+  const res = await fetch(`${MANTIS_URL}/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${API_KEY}` },
     body: JSON.stringify({
@@ -101,27 +101,35 @@ async function orchestrate(coordinator: string, task: string, ctx: any): Promise
     }),
     signal: AbortSignal.timeout(300_000),
   });
-  if (!res.ok) throw new Error(`fugu backend HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`mantis backend HTTP ${res.status}`);
   const data = await res.json();
   return data.choices?.[0]?.message?.content ?? "(empty response)";
 }
 
 export default function (pi: any) {
-  pi.registerCommand("fugu", {
+  const handleCommand = async (args: string, ctx: any) => {
+    const m = args.trim().toLowerCase() as Mode;
+    if (!["off", "trinity", "conductor", "auto"].includes(m)) {
+      ctx.ui.notify?.("Usage: /mantis off|trinity|conductor|auto", "error");
+      return;
+    }
+    mode = m;
+    ctx.ui.setStatus?.("mantis", m === "off" ? "" : `mantis:${m}`);
+    ctx.ui.notify?.(`mantis mode: ${m}`, "info");
+    if (m === "trinity") await warm("trinity", ctx);
+    if (m === "conductor") await warm("conductor", ctx);
+    if (m === "auto") await warm("trinity", ctx);
+  };
+
+  pi.registerCommand("mantis", {
     description: "Set orchestration mode: off | trinity | conductor | auto",
-    handler: async (args: string, ctx: any) => {
-      const m = args.trim().toLowerCase() as Mode;
-      if (!["off", "trinity", "conductor", "auto"].includes(m)) {
-        ctx.ui.notify?.("Usage: /fugu off|trinity|conductor|auto", "error");
-        return;
-      }
-      mode = m;
-      ctx.ui.setStatus?.("fugu", m === "off" ? "" : `fugu:${m}`);
-      ctx.ui.notify?.(`fugu mode: ${m}`, "info");
-      if (m === "trinity") await warm("trinity", ctx);
-      if (m === "conductor") await warm("conductor", ctx);
-      if (m === "auto") await warm("trinity", ctx);
-    },
+    handler: handleCommand,
+  });
+
+  // Alias /fugu to /mantis for backward compatibility
+  pi.registerCommand("fugu", {
+    description: "Set orchestration mode (alias for /mantis)",
+    handler: handleCommand,
   });
 
   pi.on("input", async (event: any, ctx: any) => {
@@ -142,7 +150,7 @@ export default function (pi: any) {
       }
       coordinator = score >= AUTO_THRESHOLD ? "conductor" : "trinity";
       logRouting(score, coordinator, event.text);
-      ctx.ui.setStatus?.("fugu", `fugu:auto→${coordinator} (c${score})`);
+      ctx.ui.setStatus?.("mantis", `mantis:auto→${coordinator} (c${score})`);
     } else {
       coordinator = mode;
     }
@@ -150,12 +158,12 @@ export default function (pi: any) {
     try {
       const result = await orchestrate(coordinator, event.text, ctx);
       await pi.sendMessage(
-        { customType: "fugu-result", content: result, display: true },
+        { customType: "mantis-result", content: result, display: true },
         { triggerTurn: false },
       );
       return { action: "handled" };
     } catch (e: any) {
-      ctx.ui.notify?.(`fugu error: ${e.message} — falling back to normal turn`, "error");
+      ctx.ui.notify?.(`mantis error: ${e.message} — falling back to normal turn`, "error");
       return { action: "continue" };
     }
   });

@@ -3,9 +3,9 @@ requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "fugu-local"
+name = "mantis-local"
 version = "0.2.0"
-description = "Local OpenFugu orchestration stack routed through OpenRouter"
+description = "Local Mantis orchestration stack routed through OpenRouter"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",

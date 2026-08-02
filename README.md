@@ -1,30 +1,30 @@
-# fugu-local
+# mantis-local
 
-Local orchestration stack for Fugu-Ultra-style LLM routing:
+Local orchestration stack for multi-tiered LLM routing:
 - **LiteLLM proxy** (:3001) — translates LiteLLM aliases to OpenRouter models.
 - **RouteLLM router with Supra complexity header** (:5500) — scores prompt complexity.
-- **OpenFugu coordinator** (:8088) — runs TRINITY and Conductor modes.
-- **Pi `/fugu` extension** — switches modes and logs routing decisions.
+- **Mantis orchestrator** (:8088) — runs TRINITY and Conductor modes.
+- **Pi `/mantis` extension** — switches modes and logs routing decisions (alias: `/fugu`).
 
 ## How it works
 
 **TRINITY** is a tiny per-turn dispatcher (Qwen3-0.6B with a learned SVF+head). For each turn it picks one worker from the 7-slot pool plus a role — `Worker` (answer), `Thinker` (reason), or `Verifier` (check) — then returns the verifier-approved response.
 
 **Conductor** is a planner that emits an entire multi-step workflow up front as three Python lists: `model_id`, `subtasks`, and `access_list`. The access list is a DAG — later steps may only read strictly earlier steps — and the last step's output becomes the final answer. There are two ways to power the planner today:
-- **LiteLLM planner (default, works today):** set `FUGU_CONDUCTOR_MODEL=gpt-5.6-luna-max` and do **not** set `FUGU_LOCAL_CONDUCTOR`. The planner call goes through the LiteLLM proxy, and the orchestrator executes the generated DAG against the worker pool.
-- **Local 3B planner (archived):** `FUGU_LOCAL_CONDUCTOR` loads a Llama-3.2-3B checkpoint. Both the public `di-zhang-fdu/openfugu-conductor-3b` base checkpoint and the retrained `outputs/conductor_retrain/retrain-conductor-20260802_003213/checkpoint` failed format validation in this repo: one emits invalid DAG topology (self/forward references), the other collapses to plain text instead of the required three-list format. These are model-overfit / format-collapse issues, not infra/memory issues. The checkpoints remain in S3 for future SFT+GRPO work but are not wired in by default.
+- **LiteLLM planner (default, works today):** set `MANTIS_CONDUCTOR_MODEL=gpt-5.6-luna-max` and do **not** set `MANTIS_LOCAL_CONDUCTOR`. The planner call goes through the LiteLLM proxy, and the orchestrator executes the generated DAG against the worker pool.
+- **Local 3B planner (archived):** `MANTIS_LOCAL_CONDUCTOR` loads a Llama-3.2-3B checkpoint. Both the public `di-zhang-fdu/openfugu-conductor-3b` base checkpoint and the retrained `outputs/conductor_retrain/retrain-conductor-20260802_003213/checkpoint` failed format validation in this repo: one emits invalid DAG topology (self/forward references), the other collapses to plain text instead of the required three-list format. These are model-overfit / format-collapse issues, not infra/memory issues. The checkpoints remain in S3 for future SFT+GRPO work but are not wired in by default.
 
 **Auto mode** asks the router for a complexity score and picks the cheapest coordinator that should still succeed:
-- simple / low-complexity prompts → direct single-call (`/fugu direct`)
-- moderate complexity prompts → TRINITY (`/fugu trinity`)
-- high complexity prompts → Conductor (`/fugu conductor`)
+- simple / low-complexity prompts → direct single-call (`/mantis direct`)
+- moderate complexity prompts → TRINITY (`/mantis trinity`)
+- high complexity prompts → Conductor (`/mantis conductor`)
 
-`FUGU_AUTO_THRESHOLD` defaults to **6** because the current LiteLLM-planned Conductor still underperforms TRINITY on hard prompts; a Supra complexity score of 6 is never emitted by the router in practice, so auto mode stays in TRINITY/direct.
+`MANTIS_AUTO_THRESHOLD` defaults to **6** because the current LiteLLM-planned Conductor still underperforms TRINITY on hard prompts; a Supra complexity score of 6 is never emitted by the router in practice, so auto mode stays in TRINITY/direct.
 
 ```text
-                    ┌─────────────────┐
-      user query →  │  Pi /fugu auto  │
-                    └────────┬────────┘
+                    ┌──────────────────┐
+      user query →  │  Pi /mantis auto │
+                    └────────┬─────────┘
                              │
           ┌──────────────────┼──────────────────┐
           ▼                  ▼                  ▼
