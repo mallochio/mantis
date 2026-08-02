@@ -1,0 +1,22 @@
+# Hybrid mode: run the openfugu orchestrator natively on the host (MPS/CUDA/CPU)
+# while litellm and llm-router stay in Docker.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.native-openfugu.yml up -d litellm router
+#   ./scripts/run_openfugu_native.sh
+#
+# The native openfugu process listens on 127.0.0.1:8088, so containers can
+# reach it at host.docker.internal:8088 on Linux with the extra_hosts below.
+services:
+  openfugu:
+    # Do not start the Docker openfugu container when running hybrid mode.
+    # The service is still defined for users who want the all-Docker path.
+    profiles: ["disabled"]
+
+  litellm:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  router:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

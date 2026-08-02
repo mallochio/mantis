@@ -1,12 +1,41 @@
 # fugu-local
 
-Local orchestration stack wiring:
-- LiteLLM proxy (:3001)
-- RouteLLM router with Supra complexity header (:5500)
-- OpenFugu coordinator (:8088) with TRINITY and Conductor modes
-- Pi `/fugu` mode-switching extension
+Local orchestration stack for Fugu-Ultra-style LLM routing:
+- **LiteLLM proxy** (:3001) — translates LiteLLM aliases to OpenRouter models.
+- **RouteLLM router with Supra complexity header** (:5500) — scores prompt complexity.
+- **OpenFugu coordinator** (:8088) — runs TRINITY and Conductor modes.
+- **Pi `/fugu` extension** — switches modes and logs routing decisions.
 
-## Quickstart
+## How it works
+
+**TRINITY** is a tiny per-turn dispatcher (Qwen3-0.6B with a learned SVF+head). For each turn it picks one worker from the 7-slot pool plus a role — `Worker` (answer), `Thinker` (reason), or `Verifier` (check) — then returns the verifier-approved response.
+
+**Conductor** is a larger planner (Llama-3.2-3B) that writes an entire multi-step workflow up front as three Python lists: `model_id`, `subtasks`, and `access_list`. The access list is a DAG — later steps may only read strictly earlier steps. The last step's output becomes the final answer.
+
+**Auto mode** asks the router for a complexity score and picks the cheapest coordinator that should still succeed:
+- simple / low-complexity prompts → direct single-call (`/fugu direct`)
+- moderate complexity prompts → TRINITY (`/fugu trinity`)
+- high complexity prompts → Conductor (`/fugu conductor`)
+
+```text
+                    ┌─────────────────┐
+      user query →  │  Pi /fugu auto  │
+                    └────────┬────────┘
+                             │
+          ┌──────────────────┼──────────────────┐
+          ▼                  ▼                  ▼
+    ┌──────────┐      ┌──────────┐       ┌────────────┐
+    │  direct  │      │  trinity │       │  conductor │
+    │ 1 call   │      │ 1 worker │       │ 1 plan +   │
+    │ cheap    │      │ per turn │       │ N workers  │
+    └──────────┘      └──────────┘       └────────────┘
+```
+
+## Running the stack
+
+### A. All-Docker (default, no local GPU conductor)
+
+Best for Linux with no local GPU or when you only want TRINITY/direct calls. The 3B Conductor runs on CPU inside the container and is slow.
 
 ```bash
 cp .env.example .env          # add OPENROUTER_API_KEY and OPENAI_API_KEY; optional HF_TOKEN
@@ -15,13 +44,42 @@ docker compose up -d
 ./scripts/verify.sh
 ```
 
-The backend LLM calls are routed through **OpenRouter** via the LiteLLM proxy. `llm-router`'s internal `mf` scorer still needs an OpenAI key for `text-embedding-3-small`; `OPENAI_API_KEY` is only used for that embedding call.
+### B. Hybrid native-GPU (recommended on Apple Silicon / any GPU host)
 
-The Pi extension logs every routing decision to `~/.config/fugu/routing-log.jsonl` (one JSON line per turn with `score`, `coordinator`, and a `task_prefix`), and the OpenFugu response `usage` object now includes `fugu_trace` — a compact string such as `Worker(4)→Thinker(1)→Verifier(1):verifier_accept` for TRINITY or `steps:5:conductor` for Conductor.
+Keep LiteLLM and `llm-router` in Docker, but run `openfugu` directly on the host so PyTorch can use MPS (Mac), CUDA (Linux), or a less-slow CPU fallback. OpenFugu on the host reaches LiteLLM on `localhost:3001` and the router on `localhost:5500` via the published Docker ports.
+
+```bash
+# 1. Start the Docker side of the stack (no openfugu container)
+docker compose -f docker-compose.yml -f docker-compose.native-openfugu.yml up -d litellm router
+
+# 2. Run the OpenFugu orchestrator natively
+./scripts/run_openfugu_native.sh
+
+# 3. In another terminal, verify
+./scripts/verify.sh
+```
+
+`run_openfugu_native.sh` creates a dedicated venv, installs `requirements-conductor.txt`, auto-detects the best PyTorch backend, and launches `openfugu-patch/serve.py` on `0.0.0.0:8088`.
+
+## Platform / device table
+
+| Host platform | Conductor device | Default dtype | Notes |
+|---|---|---|---|
+| macOS (Apple Silicon) | `mps` | `bfloat16` | Docker cannot access MPS; native mode is required for GPU conductor. |
+| Linux + NVIDIA GPU | `cuda:0` | `bfloat16` | Native or Docker `--gpus all` both work; native avoids Docker GPU setup. |
+| Linux / no GPU | `cpu` | `float32` | 3B model still loads, but generation is slow and may need >=12 GB RAM. |
+| WSL / others | `cpu` | `float32` | Same as Linux CPU. |
+
+Override with env vars:
+```bash
+FUGU_CONDUCTOR_DEVICE=mps               # or cuda:0 / cpu
+FUGU_CONDUCTOR_DTYPE=bfloat16           # or float32
+FUGU_CONDUCTOR_MAX_NEW=512
+```
 
 ## Model knobs (set in `.env` or your shell, e.g. `.zshrc`)
 
-All model selection is env-driven. Export the variables before `docker compose up` (or put them in `.zshrc`/`.bashrc` and run `set -a; source <file>; set +a` before compose).
+All model selection is env-driven. Export the variables before `docker compose up` or before `run_openfugu_native.sh`.
 
 | Variable | What it controls | Default |
 |---|---|---|
@@ -31,17 +89,17 @@ All model selection is env-driven. Export the variables before `docker compose u
 | `LITELLM_KEY` | Internal bearer token for router/openfugu | `sk-fugu-local` |
 | `EXPENSIVE_MODEL` / `CHEAP_MODEL` | Router cheap/expensive targets (LiteLLM aliases) | `gpt-5.6-sol-medium` / `gpt-5.6-luna-max` |
 | `FUGU_MODEL` | TRINITY router backbone (Qwen3-0.6B) | `Qwen/Qwen3-0.6B` |
-| `FUGU_VECTOR` | TRINITY SVF+head vector | `/app/artifacts/model_iter_60.npy` |
+| `FUGU_VECTOR` | TRINITY SVF+head vector | `/app/artifacts/model_iter_60.npy` in Docker; repo `artifacts/` in native |
 | `FUGU_HEAD` | Optional per-step head override | unset |
 | `FUGU_WORKER_MODEL` / `FUGU_WORKER_MODELS` | Worker pool CSV for TRINITY/Conductor (LiteLLM aliases) | `gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-medium,deepseek-v4-flash-0731-xhigh,claude-opus-5-medium,claude-sonnet-5-medium,gemini-3.1-pro-preview-high` |
 | `FUGU_LOCAL_MODELS` | Local HF worker models CSV (overrides LiteLLM pool) | unset |
-| `FUGU_CONDUCTOR_MODEL` | Conductor planning model via LiteLLM | `claude-opus-5-medium` |
+| `FUGU_CONDUCTOR_MODEL` | Conductor planning model via LiteLLM | `gpt-5.6-luna-max` |
 | `FUGU_LOCAL_CONDUCTOR` | HF id/path to load a local Conductor (e.g. `di-zhang-fdu/openfugu-conductor-3b`) | unset |
-| `FUGU_CONDUCTOR_DEVICE` | Device for local Conductor (`cpu`, `mps`, `cuda:0`) | `cpu` |
-| `FUGU_CONDUCTOR_DTYPE` | Torch dtype for local Conductor | `float32` |
+| `FUGU_CONDUCTOR_DEVICE` | Device for local Conductor (`cpu`, `mps`, `cuda:0`) | auto-detected; `cpu` fallback |
+| `FUGU_CONDUCTOR_DTYPE` | Torch dtype for local Conductor | `bfloat16` on mps/cuda, `float32` on cpu |
 | `FUGU_CONDUCTOR_MAX_NEW` | Max new tokens for local Conductor | `512` |
 | `FUGU_MAX_TURNS` | TRINITY loop limit | `5` |
-| `FUGU_AUTO_THRESHOLD` | Pi `/fugu auto` gate (score >= threshold -> conductor) | `4` |
+| `FUGU_AUTO_THRESHOLD` | Pi `/fugu auto` gate (score >= threshold -> conductor) | `6` |
 
 ### Example `.zshrc` snippet
 
@@ -56,13 +114,13 @@ export FUGU_WORKER_MODELS="gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-me
 # Optional: swap deepseek/glm to the OpenCode Go endpoint by setting OPENCODE_GO_API_KEY
 # export FUGU_WORKER_MODELS="gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-medium,opencode-deepseek-v4-flash,claude-opus-5-medium,claude-sonnet-5-medium,gemini-3.1-pro-preview-high"
 
-# Use the real OpenFugu Llama-3.2-3B Conductor inside Docker (CPU)
+# Use the real OpenFugu Llama-3.2-3B Conductor (works in both Docker CPU and native GPU modes)
 # export FUGU_LOCAL_CONDUCTOR="di-zhang-fdu/openfugu-conductor-3b"
 ```
 
 ## Artifacts: where the trained TRINITY/Conductor models live
 
-The repo never stores large model binaries in Git. All trained artifacts are in S3 (and mirrored locally in `outputs/`):
+The repo never stores large model binaries in Git. Trained artifacts are in S3 (and mirrored locally in `outputs/`):
 
 | Artifact | Local path | S3 path |
 |---|---|---|
@@ -88,35 +146,54 @@ aws s3 sync s3://sid-llm-runs/retrain-fugu-conductor/retrain-conductor-20260802_
             outputs/conductor_retrain/retrain-conductor-20260802_003213/checkpoint/
 ```
 
-Set the env vars before `docker compose up`:
+Set the env vars before `docker compose up` or `run_openfugu_native.sh`:
 
 ```bash
-export FUGU_VECTOR="/app/artifacts/model_iter_60.npy"
-export FUGU_HEAD="/app/artifacts/router_head.npy"
+export FUGU_VECTOR="/app/artifacts/model_iter_60.npy"        # Docker path
+export FUGU_HEAD="/app/artifacts/router_head.npy"            # Docker path
 # To use the retrained Conductor instead of the base HF checkpoint:
 export FUGU_LOCAL_CONDUCTOR="/app/outputs/conductor_retrain/retrain-conductor-20260802_003213/checkpoint"
 ```
 
-In the `openfugu` container, `/app` is the repo root, so the paths above map to the local files if you copy them into `artifacts/` / `outputs/` before `docker compose build` (or use a Docker bind/volume). For Kubernetes or a bare-metal run, point the env vars at wherever you copied the files.
+In the `openfugu` container, `/app` is the repo root, so the paths above map to the local files if you copy them into `artifacts/` / `outputs/` before `docker compose build` (or use a Docker bind/volume). In native mode, `run_openfugu_native.sh` automatically rewrites the Docker `/app/...` paths to repo-local paths if they do not exist.
 
-### Quality evidence from the latest retrain
+## Eval results
 
-On the 81 TerminalBench training tasks, the per-worker average verifiable reward was:
-- `anthropic/claude-sonnet-5-medium`: 0.0334
-- `anthropic/claude-opus-5-medium`: 0.0285
-- `openai/gpt-5.6-luna-max`: 0.0162
-- `openai/gpt-5.6-sol-medium`: 0.0154
-- `google/gemini-3.1-pro-preview-high`: 0.0117
-- `deepseek/deepseek-v4-flash-0731-xhigh`: 0.0113
-- `google/gemini-3.6-flash-high`: 0.0022
+### TRINITY vs direct
 
-The budgeted router's chosen worker averaged **0.0437**, i.e. **2.5× the average across all individual workers** and higher than any single model's average. On the held-out 8-task validation set the TRINITY head matched the budgeted gold label **77.8%** of the time (`best_val_worker_acc=0.7778`).
+On 16 realistic coding-agent prompts (`eval/fixtures.jsonl`):
 
-The full Conductor GRPO run (500 steps, A100 40GB spot) finished with `format_reward=1.0` and `action_reward=1.0` but `outcome_reward≈0.012`, so the policy now reliably emits valid DAGs but its final answer quality is still close to the direct-worker baseline; more steps / larger `num_generations` / outcome-reward tuning would be the next levers.
+| config | auto_score_mean | latency_mean_s | cost_sum_usd |
+|---|---|---|---|
+| direct | 0.568 | 7.8 | $0.0128 |
+| trinity | 0.890 | 63.9 | $0.4563 |
 
-## Retraining the router head on a new model pool
+TRINITY beats direct by **+0.322 (+56.6%)** on the auto-score rubric, at roughly **35× the cost and 8× the latency**. This matches the TRINITY retrain validation signal: the budgeted router label averaged **0.0437** reward per task vs an average of **0.0170** across all workers individually, and the head matched the budgeted gold label **77.8%** of the time on the held-out validation set.
 
-The included TRINITY router head was trained on an older 7-slot pool. To retrain it on the current Pareto-frontier pool, launch a SkyPilot job:
+### Conductor re-eval (native CPU, no one-shot example)
+
+A second run using native `openfugu-patch/serve.py` (no Docker openfugu) with `FUGU_CONDUCTOR_DEVICE=cpu` and an assistant-prefill `Plan:\n` prompt:
+
+| config | auto_score_mean | latency_mean_s | cost_sum_usd |
+|---|---|---|---|
+| conductor-old | 0.188 | 94.0 | $0.2648 |
+| conductor-new | 0.073 | 95.7 | $0.2298 |
+
+Both local Conductor checkpoints still fail to parse/execute on most prompts under CPU/float32 serving (13/16 for old, 13/16 for new). The retrained checkpoint is not yet a net win over the base public checkpoint. Native GPU (MPS/CUDA) with `bfloat16` may change latency and success rate, but the parse/execution failures are primarily model-output issues, not memory.
+
+## Retraining the router head
+
+The included TRINITY router head was trained on the current 7-slot pool defined in `configs/litellm.yaml`:
+
+1. `gemini-3.6-flash-high`
+2. `gpt-5.6-luna-max`
+3. `gpt-5.6-sol-medium`
+4. `deepseek-v4-flash-0731-xhigh`
+5. `claude-opus-5-medium`
+6. `claude-sonnet-5-medium`
+7. `gemini-3.1-pro-preview-high`
+
+To retrain it on a new pool, launch a SkyPilot job:
 
 ```bash
 export OPENROUTER_API_KEY="sk-or-v1-..."
@@ -124,12 +201,12 @@ export HF_TOKEN="hf-..."
 ./scripts/sky_launch_retrain_router.sh --dry-run
 ```
 
-The default pool in `launch/sky/retrain_fugu_router.yaml` is the 7 requested frontier models: Anthropic Sonnet/Opus 5 (medium thinking), GPT-5.6 Sol/Luna/Terra with graded reasoning effort, and low-cost DeepSeek V4 Flash / GLM-5.2. Each retraining entry can append `|reasoning_effort` (e.g. `openai/gpt-5.6-terra|xhigh`) so the labels match the runtime LiteLLM aliases. The script:
+Each retraining entry can append `|reasoning_effort` (e.g. `openai/gpt-5.6-luna|max`) so the labels match the runtime LiteLLM aliases. The script:
 
 1. Loads `nvidia/ToolScale` or `s3://external-datasets-archive/terminal-bench-2.1/` tasks.
 2. Calls each worker in the pool through OpenRouter and scores each response.
 3. Extracts Qwen3-0.6B hidden states.
-4. Fine-tunes the 10x1024 TRINITY head (worker + role logits) with L2 regularization toward the original head.
+4. Fine-tunes the 10×1024 TRINITY head (worker + role logits) with L2 regularization toward the original head.
 5. Writes `model_iter_60.npy` and `router_head.npy` to the S3 mount at `s3://sid-llm-runs/retrain-fugu-router/<timestamp>/`.
 
 After you approve the shortlist and cost estimate, run the same command without `--dry-run`.
@@ -166,7 +243,7 @@ sky launch -y --detach-run \
   --env AWS_ACCESS_KEY_ID --env AWS_SECRET_ACCESS_KEY --env AWS_DEFAULT_REGION \
   launch/sky/retrain_fugu_conductor_real_3b_smoke_gcp.yaml
 
-# 4. (Optional, expensive) Full Conductor GRPO run on 4x A100-80GB spot.
+# 4. (Optional, expensive) Full Conductor GRPO run on A100 spot.
 # sky launch -y --env OPENROUTER_API_KEY --env HF_TOKEN \
 #   launch/sky/retrain_fugu_conductor.yaml
 ```
@@ -261,7 +338,7 @@ Update the same YAML (or pass `--steps` / `--limit` / `--num-generations`) and r
 ### Quarterly-retrain precedent
 
 When the worker pool changes:
-1. Update `RETRAIN_WORKER_MODELS` in **both** `launch/sky/retrain_fugu_router.yaml` and `launch/sky/retrain_fugu_conductor.yaml`.
+1. Update `RETRAIN_WORKER_MODELS` in **both** `launch/sky/retrain_fugu_router.yaml` and `launch/sky/retrain_fugu_conductor.yaml` (or use `update_pool.py`).
 2. Run the router retrain, evaluate the new head.
 3. If routing improves, run the Conductor smoke (`--steps 20 --limit 8`).
 4. If smoke metrics show parseable-workflow format reward stable/non-zero, launch the full Conductor retrain.
@@ -270,18 +347,30 @@ When the worker pool changes:
 
 The base `meta-llama/Llama-3.2-3B-Instruct` checkpoint and the derived `di-zhang-fdu/openfugu-conductor-3b` adapter are subject to the **Llama 3.2 Community License**. Ensure your use complies before downloading or redistributing the trained checkpoint.
 
-## Mac M5 2025 / Apple Silicon notes
+## Troubleshooting
 
-- Docker Desktop for Mac does **not** expose MPS or Metal to Linux containers, so PyTorch runs on CPU inside the `openfugu` container. The default `FUGU_CONDUCTOR_DEVICE=cpu` and `FUGU_CONDUCTOR_DTYPE=float32` are correct.
-- The Qwen3-0.6B router (~1.5 GB) and Llama-3.2-3B Conductor (~6–7 GB) will download on first run and be cached in the `hf-cache` Docker volume. Give Docker enough memory (>=10 GB recommended if using the 3B Conductor).
-- If you want to use `mps` or Metal, run `openfugu/serve.py` natively outside Docker with `FUGU_CONDUCTOR_DEVICE=mps` and the rest of the stack still in Docker.
+### Conductor returns HTTP 500 or empty response
+
+Common causes:
+
+1. **Docker Desktop memory limit (Mac)** — the Llama-3.2-3B Conductor checkpoint needs ~12 GB of RAM at `float32`. If Docker Desktop's VM is capped at ~7.7 GB the container may OOM during load or generation. Increase the VM memory limit or switch to **hybrid native-GPU mode** (`./scripts/run_openfugu_native.sh`), which runs PyTorch directly on the host.
+2. **Invalid Conductor DAG** — the local checkpoint sometimes emits workflows with self/forward references, unequal-length lists, or direct answers instead of the three required lists. This is a model-output issue. Native path with `bfloat16`/GPU and an assistant `Plan:\n` prefill helps, but a checkpoint that reliably emits valid DAGs is required. See `eval/conductor-500-diagnosis.md` for the exact errors observed.
+3. **Litellm proxy not reachable** — in hybrid mode, the native `openfugu` process needs `FUGU_BASE_URL=http://127.0.0.1:3001/v1` (set by `run_openfugu_native.sh` automatically). Confirm `curl http://localhost:3001/health` responds.
+
+### TRINITY is slow on first call
+
+The Qwen3-0.6B router and any local worker models download from HuggingFace on first use and are cached in `hf-cache` (Docker) or `~/.cache/huggingface` (native). Subsequent calls are much faster.
+
+### `verify.sh` fails on the openfugu check
+
+`scripts/verify.sh` curls `http://localhost:8088/health`. If you are running hybrid mode, make sure `run_openfugu_native.sh` is still running. If you are running all-Docker, make sure `docker compose up -d` included the `openfugu` service.
 
 ## Deviation notes
 
 - The upstream `trotsky1997/OpenFugu` `fetch_artifacts.py` cannot locate the `model_iter_60.npy` vector. `fugu-local` includes the public `router_head.safetensors` from `nshkrdotcom/trinity-coordinator-adapted-qwen3-0.6b` and `scripts/make_vec.py` builds `artifacts/model_iter_60.npy` from it (zero SVF offsets + real head).
 - `configs/litellm.yaml` and `docker-compose.yml` route all backend LLM calls through OpenRouter. `llm-router` still consumes `OPENAI_API_KEY` only for its internal `mf` embedding scorer.
 - `openfugu-patch/serve.py` wraps the OpenFugu `LiteLLMWorker` classes to pass `custom_llm_provider="openai"` so LiteLLM dispatches proxy aliases correctly.
-- `serve.py` was patched to select the TRINITY vs Conductor coordinator from the request `model` field, lazy-load the requested coordinator on first use, optionally load a local `transformers`-based Conductor checkpoint, and log each request's routed model/coordinator.
+- `serve.py` was patched to select the TRINITY vs Conductor coordinator from the request `model` field, lazy-load the requested coordinator on first use, optionally load a local `transformers`-based Conductor checkpoint, auto-detect `mps`/`cuda`/`cpu`, log device/dtype at startup, and add an assistant `Plan:\n` prefill to nudge local Conductor checkpoints into the required three-list format.
 
 ## References
 

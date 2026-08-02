@@ -225,13 +225,33 @@ class ConductorCoordinator:
         return _run_conductor_workflow(self.worker, query, self.slot_labels, completion, verbose)
 
 
+def choose_conductor_device(torch_module: Any, env_device: str | None = None) -> str:
+    """Pick mps > cuda:0 > cpu, allowing an explicit env override."""
+    if env_device and env_device != "auto":
+        return env_device
+    if torch_module.backends.mps.is_available():
+        return "mps"
+    if torch_module.cuda.is_available():
+        return "cuda:0"
+    return "cpu"
+
+
+def choose_conductor_dtype(
+    device: str, torch_module: Any, env_dtype: str | None = None
+) -> Any:
+    """Return torch dtype for a Conductor device, honoring an explicit override."""
+    if env_dtype:
+        return getattr(torch_module, env_dtype)
+    return torch_module.bfloat16 if device in ("mps", "cuda", "cuda:0") else torch_module.float32
+
+
 class EnvLocalConductor:
     """Load a GRPO-trained Conductor checkpoint locally with transformers.
 
     Env overrides: FUGU_CONDUCTOR_DEVICE (cpu/cuda:0/mps/auto),
                     FUGU_CONDUCTOR_DTYPE (float32/bfloat16/float16),
                     FUGU_CONDUCTOR_MAX_NEW.
-    Falls back to float32 on CPU/MPS; bfloat16 only on CUDA."""
+    Defaults to bfloat16 on mps/cuda and float32 on cpu."""
 
     def __init__(self, ckpt: str, device: str | None = None, max_new: int | None = None) -> None:
         import torch as _torch
@@ -239,24 +259,21 @@ class EnvLocalConductor:
 
         self.torch = _torch
         self.ckpt = ckpt
-        if device is None:
-            device = os.environ.get("FUGU_CONDUCTOR_DEVICE")
-        if device is None or device == "auto":
-            if _torch.cuda.is_available():
-                device = "cuda:0"
-            elif _torch.backends.mps.is_available():
-                device = "mps"
-            else:
-                device = "cpu"
-        self.device = device
+        env_device = device if device is not None else os.environ.get("FUGU_CONDUCTOR_DEVICE")
+        self.device = choose_conductor_device(_torch, env_device)
         self.max_new = max_new or int(os.environ.get("FUGU_CONDUCTOR_MAX_NEW", "512"))
         dtype_env = os.environ.get("FUGU_CONDUCTOR_DTYPE")
-        if dtype_env:
-            self.dtype = getattr(_torch, dtype_env)
+        self.dtype = choose_conductor_dtype(self.device, _torch, dtype_env)
+        self.temperature = float(os.environ.get("FUGU_CONDUCTOR_TEMPERATURE", "0.7"))
+        self.top_p = float(os.environ.get("FUGU_CONDUCTOR_TOP_P", "0.9"))
+        do_sample_env = os.environ.get("FUGU_CONDUCTOR_DO_SAMPLE")
+        if do_sample_env:
+            self.do_sample = do_sample_env.lower() not in ("0", "false", "no", "")
         else:
-            self.dtype = _torch.bfloat16 if self.device.startswith("cuda") else _torch.float32
+            self.do_sample = True
         print(
-            f"[serve] loading local Conductor ({ckpt}) on {self.device} dtype={self.dtype} ...",
+            f"[serve] loading local Conductor ({ckpt}) on {self.device} dtype={self.dtype} "
+            f"do_sample={self.do_sample} temp={self.temperature} top_p={self.top_p} ...",
             flush=True,
         )
         self.tok = AutoTokenizer.from_pretrained(ckpt)
@@ -270,25 +287,49 @@ class EnvLocalConductor:
         self.model.eval()
         print("[serve] Conductor ready", flush=True)
 
+    def _build_messages(self, messages: list) -> list[dict[str, str]]:
+        """Add an assistant prefill that nudges the Conductor into the 3-list format.
+
+        One-shot examples are intentionally avoided here: the 3B Conductor
+        checkpoints tend to collapse into repeating a fixed example rather
+        than following the actual user query.
+        """
+        return list(messages) + [{"role": "assistant", "content": "Plan:\n"}]
+
     def conduct(self, messages: list) -> str:
         torch = self.torch
+        messages = self._build_messages(messages)
         try:
             text = self.tok.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,
+                continue_final_message=True,
+                truncation=True,
+                max_length=2048,
             )
         except (ValueError, TypeError, AttributeError):
-            text = "\n".join(m["content"] for m in messages)
-        ids = self.tok(
-            text, return_tensors="pt", truncation=True, max_length=2048
-        ).to(self.device)
+            # Fallback for tokenizers without chat_template or old transformers.
+            parts = [f"{m['role'].capitalize()}: {m['content']}" for m in messages]
+            text = "\n\n".join(parts)
+        ids = self.tok(text, return_tensors="pt", truncation=True, max_length=2048).to(self.device)
+        gen_kwargs: dict[str, Any] = {
+            "max_new_tokens": self.max_new,
+            "pad_token_id": self.tok.pad_token_id,
+        }
+        if self.do_sample:
+            gen_kwargs["do_sample"] = True
+            gen_kwargs["temperature"] = self.temperature
+            gen_kwargs["top_p"] = self.top_p
+        else:
+            gen_kwargs["do_sample"] = False
         with torch.no_grad():
-            out = self.model.generate(
-                **ids,
-                max_new_tokens=self.max_new,
-                do_sample=False,
-                pad_token_id=self.tok.pad_token_id,
-            )
-        return str(self.tok.decode(out[0, ids["input_ids"].shape[1] :], skip_special_tokens=True))
+            out = self.model.generate(**ids, **gen_kwargs)
+        completion = str(
+            self.tok.decode(out[0, ids["input_ids"].shape[1] :], skip_special_tokens=True)
+        )
+        print(f"[serve] raw conductor completion: {completion[:1000]!r}", flush=True)
+        return completion
 
 
 class EnvConductorCoordinator(ConductorCoordinator):

@@ -86,6 +86,7 @@ Thumbs.db
 
 # Logs & Temporary Run Outputs
 *.log
+!pi-check-v3.log
 outputs/
 /tmp/
 
