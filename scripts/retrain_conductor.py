@@ -462,7 +462,10 @@ def main() -> None:
     worker_timeout = _env_int("FUGU_WORKER_TIMEOUT", "120")
     worker_max_tokens = _env_int("FUGU_WORKER_MAX_TOKENS", "512")
     mock_worker = os.environ.get("FUGU_CONDUCTOR_MOCK_WORKER") == "1"
-    temperature = float(os.environ.get("RETRAIN_TEMPERATURE", "1.0"))
+    temperature = float(os.environ.get("RETRAIN_TEMPERATURE", "0.6"))
+    top_p = float(os.environ.get("RETRAIN_TOP_P", "0.9"))
+    top_k = int(os.environ.get("RETRAIN_TOP_K", "50"))
+    repetition_penalty = float(os.environ.get("RETRAIN_REPETITION_PENALTY", "1.0"))
     optim = os.environ.get("RETRAIN_OPTIM", "adamw_torch")
 
     parser.add_argument("--pool", required=True, help="model|effort CSV (same as router retrain)")
@@ -481,6 +484,9 @@ def main() -> None:
     parser.add_argument("--worker-max-tokens", type=int, default=worker_max_tokens)
     parser.add_argument("--mock-worker", action="store_true", default=mock_worker)
     parser.add_argument("--temperature", type=float, default=temperature)
+    parser.add_argument("--top-p", type=float, default=top_p)
+    parser.add_argument("--top-k", type=int, default=top_k)
+    parser.add_argument("--repetition-penalty", type=float, default=repetition_penalty)
     parser.add_argument(
         "--optim",
         default=optim,
@@ -510,9 +516,10 @@ def main() -> None:
         if args.num_generations is None:
             args.num_generations = num_gen
 
-    # num_generations must divide per_device_train_batch_size for GRPO grouping.
     if args.num_generations < 2:
         parser.error("--num-generations must be at least 2 for GRPO")
+    # TRL 0.19's default generation_batch_size equals per_device_train_batch_size
+    # when steps_per_generation=1, and it must be divisible by num_generations.
     if args.per_device_batch % args.num_generations != 0:
         parser.error(
             f"--per-device-batch ({args.per_device_batch}) must be a multiple of "
@@ -565,6 +572,20 @@ def main() -> None:
     model = model.to(torch.device(device))  # type: ignore[arg-type]
     model.config.use_cache = False
 
+    # TRL 0.19 + bfloat16 gradient checkpointing can corrupt generation while the
+    # model is in train mode. Force eval during sampling and restore train mode
+    # afterwards so the loss forward still benefits from gradient checkpointing.
+    _orig_generate = model.generate
+
+    def _generate_eval_then_train(*args: Any, **kwargs: Any):
+        model.eval()
+        try:
+            return _orig_generate(*args, **kwargs)
+        finally:
+            model.train()
+
+    model.generate = _generate_eval_then_train
+
     ds = _build_dataset(records, tok, slot_labels, args.max_prompt_length)
 
     if args.mock_worker:
@@ -606,6 +627,9 @@ def main() -> None:
         gradient_checkpointing=torch.cuda.is_available(),
         optim=args.optim,
         temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        repetition_penalty=args.repetition_penalty,
         beta=0.0,  # no KL — matches Fugu-Ultra report
     )
 
@@ -636,31 +660,29 @@ def main() -> None:
     acceptance_passed = False
     checkpoint_path = str(out / "checkpoint")
 
-    if args.real_checkpoint_smoke:
-        test_prompt = _build_prompt(records[0]["task"], tok, slot_labels, args.max_prompt_length)
-        completion, format_reward = _acceptance_generation(
-            out / "checkpoint",
-            tok,
-            slot_labels,
-            test_prompt,
-            args.max_completion_length,
-            args.temperature,
+    # Acceptance test: reload the saved checkpoint and verify it still emits a
+    # parseable Conductor DAG. The full run is only valid if this passes.
+    test_prompt = _build_prompt(records[0]["task"], tok, slot_labels, args.max_prompt_length)
+    completion, format_reward = _acceptance_generation(
+        out / "checkpoint",
+        tok,
+        slot_labels,
+        test_prompt,
+        args.max_completion_length,
+        args.temperature,
+    )
+    acceptance_passed = bool(format_reward > 0.0)
+    print(
+        f"[retrain_conductor] acceptance generation: "
+        f"format_reward={format_reward} completion={completion[:200]!r}",
+        flush=True,
+    )
+    if not acceptance_passed:
+        raise RuntimeError(
+            "Checkpoint acceptance test failed: generated completion is not a "
+            f"parseable Conductor DAG. Reward={format_reward}"
         )
-        acceptance_passed = bool(format_reward > 0.0)
-        print(
-            f"[retrain_conductor] acceptance generation: "
-            f"format_reward={format_reward} completion={completion[:200]!r}",
-            flush=True,
-        )
-        if not acceptance_passed:
-            raise RuntimeError(
-                "Real-checkpoint acceptance test failed: generated completion is not a "
-                f"parseable Conductor DAG. Reward={format_reward}"
-            )
-        valid_for_runtime = real_checkpoint_loaded and device == "cuda" and acceptance_passed
-    else:
-        # Non-smoke/regular run: valid only if it actually trained the real checkpoint on GPU.
-        valid_for_runtime = real_checkpoint_loaded and device == "cuda"
+    valid_for_runtime = real_checkpoint_loaded and device == "cuda" and acceptance_passed
 
     _write_manifest(
         out=out,

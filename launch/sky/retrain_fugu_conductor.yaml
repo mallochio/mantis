@@ -19,8 +19,12 @@ envs:
   RETRAIN_NUM_GENERATIONS: "4"
   RETRAIN_PER_DEVICE_BATCH: "4"
   RETRAIN_MAX_PROMPT_LENGTH: "512"
-  RETRAIN_MAX_COMPLETION_LENGTH: "256"
+  RETRAIN_MAX_COMPLETION_LENGTH: "512"
   RETRAIN_OPTIM: "adamw_bnb_8bit"
+  RETRAIN_TEMPERATURE: "0.6"
+  RETRAIN_TOP_P: "0.9"
+  RETRAIN_TOP_K: "50"
+  RETRAIN_REPETITION_PENALTY: "1.0"
   FUGU_WORKER_TIMEOUT: "45"
   FUGU_WORKER_MAX_TOKENS: "256"
   FUGU_CONDUCTOR_MOCK_WORKER: "0"
@@ -69,6 +73,10 @@ run: |
     --max-prompt-length "$RETRAIN_MAX_PROMPT_LENGTH" \
     --max-completion-length "$RETRAIN_MAX_COMPLETION_LENGTH" \
     --optim "$RETRAIN_OPTIM" \
+    --temperature "$RETRAIN_TEMPERATURE" \
+    --top-p "$RETRAIN_TOP_P" \
+    --top-k "$RETRAIN_TOP_K" \
+    --repetition-penalty "$RETRAIN_REPETITION_PENALTY" \
     --worker-timeout "$FUGU_WORKER_TIMEOUT" \
     --worker-max-tokens "$FUGU_WORKER_MAX_TOKENS" \
     --output-dir "$RETRAIN_OUTPUT_DIR"
