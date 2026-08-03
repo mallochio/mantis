@@ -6,7 +6,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "tsc mantis.ts --outDir dist",
-    "test": "echo 'no automated tests yet; load mantis.ts into pi and run /mantis auto'"
+    "test": "bun run tests/stream-test.ts"
   },
   "devDependencies": {
     "@mariozechner/pi-ai": "^0.73.1",

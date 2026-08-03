@@ -157,13 +157,93 @@ def test_history_worker_with_history():
         assert msgs[0] == {"role": "system", "content": "sys\n\nrepository context"}
         assert msgs[1] == {"role": "user", "content": "q1"}
         assert msgs[2] == {"role": "assistant", "content": "a1"}
-        assert msgs[3] == {
-            "role": "user",
-            "content": "Previously generated code/solution:\n\na1\n\nUpdate it according to this instruction: q2",
-        }
+        assert msgs[3] == {"role": "user", "content": "q2"}
     finally:
         serve._history_context.history = []
         serve._history_context.calls = []
+
+
+def test_history_worker_multi_turn_no_duplicate_assistant_text():
+    """Assert each prior assistant response appears exactly once per worker call message list."""
+
+    class FakeWorker:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, role, messages, agent_id):
+            self.calls.append((role, messages, agent_id))
+            return "ok"
+
+    serve._history_context.history = [
+        {"role": "user", "content": "Write hello world"},
+        {"role": "assistant", "content": "UNIQUE_ASSISTANT_RESPONSE_1"},
+        {"role": "user", "content": "Add a docstring"},
+        {"role": "assistant", "content": "UNIQUE_ASSISTANT_RESPONSE_2"},
+    ]
+    serve._history_context.calls = []
+    try:
+        worker = serve.HistoryWorker(FakeWorker())
+        result = worker("Worker", [{"role": "user", "content": "Make it a function"}], 0)
+        assert result == "ok"
+        assert len(worker._worker.calls) == 1
+        _, msgs, _ = worker._worker.calls[0]
+        assert msgs == [
+            {"role": "user", "content": "Write hello world"},
+            {"role": "assistant", "content": "UNIQUE_ASSISTANT_RESPONSE_1"},
+            {"role": "user", "content": "Add a docstring"},
+            {"role": "assistant", "content": "UNIQUE_ASSISTANT_RESPONSE_2"},
+            {"role": "user", "content": "Make it a function"},
+        ]
+        # Count occurrences of prior assistant texts across all message content strings
+        all_content = [m["content"] for m in msgs if isinstance(m, dict)]
+        count_1 = sum(c.count("UNIQUE_ASSISTANT_RESPONSE_1") for c in all_content)
+        count_2 = sum(c.count("UNIQUE_ASSISTANT_RESPONSE_2") for c in all_content)
+        assert count_1 == 1
+        assert count_2 == 1
+        assert msgs[-1]["content"] == "Make it a function"
+    finally:
+        serve._history_context.history = []
+        serve._history_context.calls = []
+
+
+def test_verifier_accept_terminates_without_extra_turns():
+    class FakeRouter:
+        def __init__(self):
+            self.calls = 0
+
+        def route(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls > 2:
+                raise AssertionError("router called after verifier acceptance")
+            role = "Worker" if self.calls == 1 else "Verifier"
+            return {"agent_id": 0, "role_id": 0 if role == "Worker" else 2, "role_name": role}
+
+    class FakeWorker:
+        names = ["test-model"]
+
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, role, _messages, _agent_id):
+            self.calls += 1
+            return "draft" if role == "Worker" else "ACCEPT — complete"
+
+    router = FakeRouter()
+    worker = FakeWorker()
+    coord = serve.Coordinator(
+        serve.RejectAwareRouter(router),
+        serve.HistoryWorker(worker),
+        max_turns=5,
+        sample=False,
+    )
+
+    result = coord.run("answer this")
+
+    assert [turn.role_name for turn in result.turns] == ["Worker", "Verifier"]
+    assert result.final == "draft"
+    assert result.terminated_by == "verifier_accept"
+    assert router.calls == 2
+    assert worker.calls == 2
 
 
 def test_verifier_rejection_forces_worker_revision():
@@ -433,6 +513,80 @@ def test_handler_models():
         assert body["data"][0]["id"] in ("mantis", "fugu")
     finally:
         serve.get_coordinator = old
+        srv.shutdown()
+
+
+def test_handler_warm_trinity_and_conductor():
+    called_modes = []
+
+    def _mock_get_coordinator(mode: str):
+        called_modes.append(mode)
+        return _fake_get_coordinator(mode)
+
+    old = serve.get_coordinator
+    try:
+        serve.get_coordinator = _mock_get_coordinator
+        srv, port = _start_server(serve.Handler)
+        time.sleep(0.1)
+
+        # GET /warm?mode=trinity
+        req1 = Request(
+            f"http://127.0.0.1:{port}/warm?mode=trinity",
+            headers={"Authorization": "Bearer test-key"},
+        )
+        resp1 = urlopen(req1)
+        body1 = json.loads(resp1.read().decode())
+        assert resp1.status == 200
+        assert body1 == {"status": "ready", "mode": "trinity"}
+
+        # POST /warm with mode=conductor
+        payload = json.dumps({"mode": "conductor"}).encode()
+        req2 = Request(
+            f"http://127.0.0.1:{port}/warm",
+            data=payload,
+            headers={"Content-Type": "application/json", "Authorization": "Bearer test-key"},
+        )
+        resp2 = urlopen(req2)
+        body2 = json.loads(resp2.read().decode())
+        assert resp2.status == 200
+        assert body2 == {"status": "ready", "mode": "conductor"}
+
+        assert called_modes == ["trinity", "conductor"]
+    finally:
+        serve.get_coordinator = old
+        srv.shutdown()
+
+
+def test_handler_warm_invalid_mode():
+    old = serve.get_coordinator
+    try:
+        serve.get_coordinator = _fake_get_coordinator
+        srv, port = _start_server(serve.Handler)
+        time.sleep(0.1)
+
+        req = Request(
+            f"http://127.0.0.1:{port}/warm?mode=invalid",
+            headers={"Authorization": "Bearer test-key"},
+        )
+        with pytest.raises(HTTPError) as exc:
+            urlopen(req)
+        assert exc.value.code == 400
+        err_body = json.loads(exc.value.read().decode())
+        assert "unknown mode" in err_body.get("error", "")
+    finally:
+        serve.get_coordinator = old
+        srv.shutdown()
+
+
+def test_handler_warm_missing_auth():
+    srv, port = _start_server(serve.Handler)
+    try:
+        time.sleep(0.1)
+        req = Request(f"http://127.0.0.1:{port}/warm?mode=trinity")
+        with pytest.raises(HTTPError) as exc:
+            urlopen(req)
+        assert exc.value.code == 401
+    finally:
         srv.shutdown()
 
 
@@ -1042,3 +1196,367 @@ def test_env_local_conductor_auto_mps(monkeypatch):
     monkeypatch.delenv("FUGU_CONDUCTOR_DEVICE", raising=False)
     conductor = serve.EnvLocalConductor("/ckpt", device=None)
     assert conductor.device == "mps"
+
+
+# ---------------------------------------------------------------------------
+# Conductor Recovery & Observability (Plan 002) Tests
+# ---------------------------------------------------------------------------
+
+def test_conductor_planning_planner_step_emitted():
+    events = []
+
+    class FakeWorker:
+        slot_models = ["model-a", "model-b"]
+
+        def conduct(self, model, prompt):
+            return (
+                "model_id: [0]\n"
+                "subtasks: ['step 1']\n"
+                "access_list: ['all']"
+            )
+
+        def __call__(self, sub, messages, agent_id):
+            return "subtask output"
+
+    serve._history_context.write_line = events.append
+    serve._history_context.calls = []
+    serve._history_context.history = []
+    try:
+        coord = serve.ConductorCoordinator(serve.HistoryWorker(FakeWorker()))
+        res = coord.run("test query")
+        assert res.final == "subtask output"
+
+        # Check emitted events
+        start_events = [e for e in events if e.get("type") == "step-start"]
+        end_events = [e for e in events if e.get("type") == "step-end"]
+
+        assert len(start_events) == 2
+        assert len(end_events) == 2
+
+        # Turn 0: Planner
+        assert start_events[0]["role"] == "Planner"
+        assert start_events[0]["turn"] == 0
+        assert start_events[0]["prompt"] == "test query"
+
+        assert end_events[0]["role"] == "Planner"
+        assert end_events[0]["turn"] == 0
+        assert "model_id: [0]" in end_events[0]["reply"]
+
+        # Turn 1: Worker step
+        assert start_events[1]["role"] == "Worker"
+        assert start_events[1]["turn"] == 1
+
+        # Check turn numbering on result
+        assert len(res.turns) == 2
+        assert res.turns[0].role == "Planner"
+        assert res.turns[0].turn == 0
+        assert res.turns[1].role == "Worker"
+        assert res.turns[1].turn == 1
+    finally:
+        serve._history_context.write_line = None
+        serve._history_context.calls = []
+        serve._history_context.history = []
+        serve._history_context.conductor_mode = False
+
+
+def test_conductor_planning_empty_or_malformed_error():
+    class FakeEmptyWorker:
+        slot_models = ["model-a"]
+
+        def conduct(self, model, prompt):
+            return ""
+
+        def __call__(self, sub, messages, agent_id):
+            return "should not be called"
+
+    coord = serve.ConductorCoordinator(serve.HistoryWorker(FakeEmptyWorker()))
+    with pytest.raises(ValueError, match="empty completion"):
+        coord.run("query")
+
+    class FakeMalformedWorker:
+        slot_models = ["model-a"]
+
+        def conduct(self, model, prompt):
+            return "This is not a valid workflow."
+
+        def __call__(self, sub, messages, agent_id):
+            return "should not be called"
+
+    coord_malformed = serve.ConductorCoordinator(serve.HistoryWorker(FakeMalformedWorker()))
+    with pytest.raises(ValueError, match="Conductor did not emit a parseable workflow"):
+        coord_malformed.run("query")
+
+
+def test_conductor_node_empty_retry_success():
+    events = []
+
+    class FakeFlakyWorker:
+        slot_models = ["model-a"]
+
+        def __init__(self):
+            self.attempts = 0
+
+        def conduct(self, model, prompt):
+            return (
+                "model_id: [0]\n"
+                "subtasks: ['flaky step']\n"
+                "access_list: ['all']"
+            )
+
+        def __call__(self, sub, messages, agent_id):
+            self.attempts += 1
+            if self.attempts == 1:
+                return ""
+            return "recovered output"
+
+    serve._history_context.write_line = events.append
+    serve._history_context.calls = []
+    try:
+        coord = serve.ConductorCoordinator(serve.HistoryWorker(FakeFlakyWorker()))
+        res = coord.run("query")
+        assert res.final == "recovered output"
+
+        start_events = [e for e in events if e.get("type") == "step-start"]
+        end_events = [e for e in events if e.get("type") == "step-end"]
+
+        assert len(start_events) == 3
+        assert len(end_events) == 3
+
+        # Turn 0: Planner
+        assert start_events[0]["role"] == "Planner"
+        assert start_events[0]["turn"] == 0
+
+        # Turn 1: Worker attempt 1 (failed)
+        assert start_events[1]["role"] == "Worker"
+        assert start_events[1]["turn"] == 1
+        assert end_events[1]["reply"] == ""
+
+        # Turn 2: Worker attempt 2 (retry succeeded)
+        assert start_events[2]["role"] == "Worker"
+        assert start_events[2]["turn"] == 2
+        assert "empty response" in start_events[2]["prompt"]
+        assert end_events[2]["reply"] == "recovered output"
+
+        assert len(res.turns) == 3
+    finally:
+        serve._history_context.write_line = None
+        serve._history_context.calls = []
+        serve._history_context.conductor_mode = False
+
+
+def test_conductor_node_empty_retry_exhaustion():
+    events = []
+
+    class FakeAlwaysEmptyWorker:
+        slot_models = ["model-a"]
+
+        def conduct(self, model, prompt):
+            return (
+                "model_id: [0]\n"
+                "subtasks: ['always empty']\n"
+                "access_list: ['all']"
+            )
+
+        def __call__(self, sub, messages, agent_id):
+            return "   "
+
+    serve._history_context.write_line = events.append
+    serve._history_context.calls = []
+    try:
+        coord = serve.ConductorCoordinator(serve.HistoryWorker(FakeAlwaysEmptyWorker()))
+        with pytest.raises(ValueError, match="returned empty response after retry"):
+            coord.run("query")
+
+        start_events = [e for e in events if e.get("type") == "step-start"]
+        end_events = [e for e in events if e.get("type") == "step-end"]
+        assert len(start_events) == 3  # Planner, attempt 1, attempt 2
+        assert len(end_events) == 3
+    finally:
+        serve._history_context.write_line = None
+        serve._history_context.calls = []
+        serve._history_context.conductor_mode = False
+
+
+def test_conductor_worker_preserves_multi_turn_history_without_feedback_leakage():
+    class HistoryCaptureWorker:
+        slot_models = ["model-a"]
+
+        def __init__(self):
+            self.messages = []
+
+        def __call__(self, _subtask, messages, _agent_id):
+            self.messages = messages
+            return "done"
+
+    serve._history_context.history = [
+        {"role": "user", "content": "first request"},
+        {"role": "assistant", "content": "first answer"},
+    ]
+    serve._history_context.conductor_mode = True
+    serve._history_context.revision_feedback = "TRINITY FEEDBACK MUST NOT LEAK"
+    try:
+        raw_worker = HistoryCaptureWorker()
+        worker = serve.HistoryWorker(raw_worker)
+        assert worker("different subtask", [{"role": "user", "content": "current node"}], 0) == "done"
+        assert raw_worker.messages == [
+            {"role": "user", "content": "first request"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "user", "content": "current node"},
+        ]
+        assert all("TRINITY FEEDBACK MUST NOT LEAK" not in m["content"] for m in raw_worker.messages)
+    finally:
+        serve._history_context.history = []
+        serve._history_context.conductor_mode = False
+        serve._history_context.revision_feedback = None
+        serve._history_context.calls = []
+
+
+def test_conductor_no_feedback_leakage():
+    class LeakCheckWorker:
+        slot_models = ["model-a"]
+
+        def __init__(self):
+            self.received_prompts = []
+
+        def conduct(self, model, prompt):
+            return (
+                "model_id: [0, 0]\n"
+                "subtasks: ['step 1', 'step 2']\n"
+                "access_list: [[], [0]]"
+            )
+
+        def __call__(self, sub, messages, agent_id):
+            prompt_content = messages[-1]["content"]
+            self.received_prompts.append(prompt_content)
+            return "done step"
+
+    serve._history_context.revision_feedback = "LEAKED VERIFIER REJECTION FEEDBACK"
+    serve._history_context.force_worker = True
+    serve._history_context.calls = []
+    try:
+        worker = LeakCheckWorker()
+        coord = serve.ConductorCoordinator(serve.HistoryWorker(worker))
+        res = coord.run("query")
+        assert res.final == "done step"
+
+        # Conductor subtasks must not contain the Trinity revision_feedback
+        for prompt in worker.received_prompts:
+            assert "LEAKED VERIFIER REJECTION FEEDBACK" not in prompt
+
+        # Trinity feedback state must remain untouched during Conductor execution
+        assert serve._history_context.revision_feedback == "LEAKED VERIFIER REJECTION FEEDBACK"
+        assert serve._history_context.force_worker is True
+    finally:
+        serve._history_context.revision_feedback = None
+        serve._history_context.force_worker = False
+        serve._history_context.calls = []
+        serve._history_context.conductor_mode = False
+
+
+def test_conductor_complete_turn_numbering():
+    class MultiStepWorker:
+        slot_models = ["model-a"]
+
+        def conduct(self, model, prompt):
+            return (
+                "model_id: [0, 0, 0]\n"
+                "subtasks: ['task A', 'task B', 'task C']\n"
+                "access_list: [[], [0], [1]]"
+            )
+
+        def __call__(self, sub, messages, agent_id):
+            return f"out for {sub}"
+
+    serve._history_context.calls = []
+    try:
+        coord = serve.ConductorCoordinator(serve.HistoryWorker(MultiStepWorker()))
+        res = coord.run("multi step query")
+        turns = res.turns
+        assert len(turns) == 4  # 1 Planner + 3 Subtasks
+        for expected_turn, turn in enumerate(turns):
+            assert turn.turn == expected_turn
+            assert turn.idx == expected_turn
+            assert turn.t == expected_turn
+
+        assert turns[0].role == "Planner"
+        assert turns[1].role == "Worker"
+        assert turns[2].role == "Worker"
+        assert turns[3].role == "Worker"
+    finally:
+        serve._history_context.calls = []
+        serve._history_context.conductor_mode = False
+
+
+def test_worker_timeout_passthrough(monkeypatch):
+    captured_kw: dict[str, Any] = {}
+
+    def _completion(**kw):
+        captured_kw.update(kw)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
+
+    monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=_completion))
+    monkeypatch.setenv("MANTIS_WORKER_TIMEOUT", "120")
+
+    worker_trinity = serve.OpenRouterTrinityWorker(slot_models=["gpt-5.6-luna"], timeout=120)
+    res_trinity = worker_trinity("Worker", [{"role": "user", "content": "test"}], 0)
+    assert res_trinity == "ok"
+    assert captured_kw["timeout"] == 120.0
+
+    captured_kw.clear()
+    worker_conductor = serve.OpenRouterConductorWorker(slot_models=["gpt-5.6-luna"], timeout=180)
+    res_conductor = worker_conductor._call("gpt-5.6-luna", [{"role": "user", "content": "test"}])
+    assert res_conductor == "ok"
+    assert captured_kw["timeout"] == 180.0
+
+
+def test_disconnect_prevents_subsequent_steps(monkeypatch):
+    worker_calls = 0
+
+    class DisconnectingWorker:
+        slot_models = ["model-0"]
+        names = ["model-0"]
+
+        def __call__(self, role, messages, agent_id):
+            nonlocal worker_calls
+            worker_calls += 1
+            if worker_calls == 1:
+                # Simulate client disconnect after step 0
+                serve._history_context.aborted = True
+            return f"reply-{worker_calls}"
+
+    class MultiStepCoord:
+        def run(self, query, verbose=False):
+            worker = serve.HistoryWorker(DisconnectingWorker())
+            worker("Worker", [{"role": "user", "content": query}], 0)
+            # This second worker call should raise ClientDisconnectedError
+            r2 = worker("Thinker", [{"role": "user", "content": query}], 0)
+            return SimpleNamespace(final=r2, turns=[])
+
+    old = serve.get_coordinator
+    try:
+        serve.get_coordinator = lambda _mode: MultiStepCoord()
+        srv, port = _start_server(serve.Handler)
+        time.sleep(0.1)
+
+        payload = json.dumps(
+            {"model": "trinity", "messages": [{"role": "user", "content": "hi"}], "stream": True}
+        ).encode()
+        req = Request(
+            f"http://127.0.0.1:{port}/v1/chat/completions",
+            data=payload,
+            headers={"Content-Type": "application/json", "Authorization": "Bearer test-key"},
+        )
+        resp = urlopen(req)
+        # Read the first event
+        resp.readline()
+        resp.close()
+
+        time.sleep(0.2)
+        # Ensure only 1 worker call occurred before aborting
+        assert worker_calls == 1
+        assert getattr(serve._history_context, "write_line", None) is None
+        assert getattr(serve._history_context, "is_client_connected", None) is None
+        assert getattr(serve._history_context, "aborted", False) is False
+    finally:
+        serve.get_coordinator = old
+        srv.shutdown()

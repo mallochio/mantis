@@ -104,7 +104,9 @@ All model selection is env-driven. Export the variables before `docker compose u
 | `FUGU_CONDUCTOR_DTYPE` | Torch dtype for local Conductor | `bfloat16` on mps/cuda, `float32` on cpu |
 | `FUGU_CONDUCTOR_MAX_NEW` | Max new tokens for local Conductor | `512` |
 | `FUGU_MAX_TURNS` | TRINITY loop limit | `5` |
+| `MANTIS_WORKER_TIMEOUT` / `FUGU_WORKER_TIMEOUT` | LiteLLM worker completion call timeout in seconds | `240` |
 | `FUGU_AUTO_THRESHOLD` | Pi `/fugu auto` gate (score >= threshold -> conductor) | `6` |
+| `MANTIS_CONTEXT_WINDOW` / `FUGU_CONTEXT_WINDOW` | Advertised context window for all provider modes in tokens. Operators should set this to the smallest effective worker window leaving output reserve intact. | `256000` |
 
 ### Example `.zshrc` snippet
 

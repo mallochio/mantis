@@ -14,14 +14,19 @@ stdlib http.server only — no FastAPI/uvicorn.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import select
+import socket
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -50,6 +55,12 @@ MAX_BODY_BYTES = int(
         os.environ.get("FUGU_MAX_BODY_BYTES", str(5 * 1024 * 1024)),
     )
 )
+WORKER_TIMEOUT = float(
+    os.environ.get(
+        "MANTIS_WORKER_TIMEOUT",
+        os.environ.get("FUGU_WORKER_TIMEOUT", "240"),
+    )
+)
 
 # Aliases that carry a LiteLLM reasoning_effort parameter. OpenRouter/LiteLLM
 # reject temperature != 1 for these models.
@@ -60,19 +71,40 @@ _coordinators: dict[str, object] = {}
 _history_context = threading.local()
 
 
+class ClientDisconnectedError(Exception):
+    """Raised when client disconnects during streaming or step execution."""
+
+
+def _check_client_connected() -> None:
+    """Check if current request client connection is broken or aborted."""
+    if getattr(_history_context, "aborted", False):
+        raise ClientDisconnectedError("Client disconnected")
+    is_connected = getattr(_history_context, "is_client_connected", None)
+    if is_connected is not None and not is_connected():
+        _history_context.aborted = True
+        raise ClientDisconnectedError("Client disconnected")
+
+
 def _is_reasoning_model(model: str) -> bool:
     return any(model.startswith(p) for p in REASONING_ALIASES)
 
 
 def _build_litellm_kwargs(
-    model: str, messages: list[dict[str, str]], max_tokens: int, temperature: float
+    model: str,
+    messages: list[dict[str, str]],
+    max_tokens: int,
+    temperature: float,
+    timeout: float | None = None,
 ) -> dict[str, Any]:
     """Construct kwargs for a LiteLLM completion routed through the OpenRouter proxy."""
+    if timeout is None:
+        timeout = WORKER_TIMEOUT
     kw: dict[str, Any] = {
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
         "custom_llm_provider": "openai",
+        "timeout": timeout,
     }
     # LiteLLM's openai provider rejects temperature != 1 when reasoning_effort
     # is enabled (claude-*, gpt-5.6-*). Drop it for those models while keeping
@@ -149,59 +181,119 @@ class HistoryWorker:
                 return str(getattr(m, "content", ""))
         return ""
 
-    def _last_assistant_content(self, history: Any) -> str:
-        """Return the most recent non-empty assistant message, if any."""
-        if not isinstance(history, list):
-            return ""
-        for m in reversed(history):
-            if isinstance(m, dict) and m.get("role") == "assistant":
-                content = m.get("content", "")
-                if content and str(content).strip():
-                    return str(content)
-        return ""
-
-    def _enhance_worker_messages(self, messages: Any, history: Any) -> Any:
-        """For follow-up turns, wrap the worker query with the prior result.
-
-        The coordinator only sees the latest user message; without an explicit
-        pointer back to the previous assistant code, low-context workers answer
-        generically. This keeps the original user text intact for display."""
-        if not isinstance(messages, list) or not messages:
-            return messages
-        prior = self._last_assistant_content(history)
-        if not prior:
-            return messages
-        last = messages[-1]
-        if not isinstance(last, dict) or last.get("role") != "user":
-            return messages
-        original = str(last.get("content", ""))
-        if not original.strip():
-            return messages
-        enhanced = (
-            f"Previously generated code/solution:\n\n{prior}\n\n"
-            f"Update it according to this instruction: {original}"
-        )
-        return messages[:-1] + [{**last, "content": enhanced}]
-
     def __call__(self, *args: Any) -> Any:
+        _check_client_connected()
         if len(args) == 3:
             role_or_subtask, messages, agent_id = args
             combined = self._combine(messages)
+            is_conductor = getattr(_history_context, "conductor_mode", False)
             known_roles = {"Worker", "Thinker", "Verifier"}
             role = role_or_subtask if role_or_subtask in known_roles else "Worker"
-            # Workers in later turns need to know what they are editing.
+
+            if is_conductor:
+                original_prompt = self._last_user_prompt(messages)
+                call: dict[str, Any] = {
+                    "role": role,
+                    "agent_id": agent_id,
+                    "model_name": self._model_name(agent_id),
+                    "messages": combined,
+                    "prompt": original_prompt,
+                }
+                calls = getattr(_history_context, "calls", None)
+                if calls is not None:
+                    calls.append(call)
+                write_line = getattr(_history_context, "write_line", None)
+                turn_index = len(calls) - 1 if calls else 0
+                if write_line:
+                    write_line({
+                        "type": "step-start",
+                        "turn": turn_index,
+                        "role": role,
+                        "agent_id": agent_id,
+                        "model_name": call["model_name"],
+                        "prompt": call["prompt"],
+                    })
+                reply = self._worker(role_or_subtask, combined, agent_id)
+                call["reply"] = reply
+                if write_line:
+                    write_line({
+                        "type": "step-end",
+                        "turn": turn_index,
+                        "role": role,
+                        "agent_id": agent_id,
+                        "model_name": call["model_name"],
+                        "prompt": call["prompt"],
+                        "reply": reply,
+                    })
+
+                if reply and reply.strip():
+                    return reply
+
+                # Bounded retry once for an empty Conductor node
+                retry_instruction = (
+                    "\n\nPrevious attempt produced an empty response; produce a complete answer."
+                )
+                last_msg = (
+                    combined[-1]
+                    if combined and isinstance(combined[-1], dict)
+                    else {"role": "user", "content": ""}
+                )
+                retry_content = str(last_msg.get("content", "")) + retry_instruction
+                retry_messages = combined[:-1] + [{**last_msg, "content": retry_content}]
+                retry_prompt = self._last_user_prompt(retry_messages)
+                retry_call: dict[str, Any] = {
+                    "role": role,
+                    "agent_id": agent_id,
+                    "model_name": self._model_name(agent_id),
+                    "messages": retry_messages,
+                    "prompt": retry_prompt,
+                }
+                if calls is not None:
+                    calls.append(retry_call)
+                turn_index_retry = len(calls) - 1 if calls else 0
+                if write_line:
+                    write_line({
+                        "type": "step-start",
+                        "turn": turn_index_retry,
+                        "role": role,
+                        "agent_id": agent_id,
+                        "model_name": retry_call["model_name"],
+                        "prompt": retry_call["prompt"],
+                    })
+                reply_retry = self._worker(role_or_subtask, retry_messages, agent_id)
+                retry_call["reply"] = reply_retry
+                if write_line:
+                    write_line({
+                        "type": "step-end",
+                        "turn": turn_index_retry,
+                        "role": role,
+                        "agent_id": agent_id,
+                        "model_name": retry_call["model_name"],
+                        "prompt": retry_call["prompt"],
+                        "reply": reply_retry,
+                    })
+
+                if reply_retry and reply_retry.strip():
+                    return reply_retry
+
+                raise ValueError(
+                    f"Conductor subtask node {agent_id} returned empty response after retry."
+                )
+
             if role == "Worker":
-                history = getattr(_history_context, "history", None) or []
-                combined = self._enhance_worker_messages(combined, history)
                 feedback = getattr(_history_context, "revision_feedback", None)
                 if feedback and combined and isinstance(combined[-1], dict):
+                    prev_content = combined[-1].get("content", "")
                     combined[-1] = {
                         **combined[-1],
-                        "content": f"{combined[-1].get('content', '')}\n\nRevise the answer to address this verifier feedback:\n{feedback}",
+                        "content": (
+                            f"{prev_content}\n\n"
+                            f"Revise the answer to address this verifier feedback:\n{feedback}"
+                        ),
                     }
                     _history_context.revision_feedback = None
             original_prompt = self._last_user_prompt(messages)
-            call: dict[str, Any] = {
+            call = {
                 "role": role,
                 "agent_id": agent_id,
                 "model_name": self._model_name(agent_id),
@@ -226,7 +318,9 @@ class HistoryWorker:
             call["reply"] = reply
             if role == "Worker" and not reply.strip():
                 _history_context.force_worker = True
-                _history_context.revision_feedback = "Previous worker returned no response; produce a complete answer."
+                _history_context.revision_feedback = (
+                    "Previous worker returned no response; produce a complete answer."
+                )
             elif role == "Verifier" and reply.strip().upper().startswith("REJECT"):
                 _history_context.force_worker = True
                 _history_context.revision_feedback = reply
@@ -244,6 +338,7 @@ class HistoryWorker:
         return self._worker(*args)
 
     def conduct(self, *args: Any) -> Any:
+        _check_client_connected()
         if not (getattr(_history_context, "history", None) or []):
             return self._worker.conduct(*args)
         if len(args) == 2:
@@ -261,12 +356,32 @@ class HistoryWorker:
 class OpenRouterTrinityWorker(_TrinityLiteLLMWorker):
     """TRINITY worker that dispatches each turn through the LiteLLM/OpenRouter proxy."""
 
+    def __init__(
+        self,
+        slot_models: list[str] | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        api_key: str | None = None,
+        api_base: str | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        super().__init__(
+            slot_models=slot_models,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            api_key=api_key,
+            api_base=api_base,
+        )
+        self.timeout = timeout if timeout is not None else WORKER_TIMEOUT
+
     def __call__(self, role_name: str, messages: list, agent_id: int) -> str:
         import litellm
 
         model = self.slot_models[agent_id % len(self.slot_models)]
         msgs = [{"role": m["role"], "content": m["content"]} for m in messages]
-        kw = _build_litellm_kwargs(model, msgs, self.max_tokens, self.temperature)
+        kw = _build_litellm_kwargs(
+            model, msgs, self.max_tokens, self.temperature, timeout=self.timeout
+        )
         if self.api_key:
             kw["api_key"] = self.api_key
         if self.api_base:
@@ -277,8 +392,28 @@ class OpenRouterTrinityWorker(_TrinityLiteLLMWorker):
 class OpenRouterConductorWorker(_ConductorLiteLLMWorker):
     """Conductor worker that dispatches plan and step calls through LiteLLM/OpenRouter."""
 
+    def __init__(
+        self,
+        slot_models: list[str] | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        api_key: str | None = None,
+        api_base: str | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        super().__init__(
+            slot_models=slot_models,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            api_key=api_key,
+            api_base=api_base,
+        )
+        self.timeout = timeout if timeout is not None else WORKER_TIMEOUT
+
     def _call(self, model: str, messages: list) -> str:
-        kw = _build_litellm_kwargs(model, messages, self.max_tokens, self.temperature)
+        kw = _build_litellm_kwargs(
+            model, messages, self.max_tokens, self.temperature, timeout=self.timeout
+        )
         if self.api_key:
             kw["api_key"] = self.api_key
         if self.api_base:
@@ -422,10 +557,112 @@ class ConductorCoordinator:
             slot_labels or getattr(worker, "slot_models", None) or DEFAULT_SLOT_LABELS
         )
 
-    def run(self, query: str, verbose: bool = False):
+    def _prepare_planning(self, query: str) -> tuple[str, list[dict[str, Any]], Any]:
         conductor_model = _resolve_conductor_model(self.worker)
-        completion = self.worker.conduct(conductor_model, conductor_prompt(query, self.slot_labels))
-        return _run_conductor_workflow(self.worker, query, self.slot_labels, completion, verbose)
+        prompt_msgs = conductor_prompt(query, self.slot_labels)
+
+        def _get_completion() -> str:
+            return str(self.worker.conduct(conductor_model, prompt_msgs))
+
+        return conductor_model, prompt_msgs, _get_completion
+
+    def run(self, query: str, verbose: bool = False):
+        _history_context.conductor_mode = True
+        try:
+            conductor_model, prompt_msgs, get_completion = self._prepare_planning(query)
+
+            calls = getattr(_history_context, "calls", None)
+            if calls is None:
+                calls = []
+                _history_context.calls = calls
+
+            write_line = getattr(_history_context, "write_line", None)
+            planner_turn = len(calls)
+            planner_call: dict[str, Any] = {
+                "role": "Planner",
+                "agent_id": 0,
+                "model_name": conductor_model,
+                "messages": prompt_msgs,
+                "prompt": query,
+            }
+            calls.append(planner_call)
+
+            if write_line:
+                write_line({
+                    "type": "step-start",
+                    "turn": planner_turn,
+                    "role": "Planner",
+                    "agent_id": 0,
+                    "model_name": conductor_model,
+                    "prompt": query,
+                })
+
+            completion = get_completion()
+            planner_call["reply"] = completion
+
+            if write_line:
+                write_line({
+                    "type": "step-end",
+                    "turn": planner_turn,
+                    "role": "Planner",
+                    "agent_id": 0,
+                    "model_name": conductor_model,
+                    "prompt": query,
+                    "reply": completion,
+                })
+
+            if not completion or not str(completion).strip():
+                raise ValueError("Conductor planning returned an empty completion.")
+
+            res = _run_conductor_workflow(self.worker, query, self.slot_labels, completion, verbose)
+
+            if len(calls) > 1:
+                turns = []
+                for idx, call in enumerate(calls):
+                    t = SimpleNamespace(
+                        idx=idx,
+                        turn=idx,
+                        t=idx,
+                        agent_id=call.get("agent_id", 0),
+                        role=call.get("role", "Worker"),
+                        role_name=call.get("role", "Worker"),
+                        subtask=call.get("prompt", ""),
+                        prompt=call.get("prompt", ""),
+                        reply=call.get("reply", ""),
+                        text=call.get("reply", ""),
+                        model_name=call.get("model_name", ""),
+                        sees=[],
+                    )
+                    turns.append(t)
+                res.turns = turns
+            else:
+                planner_turn_obj = SimpleNamespace(
+                    idx=0,
+                    turn=0,
+                    t=0,
+                    agent_id=0,
+                    role="Planner",
+                    role_name="Planner",
+                    subtask=query,
+                    prompt=query,
+                    reply=completion,
+                    text=completion,
+                    model_name=conductor_model,
+                    sees=[],
+                )
+                dag_steps = getattr(res, "steps", [])
+                for i, s in enumerate(dag_steps, start=1):
+                    if hasattr(s, "idx"):
+                        s.idx = i
+                    if hasattr(s, "t"):
+                        s.t = i
+                    if hasattr(s, "turn"):
+                        s.turn = i
+                res.turns = [planner_turn_obj] + dag_steps
+
+            return res
+        finally:
+            _history_context.conductor_mode = False
 
 
 def choose_conductor_device(torch_module: Any, env_device: str | None = None) -> str:
@@ -544,15 +781,23 @@ class EnvConductorCoordinator(ConductorCoordinator):
         super().__init__(worker, slot_labels=slot_labels)
         self.local_conductor = conductor
 
-    def run(self, query: str, verbose: bool = False):
-        if self.local_conductor is not None:
-            completion = self.local_conductor.conduct(conductor_prompt(query, self.slot_labels))
-        else:
-            completion = self.worker.conduct(
-                _resolve_conductor_model(self.worker),
-                conductor_prompt(query, self.slot_labels),
-            )
-        return _run_conductor_workflow(self.worker, query, self.slot_labels, completion, verbose)
+    def _prepare_planning(self, query: str) -> tuple[str, list[dict[str, Any]], Any]:
+        prompt_msgs = conductor_prompt(query, self.slot_labels)
+        lc = self.local_conductor
+        if lc is not None:
+            conductor_model = getattr(lc, "ckpt", "local-conductor")
+
+            def _get_completion_local() -> str:
+                return str(lc.conduct(prompt_msgs))
+
+            return conductor_model, prompt_msgs, _get_completion_local
+
+        conductor_model = _resolve_conductor_model(self.worker)
+
+        def _get_completion_worker() -> str:
+            return str(self.worker.conduct(conductor_model, prompt_msgs))
+
+        return conductor_model, prompt_msgs, _get_completion_worker
 
 
 def _split_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
@@ -634,11 +879,34 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
-    def _write_ndjson_line(self, obj: Any) -> None:
-        self.wfile.write((json.dumps(obj) + "\n").encode())
-        self.wfile.flush()
+    def is_connected(self) -> bool:
+        if getattr(self, "_disconnected", False):
+            return False
+        try:
+            sock = getattr(self, "connection", None)
+            if sock is None:
+                return True
+            r, _, _ = select.select([sock], [], [], 0)
+            if r:
+                buf = sock.recv(1, socket.MSG_PEEK)
+                if not buf:
+                    self._disconnected = True
+                    return False
+        except Exception:  # noqa: BLE001
+            self._disconnected = True
+            return False
+        return True
 
-    def _handle_stream(self, coordinator_mode: str, query: str, model: str) -> None:
+    def _write_ndjson_line(self, obj: Any) -> None:
+        try:
+            self.wfile.write((json.dumps(obj) + "\n").encode())
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError) as err:
+            self._disconnected = True
+            _history_context.aborted = True
+            raise ClientDisconnectedError("Client disconnected") from err
+
+    def _run_stream(self, coordinator_mode: str, query: str, model: str) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
         self.send_header("Cache-Control", "no-cache")
@@ -646,48 +914,98 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
         _history_context.write_line = self._write_ndjson_line
+        _history_context.is_client_connected = self.is_connected
+        _history_context.aborted = False
         _history_context.calls = []
         _history_context.force_worker = False
         _history_context.revision_feedback = None
         try:
             coord = get_coordinator(coordinator_mode)
             res = coord.run(query, verbose=False)
+        except ClientDisconnectedError:
+            print("[serve] client disconnected during stream, aborting orchestration", flush=True)
+            return
         except Exception as e:  # noqa: BLE001
-            self._write_ndjson_line({"type": "error", "error": str(e)})
+            with contextlib.suppress(
+                BrokenPipeError, ConnectionResetError, OSError, ClientDisconnectedError
+            ):
+                self._write_ndjson_line({"type": "error", "error": str(e)})
             return
         finally:
             _history_context.write_line = None
+            _history_context.is_client_connected = None
+            _history_context.aborted = False
             _history_context.history = []
             _history_context.force_worker = False
             _history_context.revision_feedback = None
             calls = getattr(_history_context, "calls", [])
             _history_context.calls = []
+
         for turn, call in zip(getattr(res, "turns", []), calls, strict=False):
             turn.prompt = call.get("prompt", "")
             turn.model_name = call.get("model_name", "")
         body = _chat_response(res, model)
-        self._write_ndjson_line({
-            "type": "result",
-            "text": body["choices"][0]["message"]["content"],
-            "trace": body["usage"]["mantis_trace"],
-            "coordinator": coordinator_mode,
-            "mantis_steps": body.get("mantis_steps", []),
-            **body,
-        })
+        try:
+            self._write_ndjson_line({
+                "type": "result",
+                "text": body["choices"][0]["message"]["content"],
+                "trace": body["usage"]["mantis_trace"],
+                "coordinator": coordinator_mode,
+                "mantis_steps": body.get("mantis_steps", []),
+                **body,
+            })
+        except ClientDisconnectedError:
+            print("[serve] client disconnected before writing final result", flush=True)
+
+    def _handle_stream(self, coordinator_mode: str, query: str, model: str) -> None:
+        self._run_stream(coordinator_mode, query, model)
+
+    def _handle_warm(
+        self, parsed: urllib.parse.ParseResult, mode_from_body: str | None = None
+    ) -> None:
+        if not self._check_auth():
+            return
+        qs = urllib.parse.parse_qs(parsed.query)
+        mode = mode_from_body or (qs.get("mode", ["trinity"])[0] if qs.get("mode") else "trinity")
+        if mode not in ("trinity", "conductor"):
+            self._send(400, {"error": f"unknown mode: {mode}"})
+            return
+        try:
+            get_coordinator(mode)
+            self._send(200, {"status": "ready", "mode": mode})
+        except Exception as e:  # noqa: BLE001
+            self._send(500, {"error": str(e)})
 
     def do_GET(self) -> None:
-        if self.path == "/v1/models":
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path in ("/warm", "/v1/warm"):
+            self._handle_warm(parsed)
+        elif parsed.path == "/v1/models":
             if not self._check_auth():
                 return
             self._send(200, {"object": "list", "data": [
                 {"id": MODEL_NAME, "object": "model", "owned_by": "mantis"}]})
-        elif self.path in ("/health", "/"):
+        elif parsed.path in ("/health", "/"):
             self._send(200, {"status": "ok", "model": MODEL_NAME})
         else:
             self._send(404, {"error": "not found"})
 
     def do_POST(self) -> None:
-        if self.path.rstrip("/") != "/v1/chat/completions":
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path in ("/warm", "/v1/warm"):
+            mode = None
+            try:
+                raw = self._read_request_body()
+                if raw:
+                    req = json.loads(raw)
+                    if isinstance(req, dict):
+                        mode = req.get("mode")
+            except (json.JSONDecodeError, ValueError, KeyError, RuntimeError, TypeError):
+                pass
+            self._handle_warm(parsed, mode_from_body=mode)
+            return
+
+        if parsed.path.rstrip("/") != "/v1/chat/completions":
             self._send(404, {"error": "not found"})
             return
         if not self._check_auth():
@@ -722,11 +1040,21 @@ class Handler(BaseHTTPRequestHandler):
             _history_context.calls = []
             _history_context.force_worker = False
             _history_context.revision_feedback = None
+            _history_context.is_client_connected = self.is_connected
+            _history_context.aborted = False
             try:
                 coord = get_coordinator(coordinator_mode)
                 res = coord.run(query, verbose=False)
+            except ClientDisconnectedError:
+                print(
+                    "[serve] client disconnected during request, aborting orchestration",
+                    flush=True,
+                )
+                return
             finally:
                 _history_context.history = []
+                _history_context.is_client_connected = None
+                _history_context.aborted = False
                 _history_context.force_worker = False
                 _history_context.revision_feedback = None
                 calls = getattr(_history_context, "calls", [])
@@ -868,7 +1196,9 @@ def load_coordinator(mode: str):
     MAX_TURNS = args.max_turns
     worker = HistoryWorker(_worker_from_args(args, mode))
     if mode == "trinity":
-        return Coordinator(RejectAwareRouter(get_router()), worker, max_turns=args.max_turns, sample=True)
+        return Coordinator(
+            RejectAwareRouter(get_router()), worker, max_turns=args.max_turns, sample=True
+        )
     local_ckpt = os.environ.get("MANTIS_LOCAL_CONDUCTOR", os.environ.get("FUGU_LOCAL_CONDUCTOR"))
     conductor = EnvLocalConductor(local_ckpt) if local_ckpt else None
     return EnvConductorCoordinator(

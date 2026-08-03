@@ -89,6 +89,7 @@ Thumbs.db
 !runs/logs/*.log
 outputs/
 /tmp/
+.scratch/
 
 # Model Weights & Binary Data (ignore by default; only the baseline router head is tracked)
 *.safetensors

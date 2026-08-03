@@ -96,6 +96,20 @@ function getApiKey(): string {
   return "";
 }
 
+export function getMantisContextWindow(): number {
+  const envVal = process.env.MANTIS_CONTEXT_WINDOW ?? process.env.FUGU_CONTEXT_WINDOW;
+  if (envVal) {
+    const trimmed = envVal.trim();
+    if (/^\d+$/.test(trimmed)) {
+      const parsed = parseInt(trimmed, 10);
+      if (parsed > 0) {
+        return parsed;
+      }
+    }
+  }
+  return 256000;
+}
+
 function getMantisUrl(): string {
   return process.env.MANTIS_URL ?? process.env.FUGU_URL ?? "http://127.0.0.1:8088/v1";
 }
@@ -110,7 +124,7 @@ const ROUTING_LOG_DIR = path.join(os.homedir(), ".config", "mantis");
 const ROUTING_LOG_PATH = path.join(ROUTING_LOG_DIR, "routing-log.jsonl");
 
 let activeMode: Mode = "off";
-const warmed = new Set<string>();
+export const warmed = new Set<string>();
 
 function logRouting(score: number, coordinator: string, text: string) {
   try {
@@ -187,7 +201,6 @@ function getRepositoryContext(cwd = process.cwd()): string {
 
 interface BackendMessagesResult {
   messages: ChatMessage[];
-  key: string;
   lastUserContent: string;
 }
 
@@ -222,13 +235,17 @@ function toBackendMessages(context: Context): BackendMessagesResult {
     }
   }
 
-  const key = JSON.stringify(messages);
-  return { messages, key, lastUserContent };
+  return { messages, lastUserContent };
 }
 
-async function supraScore(text: string): Promise<number> {
+async function supraScore(text: string, signal?: AbortSignal): Promise<number> {
   const apiKey = getApiKey();
   const routerUrl = getRouterUrl();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30_000);
+  const onAbort = () => controller.abort();
+  signal?.addEventListener("abort", onAbort, { once: true });
+  if (signal?.aborted) controller.abort();
   try {
     const probeText = text.slice(0, 500);
     const res = await fetch(`${routerUrl}/chat/completions`, {
@@ -239,21 +256,25 @@ async function supraScore(text: string): Promise<number> {
         messages: [{ role: "user", content: probeText }],
         max_tokens: 1,
       }),
+      signal: controller.signal,
     });
     return parseInt(res.headers.get("x-route-supra-complexity") ?? "1", 10);
   } catch {
     return 1;
+  } finally {
+    clearTimeout(timeout);
+    signal?.removeEventListener("abort", onAbort);
   }
 }
 
-async function chooseCoordinator(lastUserContent: string): Promise<"trinity" | "conductor"> {
-  const score = await supraScore(lastUserContent);
+async function chooseCoordinator(lastUserContent: string, signal?: AbortSignal): Promise<"trinity" | "conductor"> {
+  const score = await supraScore(lastUserContent, signal);
   const coordinator = score >= AUTO_THRESHOLD ? "conductor" : "trinity";
   logRouting(score, coordinator, lastUserContent);
   return coordinator;
 }
 
-async function warm(coordinator: string, ctx: ExtensionContext) {
+export async function warm(coordinator: string, ctx: ExtensionContext, timeoutMs: number = 30000) {
   if (warmed.has(coordinator)) return;
   const apiKey = getApiKey();
   const mantisUrl = getMantisUrl();
@@ -264,40 +285,40 @@ async function warm(coordinator: string, ctx: ExtensionContext) {
 
   ctx.ui.notify?.(`mantis: warming ${coordinator} (first call may download weights)…`, "info");
 
-  try {
-    const health = await fetch(`${mantisUrl}/models`, {
-      headers: { Authorization: `Bearer ${apiKey}` },
-    });
-    if (health.ok) {
-      warmed.add(coordinator);
-      ctx.ui.notify?.(`mantis: ${coordinator} ready`, "info");
-      return;
-    }
-  } catch {
-    // fall through
-  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    await fetch(`${mantisUrl}/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: coordinator,
-        messages: [{ role: "user", content: "ping" }],
-        max_tokens: 1,
-      }),
+    const res = await fetch(`${mantisUrl}/warm?mode=${encodeURIComponent(coordinator)}`, {
+      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+      signal: controller.signal,
     });
-    warmed.add(coordinator);
-    ctx.ui.notify?.(`mantis: ${coordinator} ready`, "info");
+    if (res.ok) {
+      warmed.add(coordinator);
+      ctx.ui.notify?.(`mantis: ${coordinator} ready`, "info");
+    } else {
+      let errDetail = `status ${res.status}`;
+      try {
+        const data = await res.json();
+        if (data.error) errDetail = data.error;
+      } catch {
+        // use status
+      }
+      ctx.ui.notify?.(`mantis: warm failed (${coordinator}): ${errDetail}`, "warning");
+    }
   } catch (e: any) {
-    ctx.ui.notify?.(`mantis: warm failed (${coordinator}): ${e.message}`, "warning");
+    const msg = e.name === "AbortError" ? "request timed out" : (e.message || String(e));
+    ctx.ui.notify?.(`mantis: warm failed (${coordinator}): ${msg}`, "warning");
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-async function* streamOrchestrate(
+export async function* streamOrchestrate(
   coordinator: string,
   messages: ChatMessage[],
   signal?: AbortSignal,
+  timeoutSeconds: number = 300,
 ): AsyncGenerator<StreamEvent> {
   const apiKey = getApiKey();
   const mantisUrl = getMantisUrl();
@@ -307,35 +328,76 @@ async function* streamOrchestrate(
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 300_000);
+  let isTimeout = false;
+  let isUserAbort = false;
+
+  const timeoutId = setTimeout(() => {
+    isTimeout = true;
+    controller.abort();
+  }, timeoutSeconds * 1000);
+
+  const onAbort = () => {
+    isUserAbort = true;
+    controller.abort();
+  };
+
   if (signal) {
-    signal.addEventListener("abort", () => controller.abort(), { once: true });
+    if (signal.aborted) {
+      isUserAbort = true;
+      controller.abort();
+    } else {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
   }
 
+  const formatError = (err: any): Error => {
+    if (isTimeout) {
+      return new Error(`mantis request timed out after ${timeoutSeconds} seconds`);
+    }
+    if (isUserAbort || signal?.aborted || err?.name === "AbortError" || err?.message === "aborted") {
+      return new Error("mantis request aborted by user");
+    }
+    if (err instanceof Error) {
+      return err;
+    }
+    return new Error(String(err));
+  };
+
   try {
-    const res = await fetch(`${mantisUrl}/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: coordinator,
-        messages,
-        stream: true,
-      }),
-      signal: controller.signal,
-    });
+    let res: Response;
+    try {
+      res = await fetch(`${mantisUrl}/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model: coordinator,
+          messages,
+          stream: true,
+        }),
+        signal: controller.signal,
+      });
+    } catch (e: any) {
+      if (isTimeout) {
+        throw new Error(`mantis request timed out after ${timeoutSeconds} seconds`);
+      }
+      if (isUserAbort || signal?.aborted || e?.name === "AbortError" || e?.message === "aborted") {
+        throw new Error("mantis request aborted by user");
+      }
+      throw new Error(`mantis backend disconnected: ${e?.message || String(e)}`);
+    }
 
     if (!res.ok) {
       const body = await res.text();
-      throw new Error(`mantis backend HTTP ${res.status}: ${body}`);
+      throw new Error(`mantis provider failure (HTTP ${res.status}): ${body}`);
     }
 
     // Older orchestrator images ignore `stream: true` and return one regular
     // OpenAI completion. Accept that response without requiring a backend rebuild.
     if (res.headers.get("content-type")?.includes("application/json")) {
-      const body = await res.json() as any;
+      const body = (await res.json()) as any;
       const text = body.choices?.[0]?.message?.content;
       if (typeof text !== "string") {
-        throw new Error("mantis backend returned an invalid completion");
+        throw new Error("mantis provider failure: backend returned an invalid completion");
       }
       yield {
         type: "result",
@@ -349,13 +411,23 @@ async function* streamOrchestrate(
 
     const reader = res.body?.getReader();
     if (!reader) {
-      throw new Error("mantis backend returned an empty response body");
+      throw new Error("mantis backend disconnected: empty response body");
     }
 
     const decoder = new TextDecoder();
     let buffer = "";
     while (true) {
-      const { done, value } = await reader.read();
+      let readResult: ReadableStreamReadResult<Uint8Array>;
+      try {
+        readResult = await reader.read();
+      } catch (e: any) {
+        throw formatError(
+          e?.name === "TypeError" || e?.name === "FetchError"
+            ? new Error(`mantis backend disconnected: ${e?.message || String(e)}`)
+            : e,
+        );
+      }
+      const { done, value } = readResult;
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
@@ -365,28 +437,41 @@ async function* streamOrchestrate(
         if (!trimmed) continue;
         try {
           const data = JSON.parse(trimmed);
+          if (data.type === "error") {
+            throw new Error(`mantis provider failure: ${data.error}`);
+          }
           yield data as StreamEvent;
-        } catch {
-          // Ignore malformed NDJSON lines.
+        } catch (e: any) {
+          if (e.message?.startsWith("mantis provider failure:")) {
+            throw e;
+          }
+          throw new Error("Malformed NDJSON event from mantis backend: " + trimmed);
         }
       }
     }
     if (buffer.trim()) {
+      const trimmed = buffer.trim();
       try {
-        yield JSON.parse(buffer.trim()) as StreamEvent;
-      } catch {
-        // Ignore trailing malformed line.
+        const data = JSON.parse(trimmed);
+        if (data.type === "error") {
+          throw new Error(`mantis provider failure: ${data.error}`);
+        }
+        yield data as StreamEvent;
+      } catch (e: any) {
+        if (e.message?.startsWith("mantis provider failure:")) {
+          throw e;
+        }
+        throw new Error("Malformed NDJSON event from mantis backend: " + trimmed);
       }
     }
+  } catch (err: any) {
+    throw formatError(err);
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(timeoutId);
+    if (signal) {
+      signal.removeEventListener("abort", onAbort);
+    }
   }
-}
-
-async function collectStream<T>(gen: AsyncGenerator<T>): Promise<T[]> {
-  const items: T[] = [];
-  for await (const item of gen) items.push(item);
-  return items;
 }
 
 function emitText(stream: AssistantMessageEventStream, text: string, output: AssistantMessage) {
@@ -401,8 +486,13 @@ function emitText(stream: AssistantMessageEventStream, text: string, output: Ass
   stream.push({ type: "text_end", contentIndex, content: text, partial: output });
 }
 
-const MAX_SESSION_CACHE = 32;
-const sessionCache = new Map<string, { finalText: string; finalTrace: string; steps: MantisStep[] }>();
+interface PendingFinal {
+  finalText: string;
+  toolCallIds: string[];
+}
+
+const MAX_PENDING_FINALS = 128;
+const pendingFinalByToolCallId = new Map<string, PendingFinal>();
 
 const MAX_TOOL_CACHE = 128;
 const toolReplyCache = new Map<string, MantisStep>();
@@ -412,6 +502,33 @@ function pruneMap<K, V>(map: Map<K, V>, maxSize: number) {
     const first = map.keys().next().value;
     if (first !== undefined) map.delete(first);
   }
+}
+
+function takePendingFinal(messages: Message[]): PendingFinal | undefined {
+  const trailingToolCallIds: string[] = [];
+  for (let i = messages.length - 1; i >= 0 && messages[i].role === "toolResult"; i--) {
+    const message = messages[i];
+    if (message.role === "toolResult" && message.toolName === "mantis_step") {
+      trailingToolCallIds.push(message.toolCallId);
+    }
+  }
+  if (trailingToolCallIds.length === 0) return undefined;
+
+  const matches = new Set(
+    trailingToolCallIds
+      .map((toolCallId) => pendingFinalByToolCallId.get(toolCallId))
+      .filter((pending): pending is PendingFinal => pending !== undefined),
+  );
+  if (matches.size === 0) {
+    throw new Error("mantis final response bridge is unavailable or already consumed");
+  }
+  if (matches.size > 1) {
+    throw new Error("mantis tool results refer to multiple pending responses");
+  }
+
+  const pending = matches.values().next().value as PendingFinal;
+  for (const toolCallId of pending.toolCallIds) pendingFinalByToolCallId.delete(toolCallId);
+  return pending;
 }
 
 function mantisStreamSimple(
@@ -446,17 +563,17 @@ function mantisStreamSimple(
       }
 
       const mode = model.id as Mode;
-      const { messages: backendMessages, key, lastUserContent } = toBackendMessages(context);
+      const pendingFinal = takePendingFinal(context.messages);
+      const { messages: backendMessages, lastUserContent } = toBackendMessages(context);
       output.usage.input = Math.ceil(backendMessages.reduce((chars, message) => chars + message.content.length, 0) / 4);
       output.usage.totalTokens = output.usage.input;
       if (output.usage.input > model.contextWindow - model.maxTokens) {
         throw new Error(`input token count ${output.usage.input} exceeds the context window of this model`);
       }
 
-      const cached = sessionCache.get(key);
-      if (cached) {
+      if (pendingFinal) {
         stream.push({ type: "start", partial: output });
-        emitText(stream, cached.finalText, output);
+        emitText(stream, pendingFinal.finalText, output);
         output.stopReason = "stop";
         stream.push({ type: "done", reason: "stop", message: output });
         stream.end?.();
@@ -467,19 +584,22 @@ function mantisStreamSimple(
         throw new Error("No user message to process");
       }
 
-      const coordinator = mode === "auto" ? await chooseCoordinator(lastUserContent) : mode;
-      const events = await collectStream(streamOrchestrate(coordinator, backendMessages, options?.signal));
+      const coordinator = mode === "auto" ? await chooseCoordinator(lastUserContent, options?.signal) : mode;
+      if (options?.signal?.aborted) throw new Error("aborted");
+
+      stream.push({ type: "start", partial: output });
 
       const steps: MantisStep[] = [];
+      const toolCallIds: string[] = [];
       let finalText = "";
-      let finalTrace = "";
+      let hasResult = false;
 
-      for (const ev of events) {
+      for await (const ev of streamOrchestrate(coordinator, backendMessages, options?.signal)) {
         if (ev.type === "step-start") {
-          // Only stored via step-end; no-op here.
+          // Stored via step-end; no-op here.
         } else if (ev.type === "step-end") {
           const reply = ev.reply?.trim() ? ev.reply : "(no response)";
-          steps.push({
+          const step: MantisStep = {
             turn: ev.turn,
             agent_id: ev.agent_id,
             role: ev.role,
@@ -487,15 +607,75 @@ function mantisStreamSimple(
             prompt: ev.prompt,
             model_name: ev.model_name,
             output: reply,
+          };
+          steps.push(step);
+
+          const toolCallId = `mantis_${output.timestamp}_${steps.length - 1}_${Math.random().toString(36).slice(2, 8)}`;
+          toolCallIds.push(toolCallId);
+          toolReplyCache.set(toolCallId, step);
+          pruneMap(toolReplyCache, MAX_TOOL_CACHE);
+
+          const toolCall: ToolCall = {
+            type: "toolCall",
+            id: toolCallId,
+            name: "mantis_step",
+            arguments: {
+              turn: step.turn,
+              role: step.role,
+              agent_id: step.agent_id,
+              model_name: step.model_name,
+              prompt: step.prompt,
+            },
+          };
+
+          const contentIndex = output.content.length;
+          output.content.push(toolCall as any);
+          stream.push({ type: "toolcall_start", contentIndex, partial: output });
+          stream.push({
+            type: "toolcall_end",
+            contentIndex,
+            toolCall,
+            partial: output,
           });
         } else if (ev.type === "result") {
+          if (hasResult) {
+            throw new Error("Duplicate terminal result event received");
+          }
+          hasResult = true;
           finalText = ev.text;
-          finalTrace = ev.trace;
-          // Fallback if the backend did not emit per-step events.
-          if (steps.length === 0) {
-            for (const s of ev.mantis_steps || []) {
+          if (steps.length === 0 && ev.mantis_steps?.length) {
+            for (const s of ev.mantis_steps) {
               const reply = s.reply?.trim() ? s.reply : "(no response)";
-              steps.push({ ...s, reply, output: reply });
+              const step: MantisStep = { ...s, reply, output: reply };
+              steps.push(step);
+
+              const toolCallId = `mantis_${output.timestamp}_${steps.length - 1}_${Math.random().toString(36).slice(2, 8)}`;
+              toolCallIds.push(toolCallId);
+              toolReplyCache.set(toolCallId, step);
+              pruneMap(toolReplyCache, MAX_TOOL_CACHE);
+
+              const toolCall: ToolCall = {
+                type: "toolCall",
+                id: toolCallId,
+                name: "mantis_step",
+                arguments: {
+                  turn: step.turn,
+                  role: step.role,
+                  agent_id: step.agent_id,
+                  model_name: step.model_name,
+                  prompt: step.prompt,
+                },
+              };
+
+              const contentIndex = output.content.length;
+              output.content.push(toolCall as any);
+              stream.push({ type: "toolcall_start", contentIndex, partial: output });
+              stream.push({
+                type: "toolcall_end",
+                contentIndex,
+                toolCall,
+                partial: output,
+              });
             }
           }
         } else if (ev.type === "error") {
@@ -503,51 +683,24 @@ function mantisStreamSimple(
         }
       }
 
-      sessionCache.set(key, { finalText, finalTrace, steps });
-      pruneMap(sessionCache, MAX_SESSION_CACHE);
+      if (!hasResult) {
+        throw new Error("Stream ended without terminal result event");
+      }
 
-      stream.push({ type: "start", partial: output });
+      if (steps.length > 0) {
+        const pendingFinal = { finalText, toolCallIds };
+        for (const toolCallId of toolCallIds) pendingFinalByToolCallId.set(toolCallId, pendingFinal);
+        pruneMap(pendingFinalByToolCallId, MAX_PENDING_FINALS);
 
-      if (steps.length === 0) {
-        emitText(stream, finalText || "(no response)", output);
-        output.stopReason = "stop";
-        stream.push({ type: "done", reason: "stop", message: output });
+        output.stopReason = "toolUse";
+        stream.push({ type: "done", reason: "toolUse", message: output });
         stream.end?.();
         return;
       }
 
-      for (let i = 0; i < steps.length; i++) {
-        const step = steps[i];
-        const toolCallId = `mantis_${output.timestamp}_${i}_${Math.random().toString(36).slice(2, 8)}`;
-        toolReplyCache.set(toolCallId, step);
-        pruneMap(toolReplyCache, MAX_TOOL_CACHE);
-
-        const toolCall: ToolCall = {
-          type: "toolCall",
-          id: toolCallId,
-          name: "mantis_step",
-          arguments: {
-            turn: step.turn,
-            role: step.role,
-            agent_id: step.agent_id,
-            model_name: step.model_name,
-            prompt: step.prompt,
-          },
-        };
-
-        const contentIndex = output.content.length;
-        output.content.push(toolCall as any);
-        stream.push({ type: "toolcall_start", contentIndex, partial: output });
-        stream.push({
-          type: "toolcall_end",
-          contentIndex,
-          toolCall,
-          partial: output,
-        });
-      }
-
-      output.stopReason = "toolUse";
-      stream.push({ type: "done", reason: "toolUse", message: output });
+      emitText(stream, finalText || "(no response)", output);
+      output.stopReason = "stop";
+      stream.push({ type: "done", reason: "stop", message: output });
       stream.end?.();
     } catch (err: any) {
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
@@ -574,6 +727,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   // 1. Register mantis provider with custom streamSimple implementation.
+  const contextWindow = getMantisContextWindow();
   const models = [
     {
       id: "trinity",
@@ -581,7 +735,7 @@ export default function (pi: ExtensionAPI) {
       reasoning: true,
       input: ["text"] as ("text" | "image")[],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 256000,
+      contextWindow,
       maxTokens: 16384,
     },
     {
@@ -590,7 +744,7 @@ export default function (pi: ExtensionAPI) {
       reasoning: true,
       input: ["text"] as ("text" | "image")[],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 256000,
+      contextWindow,
       maxTokens: 16384,
     },
     {
@@ -599,7 +753,7 @@ export default function (pi: ExtensionAPI) {
       reasoning: true,
       input: ["text"] as ("text" | "image")[],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 256000,
+      contextWindow,
       maxTokens: 16384,
     },
   ];
@@ -616,7 +770,7 @@ export default function (pi: ExtensionAPI) {
   // 2. Register native mantis_step tool used by the provider to expose worker turns.
   const mantisStepSchema = Type.Object({
     turn: Type.Number({ description: "Step turn index" }),
-    role: Type.String({ description: "Role: Worker, Thinker, or Verifier" }),
+    role: Type.String({ description: "Role: Worker, Thinker, Verifier, or Planner" }),
     agent_id: Type.Number({ description: "Worker slot id (0..6)" }),
     model_name: Type.Optional(Type.String({ description: "Model name" })),
     prompt: Type.String({ description: "Prompt sent to the worker" }),
@@ -644,10 +798,10 @@ export default function (pi: ExtensionAPI) {
       return new Text(`${title}${details}`, 0, 0);
     },
 
-    renderResult(result: AgentToolResult<MantisStep>, _options: any, theme: any) {
+    renderResult(result: AgentToolResult<MantisStep>, { expanded }: { expanded?: boolean }, theme: any) {
+      if (!expanded) return new Text("", 0, 0);
       const outputStr = result.content?.[0]?.type === "text" ? result.content[0].text : JSON.stringify(result.content);
-      const formatted = theme.fg("toolOutput", outputStr);
-      return new Text(formatted, 0, 0);
+      return new Text(`\n${theme.fg("toolOutput", outputStr)}`, 0, 0);
     },
 
     async execute(toolCallId: string, params: MantisStepToolParams): Promise<AgentToolResult<MantisStep>> {
