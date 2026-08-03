@@ -9,7 +9,15 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Text } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
+import { Static, Type } from "@sinclair/typebox";
+import type {
+  AgentToolResult,
+  ExtensionAPI,
+  ExtensionCommandContext,
+  ExtensionContext,
+  InputEvent,
+  InputEventResult,
+} from "@mariozechner/pi-coding-agent";
 
 type Mode = "off" | "trinity" | "conductor" | "auto";
 
@@ -27,6 +35,12 @@ interface MantisStep {
   model_name?: string;
   output?: string;
 }
+
+type StreamEvent =
+  | { type: "step-start"; turn: number; role: string; agent_id: number; model_name: string; prompt: string }
+  | { type: "step-end"; turn: number; role: string; agent_id: number; model_name: string; prompt: string; reply: string }
+  | { type: "result"; text: string; trace: string; coordinator: string; mantis_steps: MantisStep[] }
+  | { type: "error"; error: string };
 
 const WORKER_NAMES: Record<number, string> = {
   0: "gemini-3.6-flash-high",
@@ -103,12 +117,12 @@ function logRouting(score: number, coordinator: string, text: string) {
   }
 }
 
-function buildMessagesHistory(ctx: any, currentText: string): ChatMessage[] {
+function buildMessagesHistory(ctx: ExtensionContext, currentText: string): ChatMessage[] {
   const messages: ChatMessage[] = [];
   try {
     const branch = ctx.sessionManager?.getBranch() ?? [];
     for (const entry of branch) {
-      const msg = entry.message;
+      const msg = (entry as any).message;
       if (!msg) continue;
 
       if (msg.role === "user") {
@@ -199,7 +213,7 @@ async function supraScore(text: string): Promise<number> {
   }
 }
 
-async function warm(coordinator: string, ctx: any) {
+async function warm(coordinator: string, ctx: ExtensionContext) {
   if (warmed.has(coordinator)) return;
   const apiKey = getApiKey();
   const mantisUrl = getMantisUrl();
@@ -240,12 +254,11 @@ async function warm(coordinator: string, ctx: any) {
   }
 }
 
-async function orchestrate(
+async function* streamOrchestrate(
   coordinator: string,
   messages: ChatMessage[],
-  ctx: any,
-): Promise<{ text: string; steps: MantisStep[] }> {
-  await warm(coordinator, ctx);
+  signal?: AbortSignal,
+): AsyncGenerator<StreamEvent> {
   const apiKey = getApiKey();
   const mantisUrl = getMantisUrl();
 
@@ -253,23 +266,66 @@ async function orchestrate(
     throw new Error("MANTIS_API_KEY / LITELLM_KEY is not set in environment or .env file");
   }
 
-  const res = await fetch(`${mantisUrl}/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model: coordinator,
-      messages,
-    }),
-    signal: AbortSignal.timeout(300_000),
-  });
-  if (!res.ok) throw new Error(`mantis backend HTTP ${res.status}`);
-  const data = await res.json();
-  const text = data.choices?.[0]?.message?.content ?? "(empty response)";
-  const steps: MantisStep[] = data.mantis_steps ?? data.choices?.[0]?.message?.mantis_steps ?? data.usage?.mantis_steps ?? [];
-  return { text, steps };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 300_000);
+  if (signal) {
+    signal.addEventListener("abort", () => controller.abort(), { once: true });
+  }
+
+  try {
+    const res = await fetch(`${mantisUrl}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: coordinator,
+        messages,
+        stream: true,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`mantis backend HTTP ${res.status}: ${body}`);
+    }
+
+    const reader = res.body?.getReader();
+    if (!reader) {
+      throw new Error("mantis backend returned an empty response body");
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const data = JSON.parse(trimmed);
+          yield data as StreamEvent;
+        } catch {
+          // Ignore malformed NDJSON lines.
+        }
+      }
+    }
+    if (buffer.trim()) {
+      try {
+        yield JSON.parse(buffer.trim()) as StreamEvent;
+      } catch {
+        // Ignore trailing malformed line.
+      }
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
-export default function (pi: any) {
+export default function (pi: ExtensionAPI) {
   // Ensure pi's auth resolver can find a MANTIS_API_KEY even if the user only
   // configured FUGU_API_KEY / LITELLM_KEY in the environment or .env file.
   const apiKey = getApiKey();
@@ -283,7 +339,7 @@ export default function (pi: any) {
       id: "trinity",
       name: "mantis: trinity",
       reasoning: true,
-      input: ["text"],
+      input: ["text"] as ("text" | "image")[],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: 128000,
       maxTokens: 16384,
@@ -292,7 +348,7 @@ export default function (pi: any) {
       id: "conductor",
       name: "mantis: conductor",
       reasoning: true,
-      input: ["text"],
+      input: ["text"] as ("text" | "image")[],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: 128000,
       maxTokens: 16384,
@@ -301,7 +357,7 @@ export default function (pi: any) {
       id: "auto",
       name: "mantis: auto",
       reasoning: true,
-      input: ["text"],
+      input: ["text"] as ("text" | "image")[],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: 128000,
       maxTokens: 16384,
@@ -325,25 +381,28 @@ export default function (pi: any) {
   });
 
   // 2. Register native tool mantis_step to expose background turns natively
+  const mantisStepSchema = Type.Object({
+    turn: Type.Number({ description: "Step turn index" }),
+    role: Type.String({ description: "Role: Worker, Thinker, or Verifier" }),
+    agent_id: Type.Number({ description: "Worker slot id (0..6)" }),
+    model_name: Type.Optional(Type.String({ description: "Model name" })),
+    output: Type.String({ description: "Step output content" }),
+  });
+  type MantisStepToolParams = Static<typeof mantisStepSchema>;
+
   pi.registerTool({
     name: "mantis_step",
     label: "Mantis Worker Step",
     description: "Executes an internal TRINITY/Conductor worker turn or DAG step",
-    parameters: Type.Object({
-      turn: Type.Number({ description: "Step turn index" }),
-      role: Type.String({ description: "Role: Worker, Thinker, or Verifier" }),
-      agent_id: Type.Number({ description: "Worker slot id (0..6)" }),
-      model_name: Type.Optional(Type.String({ description: "Model name" })),
-      output: Type.String({ description: "Step output content" }),
-    }),
+    parameters: mantisStepSchema,
     executionMode: "sequential",
 
-    renderCall(args: any, theme: any) {
+    renderCall(args: MantisStepToolParams, theme: any) {
       const role = args.role ?? "Worker";
       const agentId = args.agent_id ?? 0;
       const modelName = args.model_name ?? WORKER_NAMES[agentId] ?? `slot-${agentId}`;
 
-      let roleColor = "accent";
+      let roleColor: "accent" | "success" | "warning" = "accent";
       if (role === "Verifier") roleColor = "success";
       if (role === "Thinker") roleColor = "warning";
 
@@ -352,17 +411,16 @@ export default function (pi: any) {
       return new Text(`${title}${details}`, 0, 0);
     },
 
-    renderResult(result: any, _options: any, theme: any) {
+    renderResult(result: AgentToolResult<MantisStepToolParams>, _options: any, theme: any) {
       const outputStr = result.content?.[0]?.type === "text" ? result.content[0].text : JSON.stringify(result.content);
       const formatted = theme.fg("toolOutput", outputStr);
       return new Text(formatted, 0, 0);
     },
 
-    async execute(_toolCallId: string, params: any) {
+    async execute(_toolCallId: string, params: MantisStepToolParams): Promise<AgentToolResult<MantisStepToolParams>> {
       return {
         content: [{ type: "text", text: params.output }],
         details: params,
-        isError: false,
       };
     },
   });
@@ -400,7 +458,7 @@ export default function (pi: any) {
   });
 
   // 3. Register Slash Commands for mode switching & model setting
-  const switchMode = async (m: Mode, ctx: any) => {
+  const switchMode = async (m: Mode, ctx: ExtensionCommandContext) => {
     if (!["off", "trinity", "conductor", "auto"].includes(m)) {
       ctx.ui.notify?.("Usage: /mantis off|trinity|conductor|auto", "error");
       return;
@@ -425,20 +483,20 @@ export default function (pi: any) {
 
   pi.registerCommand("mantis", {
     description: "Set orchestration mode: off | trinity | conductor | auto",
-    handler: async (args: string, ctx: any) => {
+    handler: async (args: string, ctx: ExtensionCommandContext) => {
       await switchMode(args.trim().toLowerCase() as Mode, ctx);
     },
   });
 
   pi.registerCommand("fugu", {
     description: "Set orchestration mode (alias for /mantis)",
-    handler: async (args: string, ctx: any) => {
+    handler: async (args: string, ctx: ExtensionCommandContext) => {
       await switchMode(args.trim().toLowerCase() as Mode, ctx);
     },
   });
 
   // 4. Input Handler: Coordinates turns while preserving Native User / Assistant messages
-  pi.on("input", async (event: any, ctx: any) => {
+  pi.on("input", async (event: InputEvent, ctx: ExtensionContext): Promise<InputEventResult> => {
     if (
       (event.source !== "interactive" && event.source !== "rpc") ||
       activeMode === "off"
@@ -449,14 +507,15 @@ export default function (pi: any) {
     let coordinator: "trinity" | "conductor";
     let score: number | undefined;
 
-    ctx.ui.setWorkingMessage?.(`mantis: checking prompt complexity…`);
-    ctx.ui.setWorkingIndicator?.({ intervalMs: 120 });
+    ctx.ui.setWorkingMessage?.("mantis: checking prompt complexity…");
+    ctx.ui.setWorkingVisible?.(true);
 
     if (activeMode === "auto") {
       score = await supraScore(event.text);
       if (score <= 2) {
         logRouting(score, "bypass", event.text);
         ctx.ui.setWorkingMessage?.();
+        ctx.ui.setWorkingVisible?.(false);
         return { action: "continue" };
       }
       coordinator = score >= AUTO_THRESHOLD ? "conductor" : "trinity";
@@ -470,56 +529,57 @@ export default function (pi: any) {
 
     try {
       const fullMessages = buildMessagesHistory(ctx, event.text);
-      const { text, steps } = await orchestrate(coordinator, fullMessages, ctx);
-
-      ctx.ui.setWorkingMessage?.();
-
-      // Emit each background turn as a user message to the model followed by
-      // the model reply rendered as a native tool-call-style step.
-      if (steps && steps.length > 0) {
-        for (const step of steps) {
-          const modelName = step.model_name ?? WORKER_NAMES[step.agent_id] ?? `slot-${step.agent_id}`;
-          if (step.prompt) {
-            await pi.sendMessage(
-              {
-                customType: "mantis-prompt",
-                content: step.prompt,
-                details: {
-                  turn: step.turn,
-                  role: step.role,
-                  agent_id: step.agent_id,
-                  model_name: modelName,
-                },
-                display: true,
-              },
-              { triggerTurn: false },
-            );
-          }
-          await pi.sendMessage(
+      const stream = streamOrchestrate(coordinator, fullMessages, ctx.signal);
+      let finalText = "";
+      let finalTrace = "";
+      let finalSteps: MantisStep[] = [];
+      for await (const ev of stream) {
+        if (ev.type === "step-start") {
+          const modelName = ev.model_name ?? WORKER_NAMES[ev.agent_id] ?? `slot-${ev.agent_id}`;
+          pi.sendMessage(
+            {
+              customType: "mantis-prompt",
+              content: ev.prompt,
+              details: { turn: ev.turn, role: ev.role, agent_id: ev.agent_id, model_name: modelName },
+              display: true,
+            },
+            { triggerTurn: false },
+          );
+        } else if (ev.type === "step-end") {
+          const modelName = ev.model_name ?? WORKER_NAMES[ev.agent_id] ?? `slot-${ev.agent_id}`;
+          pi.sendMessage(
             {
               customType: "mantis-step",
-              content: step.reply ?? step.output ?? "",
+              content: ev.reply,
               details: {
-                turn: step.turn,
-                role: step.role,
-                agent_id: step.agent_id,
+                turn: ev.turn,
+                role: ev.role,
+                agent_id: ev.agent_id,
                 model_name: modelName,
-                prompt: step.prompt,
-                output: step.reply ?? step.output ?? "",
+                prompt: ev.prompt,
+                output: ev.reply,
               },
               display: true,
             },
             { triggerTurn: false },
           );
+        } else if (ev.type === "result") {
+          finalText = ev.text;
+          finalTrace = ev.trace;
+          finalSteps = ev.mantis_steps;
+        } else if (ev.type === "error") {
+          throw new Error(ev.error);
         }
       }
 
-      // Send response as native assistant message content via sendMessage
-      await pi.sendMessage(
+      ctx.ui.setWorkingMessage?.();
+      ctx.ui.setWorkingVisible?.(false);
+
+      pi.sendMessage(
         {
           customType: "mantis-result",
-          content: text,
-          details: { coordinator, score },
+          content: finalText,
+          details: { coordinator, score, trace: finalTrace, mantis_steps: finalSteps },
           display: true,
         },
         { triggerTurn: false },
@@ -528,13 +588,14 @@ export default function (pi: any) {
       return { action: "handled" };
     } catch (e: any) {
       ctx.ui.setWorkingMessage?.();
+      ctx.ui.setWorkingVisible?.(false);
       ctx.ui.notify?.(`mantis error: ${e.message} — falling back to normal turn`, "error");
       return { action: "continue" };
     }
   });
 
   // Track model selections natively
-  pi.on("model_select", async (event: any, ctx: any) => {
+  pi.on("model_select", async (event: any, ctx: ExtensionContext) => {
     if (event.model?.provider === "mantis" || event.model?.provider === "fugu") {
       const m = event.model.id as Mode;
       if (["trinity", "conductor", "auto"].includes(m)) {

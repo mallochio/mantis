@@ -537,6 +537,60 @@ def test_handler_post_coordinator_error():
         srv.shutdown()
 
 
+def test_handler_post_stream():
+    class FakeWorker:
+        slot_models = ["gpt-5.6-luna", "gpt-5.6-sol", "deepseek-v4"]
+        names = slot_models
+
+        def __call__(self, role, messages, agent_id):
+            return "ok"
+
+    class StreamCoord:
+        def run(self, query, verbose=False):
+            worker = serve.HistoryWorker(FakeWorker())
+            r1 = worker("Worker", [{"role": "user", "content": query}], 4)
+            r2 = worker("Thinker", [{"role": "user", "content": query}], 1)
+            r3 = worker("Verifier", [{"role": "user", "content": query}], 1)
+            return SimpleNamespace(
+                final="final answer",
+                turns=[
+                    SimpleNamespace(t=1, agent_id=4, role_name="Worker", reply=r1),
+                    SimpleNamespace(t=2, agent_id=1, role_name="Thinker", reply=r2),
+                    SimpleNamespace(t=3, agent_id=1, role_name="Verifier", reply=r3),
+                ],
+                terminated_by="verifier_accept",
+            )
+
+    old = serve.get_coordinator
+    try:
+        serve.get_coordinator = lambda _mode: StreamCoord()
+        srv, port = _start_server(serve.Handler)
+        time.sleep(0.1)
+        payload = json.dumps(
+            {"model": "trinity", "messages": [{"role": "user", "content": "hi"}], "stream": True}
+        ).encode()
+        req = Request(
+            f"http://127.0.0.1:{port}/v1/chat/completions",
+            data=payload,
+            headers={"Content-Type": "application/json", "Authorization": "Bearer test-key"},
+        )
+        resp = urlopen(req)
+        lines = [line for line in resp.read().decode().split("\n") if line.strip()]
+        events = [json.loads(line) for line in lines]
+        starts = [e for e in events if e.get("type") == "step-start"]
+        ends = [e for e in events if e.get("type") == "step-end"]
+        results = [e for e in events if e.get("type") == "result"]
+        assert len(starts) == 3
+        assert len(ends) == 3
+        assert len(results) == 1
+        assert results[0]["text"] == "final answer"
+        assert results[0]["mantis_steps"][0]["model_name"] == "gpt-5.6-sol"
+        assert results[0]["mantis_steps"][0]["prompt"] == "hi"
+    finally:
+        serve.get_coordinator = old
+        srv.shutdown()
+
+
 # ---------------------------------------------------------------------------
 # Worker wrappers
 # ---------------------------------------------------------------------------

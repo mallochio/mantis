@@ -131,16 +131,40 @@ class HistoryWorker:
             combined = self._combine(messages)
             known_roles = {"Worker", "Thinker", "Verifier"}
             role = role_or_subtask if role_or_subtask in known_roles else "Worker"
+            call: dict[str, Any] = {
+                "role": role,
+                "agent_id": agent_id,
+                "model_name": self._model_name(agent_id),
+                "messages": combined,
+                "prompt": self._last_user_prompt(combined),
+            }
             calls = getattr(_history_context, "calls", None)
             if calls is not None:
-                calls.append({
+                calls.append(call)
+            write_line = getattr(_history_context, "write_line", None)
+            turn_index = len(calls) - 1 if calls else 0
+            if write_line:
+                write_line({
+                    "type": "step-start",
+                    "turn": turn_index,
                     "role": role,
                     "agent_id": agent_id,
-                    "model_name": self._model_name(agent_id),
-                    "messages": combined,
-                    "prompt": self._last_user_prompt(combined),
+                    "model_name": call["model_name"],
+                    "prompt": call["prompt"],
                 })
-            return self._worker(role_or_subtask, combined, agent_id)
+            reply = self._worker(role_or_subtask, combined, agent_id)
+            call["reply"] = reply
+            if write_line:
+                write_line({
+                    "type": "step-end",
+                    "turn": turn_index,
+                    "role": role,
+                    "agent_id": agent_id,
+                    "model_name": call["model_name"],
+                    "prompt": call["prompt"],
+                    "reply": reply,
+                })
+            return reply
         return self._worker(*args)
 
     def conduct(self, *args: Any) -> Any:
@@ -499,6 +523,43 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _write_ndjson_line(self, obj: Any) -> None:
+        self.wfile.write((json.dumps(obj) + "\n").encode())
+        self.wfile.flush()
+
+    def _handle_stream(self, coordinator_mode: str, query: str, model: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        _history_context.write_line = self._write_ndjson_line
+        _history_context.calls = []
+        try:
+            coord = get_coordinator(coordinator_mode)
+            res = coord.run(query, verbose=False)
+        except Exception as e:  # noqa: BLE001
+            self._write_ndjson_line({"type": "error", "error": str(e)})
+            return
+        finally:
+            _history_context.write_line = None
+            _history_context.history = []
+            calls = getattr(_history_context, "calls", [])
+            _history_context.calls = []
+        for turn, call in zip(getattr(res, "turns", []), calls, strict=False):
+            turn.prompt = call.get("prompt", "")
+            turn.model_name = call.get("model_name", "")
+        body = _chat_response(res, model)
+        self._write_ndjson_line({
+            "type": "result",
+            "text": body["choices"][0]["message"]["content"],
+            "trace": body["usage"]["mantis_trace"],
+            "coordinator": coordinator_mode,
+            "mantis_steps": body.get("mantis_steps", []),
+            **body,
+        })
+
     def do_GET(self) -> None:
         if self.path == "/v1/models":
             if not self._check_auth():
@@ -529,6 +590,7 @@ class Handler(BaseHTTPRequestHandler):
 
             requested = (req.get("model") or "trinity").lower()
             coordinator_mode = "conductor" if requested in ("conductor", "ultra") else "trinity"
+            model_name = req.get("model", MODEL_NAME)
 
             # the user query = last user message; history = everything before it
             query, history = _split_messages(messages)
@@ -536,6 +598,11 @@ class Handler(BaseHTTPRequestHandler):
                 f"[serve] route request model={requested} -> coordinator={coordinator_mode}",
                 flush=True,
             )
+            if req.get("stream"):
+                _history_context.history = history
+                _history_context.calls = []
+                return self._handle_stream(coordinator_mode, query, model_name)
+
             _history_context.history = history
             _history_context.calls = []
             try:
@@ -549,7 +616,7 @@ class Handler(BaseHTTPRequestHandler):
                 turn.prompt = call.get("prompt", "")
                 turn.model_name = call.get("model_name", "")
             self._send(
-                200, _chat_response(res, req.get("model", MODEL_NAME))
+                200, _chat_response(res, model_name)
             )
         except (json.JSONDecodeError, ValueError, KeyError, RuntimeError) as e:
             self._send(500, {"error": str(e)})
