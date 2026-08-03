@@ -137,6 +137,7 @@ def test_history_worker_with_history():
             return "ok"
 
     serve._history_context.history = [
+        {"role": "system", "content": "repository context"},
         {"role": "user", "content": "q1"},
         {"role": "assistant", "content": "a1"},
     ]
@@ -153,7 +154,7 @@ def test_history_worker_with_history():
         assert result == "ok"
         assert worker._worker.calls[0][1] == "Worker"
         msgs = worker._worker.calls[0][2]
-        assert msgs[0] == {"role": "system", "content": "sys"}
+        assert msgs[0] == {"role": "system", "content": "sys\n\nrepository context"}
         assert msgs[1] == {"role": "user", "content": "q1"}
         assert msgs[2] == {"role": "assistant", "content": "a1"}
         assert msgs[3] == {

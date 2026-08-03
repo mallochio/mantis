@@ -53,6 +53,10 @@ if (!mantisProvider?.streamSimple) {
   console.error("FAIL: mantis provider with streamSimple not registered");
   process.exit(1);
 }
+if (mantisProvider.models.some((model: any) => model.contextWindow !== 256000)) {
+  console.error("FAIL: not all mantis models advertise a 256k context window");
+  process.exit(1);
+}
 
 const mantisStepTool = tools.get("mantis_step");
 if (!mantisStepTool) {
@@ -80,6 +84,7 @@ const commandCtx = {
 await mantisCmd.handler("trinity", commandCtx);
 
 const encoder = new TextEncoder();
+const backendRequests: any[] = [];
 const streamLines = [
   JSON.stringify({
     type: "step-start",
@@ -125,6 +130,7 @@ const streamLines = [
     });
   }
   if (init && typeof init.body === "string" && init.body.includes('"stream":true')) {
+    backendRequests.push(JSON.parse(init.body));
     if (init.body.includes("Say hi")) {
       return new Response(JSON.stringify({
         choices: [{ message: { content: "Hello!" } }],
@@ -157,10 +163,18 @@ const userMessage: Message = {
   timestamp: Date.now(),
 };
 
-const context1: Context = { messages: [userMessage] };
+const context1: Context = { systemPrompt: "PI_SYSTEM_CONTEXT", messages: [userMessage] };
 const stream1 = mantisProvider.streamSimple(model, context1, { apiKey: "test-key" });
 const events1: any[] = [];
 for await (const ev of stream1) events1.push(ev);
+
+const sentSystemContext = backendRequests[0]?.messages?.[0]?.content ?? "";
+if (!sentSystemContext.includes("PI_SYSTEM_CONTEXT") ||
+    !sentSystemContext.includes("Repository tree") ||
+    !sentSystemContext.includes("contextWindow: 256000")) {
+  console.error("FAIL: Pi and repository source context were not sent to the backend");
+  process.exit(1);
+}
 
 const start1 = events1.find((e) => e.type === "start");
 if (!start1) {
@@ -215,7 +229,7 @@ const toolResultMessage: Message = {
   timestamp: Date.now(),
 };
 
-const context2: Context = { messages: [userMessage, toolResultMessage] };
+const context2: Context = { systemPrompt: "PI_SYSTEM_CONTEXT", messages: [userMessage, toolResultMessage] };
 const stream2 = mantisProvider.streamSimple(model, context2, { apiKey: "test-key" });
 const events2: any[] = [];
 for await (const ev of stream2) events2.push(ev);

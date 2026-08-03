@@ -97,12 +97,19 @@ class HistoryWorker:
         history = getattr(_history_context, "history", None) or []
         if not history or not isinstance(messages, list):
             return messages
-        # Strip any system messages from history; the coordinator adds its own.
+        system_context = "\n\n".join(
+            str(m.get("content", ""))
+            for m in history
+            if isinstance(m, dict) and m.get("role") == "system" and m.get("content")
+        )
         prior = [m for m in history if isinstance(m, dict) and m.get("role") != "system"]
-        if not prior:
-            return messages
         if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
-            return [messages[0]] + prior + list(messages[1:])
+            first = messages[0]
+            if system_context:
+                first = {**first, "content": f"{first.get('content', '')}\n\n{system_context}"}
+            return [first] + prior + list(messages[1:])
+        if system_context:
+            return [{"role": "system", "content": system_context}] + prior + list(messages)
         return prior + list(messages)
 
     def _model_name(self, agent_id: int) -> str:

@@ -137,15 +137,68 @@ function getTextFromContent(content: string | unknown[]): string {
     .join("\n");
 }
 
+const REPO_CONTEXT_FILES = ["README.md", "package.json", "pyproject.toml", "Cargo.toml", "go.mod"];
+const REPO_CONTEXT_IGNORED = new Set([".git", ".scratch", "node_modules", "dist", "build", "__pycache__", ".venv"]);
+
+function getRepositoryContext(cwd = process.cwd()): string {
+  try {
+    const entries = fs.readdirSync(cwd, { withFileTypes: true })
+      .filter((entry) => !REPO_CONTEXT_IGNORED.has(entry.name))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    const tree: string[] = [];
+    for (const entry of entries) {
+      tree.push(entry.name + (entry.isDirectory() ? "/" : ""));
+      if (!entry.isDirectory()) continue;
+      try {
+        for (const child of fs.readdirSync(path.join(cwd, entry.name), { withFileTypes: true }).slice(0, 40)) {
+          if (!REPO_CONTEXT_IGNORED.has(child.name)) {
+            tree.push(`  ${child.name}${child.isDirectory() ? "/" : ""}`);
+          }
+        }
+      } catch {
+        // A partial tree is still useful if one directory is unreadable.
+      }
+    }
+
+    const contextFiles = [...REPO_CONTEXT_FILES];
+    try {
+      const packageJson = JSON.parse(fs.readFileSync(path.join(cwd, "package.json"), "utf8"));
+      for (const extension of [packageJson.main, ...(packageJson.pi?.extensions ?? [])]) {
+        if (typeof extension === "string" && !contextFiles.includes(extension)) contextFiles.push(extension);
+      }
+    } catch {
+      // Not every repository is a Pi package.
+    }
+
+    let remaining = 96_000;
+    const files: string[] = [];
+    for (const name of contextFiles) {
+      const filePath = path.resolve(cwd, name);
+      if (!filePath.startsWith(cwd + path.sep) || !fs.existsSync(filePath) || remaining <= 0) continue;
+      const content = fs.readFileSync(filePath, "utf8").slice(0, remaining);
+      files.push(`--- ${name} ---\n${content}`);
+      remaining -= content.length;
+    }
+    return `Working directory: ${cwd}\n\nRepository tree (two levels):\n${tree.join("\n")}\n\n${files.join("\n\n")}`;
+  } catch {
+    return `Working directory: ${cwd}`;
+  }
+}
+
 interface BackendMessagesResult {
   messages: ChatMessage[];
   key: string;
   lastUserContent: string;
 }
 
-function toBackendMessages(contextMessages: Message[]): BackendMessagesResult {
-  const messages: ChatMessage[] = [];
+function toBackendMessages(context: Context): BackendMessagesResult {
+  const messages: ChatMessage[] = [{
+    role: "system",
+    content: [context.systemPrompt, getRepositoryContext()].filter(Boolean).join("\n\n"),
+  }];
   let lastUserContent = "";
+
+  const contextMessages = context.messages;
 
   for (const m of contextMessages) {
     if (m.role === "user") {
@@ -391,7 +444,7 @@ function mantisStreamSimple(
       }
 
       const mode = model.id as Mode;
-      const { messages: backendMessages, key, lastUserContent } = toBackendMessages(context.messages);
+      const { messages: backendMessages, key, lastUserContent } = toBackendMessages(context);
 
       const cached = sessionCache.get(key);
       if (cached) {
@@ -523,7 +576,7 @@ export default function (pi: ExtensionAPI) {
       reasoning: true,
       input: ["text"] as ("text" | "image")[],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 128000,
+      contextWindow: 256000,
       maxTokens: 16384,
     },
     {
@@ -532,7 +585,7 @@ export default function (pi: ExtensionAPI) {
       reasoning: true,
       input: ["text"] as ("text" | "image")[],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 128000,
+      contextWindow: 256000,
       maxTokens: 16384,
     },
     {
@@ -541,7 +594,7 @@ export default function (pi: ExtensionAPI) {
       reasoning: true,
       input: ["text"] as ("text" | "image")[],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: 128000,
+      contextWindow: 256000,
       maxTokens: 16384,
     },
   ];
