@@ -359,6 +359,8 @@ async def chat_completions(request: Request, authorization: str | None = Header(
         def gen():
             t0 = time.time()
             ttfb = None
+            saw_finish_reason = False
+            saw_done = False
             try:
                 with client.stream("POST", url, json=out_body, headers=headers) as resp:
                     if resp.status_code != 200:
@@ -369,9 +371,31 @@ async def chat_completions(request: Request, authorization: str | None = Header(
                         if ttfb is None:
                             ttfb = int((time.time() - t0) * 1000)
                         if line:
+                            sline = line.strip()
+                            if sline == "data: [DONE]":
+                                saw_done = True
+                            elif sline.startswith("data: "):
+                                try:
+                                    payload = json.loads(sline[6:])
+                                    choices = payload.get("choices")
+                                    if isinstance(choices, list) and choices and choices[0].get("finish_reason") is not None:
+                                        saw_finish_reason = True
+                                except Exception:
+                                    pass
                             yield (line + "\n").encode()
-                        yield b"\n"
-                    yield b"data: [DONE]\n\n"
+                        else:
+                            yield b"\n"
+                    if not saw_finish_reason:
+                        finish_chunk = {
+                            "id": "gen-finish",
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": backend["model"],
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        }
+                        yield f"data: {json.dumps(finish_chunk)}\n\n".encode()
+                    if not saw_done:
+                        yield b"data: [DONE]\n\n"
             finally:
                 client.close()
             _log(decision, score, backend["model"], prompt, ttfb, supra_complexity, supra_ms)

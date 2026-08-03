@@ -6,7 +6,7 @@ OUT=/tmp/pi_route_final.out
 cd "$HOME"
 pi --provider routellm --model auto --no-tools --no-extensions --mode text \
    -p 'In one short sentence, what does the Python print function do?' \
-   > "$OUT" 2>&1
+   < /dev/null > "$OUT" 2>&1
 rc=$?
 echo "=== pi exit: $rc ==="
 echo "=== pi output ==="
