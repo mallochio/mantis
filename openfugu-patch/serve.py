@@ -616,7 +616,6 @@ def main() -> None:
         flush=True,
     )
     srv.serve_forever()
-    srv.serve_forever()
 
 
 if __name__ == "__main__":

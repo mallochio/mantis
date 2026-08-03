@@ -50,20 +50,20 @@ docker compose up -d
 
 ### B. Hybrid native-GPU (recommended on Apple Silicon / any GPU host)
 
-Keep LiteLLM and `llm-router` in Docker, but run `openfugu` directly on the host so PyTorch can use MPS (Mac), CUDA (Linux), or a less-slow CPU fallback. OpenFugu on the host reaches LiteLLM on `localhost:3001` and the router on `localhost:5500` via the published Docker ports.
+Keep LiteLLM and `llm-router` in Docker, but run the Mantis orchestrator directly on the host so PyTorch can use MPS (Mac), CUDA (Linux), or a less-slow CPU fallback. The native process reaches LiteLLM on `localhost:3001` and the router on `localhost:5500` via the published Docker ports.
 
 ```bash
 # 1. Start the Docker side of the stack (no openfugu container)
 docker compose -f docker-compose.yml -f docker-compose.native-openfugu.yml up -d litellm router
 
-# 2. Run the OpenFugu orchestrator natively
-./scripts/run_openfugu_native.sh
+# 2. Run the Mantis orchestrator natively
+./scripts/run_mantis_native.sh
 
 # 3. In another terminal, verify
 ./scripts/verify.sh
 ```
 
-`run_openfugu_native.sh` creates a dedicated venv, installs the core orchestrator package (`pip install -e .`), builds the TRINITY base vector from `artifacts/router_head.safetensors`, auto-detects the best PyTorch backend, and launches `openfugu-patch/serve.py` on `0.0.0.0:8088`.
+`run_mantis_native.sh` creates a dedicated venv, installs the core orchestrator package (`pip install -e .`), builds the TRINITY base vector from `artifacts/router_head.safetensors`, auto-detects the best PyTorch backend, and launches `openfugu-patch/serve.py` on `0.0.0.0:8088`.
 
 ## Platform / device table
 
@@ -83,14 +83,14 @@ FUGU_CONDUCTOR_MAX_NEW=512
 
 ## Model knobs (set in `.env` or your shell, e.g. `.zshrc`)
 
-All model selection is env-driven. Export the variables before `docker compose up` or before `run_openfugu_native.sh`.
+All model selection is env-driven. Export the variables before `docker compose up` or before `run_mantis_native.sh`.
 
 | Variable | What it controls | Default |
 |---|---|---|
 | `OPENROUTER_API_KEY` | API key LiteLLM uses to call OpenRouter | required |
 | `OPENCODE_GO_API_KEY` | API key for optional opencode-* LiteLLM aliases | optional |
 | `OPENAI_API_KEY` | OpenAI key for `llm-router` embeddings only | required for router |
-| `LITELLM_KEY` | Shared internal bearer token for router/openfugu | `change-me` |
+| `LITELLM_KEY` | Shared internal bearer token for router/mantis | `change-me` |
 | `FUGU_API_KEY` | Same token, used by the pi extension and `serve.py` auth | `${LITELLM_KEY}` |
 | `EXPENSIVE_MODEL` / `CHEAP_MODEL` | Router cheap/expensive targets (LiteLLM aliases) | `gpt-5.6-sol-medium` / `gpt-5.6-luna-max` |
 | `FUGU_MODEL` | TRINITY router backbone (Qwen3-0.6B) | `Qwen/Qwen3-0.6B` |
@@ -155,7 +155,7 @@ aws s3 sync s3://sid-llm-runs/retrain-fugu-conductor/retrain-conductor-20260802_
             outputs/conductor_retrain/retrain-conductor-20260802_003213/checkpoint/
 ```
 
-Set the env vars before `docker compose up` or `run_openfugu_native.sh`:
+Set the env vars before `docker compose up` or `run_mantis_native.sh`:
 
 ```bash
 export FUGU_VECTOR="/app/artifacts/model_iter_60.npy"        # Docker path
@@ -164,7 +164,7 @@ export FUGU_HEAD="/app/artifacts/router_head.safetensors"    # optional override
 export FUGU_LOCAL_CONDUCTOR="/app/outputs/conductor_retrain/retrain-conductor-20260802_003213/checkpoint"
 ```
 
-In the `openfugu` container, `/app` is the repo root, so the paths above map to the local files if you copy them into `artifacts/` / `outputs/` before `docker compose build` (or use a Docker bind/volume). In native mode, `run_openfugu_native.sh` automatically rewrites the Docker `/app/...` paths to repo-local paths if they do not exist.
+In the `openfugu` container, `/app` is the repo root, so the paths above map to the local files if you copy them into `artifacts/` / `outputs/` before `docker compose build` (or use a Docker bind/volume). In native mode, `run_mantis_native.sh` automatically rewrites the Docker `/app/...` paths to repo-local paths if they do not exist.
 
 ## Eval results
 
@@ -384,34 +384,34 @@ npm install
 npm run typecheck
 ```
 
-See `extensions/README.md` for how to load `fugu.ts` into pi and smoke test `/fugu auto`.
+See `extensions/README.md` for how to load `mantis.ts` into pi and smoke test `/mantis auto` (`/fugu` is an alias).
 
 ## Troubleshooting
 
-### `serve.py` exits with "FATAL: set FUGU_API_KEY"
+### `serve.py` exits with "FATAL: set MANTIS_API_KEY"
 
-The openfugu orchestrator now refuses to start without a bearer token. Copy `.env.example` to `.env` and set both `LITELLM_KEY` and `FUGU_API_KEY` to the same value, or just set `LITELLM_KEY` and use `FUGU_API_KEY=${LITELLM_KEY}`. `scripts/verify.sh` and the pi extension also read `FUGU_API_KEY`.
+The mantis orchestrator now refuses to start without a bearer token. Copy `.env.example` to `.env` and set both `LITELLM_KEY` and `MANTIS_API_KEY` to the same value, or just set `LITELLM_KEY` and use `MANTIS_API_KEY=${LITELLM_KEY}`. `scripts/verify.sh` and the pi extension also read `MANTIS_API_KEY` (with `FUGU_API_KEY` as a fallback).
 
 ### `verify.sh` fails with HTTP 401
 
-The orchestrator requires an `Authorization: Bearer <token>` header. `scripts/verify.sh` sources `.env` and uses `FUGU_API_KEY`/`LITELLM_KEY`. Make sure the token you pass to `curl` matches the value set in the openfugu container/process.
+The orchestrator requires an `Authorization: Bearer <token>` header. `scripts/verify.sh` sources `.env` and uses `MANTIS_API_KEY`/`FUGU_API_KEY`/`LITELLM_KEY`. Make sure the token you pass to `curl` matches the value set in the mantis container/process.
 
 ### Conductor returns HTTP 500 or empty response
 
 Common causes:
 
-1. **Docker Desktop memory limit (Mac)** — the Llama-3.2-3B Conductor checkpoint needs ~12 GB of RAM at `float32`. If Docker Desktop's VM is capped at ~7.7 GB the container may OOM during load or generation. Increase the VM memory limit or switch to **hybrid native-GPU mode** (`./scripts/run_openfugu_native.sh`), which runs PyTorch directly on the host.
+1. **Docker Desktop memory limit (Mac)** — the Llama-3.2-3B Conductor checkpoint needs ~12 GB of RAM at `float32`. If Docker Desktop's VM is capped at ~7.7 GB the container may OOM during load or generation. Increase the VM memory limit or switch to **hybrid native-GPU mode** (`./scripts/run_mantis_native.sh`), which runs PyTorch directly on the host.
 2. **Invalid Conductor DAG** — the local checkpoint sometimes emits workflows with self/forward references, unequal-length lists, or direct answers instead of the three required lists. This is a model-output issue. Native path with `bfloat16`/GPU and an assistant `Plan:\n` prefill helps, but a checkpoint that reliably emits valid DAGs is required. See `eval/conductor-500-diagnosis.md` for the exact errors observed.
 3. **Conductor returns a plain answer instead of a DAG** — the planner model is not following the workflow format. If `FUGU_CONDUCTOR_MODEL=claude-opus-5-medium`, switch it to `gpt-5.6-luna-max`, which reliably emits the three-list `model_id / subtasks / access_list` structure. Do not set `FUGU_LOCAL_CONDUCTOR` unless you are testing the archived 3B checkpoints.
-4. **Litellm proxy not reachable** — in hybrid mode, the native `openfugu` process needs `FUGU_BASE_URL=http://127.0.0.1:3001/v1` (set by `run_openfugu_native.sh` automatically). Confirm `curl http://localhost:3001/health` responds.
+4. **Litellm proxy not reachable** — in hybrid mode, the native mantis process needs `MANTIS_BASE_URL=http://127.0.0.1:3001/v1` (set by `run_mantis_native.sh` automatically). Confirm `curl http://localhost:3001/health` responds.
 
 ### TRINITY is slow on first call
 
 The Qwen3-0.6B router and any local worker models download from HuggingFace on first use and are cached in `hf-cache` (Docker) or `~/.cache/huggingface` (native). Subsequent calls are much faster.
 
-### `verify.sh` fails on the openfugu check
+### `verify.sh` fails on the mantis check
 
-`scripts/verify.sh` curls `http://localhost:8088/health`. If you are running hybrid mode, make sure `run_openfugu_native.sh` is still running. If you are running all-Docker, make sure `docker compose up -d` included the `openfugu` service.
+`scripts/verify.sh` curls `http://localhost:8088/health`. If you are running hybrid mode, make sure `run_mantis_native.sh` is still running. If you are running all-Docker, make sure `docker compose up -d` included the `openfugu` service.
 
 ## Deviation notes
 
