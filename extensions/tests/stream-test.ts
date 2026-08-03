@@ -164,7 +164,14 @@ const streamLines = [
   });
 };
 
-const model = { id: "trinity", provider: "mantis", api: "mantis", name: "mantis: trinity" };
+const model = {
+  id: "trinity",
+  provider: "mantis",
+  api: "mantis",
+  name: "mantis: trinity",
+  contextWindow: 256000,
+  maxTokens: 16384,
+};
 
 const userMessage: Message = {
   role: "user",
@@ -293,4 +300,19 @@ if (legacyText !== "Hello!") {
   process.exit(1);
 }
 console.log("✓ Regular JSON completion fallback returned final answer");
+
+const requestsBeforeOverflow = backendRequests.length;
+const overflowEvents: any[] = [];
+for await (const ev of mantisProvider.streamSimple(model, {
+  messages: [{ role: "user", content: "x".repeat(1_100_000), timestamp: Date.now() }],
+}, { apiKey: "test-key" })) {
+  overflowEvents.push(ev);
+}
+const overflow = overflowEvents.find((e) => e.type === "error");
+if (!overflow?.error?.errorMessage?.includes("exceeds the context window") ||
+    backendRequests.length !== requestsBeforeOverflow) {
+  console.error("FAIL: oversized context was sent to the backend");
+  process.exit(1);
+}
+console.log("✓ Oversized context fails locally for Pi/Slipstream compaction recovery");
 console.log("\nALL STREAMING TESTS PASSED SUCCESSFULLY!");

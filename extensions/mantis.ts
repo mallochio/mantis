@@ -449,6 +449,9 @@ function mantisStreamSimple(
       const { messages: backendMessages, key, lastUserContent } = toBackendMessages(context);
       output.usage.input = Math.ceil(backendMessages.reduce((chars, message) => chars + message.content.length, 0) / 4);
       output.usage.totalTokens = output.usage.input;
+      if (output.usage.input > model.contextWindow - model.maxTokens) {
+        throw new Error(`input token count ${output.usage.input} exceeds the context window of this model`);
+      }
 
       const cached = sessionCache.get(key);
       if (cached) {
