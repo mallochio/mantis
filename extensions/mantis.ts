@@ -554,6 +554,7 @@ export default function (pi: ExtensionAPI) {
             { triggerTurn: false },
           );
         } else if (ev.type === "step-end") {
+          if (!ev.reply?.trim()) continue;
           const modelName = ev.model_name ?? WORKER_NAMES[ev.agent_id] ?? `slot-${ev.agent_id}`;
           pi.sendMessage(
             {
@@ -574,7 +575,7 @@ export default function (pi: ExtensionAPI) {
         } else if (ev.type === "result") {
           finalText = ev.text;
           finalTrace = ev.trace;
-          finalSteps = ev.mantis_steps;
+          finalSteps = (ev.mantis_steps || []).filter((s) => s.reply?.trim());
         } else if (ev.type === "error") {
           throw new Error(ev.error);
         }

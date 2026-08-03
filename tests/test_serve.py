@@ -156,7 +156,36 @@ def test_history_worker_with_history():
         assert msgs[0] == {"role": "system", "content": "sys"}
         assert msgs[1] == {"role": "user", "content": "q1"}
         assert msgs[2] == {"role": "assistant", "content": "a1"}
-        assert msgs[3] == {"role": "user", "content": "q2"}
+        assert msgs[3] == {
+            "role": "user",
+            "content": "Previously generated code/solution:\n\na1\n\nUpdate it according to this instruction: q2",
+        }
+    finally:
+        serve._history_context.history = []
+        serve._history_context.calls = []
+
+
+def test_history_worker_first_turn_no_context_prefix():
+    """When there is no prior assistant message the worker query is unchanged."""
+
+    class FakeWorker:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, role, messages, agent_id):
+            self.calls.append((role, messages, agent_id))
+            return "ok"
+
+    serve._history_context.history = [{"role": "user", "content": "q1"}]
+    serve._history_context.calls = []
+    try:
+        worker = serve.HistoryWorker(FakeWorker())
+        result = worker("Worker", [{"role": "system", "content": "sys"}, {"role": "user", "content": "q2"}], 0)
+        assert result == "ok"
+        msgs = worker._worker.calls[0][1]
+        assert msgs[0] == {"role": "system", "content": "sys"}
+        assert msgs[1] == {"role": "user", "content": "q1"}
+        assert msgs[2] == {"role": "user", "content": "q2"}
     finally:
         serve._history_context.history = []
         serve._history_context.calls = []

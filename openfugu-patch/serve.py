@@ -125,18 +125,57 @@ class HistoryWorker:
                 return str(getattr(m, "content", ""))
         return ""
 
+    def _last_assistant_content(self, history: Any) -> str:
+        """Return the most recent non-empty assistant message, if any."""
+        if not isinstance(history, list):
+            return ""
+        for m in reversed(history):
+            if isinstance(m, dict) and m.get("role") == "assistant":
+                content = m.get("content", "")
+                if content and str(content).strip():
+                    return str(content)
+        return ""
+
+    def _enhance_worker_messages(self, messages: Any, history: Any) -> Any:
+        """For follow-up turns, wrap the worker query with the prior result.
+
+        The coordinator only sees the latest user message; without an explicit
+        pointer back to the previous assistant code, low-context workers answer
+        generically. This keeps the original user text intact for display."""
+        if not isinstance(messages, list) or not messages:
+            return messages
+        prior = self._last_assistant_content(history)
+        if not prior:
+            return messages
+        last = messages[-1]
+        if not isinstance(last, dict) or last.get("role") != "user":
+            return messages
+        original = str(last.get("content", ""))
+        if not original.strip():
+            return messages
+        enhanced = (
+            f"Previously generated code/solution:\n\n{prior}\n\n"
+            f"Update it according to this instruction: {original}"
+        )
+        return messages[:-1] + [{**last, "content": enhanced}]
+
     def __call__(self, *args: Any) -> Any:
         if len(args) == 3:
             role_or_subtask, messages, agent_id = args
             combined = self._combine(messages)
             known_roles = {"Worker", "Thinker", "Verifier"}
             role = role_or_subtask if role_or_subtask in known_roles else "Worker"
+            # Workers in later turns need to know what they are editing.
+            if role == "Worker":
+                history = getattr(_history_context, "history", None) or []
+                combined = self._enhance_worker_messages(combined, history)
+            original_prompt = self._last_user_prompt(messages)
             call: dict[str, Any] = {
                 "role": role,
                 "agent_id": agent_id,
                 "model_name": self._model_name(agent_id),
                 "messages": combined,
-                "prompt": self._last_user_prompt(combined),
+                "prompt": original_prompt,
             }
             calls = getattr(_history_context, "calls", None)
             if calls is not None:
