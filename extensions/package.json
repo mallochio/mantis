@@ -9,6 +9,7 @@
     "test": "echo 'no automated tests yet; load mantis.ts into pi and run /mantis auto'"
   },
   "devDependencies": {
+    "@mariozechner/pi-ai": "^0.73.1",
     "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*",
     "@sinclair/typebox": "^0.34.0",
