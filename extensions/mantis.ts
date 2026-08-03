@@ -391,6 +391,8 @@ async function collectStream<T>(gen: AsyncGenerator<T>): Promise<T[]> {
 
 function emitText(stream: AssistantMessageEventStream, text: string, output: AssistantMessage) {
   const contentIndex = output.content.length;
+  output.usage.output += Math.ceil(text.length / 4);
+  output.usage.totalTokens = output.usage.input + output.usage.output;
   output.content.push({ type: "text", text: "" });
   stream.push({ type: "text_start", contentIndex, partial: output });
   const block = output.content[contentIndex] as TextContent;
@@ -445,6 +447,8 @@ function mantisStreamSimple(
 
       const mode = model.id as Mode;
       const { messages: backendMessages, key, lastUserContent } = toBackendMessages(context);
+      output.usage.input = Math.ceil(backendMessages.reduce((chars, message) => chars + message.content.length, 0) / 4);
+      output.usage.totalTokens = output.usage.input;
 
       const cached = sessionCache.get(key);
       if (cached) {
@@ -471,26 +475,24 @@ function mantisStreamSimple(
         if (ev.type === "step-start") {
           // Only stored via step-end; no-op here.
         } else if (ev.type === "step-end") {
-          if (ev.reply?.trim()) {
-            steps.push({
-              turn: ev.turn,
-              agent_id: ev.agent_id,
-              role: ev.role,
-              reply: ev.reply,
-              prompt: ev.prompt,
-              model_name: ev.model_name,
-              output: ev.reply,
-            });
-          }
+          const reply = ev.reply?.trim() ? ev.reply : "(no response)";
+          steps.push({
+            turn: ev.turn,
+            agent_id: ev.agent_id,
+            role: ev.role,
+            reply,
+            prompt: ev.prompt,
+            model_name: ev.model_name,
+            output: reply,
+          });
         } else if (ev.type === "result") {
           finalText = ev.text;
           finalTrace = ev.trace;
           // Fallback if the backend did not emit per-step events.
           if (steps.length === 0) {
             for (const s of ev.mantis_steps || []) {
-              if (s.reply?.trim()) {
-                steps.push(s);
-              }
+              const reply = s.reply?.trim() ? s.reply : "(no response)";
+              steps.push({ ...s, reply, output: reply });
             }
           }
         } else if (ev.type === "error") {

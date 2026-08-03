@@ -104,6 +104,15 @@ const streamLines = [
     reply: "def reverse(s): return s[::-1]",
   }) + "\n",
   JSON.stringify({
+    type: "step-end",
+    turn: 1,
+    role: "Worker",
+    agent_id: 2,
+    model_name: "gpt-5.6-sol-medium",
+    prompt: "Retry the helper",
+    reply: "",
+  }) + "\n",
+  JSON.stringify({
     type: "result",
     text: "def reverse(s):\n    return s[::-1]",
     trace: "Worker(4)→Verifier(1):verifier_accept",
@@ -182,9 +191,10 @@ if (!start1) {
   process.exit(1);
 }
 
-const toolcallEnd = events1.find((e) => e.type === "toolcall_end");
-if (!toolcallEnd) {
-  console.error("FAIL: first stream did not emit a toolcall_end event");
+const toolcallEnds = events1.filter((e) => e.type === "toolcall_end");
+const toolcallEnd = toolcallEnds[0];
+if (toolcallEnds.length !== 2) {
+  console.error("FAIL: stream did not expose every backend turn, got:", toolcallEnds.length);
   process.exit(1);
 }
 
@@ -217,7 +227,19 @@ if (resultText !== expectedReply) {
   process.exit(1);
 }
 
-console.log("✓ mantis_step execute returned the worker reply");
+const emptyToolResult = await mantisStepTool.execute(
+  toolcallEnds[1].toolCall.id,
+  toolcallEnds[1].toolCall.arguments,
+  undefined,
+  undefined,
+  {},
+);
+const emptyResultText = emptyToolResult.content?.find((c: any) => c.type === "text")?.text;
+if (emptyResultText !== "(no response)") {
+  console.error("FAIL: empty backend turn was hidden, got:", emptyResultText);
+  process.exit(1);
+}
+console.log("✓ mantis_step exposed successful and empty worker turns");
 
 // Second provider call: pi sends the tool result back and expects the final answer.
 const toolResultMessage: Message = {
@@ -250,8 +272,12 @@ if (!done2 || done2.reason !== "stop") {
   console.error("FAIL: second stream did not end with reason stop, got:", done2?.reason);
   process.exit(1);
 }
+if (done2.message.usage.input <= 0 || done2.message.usage.totalTokens <= done2.message.usage.input) {
+  console.error("FAIL: mantis did not report estimated context usage");
+  process.exit(1);
+}
 
-console.log("✓ Second stream returned final answer after tool execution");
+console.log("✓ Second stream returned final answer with estimated context usage");
 
 // Older backend images return a normal JSON completion even when stream=true.
 const legacyContext: Context = {

@@ -82,6 +82,23 @@ def _build_litellm_kwargs(
     return kw
 
 
+class RejectAwareRouter:
+    """Force a revision after a verifier rejects instead of re-verifying unchanged text."""
+
+    def __init__(self, router: Any) -> None:
+        self._router = router
+
+    def route(self, *args: Any, **kwargs: Any) -> Any:
+        result = self._router.route(*args, **kwargs)
+        if getattr(_history_context, "force_worker", False):
+            _history_context.force_worker = False
+            result = {**result, "role_id": 0, "role_name": "Worker"}
+        return result
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._router, name)
+
+
 class HistoryWorker:
     """Wrap a worker so every LLM call sees the conversation history.
 
@@ -176,6 +193,13 @@ class HistoryWorker:
             if role == "Worker":
                 history = getattr(_history_context, "history", None) or []
                 combined = self._enhance_worker_messages(combined, history)
+                feedback = getattr(_history_context, "revision_feedback", None)
+                if feedback and combined and isinstance(combined[-1], dict):
+                    combined[-1] = {
+                        **combined[-1],
+                        "content": f"{combined[-1].get('content', '')}\n\nRevise the answer to address this verifier feedback:\n{feedback}",
+                    }
+                    _history_context.revision_feedback = None
             original_prompt = self._last_user_prompt(messages)
             call: dict[str, Any] = {
                 "role": role,
@@ -200,6 +224,12 @@ class HistoryWorker:
                 })
             reply = self._worker(role_or_subtask, combined, agent_id)
             call["reply"] = reply
+            if role == "Worker" and not reply.strip():
+                _history_context.force_worker = True
+                _history_context.revision_feedback = "Previous worker returned no response; produce a complete answer."
+            elif role == "Verifier" and reply.strip().upper().startswith("REJECT"):
+                _history_context.force_worker = True
+                _history_context.revision_feedback = reply
             if write_line:
                 write_line({
                     "type": "step-end",
@@ -617,6 +647,8 @@ class Handler(BaseHTTPRequestHandler):
 
         _history_context.write_line = self._write_ndjson_line
         _history_context.calls = []
+        _history_context.force_worker = False
+        _history_context.revision_feedback = None
         try:
             coord = get_coordinator(coordinator_mode)
             res = coord.run(query, verbose=False)
@@ -626,6 +658,8 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             _history_context.write_line = None
             _history_context.history = []
+            _history_context.force_worker = False
+            _history_context.revision_feedback = None
             calls = getattr(_history_context, "calls", [])
             _history_context.calls = []
         for turn, call in zip(getattr(res, "turns", []), calls, strict=False):
@@ -686,11 +720,15 @@ class Handler(BaseHTTPRequestHandler):
 
             _history_context.history = history
             _history_context.calls = []
+            _history_context.force_worker = False
+            _history_context.revision_feedback = None
             try:
                 coord = get_coordinator(coordinator_mode)
                 res = coord.run(query, verbose=False)
             finally:
                 _history_context.history = []
+                _history_context.force_worker = False
+                _history_context.revision_feedback = None
                 calls = getattr(_history_context, "calls", [])
                 _history_context.calls = []
             for turn, call in zip(getattr(res, "turns", []), calls, strict=False):
@@ -830,7 +868,7 @@ def load_coordinator(mode: str):
     MAX_TURNS = args.max_turns
     worker = HistoryWorker(_worker_from_args(args, mode))
     if mode == "trinity":
-        return Coordinator(get_router(), worker, max_turns=args.max_turns, sample=True)
+        return Coordinator(RejectAwareRouter(get_router()), worker, max_turns=args.max_turns, sample=True)
     local_ckpt = os.environ.get("MANTIS_LOCAL_CONDUCTOR", os.environ.get("FUGU_LOCAL_CONDUCTOR"))
     conductor = EnvLocalConductor(local_ckpt) if local_ckpt else None
     return EnvConductorCoordinator(

@@ -166,6 +166,49 @@ def test_history_worker_with_history():
         serve._history_context.calls = []
 
 
+def test_verifier_rejection_forces_worker_revision():
+    class FakeRouter:
+        def __init__(self):
+            self.calls = 0
+
+        def route(self, *_args, **_kwargs):
+            self.calls += 1
+            role = "Worker" if self.calls == 1 else "Verifier"
+            return {"agent_id": 0, "role_id": 0 if role == "Worker" else 2, "role_name": role}
+
+    class FakeWorker:
+        names = ["test-model"]
+
+        def __call__(self, role, messages, _agent_id):
+            prompt = messages[-1]["content"]
+            if role == "Worker":
+                if "returned no response" in prompt:
+                    return "revised"
+                return "" if "verifier feedback" in prompt else "draft"
+            return "ACCEPT — fixed" if "<response>\nrevised" in prompt else "REJECT — fix the draft"
+
+    serve._history_context.history = []
+    serve._history_context.calls = []
+    serve._history_context.force_worker = False
+    serve._history_context.revision_feedback = None
+    try:
+        coord = serve.Coordinator(
+            serve.RejectAwareRouter(FakeRouter()),
+            serve.HistoryWorker(FakeWorker()),
+            max_turns=5,
+            sample=False,
+        )
+        result = coord.run("answer this")
+        assert [turn.role_name for turn in result.turns] == ["Worker", "Verifier", "Worker", "Worker", "Verifier"]
+        assert result.final == "revised"
+        assert result.terminated_by == "verifier_accept"
+    finally:
+        serve._history_context.history = []
+        serve._history_context.calls = []
+        serve._history_context.force_worker = False
+        serve._history_context.revision_feedback = None
+
+
 def test_history_worker_first_turn_no_context_prefix():
     """When there is no prior assistant message the worker query is unchanged."""
 
