@@ -30,10 +30,12 @@ import httpx
 from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+# Defaults mirror llm-router.sh (canonical source, calibrated there) —
+# keep in sync so bare `python server.py` behaves identically to the launcher.
 HOST = os.environ.get("ROUTELLM_HOST", "127.0.0.1")
 PORT = int(os.environ.get("ROUTELLM_PORT", "5500"))
 SERVER_KEY = os.environ.get("ROUTELLM_KEY", "sk-route-local")
-THRESHOLD = float(os.environ.get("ROUTELLM_THRESHOLD", "0.45"))
+THRESHOLD = float(os.environ.get("ROUTELLM_THRESHOLD", "0.156"))
 ROUTER_NAME = os.environ.get("ROUTELLM_ROUTER", "mf")
 SUPRA_ENABLED = os.environ.get("ROUTELLM_USE_SUPRA", "1") != "0"
 SUPRA_THRESHOLD = int(os.environ.get("ROUTELLM_SUPRA_THRESHOLD", "3"))
@@ -105,6 +107,11 @@ def _get_context_window() -> int:
         return _cached_context_window
 
     _cached_context_window = 1000000
+    print(
+        "WARNING: could not determine context window from model lists; "
+        "falling back to 1000000. Set ROUTELLM_CONTEXT_WINDOW to override.",
+        flush=True,
+    )
     return _cached_context_window
 
 _router = None  # lazy global
@@ -340,4 +347,11 @@ async def chat_completions(request: Request, authorization: str | None = Header(
 
 if __name__ == "__main__":
     import uvicorn
+    print(
+        "effective config: "
+        f"router={ROUTER_NAME} threshold={THRESHOLD} supra={SUPRA_ENABLED} "
+        f"supra_threshold={SUPRA_THRESHOLD} expensive={EXPENSIVE['model']} "
+        f"cheap={CHEAP['model']} port={PORT}",
+        flush=True,
+    )
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
