@@ -11,7 +11,7 @@ your row when done.
 |------|-------|----------|--------|------------|--------|
 | 001  | Extract and test request-mutation logic | P1 | S | — | DONE |
 | 002  | Make config defaults a single source of truth | P1 | S | — | DONE |
-| 003  | Eager model load at startup with a truthful ready gate | P2 | M | — | TODO |
+| 003  | Eager model load at startup with a truthful ready gate | P2 | M | — | DONE |
 | 004  | Make routing latency observable and tunable | P2 | M | — | TODO |
 | 005  | Dependency manifest and honest README | P3 | S | — | DONE |
 

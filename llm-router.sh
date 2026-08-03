@@ -137,11 +137,13 @@ fi
 
 nohup python server.py > logs/server.out 2> logs/server.err &
 echo $! > logs/server.pid
-for _ in $(seq 1 50); do
+for _ in $(seq 1 600); do  # 60s — first boot downloads the Supra checkpoint
   if lsof -nP -iTCP:"$ROUTELLM_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-    ROUTER_PID=$(lsof -nP -iTCP:"$ROUTELLM_PORT" -sTCP:LISTEN -t 2>/dev/null | head -n1 || true)
-    echo "router running pid ${ROUTER_PID:-$(cat logs/server.pid)} on :$ROUTELLM_PORT"
-    exit 0
+    if curl -fsS --max-time 2 "http://127.0.0.1:$ROUTELLM_PORT/healthz" 2>/dev/null | grep -q '"ready":true'; then
+      ROUTER_PID=$(lsof -nP -iTCP:"$ROUTELLM_PORT" -sTCP:LISTEN -t 2>/dev/null | head -n1 || true)
+      echo "router running pid ${ROUTER_PID:-$(cat logs/server.pid)} on :$ROUTELLM_PORT"
+      exit 0
+    fi
   fi
   sleep 0.1
 done

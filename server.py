@@ -24,6 +24,7 @@ import asyncio
 import json
 import os
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
@@ -267,13 +268,31 @@ def _log(decision: str, score: float, backend_model: str, prompt: str, ttfb_ms: 
         f.write(json.dumps(row) + "\n")
 
 
-app = FastAPI(title="RouteLLM coding-router")
+_READY = False
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Load both scoring models before serving so the first request is fast and
+    # load failures (missing OPENAI_API_KEY, HF unreachable) fail startup
+    # instead of silently degrading routing mid-request.
+    try:
+        _load_router()
+        if SUPRA_ENABLED:
+            _load_supra()
+    finally:
+        global _READY
+        _READY = True
+    yield
+
+
+app = FastAPI(title="RouteLLM coding-router", lifespan=lifespan)
 
 
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "router": ROUTER_NAME, "threshold": THRESHOLD,
-            "backend": "litellm"}
+    return {"ok": _READY, "router": ROUTER_NAME, "threshold": THRESHOLD,
+            "backend": "litellm", "ready": _READY}
 
 
 @app.get("/v1/models")
