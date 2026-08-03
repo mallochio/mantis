@@ -276,6 +276,24 @@ async function* streamOrchestrate(
       throw new Error(`mantis backend HTTP ${res.status}: ${body}`);
     }
 
+    // Older orchestrator images ignore `stream: true` and return one regular
+    // OpenAI completion. Accept that response without requiring a backend rebuild.
+    if (res.headers.get("content-type")?.includes("application/json")) {
+      const body = await res.json() as any;
+      const text = body.choices?.[0]?.message?.content;
+      if (typeof text !== "string") {
+        throw new Error("mantis backend returned an invalid completion");
+      }
+      yield {
+        type: "result",
+        text,
+        trace: body.usage?.mantis_trace ?? body.usage?.fugu_trace ?? "",
+        coordinator,
+        mantis_steps: body.mantis_steps ?? body.choices?.[0]?.message?.mantis_steps ?? [],
+      };
+      return;
+    }
+
     const reader = res.body?.getReader();
     if (!reader) {
       throw new Error("mantis backend returned an empty response body");

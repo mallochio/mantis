@@ -125,6 +125,12 @@ const streamLines = [
     });
   }
   if (init && typeof init.body === "string" && init.body.includes('"stream":true')) {
+    if (init.body.includes("Say hi")) {
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: "Hello!" } }],
+        usage: { fugu_trace: "Worker(0):max_turns" },
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
     return new Response(
       new ReadableStream({
         start(controller) {
@@ -232,4 +238,19 @@ if (!done2 || done2.reason !== "stop") {
 }
 
 console.log("✓ Second stream returned final answer after tool execution");
+
+// Older backend images return a normal JSON completion even when stream=true.
+const legacyContext: Context = {
+  messages: [{ role: "user", content: "Say hi", timestamp: Date.now() }],
+};
+const legacyEvents: any[] = [];
+for await (const ev of mantisProvider.streamSimple(model, legacyContext, { apiKey: "test-key" })) {
+  legacyEvents.push(ev);
+}
+const legacyText = legacyEvents.find((e) => e.type === "text_end")?.content;
+if (legacyText !== "Hello!") {
+  console.error("FAIL: regular JSON completion fallback returned:", legacyText);
+  process.exit(1);
+}
+console.log("✓ Regular JSON completion fallback returned final answer");
 console.log("\nALL STREAMING TESTS PASSED SUCCESSFULLY!");
