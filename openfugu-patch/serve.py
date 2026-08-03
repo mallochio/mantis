@@ -495,12 +495,47 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def _send(self, code: int, body: dict) -> None:
+        self.close_connection = True
         data = json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
+
+    def _read_request_body(self) -> bytes:
+        """Read POST body, supporting both Content-Length and chunked encoding."""
+        te = self.headers.get("Transfer-Encoding", "")
+        if te.lower() == "chunked":
+            return self._read_chunked_body()
+        n = int(self.headers.get("Content-Length", 0))
+        return self.rfile.read(n) if n > 0 else b""
+
+    def _read_chunked_body(self) -> bytes:
+        """Decode a chunked transfer-coded request body."""
+        body = b""
+        while True:
+            line = self.rfile.readline()
+            if not line:
+                break
+            size_str = line.split(b";", 1)[0].strip()
+            try:
+                chunk_size = int(size_str, 16)
+            except ValueError:
+                break
+            if chunk_size == 0:
+                # consume optional trailers until final CRLF
+                while True:
+                    line = self.rfile.readline()
+                    if not line or line == b"\r\n":
+                        break
+                break
+            chunk = self.rfile.read(chunk_size)
+            body += chunk
+            # consume trailing CRLF after chunk data
+            self.rfile.read(2)
+        return body
 
     def _auth_token(self) -> str | None:
         return (
@@ -578,11 +613,11 @@ class Handler(BaseHTTPRequestHandler):
         if not self._check_auth():
             return
         try:
-            n = int(self.headers.get("Content-Length", 0))
-            if n > MAX_BODY_BYTES:
+            raw = self._read_request_body()
+            if len(raw) > MAX_BODY_BYTES:
                 self._send(413, {"error": f"request body exceeds {MAX_BODY_BYTES} bytes"})
                 return
-            req = json.loads(self.rfile.read(n) or b"{}")
+            req = json.loads(raw or b"{}")
             messages = req.get("messages", [])
             if not messages:
                 self._send(400, {"error": "messages required"})

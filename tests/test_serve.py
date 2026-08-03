@@ -1,6 +1,7 @@
 """Unit tests for openfugu-patch/serve.py."""
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import sys
@@ -586,6 +587,55 @@ def test_handler_post_stream():
         assert results[0]["text"] == "final answer"
         assert results[0]["mantis_steps"][0]["model_name"] == "gpt-5.6-sol"
         assert results[0]["mantis_steps"][0]["prompt"] == "hi"
+    finally:
+        serve.get_coordinator = old
+        srv.shutdown()
+
+
+def test_handler_post_chunked():
+    """Pi/fetch can send chunked POST bodies; the handler must consume them."""
+
+    class SimpleCoord:
+        def run(self, query, verbose=False):
+            return SimpleNamespace(
+                final="chunked ok",
+                turns=[
+                    SimpleNamespace(
+                        t=0,
+                        agent_id=2,
+                        role_name="Worker",
+                        reply="ok",
+                        prompt=query,
+                        model_name="gpt-5.6-luna",
+                    )
+                ],
+                terminated_by="verifier_accept",
+            )
+
+    old = serve.get_coordinator
+    try:
+        serve.get_coordinator = lambda _mode: SimpleCoord()
+        srv, port = _start_server(serve.Handler)
+        time.sleep(0.1)
+        payload = json.dumps(
+            {"model": "trinity", "messages": [{"role": "user", "content": "hi"}]}
+        ).encode()
+        chunks = [payload[i : i + 10] for i in range(0, len(payload), 10)]
+        conn = http.client.HTTPConnection("127.0.0.1", port)
+        conn.putrequest("POST", "/v1/chat/completions")
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Authorization", "Bearer test-key")
+        conn.putheader("Transfer-Encoding", "chunked")
+        conn.endheaders()
+        for chunk in chunks:
+            conn.send(f"{len(chunk):X}\r\n".encode() + chunk + b"\r\n")
+        conn.send(b"0\r\n\r\n")
+        resp = conn.getresponse()
+        body = resp.read().decode()
+        assert resp.status == 200
+        data = json.loads(body)
+        assert data["choices"][0]["message"]["content"] == "chunked ok"
+        assert data["mantis_steps"][0]["model_name"] == "gpt-5.6-luna"
     finally:
         serve.get_coordinator = old
         srv.shutdown()

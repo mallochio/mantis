@@ -497,10 +497,18 @@ export default function (pi: ExtensionAPI) {
 
   // 4. Input Handler: Coordinates turns while preserving Native User / Assistant messages
   pi.on("input", async (event: InputEvent, ctx: ExtensionContext): Promise<InputEventResult> => {
+    // Auto-activate when the user has selected a mantis/fugu model (print/RPC or
+    // interactive); if a /mantis command was used, activeMode already reflects it.
+    const current = ctx.model;
     if (
-      (event.source !== "interactive" && event.source !== "rpc") ||
-      activeMode === "off"
+      activeMode === "off" &&
+      current &&
+      (current.provider === "mantis" || current.provider === "fugu") &&
+      ["trinity", "conductor", "auto"].includes(current.id as Mode)
     ) {
+      activeMode = current.id as Mode;
+    }
+    if (activeMode === "off") {
       return { action: "continue" };
     }
 
