@@ -147,6 +147,21 @@ function buildMessagesHistory(ctx: any, currentText: string): ChatMessage[] {
         if (text.trim()) {
           messages.push({ role: "user", content: `[Tool Result ${msg.toolName}]: ${text}` });
         }
+      } else if (msg.role === "custom" && msg.customType === "mantis-result") {
+        // Persist the assistant result into the conversation history so the next
+        // user turn can see it.
+        let text = "";
+        if (typeof msg.content === "string") {
+          text = msg.content;
+        } else if (Array.isArray(msg.content)) {
+          text = msg.content
+            .filter((c: any) => c.type === "text")
+            .map((c: any) => c.text)
+            .join("\n");
+        }
+        if (text.trim()) {
+          messages.push({ role: "assistant", content: text });
+        }
       }
     }
   } catch {
@@ -353,8 +368,12 @@ export default function (pi: any) {
     if (m !== "off") {
       const foundModel = ctx.modelRegistry?.find?.("mantis", m === "auto" ? "auto" : m) ??
         ctx.modelRegistry?.find?.("fugu", m === "auto" ? "auto" : m);
-      if (foundModel && ctx.setModel) {
-        await ctx.setModel(foundModel);
+      if (foundModel && pi.setModel) {
+        try {
+          await pi.setModel(foundModel);
+        } catch {
+          // ignore; the input handler will still route via activeMode
+        }
       }
       await warm(m === "auto" ? "trinity" : m, ctx);
     }

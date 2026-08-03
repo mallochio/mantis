@@ -114,6 +114,64 @@ def test_openrouter_conductor_worker_call(monkeypatch):
     assert result == "conductor"
 
 
+def test_split_messages():
+    assert serve._split_messages([{"role": "user", "content": "hi"}]) == ("hi", [])
+    msgs = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"},
+    ]
+    query, history = serve._split_messages(msgs)
+    assert query == "q2"
+    assert history == [{"role": "user", "content": "q1"}, {"role": "assistant", "content": "a1"}]
+
+
+def test_history_worker_with_history():
+    class FakeWorker:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, role, messages, agent_id):
+            self.calls.append(("call", role, messages, agent_id))
+            return "ok"
+
+    serve._history_context.history = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+    ]
+    try:
+        worker = serve.HistoryWorker(FakeWorker())
+        result = worker("Worker", [{"role": "system", "content": "sys"}, {"role": "user", "content": "q2"}], 0)
+        assert result == "ok"
+        assert worker._worker.calls[0][1] == "Worker"
+        msgs = worker._worker.calls[0][2]
+        assert msgs[0] == {"role": "system", "content": "sys"}
+        assert msgs[1] == {"role": "user", "content": "q1"}
+        assert msgs[2] == {"role": "assistant", "content": "a1"}
+        assert msgs[3] == {"role": "user", "content": "q2"}
+    finally:
+        serve._history_context.history = []
+
+
+def test_history_worker_conduct():
+    class FakeWorker:
+        def __init__(self):
+            self.calls = []
+
+        def conduct(self, model, messages):
+            self.calls.append(("conduct", model, messages))
+            return "plan"
+
+    serve._history_context.history = [{"role": "assistant", "content": "a1"}]
+    try:
+        worker = serve.HistoryWorker(FakeWorker())
+        result = worker.conduct("model", [{"role": "user", "content": "q"}])
+        assert result == "plan"
+        assert worker._worker.calls[0][2] == [{"role": "assistant", "content": "a1"}, {"role": "user", "content": "q"}]
+    finally:
+        serve._history_context.history = []
+
+
 # ---------------------------------------------------------------------------
 # Local pool worker with mocked transformers
 # ---------------------------------------------------------------------------

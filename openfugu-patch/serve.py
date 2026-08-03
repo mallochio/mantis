@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -56,6 +57,7 @@ REASONING_ALIASES = ("claude-", "gpt-5.6-", "expensive", "cheap")
 
 _args: argparse.Namespace | None = None
 _coordinators: dict[str, object] = {}
+_history_context = threading.local()
 
 
 def _is_reasoning_model(model: str) -> bool:
@@ -78,6 +80,50 @@ def _build_litellm_kwargs(
     if not _is_reasoning_model(model):
         kw["temperature"] = temperature
     return kw
+
+
+class HistoryWorker:
+    """Wrap a worker so every LLM call sees the conversation history.
+
+    The coordinator classes only know the current query; this wrapper prepends
+    the prior user/assistant turns (carried in a per-request thread-local) to
+    the messages list handed to the underlying worker. This makes multi-turn
+    coding sessions work without modifying the upstream Coordinator code."""
+
+    def __init__(self, worker: Any) -> None:
+        self._worker = worker
+
+    def _combine(self, messages: Any) -> Any:
+        history = getattr(_history_context, "history", None) or []
+        if not history or not isinstance(messages, list):
+            return messages
+        # Strip any system messages from history; the coordinator adds its own.
+        prior = [m for m in history if isinstance(m, dict) and m.get("role") != "system"]
+        if not prior:
+            return messages
+        if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+            return [messages[0]] + prior + list(messages[1:])
+        return prior + list(messages)
+
+    def __call__(self, *args: Any) -> Any:
+        if len(args) == 3:
+            role_or_subtask, messages, agent_id = args
+            return self._worker(role_or_subtask, self._combine(messages), agent_id)
+        return self._worker(*args)
+
+    def conduct(self, *args: Any) -> Any:
+        if not (getattr(_history_context, "history", None) or []):
+            return self._worker.conduct(*args)
+        if len(args) == 2:
+            model, messages = args
+            return self._worker.conduct(model, self._combine(messages))
+        if len(args) == 1:
+            messages, = args
+            return self._worker.conduct(self._combine(messages))
+        return self._worker.conduct(*args)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._worker, name)
 
 
 class OpenRouterTrinityWorker(_TrinityLiteLLMWorker):
@@ -375,6 +421,18 @@ class EnvConductorCoordinator(ConductorCoordinator):
         return _run_conductor_workflow(self.worker, query, self.slot_labels, completion, verbose)
 
 
+def _split_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+    """Return (query, history) where query is the last user message."""
+    last_user_idx = -1
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            last_user_idx = i
+            break
+    if last_user_idx == -1:
+        return "", messages
+    return messages[last_user_idx].get("content", ""), messages[:last_user_idx]
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -438,16 +496,18 @@ class Handler(BaseHTTPRequestHandler):
             requested = (req.get("model") or "trinity").lower()
             coordinator_mode = "conductor" if requested in ("conductor", "ultra") else "trinity"
 
-            # the user query = last user message; coordinator runs the full loop
-            query = next(
-                (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
-            )
+            # the user query = last user message; history = everything before it
+            query, history = _split_messages(messages)
             print(
                 f"[serve] route request model={requested} -> coordinator={coordinator_mode}",
                 flush=True,
             )
-            coord = get_coordinator(coordinator_mode)
-            res = coord.run(query, verbose=False)
+            _history_context.history = history
+            try:
+                coord = get_coordinator(coordinator_mode)
+                res = coord.run(query, verbose=False)
+            finally:
+                _history_context.history = []
             self._send(
                 200, _chat_response(res, req.get("model", MODEL_NAME))
             )
@@ -580,7 +640,7 @@ def load_coordinator(mode: str):
         raise ValueError(f"unknown coordinator mode: {mode}")
     args = _parse_args()
     MAX_TURNS = args.max_turns
-    worker = _worker_from_args(args, mode)
+    worker = HistoryWorker(_worker_from_args(args, mode))
     if mode == "trinity":
         return Coordinator(get_router(), worker, max_turns=args.max_turns, sample=True)
     local_ckpt = os.environ.get("MANTIS_LOCAL_CONDUCTOR", os.environ.get("FUGU_LOCAL_CONDUCTOR"))
