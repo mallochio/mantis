@@ -173,14 +173,12 @@ def _chat_response(result: Any, model: str) -> dict:
     text = getattr(result, "final", "")
     turns = getattr(result, "turns", [])
     trace = _build_fugu_trace(result)
-    step_details = []
-    for turn in turns:
-        step_details.append({
-            "turn": getattr(turn, "t", getattr(turn, "step", 0)),
-            "agent_id": getattr(turn, "agent_id", 0),
-            "role": getattr(turn, "role", getattr(turn, "role_name", "Worker")),
-            "reply": getattr(turn, "reply", getattr(turn, "text", "")),
-        })
+    step_details = [{
+        "turn": getattr(turn, "t", getattr(turn, "step", 0)),
+        "agent_id": getattr(turn, "agent_id", 0),
+        "role": getattr(turn, "role", getattr(turn, "role_name", "Worker")),
+        "reply": getattr(turn, "reply", getattr(turn, "text", "")),
+    } for turn in turns]
     return {
         "id": "chatcmpl-" + uuid.uuid4().hex[:24],
         "object": "chat.completion",
