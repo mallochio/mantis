@@ -105,10 +105,42 @@ class HistoryWorker:
             return [messages[0]] + prior + list(messages[1:])
         return prior + list(messages)
 
+    def _model_name(self, agent_id: int) -> str:
+        labels = (
+            getattr(self._worker, "slot_models", None)
+            or getattr(self._worker, "names", None)
+            or []
+        )
+        if not labels:
+            return f"slot-{agent_id}"
+        return str(labels[agent_id % len(labels)])
+
+    def _last_user_prompt(self, messages: Any) -> str:
+        if not isinstance(messages, list):
+            return ""
+        for m in reversed(messages):
+            if isinstance(m, dict) and m.get("role") == "user":
+                return str(m.get("content", ""))
+            if getattr(m, "role", None) == "user":
+                return str(getattr(m, "content", ""))
+        return ""
+
     def __call__(self, *args: Any) -> Any:
         if len(args) == 3:
             role_or_subtask, messages, agent_id = args
-            return self._worker(role_or_subtask, self._combine(messages), agent_id)
+            combined = self._combine(messages)
+            known_roles = {"Worker", "Thinker", "Verifier"}
+            role = role_or_subtask if role_or_subtask in known_roles else "Worker"
+            calls = getattr(_history_context, "calls", None)
+            if calls is not None:
+                calls.append({
+                    "role": role,
+                    "agent_id": agent_id,
+                    "model_name": self._model_name(agent_id),
+                    "messages": combined,
+                    "prompt": self._last_user_prompt(combined),
+                })
+            return self._worker(role_or_subtask, combined, agent_id)
         return self._worker(*args)
 
     def conduct(self, *args: Any) -> Any:
@@ -220,10 +252,12 @@ def _chat_response(result: Any, model: str) -> dict:
     turns = getattr(result, "turns", [])
     trace = _build_fugu_trace(result)
     step_details = [{
-        "turn": getattr(turn, "t", getattr(turn, "step", 0)),
+        "turn": getattr(turn, "t", getattr(turn, "step", getattr(turn, "idx", 0))),
         "agent_id": getattr(turn, "agent_id", 0),
         "role": getattr(turn, "role", getattr(turn, "role_name", "Worker")),
         "reply": getattr(turn, "reply", getattr(turn, "text", "")),
+        "prompt": getattr(turn, "prompt", ""),
+        "model_name": getattr(turn, "model_name", ""),
     } for turn in turns]
     return {
         "id": "chatcmpl-" + uuid.uuid4().hex[:24],
@@ -503,11 +537,17 @@ class Handler(BaseHTTPRequestHandler):
                 flush=True,
             )
             _history_context.history = history
+            _history_context.calls = []
             try:
                 coord = get_coordinator(coordinator_mode)
                 res = coord.run(query, verbose=False)
             finally:
                 _history_context.history = []
+                calls = getattr(_history_context, "calls", [])
+                _history_context.calls = []
+            for turn, call in zip(getattr(res, "turns", []), calls, strict=False):
+                turn.prompt = call.get("prompt", "")
+                turn.model_name = call.get("model_name", "")
             self._send(
                 200, _chat_response(res, req.get("model", MODEL_NAME))
             )

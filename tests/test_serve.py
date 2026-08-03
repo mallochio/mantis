@@ -139,9 +139,16 @@ def test_history_worker_with_history():
         {"role": "user", "content": "q1"},
         {"role": "assistant", "content": "a1"},
     ]
+    serve._history_context.calls = []
     try:
         worker = serve.HistoryWorker(FakeWorker())
         result = worker("Worker", [{"role": "system", "content": "sys"}, {"role": "user", "content": "q2"}], 0)
+        assert len(serve._history_context.calls) == 1
+        call = serve._history_context.calls[0]
+        assert call["role"] == "Worker"
+        assert call["agent_id"] == 0
+        assert call["prompt"] == "q2"
+        assert call["model_name"] == "slot-0"
         assert result == "ok"
         assert worker._worker.calls[0][1] == "Worker"
         msgs = worker._worker.calls[0][2]
@@ -151,6 +158,7 @@ def test_history_worker_with_history():
         assert msgs[3] == {"role": "user", "content": "q2"}
     finally:
         serve._history_context.history = []
+        serve._history_context.calls = []
 
 
 def test_history_worker_conduct():
@@ -170,6 +178,17 @@ def test_history_worker_conduct():
         assert worker._worker.calls[0][2] == [{"role": "assistant", "content": "a1"}, {"role": "user", "content": "q"}]
     finally:
         serve._history_context.history = []
+        serve._history_context.calls = []
+
+
+def test_chat_response_includes_prompt_and_model_name():
+    from types import SimpleNamespace
+    turn = SimpleNamespace(t=1, agent_id=2, role_name="Thinker", reply="ok", prompt="solve it", model_name="openai/gpt-4o-mini")
+    res = SimpleNamespace(final="final", turns=[turn], terminated_by="verifier_accept")
+    body = serve._chat_response(res, "mantis")
+    step = body["mantis_steps"][0]
+    assert step["prompt"] == "solve it"
+    assert step["model_name"] == "openai/gpt-4o-mini"
 
 
 # ---------------------------------------------------------------------------

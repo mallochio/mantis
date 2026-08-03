@@ -23,6 +23,9 @@ interface MantisStep {
   agent_id: number;
   role: string;
   reply: string;
+  prompt?: string;
+  model_name?: string;
+  output?: string;
 }
 
 const WORKER_NAMES: Record<number, string> = {
@@ -267,11 +270,18 @@ async function orchestrate(
 }
 
 export default function (pi: any) {
+  // Ensure pi's auth resolver can find a MANTIS_API_KEY even if the user only
+  // configured FUGU_API_KEY / LITELLM_KEY in the environment or .env file.
+  const apiKey = getApiKey();
+  if (apiKey) {
+    process.env.MANTIS_API_KEY = apiKey;
+  }
+
   // 1. Register Providers mantis & fugu with Pi's native model registry
   const models = [
     {
       id: "trinity",
-      name: "TRINITY (0.6B router + 7-slot pool)",
+      name: "mantis: trinity",
       reasoning: true,
       input: ["text"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -280,7 +290,7 @@ export default function (pi: any) {
     },
     {
       id: "conductor",
-      name: "Conductor (DAG workflow planner)",
+      name: "mantis: conductor",
       reasoning: true,
       input: ["text"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -289,7 +299,7 @@ export default function (pi: any) {
     },
     {
       id: "auto",
-      name: "Auto (Supra complexity scoring gate)",
+      name: "mantis: auto",
       reasoning: true,
       input: ["text"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -299,6 +309,7 @@ export default function (pi: any) {
   ];
 
   pi.registerProvider("mantis", {
+    name: "mantis",
     baseUrl: getMantisUrl(),
     apiKey: "MANTIS_API_KEY",
     api: "openai-completions",
@@ -306,6 +317,7 @@ export default function (pi: any) {
   });
 
   pi.registerProvider("fugu", {
+    name: "fugu",
     baseUrl: getMantisUrl(),
     apiKey: "MANTIS_API_KEY",
     api: "openai-completions",
@@ -353,6 +365,38 @@ export default function (pi: any) {
         isError: false,
       };
     },
+  });
+
+  // 3a. Custom message renderers so mantis steps look like native tool calls and
+  // the per-model user prompts look like native user messages.
+  pi.registerMessageRenderer("mantis-prompt", (message: any, _options: any, theme: any) => {
+    const details = message.details ?? {};
+    const modelName = details.model_name ?? WORKER_NAMES[details.agent_id] ?? `slot-${details.agent_id}`;
+    const role = details.role ?? "Worker";
+    const header = theme.fg("accent", `▸ user message to ${role} (${modelName})`);
+    const body = typeof message.content === "string" ? message.content : JSON.stringify(message.content);
+    return new Text(`${header}\n${body}`, 0, 0);
+  });
+
+  pi.registerMessageRenderer("mantis-step", (message: any, options: any, theme: any) => {
+    const details = message.details ?? {};
+    const role = details.role ?? "Worker";
+    const modelName = details.model_name ?? WORKER_NAMES[details.agent_id] ?? `slot-${details.agent_id}`;
+    const roleColor = role === "Verifier" ? "success" : role === "Thinker" ? "warning" : "accent";
+    const title = theme.bold(theme.fg(roleColor, `[mantis ${role}]`));
+    const subtitle = theme.fg("muted", ` slot #${details.agent_id} (${modelName}) — step ${details.turn ?? 0}`);
+    const body = typeof message.content === "string" ? message.content : JSON.stringify(message.content);
+    let text = `${title}${subtitle}\n${theme.fg("toolOutput", body)}`;
+    if (options.expanded && details.prompt) {
+      text += `\n\n${theme.fg("muted", "Prompt sent to model:")}\n${theme.fg("dim", details.prompt)}`;
+    }
+    return new Text(text, 0, 0);
+  });
+
+  pi.registerMessageRenderer("mantis-result", (message: any, _options: any, theme: any) => {
+    const header = theme.bold(theme.fg("success", "mantis result"));
+    const body = typeof message.content === "string" ? message.content : JSON.stringify(message.content);
+    return new Text(`${header}\n${body}`, 0, 0);
   });
 
   // 3. Register Slash Commands for mode switching & model setting
@@ -430,20 +474,38 @@ export default function (pi: any) {
 
       ctx.ui.setWorkingMessage?.();
 
-      // Emit background worker/thinker/verifier turns as native tool call steps
+      // Emit each background turn as a user message to the model followed by
+      // the model reply rendered as a native tool-call-style step.
       if (steps && steps.length > 0) {
         for (const step of steps) {
-          const modelName = WORKER_NAMES[step.agent_id] ?? `slot-${step.agent_id}`;
+          const modelName = step.model_name ?? WORKER_NAMES[step.agent_id] ?? `slot-${step.agent_id}`;
+          if (step.prompt) {
+            await pi.sendMessage(
+              {
+                customType: "mantis-prompt",
+                content: step.prompt,
+                details: {
+                  turn: step.turn,
+                  role: step.role,
+                  agent_id: step.agent_id,
+                  model_name: modelName,
+                },
+                display: true,
+              },
+              { triggerTurn: false },
+            );
+          }
           await pi.sendMessage(
             {
               customType: "mantis-step",
-              content: `[mantis ${step.role}] slot #${step.agent_id} (${modelName}):\n${step.reply}`,
+              content: step.reply ?? step.output ?? "",
               details: {
                 turn: step.turn,
                 role: step.role,
                 agent_id: step.agent_id,
                 model_name: modelName,
-                output: step.reply,
+                prompt: step.prompt,
+                output: step.reply ?? step.output ?? "",
               },
               display: true,
             },
