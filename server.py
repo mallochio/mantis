@@ -208,6 +208,23 @@ def _backend_for(decision: str) -> dict:
     return EXPENSIVE if decision == "expensive" else CHEAP
 
 
+def _build_outgoing_body(body: dict, backend: dict) -> dict:
+    out_body = dict(body)
+    if isinstance(out_body.get("messages"), list):
+        out_body["messages"] = _normalize_messages_for_backend(out_body["messages"])
+    out_body["model"] = backend["model"]
+    if isinstance(out_body.get("max_tokens"), int):
+        out_body["max_completion_tokens"] = out_body.pop("max_tokens")
+    if isinstance(out_body.get("max_completion_tokens"), int) and backend.get("max_tokens"):
+        out_body["max_completion_tokens"] = min(out_body["max_completion_tokens"], backend["max_tokens"])
+    out_body.pop("stop", None)
+    if backend["model"].startswith("gpt-5.6-") and out_body.get("temperature") not in (None, 1):
+        out_body.pop("temperature")
+    if backend["effort"]:
+        out_body["reasoning_effort"] = backend["effort"]
+    return out_body
+
+
 def _normalize_messages_for_backend(messages):
     out = []
     changed = False
@@ -273,19 +290,7 @@ async def chat_completions(request: Request, authorization: str | None = Header(
         decision, score, supra_complexity = "cheap", 0.0, None
     backend = _backend_for(decision)
 
-    out_body = dict(body)
-    if isinstance(out_body.get("messages"), list):
-        out_body["messages"] = _normalize_messages_for_backend(out_body["messages"])
-    out_body["model"] = backend["model"]
-    if isinstance(out_body.get("max_tokens"), int):
-        out_body["max_completion_tokens"] = out_body.pop("max_tokens")
-    if isinstance(out_body.get("max_completion_tokens"), int) and backend.get("max_tokens"):
-        out_body["max_completion_tokens"] = min(out_body["max_completion_tokens"], backend["max_tokens"])
-    out_body.pop("stop", None)
-    if backend["model"].startswith("gpt-5.6-") and out_body.get("temperature") not in (None, 1):
-        out_body.pop("temperature")
-    if backend["effort"]:
-        out_body["reasoning_effort"] = backend["effort"]
+    out_body = _build_outgoing_body(body, backend)
 
     want_stream = bool(body.get("stream"))
     headers = {"Authorization": f"Bearer {backend['key']}", "Content-Type": "application/json"}
@@ -300,7 +305,6 @@ async def chat_completions(request: Request, authorization: str | None = Header(
         route_hdr["x-route-supra-complexity"] = str(supra_complexity)
 
     if want_stream:
-        req = httpx.stream("POST", url, json=out_body, headers=headers, timeout=None)
         client = httpx.Client(timeout=None)
 
         def gen():
