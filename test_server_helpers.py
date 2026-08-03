@@ -1,7 +1,10 @@
-from server import _build_outgoing_body, _normalize_messages_for_backend, _parse_supra_complexity
+from server import _build_outgoing_body, _decide_cached, _normalize_messages_for_backend, _parse_supra_complexity
 
 
 def demo():
+    assert _decide_cached("same prompt") is _decide_cached("same prompt")
+    assert _decide_cached("a") is not _decide_cached("b")
+
     assert _normalize_messages_for_backend([{"role": "developer", "content": "x"}]) == [
         {"role": "system", "content": "x"}
     ]

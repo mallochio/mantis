@@ -25,6 +25,7 @@ import json
 import os
 import time
 from contextlib import asynccontextmanager
+from functools import lru_cache
 from pathlib import Path
 
 import httpx
@@ -40,6 +41,7 @@ THRESHOLD = float(os.environ.get("ROUTELLM_THRESHOLD", "0.156"))
 ROUTER_NAME = os.environ.get("ROUTELLM_ROUTER", "mf")
 SUPRA_ENABLED = os.environ.get("ROUTELLM_USE_SUPRA", "1") != "0"
 SUPRA_THRESHOLD = int(os.environ.get("ROUTELLM_SUPRA_THRESHOLD", "3"))
+SUPRA_MIN_SCORE = float(os.environ.get("ROUTELLM_SUPRA_MIN_SCORE", "0"))
 ROUTELLM_CONTEXT_WINDOW = os.environ.get("ROUTELLM_CONTEXT_WINDOW", "auto")
 ROUTELLM_MAX_TOKENS = int(os.environ.get("ROUTELLM_MAX_TOKENS", "131072"))
 MODEL_ID = "auto"
@@ -177,39 +179,51 @@ def _parse_supra_complexity(text: str) -> int:
     return 0
 
 
-def _supra_complexity(prompt: str) -> int:
+def _supra_complexity(prompt: str) -> tuple[int, int]:
     model, tokenizer = _load_supra()
     fmt = f"Task: {prompt}\nAnalysis: "
     inputs = tokenizer(fmt, return_tensors="pt")
     import torch
+    t0 = time.time()
     with torch.no_grad():
         out = model.generate(
             **inputs, max_new_tokens=128, do_sample=False,
             pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
         )
+    supra_ms = int((time.time() - t0) * 1000)
     gen = tokenizer.decode(
         out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True,
     ).strip()
-    return _parse_supra_complexity(gen)
+    return _parse_supra_complexity(gen), supra_ms
 
 
-def _decide(prompt: str) -> tuple[str, float, int | None]:
-    # Take tail of prompt (~15k chars) so routing evaluates the latest user request & context
-    trimmed_prompt = prompt[-15000:] if len(prompt) > 15000 else prompt
+def _decide_uncached(trimmed_prompt: str) -> tuple[str, float, int | None, int | None]:
     try:
         r = _load_router()
         score = float(r.calculate_strong_win_rate(trimmed_prompt))
         supra_complexity = None
+        supra_ms = None
         if score >= THRESHOLD:
-            return "expensive", score, supra_complexity
-        if SUPRA_ENABLED:
-            supra_complexity = _supra_complexity(trimmed_prompt)
+            return "expensive", score, supra_complexity, supra_ms
+        if SUPRA_ENABLED and score >= SUPRA_MIN_SCORE:
+            supra_complexity, supra_ms = _supra_complexity(trimmed_prompt)
             if supra_complexity >= SUPRA_THRESHOLD:
-                return "expensive", score, supra_complexity
-        return "cheap", score, supra_complexity
+                return "expensive", score, supra_complexity, supra_ms
+        return "cheap", score, supra_complexity, supra_ms
     except Exception as err:
         print(f"Router decision failed ({err}); defaulting to expensive", flush=True)
-        return "expensive", 1.0, None
+        return tuple(["expensive", 1.0, None, None])  # type: ignore
+
+
+@lru_cache(maxsize=256)
+def _decide_cached(trimmed_prompt: str) -> tuple[str, float, int | None, int | None]:
+    return _decide_uncached(trimmed_prompt)
+
+
+def _decide(prompt: str) -> tuple[str, float, int | None, int | None]:
+    # Take tail of prompt (~15k chars) so routing evaluates the latest user request & context
+    trimmed_prompt = prompt[-15000:] if len(prompt) > 15000 else prompt
+    return _decide_cached(trimmed_prompt)
 
 
 def _backend_for(decision: str) -> dict:
@@ -252,13 +266,22 @@ def _authorize(authorization: str | None) -> bool:
     return authorization[7:] == SERVER_KEY
 
 
-def _log(decision: str, score: float, backend_model: str, prompt: str, ttfb_ms: int | None, supra_complexity: int | None = None):
+def _log(
+    decision: str,
+    score: float,
+    backend_model: str,
+    prompt: str,
+    ttfb_ms: int | None,
+    supra_complexity: int | None = None,
+    supra_ms: int | None = None,
+):
     row = {
         "ts": time.time(),
         "router": ROUTER_NAME,
         "threshold": THRESHOLD,
         "score": round(score, 4),
         "supra_complexity": supra_complexity,
+        "supra_ms": supra_ms,
         "decision": decision,
         "model": backend_model,
         "ttfb_ms": ttfb_ms,
@@ -311,9 +334,9 @@ async def chat_completions(request: Request, authorization: str | None = Header(
     body = await request.json()
     prompt = _extract_prompt(body)
     if prompt.strip():
-        decision, score, supra_complexity = await asyncio.to_thread(_decide, prompt)
+        decision, score, supra_complexity, supra_ms = await asyncio.to_thread(_decide, prompt)
     else:
-        decision, score, supra_complexity = "cheap", 0.0, None
+        decision, score, supra_complexity, supra_ms = "cheap", 0.0, None, None
     backend = _backend_for(decision)
 
     out_body = _build_outgoing_body(body, backend)
@@ -351,7 +374,7 @@ async def chat_completions(request: Request, authorization: str | None = Header(
                     yield b"data: [DONE]\n\n"
             finally:
                 client.close()
-            _log(decision, score, backend["model"], prompt, ttfb, supra_complexity)
+            _log(decision, score, backend["model"], prompt, ttfb, supra_complexity, supra_ms)
 
         return StreamingResponse(gen(), media_type="text/event-stream", headers=route_hdr)
 
@@ -359,7 +382,7 @@ async def chat_completions(request: Request, authorization: str | None = Header(
     with httpx.Client(timeout=None) as c:
         resp = c.post(url, json=out_body, headers=headers)
     ttfb = int((time.time() - t0) * 1000)
-    _log(decision, score, backend["model"], prompt, ttfb, supra_complexity)
+    _log(decision, score, backend["model"], prompt, ttfb, supra_complexity, supra_ms)
     return Response(content=resp.content, status_code=resp.status_code,
                     media_type="application/json", headers=route_hdr)
 
@@ -369,8 +392,8 @@ if __name__ == "__main__":
     print(
         "effective config: "
         f"router={ROUTER_NAME} threshold={THRESHOLD} supra={SUPRA_ENABLED} "
-        f"supra_threshold={SUPRA_THRESHOLD} expensive={EXPENSIVE['model']} "
-        f"cheap={CHEAP['model']} port={PORT}",
+        f"supra_threshold={SUPRA_THRESHOLD} supra_min_score={SUPRA_MIN_SCORE} "
+        f"expensive={EXPENSIVE['model']} cheap={CHEAP['model']} port={PORT}",
         flush=True,
     )
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
