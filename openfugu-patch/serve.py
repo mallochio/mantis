@@ -11,12 +11,15 @@ model field in the request selects the coordinator.
 
 stdlib http.server only — no FastAPI/uvicorn.
 """
+
 from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
+import re
 import select
 import socket
 import sys
@@ -27,7 +30,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -40,12 +43,23 @@ if not (_HERE / "mini.py").exists():
     if _OPENFUGU.exists():
         sys.path.insert(0, str(_OPENFUGU))
 
-from mini import DEFAULT_SLOT_LABELS, HEAD_ROWS, HIDDEN, Coordinator, FuguRouter
+from mini import (
+    DEFAULT_SLOT_LABELS,
+    HEAD_ROWS,
+    HIDDEN,
+    ROUTER_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
+    THINKER_PROMPT,
+    VERIFICATION_PROMPT,
+    Coordinator,
+    FuguRouter,
+)
 from mini import LiteLLMWorker as _TrinityLiteLLMWorker
-from ultra import ConductorExecutor, conductor_prompt, parse_workflow
+from ultra import ConductorExecutor, conductor_prompt, parse_workflow, visible_indices
 from ultra import LiteLLMWorker as _ConductorLiteLLMWorker
 
 ROUTER: FuguRouter | None = None
+_router_lock = threading.Lock()
 MODEL_NAME = os.environ.get("MANTIS_MODEL_NAME", os.environ.get("FUGU_MODEL_NAME", "mantis"))
 MAX_TURNS = 5
 # Reject bodies larger than this many bytes.
@@ -68,11 +82,16 @@ REASONING_ALIASES = ("claude-", "gpt-5.6-", "expensive", "cheap")
 
 _args: argparse.Namespace | None = None
 _coordinators: dict[str, object] = {}
+_coordinator_lock = threading.Lock()
 _history_context = threading.local()
 
 
 class ClientDisconnectedError(Exception):
     """Raised when client disconnects during streaming or step execution."""
+
+
+class RequestBodyTooLargeError(Exception):
+    """Raised before an oversized request body is allocated."""
 
 
 def _check_client_connected() -> None:
@@ -86,7 +105,23 @@ def _check_client_connected() -> None:
 
 
 def _is_reasoning_model(model: str) -> bool:
-    return any(model.startswith(p) for p in REASONING_ALIASES)
+    name = model.rsplit("/", 1)[-1]
+    return any(name.startswith(p) for p in REASONING_ALIASES)
+
+
+def _litellm_api_key() -> str | None:
+    """Return the upstream proxy key, independent from Mantis ingress auth."""
+    return (
+        os.environ.get("MANTIS_LITELLM_API_KEY")
+        or os.environ.get("FUGU_LITELLM_API_KEY")
+        or os.environ.get("LITELLM_KEY")
+    )
+
+
+def _litellm_base_url() -> str:
+    return os.environ.get(
+        "MANTIS_BASE_URL", os.environ.get("FUGU_BASE_URL", "http://127.0.0.1:3001/v1")
+    )
 
 
 def _build_litellm_kwargs(
@@ -163,9 +198,7 @@ class HistoryWorker:
 
     def _model_name(self, agent_id: int) -> str:
         labels = (
-            getattr(self._worker, "slot_models", None)
-            or getattr(self._worker, "names", None)
-            or []
+            getattr(self._worker, "slot_models", None) or getattr(self._worker, "names", None) or []
         )
         if not labels:
             return f"slot-{agent_id}"
@@ -205,26 +238,30 @@ class HistoryWorker:
                 write_line = getattr(_history_context, "write_line", None)
                 turn_index = len(calls) - 1 if calls else 0
                 if write_line:
-                    write_line({
-                        "type": "step-start",
-                        "turn": turn_index,
-                        "role": role,
-                        "agent_id": agent_id,
-                        "model_name": call["model_name"],
-                        "prompt": call["prompt"],
-                    })
+                    write_line(
+                        {
+                            "type": "step-start",
+                            "turn": turn_index,
+                            "role": role,
+                            "agent_id": agent_id,
+                            "model_name": call["model_name"],
+                            "prompt": call["prompt"],
+                        }
+                    )
                 reply = self._worker(role_or_subtask, combined, agent_id)
                 call["reply"] = reply
                 if write_line:
-                    write_line({
-                        "type": "step-end",
-                        "turn": turn_index,
-                        "role": role,
-                        "agent_id": agent_id,
-                        "model_name": call["model_name"],
-                        "prompt": call["prompt"],
-                        "reply": reply,
-                    })
+                    write_line(
+                        {
+                            "type": "step-end",
+                            "turn": turn_index,
+                            "role": role,
+                            "agent_id": agent_id,
+                            "model_name": call["model_name"],
+                            "prompt": call["prompt"],
+                            "reply": reply,
+                        }
+                    )
 
                 if reply and reply.strip():
                     return reply
@@ -252,26 +289,30 @@ class HistoryWorker:
                     calls.append(retry_call)
                 turn_index_retry = len(calls) - 1 if calls else 0
                 if write_line:
-                    write_line({
-                        "type": "step-start",
-                        "turn": turn_index_retry,
-                        "role": role,
-                        "agent_id": agent_id,
-                        "model_name": retry_call["model_name"],
-                        "prompt": retry_call["prompt"],
-                    })
+                    write_line(
+                        {
+                            "type": "step-start",
+                            "turn": turn_index_retry,
+                            "role": role,
+                            "agent_id": agent_id,
+                            "model_name": retry_call["model_name"],
+                            "prompt": retry_call["prompt"],
+                        }
+                    )
                 reply_retry = self._worker(role_or_subtask, retry_messages, agent_id)
                 retry_call["reply"] = reply_retry
                 if write_line:
-                    write_line({
-                        "type": "step-end",
-                        "turn": turn_index_retry,
-                        "role": role,
-                        "agent_id": agent_id,
-                        "model_name": retry_call["model_name"],
-                        "prompt": retry_call["prompt"],
-                        "reply": reply_retry,
-                    })
+                    write_line(
+                        {
+                            "type": "step-end",
+                            "turn": turn_index_retry,
+                            "role": role,
+                            "agent_id": agent_id,
+                            "model_name": retry_call["model_name"],
+                            "prompt": retry_call["prompt"],
+                            "reply": reply_retry,
+                        }
+                    )
 
                 if reply_retry and reply_retry.strip():
                     return reply_retry
@@ -306,14 +347,16 @@ class HistoryWorker:
             write_line = getattr(_history_context, "write_line", None)
             turn_index = len(calls) - 1 if calls else 0
             if write_line:
-                write_line({
-                    "type": "step-start",
-                    "turn": turn_index,
-                    "role": role,
-                    "agent_id": agent_id,
-                    "model_name": call["model_name"],
-                    "prompt": call["prompt"],
-                })
+                write_line(
+                    {
+                        "type": "step-start",
+                        "turn": turn_index,
+                        "role": role,
+                        "agent_id": agent_id,
+                        "model_name": call["model_name"],
+                        "prompt": call["prompt"],
+                    }
+                )
             reply = self._worker(role_or_subtask, combined, agent_id)
             call["reply"] = reply
             if role == "Worker" and not reply.strip():
@@ -325,15 +368,17 @@ class HistoryWorker:
                 _history_context.force_worker = True
                 _history_context.revision_feedback = reply
             if write_line:
-                write_line({
-                    "type": "step-end",
-                    "turn": turn_index,
-                    "role": role,
-                    "agent_id": agent_id,
-                    "model_name": call["model_name"],
-                    "prompt": call["prompt"],
-                    "reply": reply,
-                })
+                write_line(
+                    {
+                        "type": "step-end",
+                        "turn": turn_index,
+                        "role": role,
+                        "agent_id": agent_id,
+                        "model_name": call["model_name"],
+                        "prompt": call["prompt"],
+                        "reply": reply,
+                    }
+                )
             return reply
         return self._worker(*args)
 
@@ -345,7 +390,7 @@ class HistoryWorker:
             model, messages = args
             return self._worker.conduct(model, self._combine(messages))
         if len(args) == 1:
-            messages, = args
+            (messages,) = args
             return self._worker.conduct(self._combine(messages))
         return self._worker.conduct(*args)
 
@@ -454,9 +499,7 @@ class LocalPoolWorker:
         wid = agent_id % len(self.models)
         tk, model, dev = self.toks[wid], self.models[wid], self.devs[wid]
         try:
-            text = tk.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
+            text = tk.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         except (ValueError, TypeError, AttributeError):
             text = "\n".join(m["content"] for m in messages)
         ids = tk(text, return_tensors="pt", truncation=True, max_length=2048).to(dev)
@@ -486,28 +529,33 @@ def _chat_response(result: Any, model: str) -> dict:
     text = getattr(result, "final", "")
     turns = getattr(result, "turns", [])
     trace = _build_fugu_trace(result)
-    step_details = [{
-        "turn": getattr(turn, "t", getattr(turn, "step", getattr(turn, "idx", 0))),
-        "agent_id": getattr(turn, "agent_id", 0),
-        "role": getattr(turn, "role", getattr(turn, "role_name", "Worker")),
-        "reply": getattr(turn, "reply", getattr(turn, "text", "")),
-        "prompt": getattr(turn, "prompt", ""),
-        "model_name": getattr(turn, "model_name", ""),
-    } for turn in turns]
+    step_details = [
+        {
+            "turn": getattr(turn, "t", getattr(turn, "step", getattr(turn, "idx", 0))),
+            "agent_id": getattr(turn, "agent_id", 0),
+            "role": getattr(turn, "role", getattr(turn, "role_name", "Worker")),
+            "reply": getattr(turn, "reply", getattr(turn, "text", "")),
+            "prompt": getattr(turn, "prompt", ""),
+            "model_name": getattr(turn, "model_name", ""),
+        }
+        for turn in turns
+    ]
     return {
         "id": "chatcmpl-" + uuid.uuid4().hex[:24],
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": text,
-                "mantis_steps": step_details,
-            },
-            "finish_reason": "stop",
-        }],
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": text,
+                    "mantis_steps": step_details,
+                },
+                "finish_reason": "stop",
+            }
+        ],
         "usage": {
             "mantis_turns": len(turns),
             "mantis_trace": trace,
@@ -588,28 +636,32 @@ class ConductorCoordinator:
             calls.append(planner_call)
 
             if write_line:
-                write_line({
-                    "type": "step-start",
-                    "turn": planner_turn,
-                    "role": "Planner",
-                    "agent_id": 0,
-                    "model_name": conductor_model,
-                    "prompt": query,
-                })
+                write_line(
+                    {
+                        "type": "step-start",
+                        "turn": planner_turn,
+                        "role": "Planner",
+                        "agent_id": 0,
+                        "model_name": conductor_model,
+                        "prompt": query,
+                    }
+                )
 
             completion = get_completion()
             planner_call["reply"] = completion
 
             if write_line:
-                write_line({
-                    "type": "step-end",
-                    "turn": planner_turn,
-                    "role": "Planner",
-                    "agent_id": 0,
-                    "model_name": conductor_model,
-                    "prompt": query,
-                    "reply": completion,
-                })
+                write_line(
+                    {
+                        "type": "step-end",
+                        "turn": planner_turn,
+                        "role": "Planner",
+                        "agent_id": 0,
+                        "model_name": conductor_model,
+                        "prompt": query,
+                        "reply": completion,
+                    }
+                )
 
             if not completion or not str(completion).strip():
                 raise ValueError("Conductor planning returned an empty completion.")
@@ -676,9 +728,7 @@ def choose_conductor_device(torch_module: Any, env_device: str | None = None) ->
     return "cpu"
 
 
-def choose_conductor_dtype(
-    device: str, torch_module: Any, env_dtype: str | None = None
-) -> Any:
+def choose_conductor_dtype(device: str, torch_module: Any, env_dtype: str | None = None) -> Any:
     """Return torch dtype for a Conductor device, honoring an explicit override."""
     if env_dtype:
         return getattr(torch_module, env_dtype)
@@ -776,8 +826,12 @@ class EnvConductorCoordinator(ConductorCoordinator):
     """ConductorCoordinator that can use a local transformers checkpoint
     (Llama-3.2-3B Conductor) or LiteLLM for the planning call."""
 
-    def __init__(self, worker: Any, conductor: EnvLocalConductor | None = None,
-                 slot_labels: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        worker: Any,
+        conductor: EnvLocalConductor | None = None,
+        slot_labels: list[str] | None = None,
+    ) -> None:
         super().__init__(worker, slot_labels=slot_labels)
         self.local_conductor = conductor
 
@@ -812,6 +866,13 @@ def _split_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str,
     return messages[last_user_idx].get("content", ""), messages[:last_user_idx]
 
 
+def _json_object(raw: bytes) -> dict[str, Any]:
+    value = json.loads(raw or b"{}")
+    if not isinstance(value, dict):
+        raise TypeError("request body must be a JSON object")
+    return value
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -825,17 +886,21 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _read_request_body(self) -> bytes:
-        """Read POST body, supporting both Content-Length and chunked encoding."""
+    def _read_request_body(self, max_bytes: int | None = None) -> bytes:
+        """Read a bounded POST body, supporting Content-Length and chunked encoding."""
+        max_bytes = MAX_BODY_BYTES if max_bytes is None else max_bytes
         te = self.headers.get("Transfer-Encoding", "")
         if te.lower() == "chunked":
-            return self._read_chunked_body()
+            return self._read_chunked_body(max_bytes)
         n = int(self.headers.get("Content-Length", 0))
+        if n > max_bytes:
+            raise RequestBodyTooLargeError
         return self.rfile.read(n) if n > 0 else b""
 
-    def _read_chunked_body(self) -> bytes:
-        """Decode a chunked transfer-coded request body."""
-        body = b""
+    def _read_chunked_body(self, max_bytes: int | None = None) -> bytes:
+        """Decode a bounded chunked transfer-coded request body."""
+        max_bytes = MAX_BODY_BYTES if max_bytes is None else max_bytes
+        body = bytearray()
         while True:
             line = self.rfile.readline()
             if not line:
@@ -845,6 +910,8 @@ class Handler(BaseHTTPRequestHandler):
                 chunk_size = int(size_str, 16)
             except ValueError:
                 break
+            if chunk_size < 0:
+                raise ValueError("invalid negative chunk size")
             if chunk_size == 0:
                 # consume optional trailers until final CRLF
                 while True:
@@ -852,11 +919,15 @@ class Handler(BaseHTTPRequestHandler):
                     if not line or line == b"\r\n":
                         break
                 break
+            if len(body) + chunk_size > max_bytes:
+                raise RequestBodyTooLargeError
             chunk = self.rfile.read(chunk_size)
-            body += chunk
-            # consume trailing CRLF after chunk data
-            self.rfile.read(2)
-        return body
+            if len(chunk) != chunk_size:
+                raise ValueError("truncated chunk data")
+            body.extend(chunk)
+            if self.rfile.read(2) != b"\r\n":
+                raise ValueError("invalid chunk terminator")
+        return bytes(body)
 
     def _auth_token(self) -> str | None:
         return (
@@ -946,14 +1017,16 @@ class Handler(BaseHTTPRequestHandler):
             turn.model_name = call.get("model_name", "")
         body = _chat_response(res, model)
         try:
-            self._write_ndjson_line({
-                "type": "result",
-                "text": body["choices"][0]["message"]["content"],
-                "trace": body["usage"]["mantis_trace"],
-                "coordinator": coordinator_mode,
-                "mantis_steps": body.get("mantis_steps", []),
-                **body,
-            })
+            self._write_ndjson_line(
+                {
+                    "type": "result",
+                    "text": body["choices"][0]["message"]["content"],
+                    "trace": body["usage"]["mantis_trace"],
+                    "coordinator": coordinator_mode,
+                    "mantis_steps": body.get("mantis_steps", []),
+                    **body,
+                }
+            )
         except ClientDisconnectedError:
             print("[serve] client disconnected before writing final result", flush=True)
 
@@ -972,7 +1045,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             get_coordinator(mode)
-            self._send(200, {"status": "ready", "mode": mode})
+            self._send(
+                200,
+                {
+                    "status": "ready",
+                    "mode": mode,
+                    "native_tool_runs": NATIVE_TOOL_RUNS,
+                },
+            )
         except Exception as e:  # noqa: BLE001
             self._send(500, {"error": str(e)})
 
@@ -983,8 +1063,13 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/v1/models":
             if not self._check_auth():
                 return
-            self._send(200, {"object": "list", "data": [
-                {"id": MODEL_NAME, "object": "model", "owned_by": "mantis"}]})
+            self._send(
+                200,
+                {
+                    "object": "list",
+                    "data": [{"id": MODEL_NAME, "object": "model", "owned_by": "mantis"}],
+                },
+            )
         elif parsed.path in ("/health", "/"):
             self._send(200, {"status": "ok", "model": MODEL_NAME})
         else:
@@ -1000,9 +1085,26 @@ class Handler(BaseHTTPRequestHandler):
                     req = json.loads(raw)
                     if isinstance(req, dict):
                         mode = req.get("mode")
+            except RequestBodyTooLargeError:
+                self._send(413, {"error": "request body exceeds limit"})
+                return
             except (json.JSONDecodeError, ValueError, KeyError, RuntimeError, TypeError):
                 pass
             self._handle_warm(parsed, mode_from_body=mode)
+            return
+
+        if parsed.path == "/v1/runs":
+            self._handle_create_run()
+            return
+        if parsed.path.startswith("/v1/runs/"):
+            rest = parsed.path[len("/v1/runs/") :]
+            run_id, action = (rest.split("/", 1) + [""])[:2]
+            if run_id and action == "continue":
+                self._handle_continue_run(run_id)
+            elif run_id and not action:
+                self._handle_fetch_run(run_id)  # advance without tool results
+            else:
+                self._send(404, {"error": "not found"})
             return
 
         if parsed.path.rstrip("/") != "/v1/chat/completions":
@@ -1012,10 +1114,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             raw = self._read_request_body()
-            if len(raw) > MAX_BODY_BYTES:
-                self._send(413, {"error": f"request body exceeds {MAX_BODY_BYTES} bytes"})
-                return
-            req = json.loads(raw or b"{}")
+            req = _json_object(raw)
             messages = req.get("messages", [])
             if not messages:
                 self._send(400, {"error": "messages required"})
@@ -1062,11 +1161,78 @@ class Handler(BaseHTTPRequestHandler):
             for turn, call in zip(getattr(res, "turns", []), calls, strict=False):
                 turn.prompt = call.get("prompt", "")
                 turn.model_name = call.get("model_name", "")
-            self._send(
-                200, _chat_response(res, model_name)
-            )
-        except (json.JSONDecodeError, ValueError, KeyError, RuntimeError) as e:
+            self._send(200, _chat_response(res, model_name))
+        except RequestBodyTooLargeError:
+            self._send(413, {"error": "request body exceeds limit"})
+        except (json.JSONDecodeError, ValueError, KeyError, RuntimeError, TypeError) as e:
             self._send(500, {"error": str(e)})
+
+    def _handle_create_run(self) -> None:
+        if not self._check_auth():
+            return
+        try:
+            raw = self._read_request_body()
+            req = _json_object(raw)
+            model = req.get("model") or "trinity"
+            if not isinstance(model, str):
+                raise TypeError("model must be a string")  # noqa: TRY301
+            mode = model.lower()
+            mode = "conductor" if mode in ("conductor", "ultra") else "trinity"
+            if not req.get("messages"):
+                self._send(400, {"error": "messages required"})
+                return
+            run = create_run(mode, req)
+            print(f"[serve] created {mode} run {run.run_id}", flush=True)
+            self._send(200, {"run_id": run.run_id, "mode": mode})
+        except RequestBodyTooLargeError:
+            self._send(413, {"error": "request body exceeds limit"})
+        except (json.JSONDecodeError, ValueError, KeyError, RuntimeError, TypeError) as e:
+            self._send(400, {"error": str(e)})
+
+    def _handle_continue_run(self, run_id: str) -> None:
+        if not self._check_auth():
+            return
+        try:
+            raw = self._read_request_body()
+            tool_results = None
+            request_id = None
+            if raw:
+                req = _json_object(raw)
+                tool_results = req.get("tool_results")
+                request_id = req.get("request_id")
+            event = advance_run(run_id, tool_results, request_id)
+            self._send(200, event)
+        except KeyError as e:
+            self._send(404, {"error": str(e)})
+        except RequestBodyTooLargeError:
+            self._send(413, {"error": "request body exceeds limit"})
+        except (json.JSONDecodeError, ValueError, RuntimeError, TypeError) as e:
+            self._send(400, {"error": str(e)})
+
+    def _handle_fetch_run(self, run_id: str) -> None:
+        if not self._check_auth():
+            return
+        try:
+            event = advance_run(run_id, None)
+            self._send(200, event)
+        except KeyError as e:
+            self._send(404, {"error": str(e)})
+        except (json.JSONDecodeError, ValueError, RuntimeError, TypeError) as e:
+            self._send(400, {"error": str(e)})
+
+    def do_DELETE(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if not parsed.path.startswith("/v1/runs/"):
+            self._send(404, {"error": "not found"})
+            return
+        if not self._check_auth():
+            return
+        run_id = parsed.path[len("/v1/runs/") :].rstrip("/")
+        if not run_id or "/" in run_id:
+            self._send(404, {"error": "not found"})
+            return
+        deleted = delete_run(run_id)
+        self._send(200, {"deleted": deleted})
 
     def log_message(self, *a) -> None:  # quiet
         pass
@@ -1134,15 +1300,22 @@ def _parse_args() -> argparse.Namespace:
 def get_router() -> FuguRouter:
     global ROUTER
     if ROUTER is None:
-        args = _parse_args()
-        device = os.environ.get("MANTIS_DEVICE", os.environ.get("FUGU_DEVICE"))
-        print(f"[serve] loading TRINITY router ({args.model}) ...", flush=True)
-        ROUTER = FuguRouter(args.model, args.vector, device=device, seed=0)
-        if args.head:  # layer a trained head over base SVF
-            head = _load_head(args.head)
-            ROUTER.head = ROUTER.torch.from_numpy(head.copy()).float().reshape(
-                HEAD_ROWS, HIDDEN).to(ROUTER.device)
-            print(f"[serve] applied trained head from {args.head}", flush=True)
+        with _router_lock:
+            if ROUTER is None:
+                args = _parse_args()
+                device = os.environ.get("MANTIS_DEVICE", os.environ.get("FUGU_DEVICE"))
+                print(f"[serve] loading TRINITY router ({args.model}) ...", flush=True)
+                router = FuguRouter(args.model, args.vector, device=device, seed=0)
+                if args.head:  # layer a trained head over base SVF
+                    head = _load_head(args.head)
+                    router.head = (
+                        router.torch.from_numpy(head.copy())
+                        .float()
+                        .reshape(HEAD_ROWS, HIDDEN)
+                        .to(router.device)
+                    )
+                    print(f"[serve] applied trained head from {args.head}", flush=True)
+                ROUTER = router
     return ROUTER
 
 
@@ -1150,6 +1323,7 @@ def _load_head(path: str) -> np.ndarray:
     """Load a 10240-float head from .npy or from a safetensors file."""
     if path.endswith(".safetensors"):
         from safetensors import safe_open
+
         with safe_open(path, framework="pt") as f:
             head = f.get_tensor("trinity_router_head")
         head = head.to(torch.float32).numpy().reshape(-1)
@@ -1166,6 +1340,7 @@ def _worker_from_args(args: argparse.Namespace, mode: str) -> Any:
         n_gpu = 0
         try:
             import torch as _torch
+
             n_gpu = _torch.cuda.device_count() if _torch.cuda.is_available() else 0
         except (ImportError, ModuleNotFoundError):
             pass
@@ -1181,11 +1356,17 @@ def _worker_from_args(args: argparse.Namespace, mode: str) -> Any:
     # 4096 tokens to leave room for high reasoning effort (max/xhigh) while still
     # capping cost on long code outputs.
     slot_models = args.slot_models.split(",") if args.slot_models else None
+    base_url = _litellm_base_url()
+    api_key = _litellm_api_key()
     if mode == "conductor":
-        return OpenRouterConductorWorker(slot_models=slot_models, max_tokens=4096)
-    if mode == "trinity":
-        return OpenRouterTrinityWorker(slot_models=slot_models, max_tokens=4096)
-    raise ValueError(f"unknown coordinator mode: {mode}")
+        worker = OpenRouterConductorWorker(slot_models=slot_models, max_tokens=4096)
+    elif mode == "trinity":
+        worker = OpenRouterTrinityWorker(slot_models=slot_models, max_tokens=4096)
+    else:
+        raise ValueError(f"unknown coordinator mode: {mode}")
+    worker.api_key = api_key
+    worker.api_base = base_url
+    return worker
 
 
 def load_coordinator(mode: str):
@@ -1208,7 +1389,9 @@ def load_coordinator(mode: str):
 
 def get_coordinator(mode: str):
     if mode not in _coordinators:
-        _coordinators[mode] = load_coordinator(mode)
+        with _coordinator_lock:
+            if mode not in _coordinators:
+                _coordinators[mode] = load_coordinator(mode)
     return _coordinators[mode]
 
 
@@ -1232,6 +1415,910 @@ def main() -> None:
         flush=True,
     )
     srv.serve_forever()
+
+
+# ---------------------------------------------------------------------------
+# Resumable native-tool runs
+# ---------------------------------------------------------------------------
+# Pi forwards its active tool schemas; the backend selects a role/model and
+# drives a tool loop, and Pi executes each tool natively and returns results.
+# Each HTTP call advances the run by exactly one model invocation; events tell
+# Pi whether to execute tools, acknowledge a completed role step, or return a
+# final answer. State lives only in the bounded in-memory registry below.
+RUN_TTL = float(os.environ.get("MANTIS_RUN_TTL", os.environ.get("FUGU_RUN_TTL", "600")))
+MAX_TOOL_ROUNDS = int(
+    os.environ.get(
+        "MANTIS_MAX_TOOL_ROUNDS_PER_STEP", os.environ.get("FUGU_MAX_TOOL_ROUNDS_PER_STEP", "8")
+    )
+)
+MAX_RUNS = int(
+    os.environ.get("MANTIS_MAX_CONCURRENT_RUNS", os.environ.get("FUGU_MAX_CONCURRENT_RUNS", "32"))
+)
+RUN_MAX_MSG_BYTES = 400_000
+
+_runs: dict[str, NativeRun] = {}
+_runs_lock = threading.Lock()
+_runs_sweeper_started = False
+NATIVE_TOOL_RUNS = True
+
+
+def _sweep_runs() -> None:
+    now = time.time()
+    stale = [
+        rid for rid, run in _runs.items() if run.in_flight == 0 and now - run.last_active > RUN_TTL
+    ]
+    for rid in stale:
+        run = _runs.pop(rid, None)
+        if run is not None:
+            run.close()
+
+
+def _ensure_runs_sweeper() -> None:
+    global _runs_sweeper_started
+    if _runs_sweeper_started:
+        return
+    _runs_sweeper_started = True
+
+    def _loop() -> None:
+        while True:
+            time.sleep(RUN_TTL / 2 if RUN_TTL > 0 else 60)
+            with _runs_lock:
+                _sweep_runs()
+
+    threading.Thread(target=_loop, daemon=True).start()
+
+
+def _register_run(run: NativeRun) -> str:
+    with _runs_lock:
+        _ensure_runs_sweeper()
+        if run.run_id in _runs:
+            raise ValueError("run id already exists")
+        while len(_runs) >= MAX_RUNS:
+            _sweep_runs()
+            if len(_runs) >= MAX_RUNS:  # still full: drop oldest
+                oldest = min(_runs, key=lambda rid: _runs[rid].created)
+                dropped = _runs.pop(oldest, None)
+                if dropped is not None:
+                    dropped.close()
+        _runs[run.run_id] = run
+    return cast(str, run.run_id)
+
+
+def _convert_tools(tools: Any) -> list[dict[str, Any]]:
+    """Convert Pi active-tool definitions to OpenAI function-tool format."""
+    out: list[dict[str, Any]] = []
+    if not isinstance(tools, list):
+        return out
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        name = t.get("name")
+        if not name or name == "mantis_step":
+            continue
+        fn: dict[str, Any] = {"name": name}
+        if t.get("description"):
+            fn["description"] = t["description"]
+        params = t.get("parameters")
+        if isinstance(params, dict):
+            fn["parameters"] = params
+        elif not params:
+            fn["parameters"] = {"type": "object", "properties": {}}
+        else:
+            continue  # non-dict parameters: cannot serialize a stable schema
+        out.append({"type": "function", "function": fn})
+    return out
+
+
+def _model_completion(
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Call LiteLLM/OpenRouter; return (text, tool_calls)."""
+    import litellm
+
+    kw = _build_litellm_kwargs(model, messages, 4096, 0.7)
+    api_key = _litellm_api_key()
+    if not api_key:
+        raise RuntimeError("set LITELLM_KEY or MANTIS_LITELLM_API_KEY for worker calls")
+    kw["api_key"] = api_key
+    kw["api_base"] = _litellm_base_url()
+    if tools:
+        kw["tools"] = tools
+    resp = litellm.completion(**kw)
+    msg = resp.choices[0].message
+    text = str(getattr(msg, "content", None) or "")
+    tcs = getattr(msg, "tool_calls", None) or []
+    calls: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for tc in tcs:
+        fn = tc.function
+        try:
+            args = json.loads(fn.arguments) if fn.arguments else {}
+        except (json.JSONDecodeError, ValueError, TypeError):
+            args = {}
+        if not isinstance(args, dict):
+            args = {}
+        call_id = str(tc.id or f"tc_{uuid.uuid4().hex}")
+        if call_id in seen_ids:
+            call_id = f"tc_{uuid.uuid4().hex}"
+        seen_ids.add(call_id)
+        calls.append(
+            {
+                "id": call_id,
+                "name": str(fn.name),
+                "arguments": args,
+            }
+        )
+    return text, calls
+
+
+def _openai_tool_call(name: str, _id: str, arguments: dict) -> dict[str, Any]:
+    return {
+        "id": _id,
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(arguments)},
+    }
+
+
+def _validate_tool_results(tool_results: Any, expected_ids: set[str]) -> list[dict[str, Any]]:
+    if not isinstance(tool_results, list):
+        raise TypeError("tool_results must be a list")
+    if not all(isinstance(result, dict) for result in tool_results):
+        raise ValueError("each tool result must be an object")
+    results = cast(list[dict[str, Any]], tool_results)
+    ids = [result.get("tool_call_id") for result in results]
+    if not all(isinstance(tool_id, str) and tool_id for tool_id in ids):
+        raise ValueError("each tool result requires a tool_call_id")
+    string_ids = cast(list[str], ids)
+    if len(string_ids) != len(set(string_ids)) or set(string_ids) != expected_ids:
+        raise ValueError(
+            f"tool result id mismatch: expected {sorted(expected_ids)} got {sorted(string_ids)}"
+        )
+    return results
+
+
+def _configured_slot_models(override: Any = None) -> list[str]:
+    value = override
+    if value is None:
+        configured = getattr(_args, "slot_models", None) if _args is not None else None
+        configured = configured or os.environ.get(
+            "MANTIS_WORKER_MODELS",
+            os.environ.get(
+                "FUGU_WORKER_MODELS",
+                os.environ.get("MANTIS_WORKER_MODEL", os.environ.get("FUGU_WORKER_MODEL")),
+            ),
+        )
+        value = configured.split(",") if configured else list(DEFAULT_SLOT_LABELS)
+    if not isinstance(value, list):
+        raise TypeError("slot_models must be a non-empty list of model names")
+    models = [model.strip() for model in value if isinstance(model, str) and model.strip()]
+    if len(models) != len(value) or not models:
+        raise ValueError("slot_models must be a non-empty list of model names")
+    return models
+
+
+_learning_lock = threading.Lock()
+_TEST_COMMAND = re.compile(
+    r"(?:^|[;&|]\s*|\s)(?:python\d*\s+-m\s+(?:pytest|unittest)|pytest|npm\s+(?:run\s+)?test|"
+    r"pnpm\s+(?:run\s+)?test|yarn\s+test|bun\s+test|cargo\s+test|go\s+test|dotnet\s+test|"
+    r"mvn\s+test|gradle\s+test)(?:\s|$)",
+    re.IGNORECASE,
+)
+_SECRET_PATTERNS = (
+    re.compile(r"\b(?:sk|hf)_[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
+    re.compile(r"\b(?:AKIA[A-Z0-9]{16}|github_pat_[A-Za-z0-9_]{20,})\b"),
+    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{20,})\b"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),
+    re.compile(r"(?i)\b(api[_ -]?key|token|password|secret|authorization)\b\s*[:=]\s*\S+"),
+    re.compile(r"(?i)\bBearer\s+\S+"),
+)
+
+
+def _learning_enabled() -> bool:
+    return os.environ.get("MANTIS_LEARNING", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _redact_learning_task(task: str) -> str:
+    redacted = task[: int(os.environ.get("MANTIS_LEARNING_MAX_TASK_CHARS", "12000"))]
+    for pattern in _SECRET_PATTERNS:
+        redacted = pattern.sub("[REDACTED]", redacted)
+    return redacted
+
+
+def _learning_path() -> Path:
+    root = Path(
+        os.path.expanduser(os.environ.get("MANTIS_LEARNING_DIR", "~/.local/share/mantis/learning"))
+    )
+    instance = os.environ.get("MANTIS_LEARNING_INSTANCE") or socket.gethostname()
+    safe_instance = re.sub(r"[^A-Za-z0-9_.-]", "_", instance)[:80] or "local"
+    return root / f"runs-{safe_instance}.jsonl"
+
+
+def _tool_call_by_id(pending: dict[str, Any], tool_call_id: str) -> dict[str, Any] | None:
+    for call in pending.get("asst", {}).get("tool_calls", []):
+        if isinstance(call, dict) and call.get("id") == tool_call_id:
+            return cast(dict[str, Any], call)
+    return None
+
+
+def _learning_record(run: NativeRun, event: dict[str, Any]) -> dict[str, Any]:
+    turns = cast(list[dict[str, Any]], getattr(run, "turns", getattr(run, "steps", [])))
+    final_worker = next((turn for turn in reversed(turns) if turn.get("role") == "Worker"), None)
+    tests = [item for item in run.tool_observations if item["is_test"]]
+    last_test_passed = bool(tests) and not tests[-1]["is_error"]
+    accepted = event.get("terminated_by") == "verifier_accept"
+    trainable = bool(run.kind == "trinity" and accepted and last_test_passed and final_worker)
+    task = _redact_learning_task(str(getattr(run, "query", "")))
+    return {
+        "schema_version": 1,
+        "timestamp": int(time.time()),
+        "run_id": run.run_id,
+        "mode": run.kind,
+        "task": task,
+        "task_hash": hashlib.sha256(task.encode()).hexdigest(),
+        "pool": list(getattr(run, "slot_models", [])),
+        "terminated_by": event.get("terminated_by", event.get("type", "")),
+        "duration_seconds": round(time.time() - run.created, 3),
+        "turn_count": len(turns),
+        "test_seen": bool(tests),
+        "last_test_passed": last_test_passed,
+        "tool_error_count": sum(item["is_error"] for item in run.tool_observations),
+        "verifier_accepted": accepted,
+        "trainable": trainable,
+        "label_worker": (
+            final_worker.get("agent_id") if trainable and final_worker is not None else None
+        ),
+        "label_role": 0 if trainable else None,
+    }
+
+
+def _write_learning_record(run: NativeRun, event: dict[str, Any]) -> None:
+    if not _learning_enabled():
+        return
+    with _learning_lock:
+        if run.learning_logged:
+            return
+        path = _learning_path()
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        os.chmod(path, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(_learning_record(run, event), ensure_ascii=False) + "\n")
+        run.learning_logged = True
+
+
+class NativeRun:
+    """Base for a resumable orchestration run."""
+
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+        self.created = time.time()
+        self.last_active = time.time()
+        self.cancelled = False
+        self.finished = False
+        self.final_text = ""
+        self.terminated_by: str | None = None
+        self.kind = "run"
+        self.lock = threading.Lock()
+        self.request_lock = threading.Lock()
+        self.request_events: dict[str, dict[str, Any]] = {}
+        self.tool_observations: list[dict[str, Any]] = []
+        self.learning_logged = False
+        self.in_flight = 0
+
+    def touch(self) -> None:
+        self.last_active = time.time()
+
+    def advance(self, tool_results: Any) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def advance_idempotent(self, tool_results: Any, request_id: Any = None) -> dict[str, Any]:
+        if request_id is None:
+            return self.advance(tool_results)
+        if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
+            raise ValueError("request_id must be a string of at most 128 characters")
+        with self.request_lock:
+            cached = self.request_events.get(request_id)
+            if cached is not None:
+                return cached
+            event = self.advance(tool_results)
+            self.request_events[request_id] = event
+            while len(self.request_events) > 64:
+                self.request_events.pop(next(iter(self.request_events)))
+            return event
+
+    def record_tool_results(
+        self, pending: dict[str, Any], tool_results: list[dict[str, Any]]
+    ) -> None:
+        for result in tool_results:
+            call = _tool_call_by_id(pending, str(result.get("tool_call_id", ""))) or {}
+            function = call.get("function", {})
+            try:
+                arguments = json.loads(function.get("arguments", "{}"))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                arguments = {}
+            command = arguments.get("command", "") if isinstance(arguments, dict) else ""
+            self.tool_observations.append(
+                {
+                    "name": str(function.get("name", "")),
+                    "is_error": bool(result.get("is_error", False)),
+                    "is_test": bool(
+                        function.get("name") == "bash"
+                        and isinstance(command, str)
+                        and _TEST_COMMAND.search(command)
+                    ),
+                }
+            )
+
+    def close(self) -> None:
+        self.cancelled = True
+
+
+class TrinityRun(NativeRun):
+    """Resumable TRINITY loop with native tool support.
+
+    Replicates Coordinator semantics (role sampling, Thinker suggestion,
+    Verifier accept/reject, cold-verifier -> Worker, empty-response recovery,
+    multi-turn history) but lets each role's model call Pi tools before its text
+    reply finalizes."""
+
+    def __init__(
+        self,
+        run_id: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        slot_models: list[str] | None = None,
+        max_turns: int = MAX_TURNS,
+    ) -> None:
+        super().__init__(run_id)
+        self.kind = "trinity"
+        self.tools = tools
+        self.slot_models = slot_models or list(DEFAULT_SLOT_LABELS)
+        self.max_turns = max_turns
+        query, history = _split_messages(messages)
+        self.query = query or ""
+        self.history = history
+        self.obs = self.query
+        self.ref_id = 0
+        self.last_response: str | None = None
+        self.suggestion: str | None = None
+        self.suggested_role: str | None = None
+        self.force_worker = False
+        self.revision_feedback: str | None = None
+        self.turns: list[dict[str, Any]] = []
+        self._pending: dict[str, Any] | None = None
+        self._expected_ids: set[str] = set()
+        self._tool_rounds = 0
+
+    def _model_name(self, agent_id: int) -> str:
+        return str(self.slot_models[agent_id % len(self.slot_models)])
+
+    def _route(self) -> tuple[str, int]:
+        msgs = [
+            {
+                "role": "system",
+                "content": ROUTER_SYSTEM_PROMPT.format(num_agents=len(self.slot_models)),
+            },
+            {"role": "user", "content": self.obs},
+        ]
+        r = get_router().route(msgs, sample=True)
+        role = r["role_name"]
+        if self.suggested_role:
+            role, self.suggested_role = self.suggested_role, None
+        if self.force_worker:
+            self.force_worker = False
+            role = "Worker"
+        if role == "Verifier" and self.last_response is None:
+            role = "Worker"  # nothing to verify yet [FC]
+        if role == "Thinker" and self.last_response is None:
+            role = "Worker"  # a Thinker with no response to reason about is noise
+        return role, int(r["agent_id"])
+
+    def _role_prompt(self, role: str) -> str:
+        if role == "Thinker":
+            info = self.query
+            if self.last_response:
+                info += f"\n\nCurrent response:\n{self.last_response}"
+            return cast(str, THINKER_PROMPT.format(info=info))
+        if role == "Verifier":
+            vp = VERIFICATION_PROMPT.format(query=self.query, response=self.last_response or "")
+            if self.suggestion:
+                vp += (
+                    f"These are useful suggestions when drafting your response:\n"
+                    f"<suggestion>{self.suggestion}</suggestion>"
+                )
+            return cast(str, vp)
+        content = self.query
+        if self.suggestion:
+            content += (
+                f"when drafting your response, thinking of following:\n"
+                f"<suggestion>{self.suggestion}</suggestion>"
+            )
+        return cast(str, content)
+
+    def _build_messages(self, role: str) -> list[dict[str, Any]]:
+        prior_sys = "\n\n".join(
+            str(m.get("content", ""))
+            for m in self.history
+            if isinstance(m, dict) and m.get("role") == "system" and m.get("content")
+        )
+        sys_content = SYSTEM_PROMPT
+        if prior_sys:
+            sys_content = f"{sys_content}\n\n{prior_sys}"
+        prior = [m for m in self.history if isinstance(m, dict) and m.get("role") != "system"]
+        msgs: list[dict[str, Any]] = [{"role": "system", "content": sys_content}]
+        msgs.extend(prior)
+        user_content = self._role_prompt(role)
+        if role == "Worker" and self.revision_feedback:
+            user_content = (
+                f"{user_content}\n\n"
+                f"Revise the answer to address this verifier feedback:\n{self.revision_feedback}"
+            )
+            self.revision_feedback = None
+        msgs.append({"role": "user", "content": user_content})
+        return msgs
+
+    def _role_complete(self, role: str, agent_id: int, turn: int, messages: list, reply: str):
+        if role == "Worker":
+            self.last_response = reply
+            self.suggestion = None
+            thought = self._extract_thought(reply)
+            if thought:
+                self.obs += (
+                    f"\n<reference_thought_{self.ref_id}>{thought}"
+                    f"</reference_thought_{self.ref_id}>"
+                )
+                self.ref_id += 1
+        elif role == "Thinker":
+            self.suggested_role, self.suggestion = self._parse_thinker(reply)
+        elif role == "Verifier":
+            self.suggestion = None
+            if self._parse_verification(reply):
+                self.terminated_by = "verifier_accept"
+                self.final_text = self.last_response or reply
+        if role == "Worker" and not reply.strip():
+            self.force_worker = True
+            nope = "produce a complete answer."
+            self.revision_feedback = f"Previous worker returned no response; {nope}"
+        elif role == "Verifier" and reply.strip().upper().startswith("REJECT"):
+            self.force_worker = True
+            self.revision_feedback = reply
+        step = {
+            "turn": turn,
+            "role": role,
+            "agent_id": agent_id,
+            "model_name": self._model_name(agent_id),
+            "prompt": messages[-1]["content"] if messages else "",
+            "reply": reply,
+        }
+        self.turns.append(step)
+        self._pending = None
+        self._expected_ids = set()
+        self._tool_rounds = 0
+        return {"type": "step_complete", **step}
+
+    def _run_model(self, role: str, agent_id: int, turn: int, messages: list):
+        model = self._model_name(agent_id)
+        text, calls = _model_completion(model, messages, self.tools)
+        if calls:
+            asst: dict[str, Any] = {
+                "role": "assistant",
+                "content": text,
+                "tool_calls": [
+                    _openai_tool_call(c["name"], c["id"], c["arguments"]) for c in calls
+                ],
+            }
+            self._pending = {
+                "role": role,
+                "agent_id": agent_id,
+                "turn": turn,
+                "messages": messages,
+                "asst": asst,
+            }
+            self._expected_ids = {c["id"] for c in calls}
+            self._tool_rounds = 1
+            return {
+                "type": "tool_calls",
+                "role": role,
+                "agent_id": agent_id,
+                "model_name": model,
+                "turn": turn,
+                "tool_calls": calls,
+            }
+        return self._role_complete(role, agent_id, turn, messages, text)
+
+    def _apply_tool_results(self, tool_results: list[dict[str, Any]]) -> None:
+        pending = self._pending
+        if pending is None:
+            raise RuntimeError("no pending tool call")  # noqa: TRY301
+        tool_results = _validate_tool_results(tool_results, self._expected_ids)
+        self.record_tool_results(pending, tool_results)
+        self._tool_rounds += 1
+        if self._tool_rounds > MAX_TOOL_ROUNDS:
+            raise ValueError(f"exceeded max tool rounds per step ({MAX_TOOL_ROUNDS})")
+        pending["messages"].append(pending["asst"])
+        for r in tool_results:
+            pending["messages"].append(
+                {
+                    "role": "tool",
+                    "tool_call_id": r.get("tool_call_id"),
+                    "content": str(r.get("content", ""))[:RUN_MAX_MSG_BYTES],
+                }
+            )
+        self._expected_ids = set()
+        self._pending = pending
+
+    def advance(self, tool_results: Any) -> dict[str, Any]:
+        with self.lock:
+            self.touch()
+            if self.cancelled:
+                return {"type": "error", "error": "run cancelled"}
+            if self.finished:
+                return {"type": "error", "error": "run already finished"}
+            try:
+                if self._pending is None and tool_results is not None:
+                    return {"type": "error", "error": "unexpected tool results"}
+                if self._pending is not None:
+                    if tool_results is None:
+                        return {"type": "error", "error": "missing tool results"}
+                    self._apply_tool_results(tool_results)
+                    p = self._pending
+                    if p is None:
+                        raise RuntimeError("no pending tool call")  # noqa: TRY301
+                    return cast(
+                        dict[str, Any],
+                        self._run_model(p["role"], p["agent_id"], p["turn"], p["messages"]),
+                    )
+
+                # Finish conditions before starting a new coordinator turn.
+                if self.terminated_by is not None:
+                    self.finished = True
+                    return self._final()
+                if len(self.turns) >= self.max_turns:
+                    self.terminated_by = "max_turns"
+                    self.finished = True
+                    return self._final()
+
+                turn = len(self.turns)
+                role, agent_id = self._route()
+                messages = self._build_messages(role)
+                return cast(dict[str, Any], self._run_model(role, agent_id, turn, messages))
+            except ValueError as e:
+                return {"type": "error", "error": str(e)}
+            except Exception as e:  # noqa: BLE001 - model/network failures abort the run
+                self.close()
+                return {"type": "error", "error": str(e)}
+
+    def _final(self) -> dict[str, Any]:
+        text = self.final_text or (self.turns[-1]["reply"] if self.turns else "")
+        return {
+            "type": "final",
+            "text": text,
+            "terminated_by": self.terminated_by or "",
+            "steps": self.turns,
+        }
+
+    @staticmethod
+    def _extract_thought(reply: str) -> str:
+        return reply.strip()
+
+    @staticmethod
+    def _parse_thinker(text: str):
+        import re
+
+        role = None
+        m = re.search(
+            r"<suggested_role>\s*(solver|thinker|verifier)\s*</suggested_role>",
+            text,
+            re.IGNORECASE,
+        )
+        if m:
+            role = {"solver": "Worker", "thinker": "Thinker", "verifier": "Verifier"}[
+                m.group(1).lower()
+            ]
+        sug = None
+        s = re.search(r"<suggestion>\s*([\s\S]*?)\s*</suggestion>", text, re.IGNORECASE)
+        if s:
+            sug = s.group(1).strip() or None
+        return role, sug
+
+    @staticmethod
+    def _parse_verification(text: str) -> bool:
+        return text.strip().upper().startswith("ACCEPT")
+
+
+class ConductorRun(NativeRun):
+    """Resumable Conductor run: planning step then DAG nodes, all tool-capable."""
+
+    def __init__(
+        self,
+        run_id: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        slot_models: list[str] | None = None,
+        max_steps: int = 5,
+    ) -> None:
+        super().__init__(run_id)
+        self.kind = "conductor"
+        self.tools = tools
+        self.slot_models = slot_models or list(DEFAULT_SLOT_LABELS)
+        self.max_steps = max_steps
+        query, history = _split_messages(messages)
+        self.query = query or ""
+        self.history = history
+        self.conductor_model = _resolve_conductor_model(
+            SimpleNamespace(slot_models=self.slot_models)
+        )
+        self.steps: list[dict[str, Any]] = []
+        self._workflow: tuple[list, list, list] | None = None
+        self._outputs: list[str] = []
+        self._next_node = 0
+        self._pending: dict[str, Any] | None = None
+        self._expected_ids: set[str] = set()
+        self._tool_rounds = 0
+
+    def _planner_messages(self) -> list[dict[str, Any]]:
+        prior = [m for m in self.history if isinstance(m, dict) and m.get("role") != "system"]
+        return cast(
+            list[dict[str, Any]],
+            conductor_prompt(self.query, self.slot_models) + prior[-4:],
+        )
+
+    def _node_messages(self, node_index: int, mid: int, sub: str) -> list[dict[str, Any]]:
+        if self._workflow is None:
+            raise ValueError("workflow required")
+        sees = visible_indices(self._workflow[2], node_index)
+        mids = self._workflow[0]
+        subs = self._workflow[1]
+        ctx = ""
+        for j in sees:
+            prev_mid = mids[j]
+            ctx += (
+                f"\n<Subtask assigned to Agent {prev_mid}>{subs[j]}"
+                f"</Subtask assigned to Agent {prev_mid}>"
+                f"\n<Agent {prev_mid} response>{self._outputs[j].strip()}"
+                f"</Agent {prev_mid} response>"
+            )
+        user = (
+            f"USER QUESTION context:\n{ctx}\n\nYour subtask: {sub}"
+            if ctx
+            else f"Your subtask: {sub}"
+        )
+        return [{"role": "user", "content": user}]
+
+    def _run_model(self, role: str, model: str, messages: list) -> dict[str, Any]:
+        seq = len(self.steps)
+        text, calls = _model_completion(model, messages, self.tools)
+        if calls:
+            asst = {
+                "role": "assistant",
+                "content": text,
+                "tool_calls": [
+                    _openai_tool_call(c["name"], c["id"], c["arguments"]) for c in calls
+                ],
+            }
+            self._pending = {"role": role, "model": model, "messages": messages, "asst": asst}
+            self._expected_ids = {c["id"] for c in calls}
+            self._tool_rounds = 1
+            return {
+                "type": "tool_calls",
+                "role": role,
+                "model_name": model,
+                "turn": seq,
+                "tool_calls": calls,
+            }
+        return self._finalize_text(role, text, seq)
+
+    def _finalize_text(self, role: str, text: str, seq: int) -> dict[str, Any]:
+        self._pending = None
+        self._expected_ids = set()
+        self._tool_rounds = 0
+        if role == "Planner":
+            try:
+                self._workflow = parse_workflow(text)
+            except Exception as e:  # noqa: BLE001
+                return {
+                    "type": "error",
+                    "error": f"Conductor did not emit a parseable workflow: {e}",
+                }
+            mids, subs, access = self._workflow
+            if not subs or not (len(mids) == len(subs) == len(access)):
+                return {
+                    "type": "error",
+                    "error": "Conductor emitted an empty or malformed workflow",
+                }
+            self.steps.append(
+                {
+                    "turn": seq,
+                    "role": "Planner",
+                    "agent_id": 0,
+                    "model_name": self.conductor_model,
+                    "prompt": self.query,
+                    "reply": text,
+                }
+            )
+            return {
+                "type": "step_complete",
+                "turn": seq,
+                "role": "Planner",
+                "agent_id": 0,
+                "model_name": self.conductor_model,
+                "prompt": self.query,
+                "reply": text,
+            }
+
+        node_index = self._next_node - 1
+        if self._workflow is None:
+            raise ValueError("workflow required")
+        mids = self._workflow[0]
+        subs = self._workflow[1]
+        mid = int(mids[node_index]) % len(self.slot_models)
+        self._outputs.append(text)
+        self.steps.append(
+            {
+                "turn": seq,
+                "role": "Worker",
+                "agent_id": mid,
+                "model_name": self.slot_models[mid],
+                "prompt": subs[node_index],
+                "reply": text,
+            }
+        )
+        return {
+            "type": "step_complete",
+            "turn": seq,
+            "role": "Worker",
+            "agent_id": mid,
+            "model_name": self.slot_models[mid],
+            "prompt": subs[node_index],
+            "reply": text,
+        }
+
+    def _apply_tool_results(self, tool_results: list[dict[str, Any]]) -> None:
+        pending = self._pending
+        if pending is None:
+            raise RuntimeError("no pending tool call")  # noqa: TRY301
+        tool_results = _validate_tool_results(tool_results, self._expected_ids)
+        self.record_tool_results(pending, tool_results)
+        self._tool_rounds += 1
+        if self._tool_rounds > MAX_TOOL_ROUNDS:
+            raise ValueError(f"exceeded max tool rounds per step ({MAX_TOOL_ROUNDS})")
+        pending["messages"].append(pending["asst"])
+        for r in tool_results:
+            pending["messages"].append(
+                {
+                    "role": "tool",
+                    "tool_call_id": r.get("tool_call_id"),
+                    "content": str(r.get("content", ""))[:RUN_MAX_MSG_BYTES],
+                }
+            )
+        self._expected_ids = set()
+        self._pending = pending
+
+    def advance(self, tool_results: Any) -> dict[str, Any]:
+        with self.lock:
+            self.touch()
+            if self.cancelled:
+                return {"type": "error", "error": "run cancelled"}
+            if self.finished:
+                return {"type": "error", "error": "run already finished"}
+            try:
+                if self._pending is None and tool_results is not None:
+                    return {"type": "error", "error": "unexpected tool results"}
+                if self._pending is not None:
+                    if tool_results is None:
+                        return {"type": "error", "error": "missing tool results"}
+                    self._apply_tool_results(tool_results)
+                    p = self._pending
+                    if p is None:
+                        raise RuntimeError("no pending tool call")  # noqa: TRY301
+                    return cast(
+                        dict[str, Any], self._run_model(p["role"], p["model"], p["messages"])
+                    )
+
+                if self._workflow is None:
+                    return self._run_model(
+                        "Planner", self.conductor_model, self._planner_messages()
+                    )
+                mids, subs, access = self._workflow
+                if self._next_node >= len(subs):
+                    self.finished = True
+                    self.final_text = self._outputs[-1] if self._outputs else ""
+                    self.terminated_by = "conductor_done"
+                    return {
+                        "type": "final",
+                        "text": self.final_text,
+                        "terminated_by": "conductor_done",
+                        "steps": self.steps,
+                    }
+                if self._next_node >= self.max_steps:
+                    self.finished = True
+                    self.final_text = self._outputs[-1] if self._outputs else ""
+                    self.terminated_by = "max_steps"
+                    return {
+                        "type": "final",
+                        "text": self.final_text,
+                        "terminated_by": "max_steps",
+                        "steps": self.steps,
+                    }
+                node_index = self._next_node
+                self._next_node += 1
+                mid = int(mids[node_index]) % len(self.slot_models)
+                model = self.slot_models[mid]
+                return self._run_model(
+                    "Worker", model, self._node_messages(node_index, mid, subs[node_index])
+                )
+            except ValueError as e:
+                return {"type": "error", "error": str(e)}
+            except Exception as e:  # noqa: BLE001
+                self.close()
+                return {"type": "error", "error": str(e)}
+
+    def close(self) -> None:
+        self.cancelled = True
+
+
+def create_run(mode: str, body: dict[str, Any]) -> NativeRun:
+    messages = body.get("messages") or []
+    if (
+        not isinstance(messages, list)
+        or not messages
+        or not all(isinstance(message, dict) for message in messages)
+    ):
+        raise ValueError("messages must be a non-empty list of objects")
+    tools = _convert_tools(body.get("tools"))
+    slot_models = _configured_slot_models(body.get("slot_models"))
+    requested_id = body.get("run_id")
+    if requested_id is not None and (
+        not isinstance(requested_id, str)
+        or len(requested_id) != 32
+        or any(char not in "0123456789abcdef" for char in requested_id.lower())
+    ):
+        raise ValueError("run_id must be a 32-character hexadecimal string")
+    run_id = requested_id or uuid.uuid4().hex
+    run: NativeRun
+    if mode == "conductor":
+        run = ConductorRun(run_id, messages, tools, slot_models=slot_models)
+    else:
+        run = TrinityRun(run_id, messages, tools, slot_models=slot_models)
+    _register_run(run)
+    return run
+
+
+def get_run(run_id: str) -> NativeRun:
+    with _runs_lock:
+        run = _runs.get(run_id)
+    if run is None:
+        raise KeyError(f"unknown or expired run: {run_id}")
+    return run
+
+
+def advance_run(run_id: str, tool_results: Any, request_id: Any = None) -> dict[str, Any]:
+    with _runs_lock:
+        run = _runs.get(run_id)
+        if run is None:
+            raise KeyError(f"unknown or expired run: {run_id}")
+        run.in_flight += 1
+    try:
+        event = run.advance_idempotent(tool_results, request_id)
+        if event.get("type") in ("final", "error"):
+            _write_learning_record(run, event)
+        return event
+    finally:
+        with _runs_lock:
+            run.in_flight -= 1
+            run.touch()
+
+
+def delete_run(run_id: str) -> bool:
+    with _runs_lock:
+        run = _runs.pop(run_id, None)
+    if run is not None:
+        _write_learning_record(run, {"type": "error", "terminated_by": "deleted"})
+        run.close()
+    return run is not None
 
 
 if __name__ == "__main__":

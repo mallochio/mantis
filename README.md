@@ -204,6 +204,40 @@ A third run using the hosted `gpt-5.6-luna-max` as the Conductor planner (no loc
 
 Conductor-luna had a **0% HTTP failure rate**, but its overall auto-score (**0.626**) was well below TRINITY (**0.890**) and its hard-tier score (**0.250**) was far below TRINITY's **0.714**. It was also roughly **2× the cost** of TRINITY. Per the decision rule in `eval/report-luna-conductor.md`, `FUGU_AUTO_THRESHOLD` stays at **6** — the Supra router never emits a score that high in practice, so `/fugu auto` remains on TRINITY/direct. Users can still invoke `/fugu conductor` manually for experimentation.
 
+## Zero-touch router learning
+
+Set one flag, then use Trinity normally:
+
+```bash
+# .env
+MANTIS_LEARNING=1
+```
+
+Mantis writes one append-only `runs-<hostname>.jsonl` file per machine under
+`~/.local/share/mantis/learning` (a persistent Docker volume in all-Docker mode).
+Records contain redacted task text, route/model ids, test/verifier outcomes, and timing;
+tool outputs are not stored. Task text itself may contain sensitive project details, so review it
+before sharing the directory outside your team. A high-confidence pseudo-label requires
+a verifier acceptance and a final successful recognized test command. Ambiguous runs are kept
+for diagnostics but never used for training.
+
+The native and Docker launchers automatically run the local trainer. After 50 distinct
+high-confidence tasks it trains a candidate, evaluates a hash-separated held-out split, and
+promotes only when worker-label accuracy improves by at least 0.02. A promoted router is used
+on the next Mantis restart. Change the thresholds with `MANTIS_LEARNING_MIN_RUNS` and
+`MANTIS_LEARNING_MIN_IMPROVEMENT`.
+
+For a team, point `MANTIS_LEARNING_DIR` at the same access-controlled synced directory in
+native mode, or set `MANTIS_LEARNING_HOST_DIR` to that directory in Docker. Per-host filenames avoid append collisions; each trainer deduplicates tasks
+before training. Only share this directory with colleagues allowed to see task descriptions.
+Learning is off by default because task text may still be sensitive after secret redaction.
+
+Run a one-off status/training check with:
+
+```bash
+python3 scripts/learn_router.py --promote
+```
+
 ## Retraining the router head
 
 The included TRINITY router head was trained on the current 7-slot pool defined in `configs/litellm.yaml`:

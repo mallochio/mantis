@@ -50,6 +50,7 @@ services:
       FUGU_BASE_URL: http://litellm:4000/v1
       MANTIS_API_KEY: ${MANTIS_API_KEY:-${LITELLM_KEY}}
       FUGU_API_KEY: ${FUGU_API_KEY:-${LITELLM_KEY}}
+      MANTIS_LITELLM_API_KEY: ${MANTIS_LITELLM_API_KEY:-${LITELLM_KEY}}
       MANTIS_MODEL: ${MANTIS_MODEL:-${FUGU_MODEL:-Qwen/Qwen3-0.6B}}
       FUGU_MODEL: ${FUGU_MODEL:-${MANTIS_MODEL:-Qwen/Qwen3-0.6B}}
       MANTIS_VECTOR: ${MANTIS_VECTOR:-${FUGU_VECTOR:-/app/artifacts/model_iter_60.npy}}
@@ -78,8 +79,13 @@ services:
       HF_TOKEN: ${HF_TOKEN:-}
       CUDA_VISIBLE_DEVICES: ""   # CPU on Mac
       TOKENIZERS_PARALLELISM: "false"
+      MANTIS_LEARNING: ${MANTIS_LEARNING:-0}
+      MANTIS_LEARNING_DIR: /app/learning
+      MANTIS_LEARNING_MIN_RUNS: ${MANTIS_LEARNING_MIN_RUNS:-50}
+      MANTIS_LEARNING_MIN_IMPROVEMENT: ${MANTIS_LEARNING_MIN_IMPROVEMENT:-0.02}
     volumes:
       - hf-cache:/root/.cache/huggingface
+      - ${MANTIS_LEARNING_HOST_DIR:-mantis-learning}:/app/learning
       - ./artifacts:/app/artifacts:ro
     depends_on:
       litellm:
@@ -92,3 +98,4 @@ networks:
 
 volumes:
   hf-cache:
+  mantis-learning:

@@ -8,6 +8,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createHash, randomUUID } from "node:crypto";
 import { Text } from "@mariozechner/pi-tui";
 import { Static, Type } from "@sinclair/typebox";
 import {
@@ -21,6 +22,7 @@ import {
   type SimpleStreamOptions,
   type TextContent,
   type ToolCall,
+  type ToolResultMessage,
 } from "@mariozechner/pi-ai";
 import type {
   AgentToolResult,
@@ -32,8 +34,14 @@ import type {
 type Mode = "off" | "trinity" | "conductor" | "auto";
 
 interface ChatMessage {
-  role: "user" | "assistant" | "system";
+  role: "user" | "assistant" | "system" | "tool";
   content: string;
+  tool_call_id?: string;
+  tool_calls?: Array<{
+    id: string;
+    type: "function";
+    function: { name: string; arguments: string };
+  }>;
 }
 
 interface MantisStep {
@@ -151,69 +159,13 @@ function getTextFromContent(content: string | unknown[]): string {
     .join("\n");
 }
 
-const REPO_CONTEXT_FILES = ["README.md", "package.json", "pyproject.toml", "Cargo.toml", "go.mod"];
-const REPO_CONTEXT_IGNORED = new Set([".git", ".scratch", "node_modules", "dist", "build", "__pycache__", ".venv"]);
-
-function getRepositoryContext(cwd = process.cwd()): string {
-  try {
-    const entries = fs.readdirSync(cwd, { withFileTypes: true })
-      .filter((entry) => !REPO_CONTEXT_IGNORED.has(entry.name))
-      .sort((a, b) => a.name.localeCompare(b.name));
-    const tree: string[] = [];
-    for (const entry of entries) {
-      tree.push(entry.name + (entry.isDirectory() ? "/" : ""));
-      if (!entry.isDirectory()) continue;
-      try {
-        for (const child of fs.readdirSync(path.join(cwd, entry.name), { withFileTypes: true }).slice(0, 40)) {
-          if (!REPO_CONTEXT_IGNORED.has(child.name)) {
-            tree.push(`  ${child.name}${child.isDirectory() ? "/" : ""}`);
-          }
-        }
-      } catch {
-        // A partial tree is still useful if one directory is unreadable.
-      }
-    }
-
-    const contextFiles = [...REPO_CONTEXT_FILES];
-    try {
-      const packageJson = JSON.parse(fs.readFileSync(path.join(cwd, "package.json"), "utf8"));
-      for (const extension of [packageJson.main, ...(packageJson.pi?.extensions ?? [])]) {
-        if (typeof extension === "string" && !contextFiles.includes(extension)) contextFiles.push(extension);
-      }
-    } catch {
-      // Not every repository is a Pi package.
-    }
-
-    let remaining = 96_000;
-    const files: string[] = [];
-    for (const name of contextFiles) {
-      const filePath = path.resolve(cwd, name);
-      if (!filePath.startsWith(cwd + path.sep) || !fs.existsSync(filePath) || remaining <= 0) continue;
-      const content = fs.readFileSync(filePath, "utf8").slice(0, remaining);
-      files.push(`--- ${name} ---\n${content}`);
-      remaining -= content.length;
-    }
-    return `Working directory: ${cwd}\n\nRepository tree (two levels):\n${tree.join("\n")}\n\n${files.join("\n\n")}`;
-  } catch {
-    return `Working directory: ${cwd}`;
-  }
-}
-
-interface BackendMessagesResult {
-  messages: ChatMessage[];
-  lastUserContent: string;
-}
-
-function toBackendMessages(context: Context): BackendMessagesResult {
-  const messages: ChatMessage[] = [{
-    role: "system",
-    content: [context.systemPrompt, getRepositoryContext()].filter(Boolean).join("\n\n"),
-  }];
+function toRunMessages(context: Context): { messages: ChatMessage[]; lastUserContent: string } {
+  // Native-tool runs do not dump a 96 KB repository snapshot into the prompt;
+  // the selected model inspects the live repository through Pi tools instead.
+  const messages: ChatMessage[] = [];
+  if (context.systemPrompt) messages.push({ role: "system", content: context.systemPrompt });
   let lastUserContent = "";
-
-  const contextMessages = context.messages;
-
-  for (const m of contextMessages) {
+  for (const m of context.messages) {
     if (m.role === "user") {
       const text = getTextFromContent(m.content);
       if (text.trim()) {
@@ -221,21 +173,172 @@ function toBackendMessages(context: Context): BackendMessagesResult {
         lastUserContent = text;
       }
     } else if (m.role === "assistant") {
-      const text = getTextFromContent(m.content as any);
-      if (text.trim()) {
-        messages.push({ role: "assistant", content: text });
-      }
-    } else if (m.role === "toolResult") {
-      // Skip internal mantis_step results; other tool results become synthetic user messages.
-      if (m.toolName === "mantis_step") continue;
       const text = getTextFromContent(m.content);
-      if (text.trim()) {
-        messages.push({ role: "user", content: `[Tool Result ${m.toolName}]: ${text}` });
+      const toolCalls = m.content
+        .filter((item): item is ToolCall => item.type === "toolCall" && item.name !== "mantis_step")
+        .map((item) => ({
+          id: item.id,
+          type: "function" as const,
+          function: { name: item.name, arguments: JSON.stringify(item.arguments) },
+        }));
+      if (text.trim() || toolCalls.length > 0) {
+        messages.push({ role: "assistant", content: text, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) });
       }
+    } else if (m.role === "toolResult" && m.toolName !== "mantis_step") {
+      messages.push({
+        role: "tool",
+        tool_call_id: m.toolCallId,
+        content: getTextFromContent(m.content),
+      });
     }
   }
-
   return { messages, lastUserContent };
+}
+
+type TrailingKind = "none" | "real" | "step";
+type RunToolResult = { tool_call_id: string; content: string; is_error: boolean };
+type TrailingResults = { kind: TrailingKind; ids: string[]; results: RunToolResult[] };
+type PendingRun = { runId: string; kind: Exclude<TrailingKind, "none">; expectedIds: string[] };
+
+function detectTrailing(messages: Message[]): TrailingResults {
+  const trailing: Message[] = [];
+  let i = messages.length - 1;
+  while (i >= 0 && messages[i].role === "toolResult") {
+    trailing.push(messages[i]);
+    i--;
+  }
+  trailing.reverse();
+  const isToolResult = (m: Message): m is ToolResultMessage => m.role === "toolResult";
+  const real: ToolResultMessage[] = trailing.filter(
+    (m): m is ToolResultMessage => isToolResult(m) && m.toolName !== "mantis_step",
+  );
+  const steps: ToolResultMessage[] = trailing.filter(
+    (m): m is ToolResultMessage => isToolResult(m) && m.toolName === "mantis_step",
+  );
+  if (real.length > 0 && steps.length > 0) {
+    throw new Error("mixed mantis tool results are not supported");
+  }
+  if (real.length > 0) {
+    return {
+      kind: "real",
+      ids: real.map((m) => m.toolCallId),
+      results: real.map((m) => ({
+        tool_call_id: m.toolCallId,
+        content: getTextFromContent(m.content),
+        is_error: m.isError,
+      })),
+    };
+  }
+  if (steps.length > 0) {
+    return { kind: "step", ids: steps.map((m) => m.toolCallId), results: [] };
+  }
+  return { kind: "none", ids: [], results: [] };
+}
+
+function authHeaders(): Record<string, string> {
+  const key = getApiKey();
+  return {
+    "Content-Type": "application/json",
+    ...(key ? { Authorization: `Bearer ${key}` } : {}),
+  };
+}
+
+const MAX_RUN_RESPONSE_BYTES = 1_000_000;
+
+async function readBoundedJson(res: Response): Promise<Record<string, any>> {
+  const declared = Number(res.headers.get("content-length") ?? 0);
+  if (declared > MAX_RUN_RESPONSE_BYTES) throw new Error("mantis response exceeds size limit");
+  if (!res.body) return {};
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_RUN_RESPONSE_BYTES) {
+      await reader.cancel();
+      throw new Error("mantis response exceeds size limit");
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  if (bytes.length === 0) return {};
+  const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("mantis response must be a JSON object");
+  }
+  return parsed as Record<string, any>;
+}
+
+async function createRun(
+  coordinator: string,
+  messages: ChatMessage[],
+  tools: Context["tools"],
+  runId: string,
+  signal?: AbortSignal,
+): Promise<{ run_id: string }> {
+  const res = await fetch(`${getMantisUrl()}/runs`, {
+    method: "POST",
+    headers: authHeaders(),
+    signal,
+    body: JSON.stringify({ model: coordinator, messages, tools, run_id: runId }),
+  });
+  const data = await readBoundedJson(res);
+  if (!res.ok || typeof data.run_id !== "string" || !data.run_id) {
+    throw new Error(`mantis run create failed (HTTP ${res.status}): ${data?.error ?? JSON.stringify(data)}`);
+  }
+  return { run_id: data.run_id };
+}
+
+type RunEvent =
+  | { type: "tool_calls"; tool_calls: Array<{ id: string; name: string; arguments: Record<string, unknown> }> }
+  | { type: "step_complete"; turn: number; agent_id: number; role: string; reply: string; prompt: string; model_name?: string }
+  | { type: "final"; text: string }
+  | { type: "error"; error: string };
+
+class MantisTransportError extends Error {}
+
+async function continueRun(
+  runId: string,
+  toolResults: RunToolResult[] | undefined,
+  requestId: string | undefined,
+  signal?: AbortSignal,
+): Promise<RunEvent> {
+  const body = requestId === undefined && toolResults === undefined
+    ? ""
+    : JSON.stringify({ tool_results: toolResults, request_id: requestId });
+  let res: Response;
+  try {
+    res = await fetch(`${getMantisUrl()}/runs/${encodeURIComponent(runId)}/continue`, {
+      method: "POST",
+      headers: authHeaders(),
+      signal,
+      body,
+    });
+  } catch (error: any) {
+    throw new MantisTransportError(error?.message ?? String(error));
+  }
+  const data = await readBoundedJson(res);
+  if (!res.ok) throw new Error(`mantis run continue failed (HTTP ${res.status}): ${data?.error ?? JSON.stringify(data)}`);
+  if (!data || typeof data.type !== "string") throw new Error("invalid mantis run event");
+  return data as RunEvent;
+}
+
+async function deleteRun(runId: string): Promise<void> {
+  const res = await fetch(`${getMantisUrl()}/runs/${encodeURIComponent(runId)}`, {
+    method: "DELETE",
+    headers: authHeaders(),
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!res.ok) {
+    // best effort cleanup; ignore failures
+  }
 }
 
 async function supraScore(text: string, signal?: AbortSignal): Promise<number> {
@@ -486,16 +589,12 @@ function emitText(stream: AssistantMessageEventStream, text: string, output: Ass
   stream.push({ type: "text_end", contentIndex, content: text, partial: output });
 }
 
-interface PendingFinal {
-  finalText: string;
-  toolCallIds: string[];
-}
-
-const MAX_PENDING_FINALS = 128;
-const pendingFinalByToolCallId = new Map<string, PendingFinal>();
-
-const MAX_TOOL_CACHE = 128;
+const MAX_TOOL_CACHE = 512;
+const MAX_PENDING_TOOL_CALLS = 512;
 const toolReplyCache = new Map<string, MantisStep>();
+const pendingByToolCallId = new Map<string, PendingRun>();
+const consumedToolCallIds = new Map<string, true>();
+const MAX_RUN_EVENTS = 200;
 
 function pruneMap<K, V>(map: Map<K, V>, maxSize: number) {
   while (map.size > maxSize) {
@@ -504,31 +603,62 @@ function pruneMap<K, V>(map: Map<K, V>, maxSize: number) {
   }
 }
 
-function takePendingFinal(messages: Message[]): PendingFinal | undefined {
-  const trailingToolCallIds: string[] = [];
-  for (let i = messages.length - 1; i >= 0 && messages[i].role === "toolResult"; i--) {
-    const message = messages[i];
-    if (message.role === "toolResult" && message.toolName === "mantis_step") {
-      trailingToolCallIds.push(message.toolCallId);
+function registerPending(runId: string, ids: string[], kind: PendingRun["kind"]): void {
+  if (ids.length === 0 || ids.length !== new Set(ids).size) {
+    throw new Error("mantis emitted invalid or duplicate tool call ids");
+  }
+  if (pendingByToolCallId.size + ids.length > MAX_PENDING_TOOL_CALLS) {
+    throw new Error("too many pending mantis tool calls");
+  }
+  const pending: PendingRun = { runId, kind, expectedIds: ids };
+  for (const id of ids) {
+    if (pendingByToolCallId.has(id) || consumedToolCallIds.has(id)) {
+      throw new Error(`duplicate mantis tool call id: ${id}`);
     }
+    pendingByToolCallId.set(id, pending);
   }
-  if (trailingToolCallIds.length === 0) return undefined;
+}
 
-  const matches = new Set(
-    trailingToolCallIds
-      .map((toolCallId) => pendingFinalByToolCallId.get(toolCallId))
-      .filter((pending): pending is PendingFinal => pending !== undefined),
-  );
-  if (matches.size === 0) {
-    throw new Error("mantis final response bridge is unavailable or already consumed");
+function consumePending(trailing: TrailingResults): PendingRun | undefined {
+  if (trailing.kind === "none") return undefined;
+  if (trailing.ids.length === 0 || trailing.ids.length !== new Set(trailing.ids).size) {
+    throw new Error("duplicate or empty mantis tool results");
   }
-  if (matches.size > 1) {
-    throw new Error("mantis tool results refer to multiple pending responses");
+  if (trailing.ids.some((id) => consumedToolCallIds.has(id))) {
+    throw new Error("mantis tool results were already consumed");
   }
-
-  const pending = matches.values().next().value as PendingFinal;
-  for (const toolCallId of pending.toolCallIds) pendingFinalByToolCallId.delete(toolCallId);
+  const matches = new Set(trailing.ids.map((id) => pendingByToolCallId.get(id)));
+  if (matches.size !== 1 || matches.has(undefined)) {
+    throw new Error("mantis tool results refer to no active run");
+  }
+  const pending = matches.values().next().value as PendingRun;
+  if (
+    pending.kind !== trailing.kind ||
+    pending.expectedIds.length !== trailing.ids.length ||
+    pending.expectedIds.some((id) => !trailing.ids.includes(id))
+  ) {
+    throw new Error("mantis tool results do not match the pending run");
+  }
+  for (const id of pending.expectedIds) {
+    pendingByToolCallId.delete(id);
+    if (pending.kind === "step") toolReplyCache.delete(id);
+    consumedToolCallIds.set(id, true);
+  }
+  pruneMap(consumedToolCallIds, MAX_PENDING_TOOL_CALLS);
   return pending;
+}
+
+function restorePending(pending: PendingRun): void {
+  for (const id of pending.expectedIds) {
+    consumedToolCallIds.delete(id);
+    pendingByToolCallId.set(id, pending);
+  }
+}
+
+function clearPendingRun(runId: string): void {
+  for (const [id, pending] of pendingByToolCallId) {
+    if (pending.runId === runId) pendingByToolCallId.delete(id);
+  }
 }
 
 function mantisStreamSimple(
@@ -537,6 +667,8 @@ function mantisStreamSimple(
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
+  let runId: string | null = null;
+  let resumedPending: PendingRun | undefined;
 
   (async () => {
     const output: AssistantMessage = {
@@ -558,47 +690,97 @@ function mantisStreamSimple(
     };
 
     try {
-      if (options?.signal?.aborted) {
-        throw new Error("aborted");
-      }
+      if (options?.signal?.aborted) throw new Error("aborted");
 
       const mode = model.id as Mode;
-      const pendingFinal = takePendingFinal(context.messages);
-      const { messages: backendMessages, lastUserContent } = toBackendMessages(context);
-      output.usage.input = Math.ceil(backendMessages.reduce((chars, message) => chars + message.content.length, 0) / 4);
-      output.usage.totalTokens = output.usage.input;
-      if (output.usage.input > model.contextWindow - model.maxTokens) {
-        throw new Error(`input token count ${output.usage.input} exceeds the context window of this model`);
+      const trailing = detectTrailing(context.messages);
+      const pending = consumePending(trailing);
+      resumedPending = pending;
+      let toolResults: RunToolResult[] | undefined;
+      let stepAck = false;
+
+      if (pending) {
+        runId = pending.runId;
+        if (trailing.kind === "real") toolResults = trailing.results;
+        else stepAck = true;
       }
 
-      if (pendingFinal) {
-        stream.push({ type: "start", partial: output });
-        emitText(stream, pendingFinal.finalText, output);
-        output.stopReason = "stop";
-        stream.push({ type: "done", reason: "stop", message: output });
-        stream.end?.();
-        return;
+      if (runId === null) {
+        const { messages: backendMessages, lastUserContent } = toRunMessages(context);
+        output.usage.input = Math.ceil(
+          backendMessages.reduce((chars, message) => chars + message.content.length, 0) / 4,
+        );
+        output.usage.totalTokens = output.usage.input;
+        if (output.usage.input > model.contextWindow - model.maxTokens) {
+          throw new Error(`input token count ${output.usage.input} exceeds the context window of this model`);
+        }
+        if (!lastUserContent.trim()) throw new Error("No user message to process");
+        const coordinator = mode === "auto" ? await chooseCoordinator(lastUserContent, options?.signal) : mode;
+        if (options?.signal?.aborted) throw new Error("aborted");
+        runId = randomUUID().replaceAll("-", "");
+        const created = await createRun(
+          coordinator, backendMessages, context.tools, runId, options?.signal,
+        );
+        runId = created.run_id;
       }
-
-      if (!lastUserContent.trim()) {
-        throw new Error("No user message to process");
-      }
-
-      const coordinator = mode === "auto" ? await chooseCoordinator(lastUserContent, options?.signal) : mode;
-      if (options?.signal?.aborted) throw new Error("aborted");
+      if (!runId) throw new Error("failed to start mantis run");
 
       stream.push({ type: "start", partial: output });
 
-      const steps: MantisStep[] = [];
-      const toolCallIds: string[] = [];
-      let finalText = "";
-      let hasResult = false;
+      let stepCount = 0;
+      let round = 0;
+      while (true) {
+        if (options?.signal?.aborted) throw new Error("aborted");
+        const requestId = resumedPending
+          ? createHash("sha256").update([...resumedPending.expectedIds].sort().join("\0")).digest("hex")
+          : undefined;
+        const ev = await continueRun(
+          runId, stepAck ? undefined : toolResults, requestId, options?.signal,
+        );
+        resumedPending = undefined;
+        stepAck = false;
+        toolResults = undefined;
+        round += 1;
+        if (round > MAX_RUN_EVENTS) throw new Error(`mantis run exceeded ${MAX_RUN_EVENTS} events`);
 
-      for await (const ev of streamOrchestrate(coordinator, backendMessages, options?.signal)) {
-        if (ev.type === "step-start") {
-          // Stored via step-end; no-op here.
-        } else if (ev.type === "step-end") {
-          const reply = ev.reply?.trim() ? ev.reply : "(no response)";
+        if (ev.type === "tool_calls") {
+          if (!Array.isArray(ev.tool_calls) || ev.tool_calls.length === 0) {
+            throw new Error("invalid mantis tool_calls event");
+          }
+          const activeTools = new Set((context.tools ?? []).map((tool) => tool.name));
+          if (ev.tool_calls.some((c) => (
+            !c || typeof c.id !== "string" || !c.id ||
+            typeof c.name !== "string" || !activeTools.has(c.name) ||
+            typeof c.arguments !== "object" || c.arguments === null || Array.isArray(c.arguments)
+          ))) {
+            throw new Error("invalid or unavailable mantis tool call");
+          }
+          registerPending(runId, ev.tool_calls.map((call) => call.id), "real");
+          for (const c of ev.tool_calls) {
+            const toolCall: ToolCall = {
+              type: "toolCall",
+              id: c.id,
+              name: c.name,
+              arguments: c.arguments ?? {},
+            };
+            const contentIndex = output.content.length;
+            output.content.push(toolCall as any);
+            stream.push({ type: "toolcall_start", contentIndex, partial: output });
+            stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
+          }
+          output.stopReason = "toolUse";
+          stream.push({ type: "done", reason: "toolUse", message: output });
+          stream.end?.();
+          return;
+        } else if (ev.type === "step_complete") {
+          if (
+            typeof ev.turn !== "number" || typeof ev.agent_id !== "number" ||
+            typeof ev.role !== "string" || typeof ev.reply !== "string" ||
+            typeof ev.prompt !== "string"
+          ) {
+            throw new Error("invalid mantis step_complete event");
+          }
+          const reply = ev.reply.trim() ? ev.reply : "(no response)";
           const step: MantisStep = {
             turn: ev.turn,
             agent_id: ev.agent_id,
@@ -608,13 +790,10 @@ function mantisStreamSimple(
             model_name: ev.model_name,
             output: reply,
           };
-          steps.push(step);
-
-          const toolCallId = `mantis_${output.timestamp}_${steps.length - 1}_${Math.random().toString(36).slice(2, 8)}`;
-          toolCallIds.push(toolCallId);
+          const toolCallId = `mantis_${output.timestamp}_${stepCount++}_${Math.random().toString(36).slice(2, 8)}`;
           toolReplyCache.set(toolCallId, step);
           pruneMap(toolReplyCache, MAX_TOOL_CACHE);
-
+          registerPending(runId, [toolCallId], "step");
           const toolCall: ToolCall = {
             type: "toolCall",
             id: toolCallId,
@@ -627,82 +806,36 @@ function mantisStreamSimple(
               prompt: step.prompt,
             },
           };
-
           const contentIndex = output.content.length;
           output.content.push(toolCall as any);
           stream.push({ type: "toolcall_start", contentIndex, partial: output });
-          stream.push({
-            type: "toolcall_end",
-            contentIndex,
-            toolCall,
-            partial: output,
-          });
-        } else if (ev.type === "result") {
-          if (hasResult) {
-            throw new Error("Duplicate terminal result event received");
-          }
-          hasResult = true;
-          finalText = ev.text;
-          if (steps.length === 0 && ev.mantis_steps?.length) {
-            for (const s of ev.mantis_steps) {
-              const reply = s.reply?.trim() ? s.reply : "(no response)";
-              const step: MantisStep = { ...s, reply, output: reply };
-              steps.push(step);
-
-              const toolCallId = `mantis_${output.timestamp}_${steps.length - 1}_${Math.random().toString(36).slice(2, 8)}`;
-              toolCallIds.push(toolCallId);
-              toolReplyCache.set(toolCallId, step);
-              pruneMap(toolReplyCache, MAX_TOOL_CACHE);
-
-              const toolCall: ToolCall = {
-                type: "toolCall",
-                id: toolCallId,
-                name: "mantis_step",
-                arguments: {
-                  turn: step.turn,
-                  role: step.role,
-                  agent_id: step.agent_id,
-                  model_name: step.model_name,
-                  prompt: step.prompt,
-                },
-              };
-
-              const contentIndex = output.content.length;
-              output.content.push(toolCall as any);
-              stream.push({ type: "toolcall_start", contentIndex, partial: output });
-              stream.push({
-                type: "toolcall_end",
-                contentIndex,
-                toolCall,
-                partial: output,
-              });
-            }
-          }
+          stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
+          output.stopReason = "toolUse";
+          stream.push({ type: "done", reason: "toolUse", message: output });
+          stream.end?.();
+          return;
+        } else if (ev.type === "final") {
+          if (typeof ev.text !== "string") throw new Error("invalid mantis final event");
+          emitText(stream, ev.text || "(no response)", output);
+          output.stopReason = "stop";
+          stream.push({ type: "done", reason: "stop", message: output });
+          stream.end?.();
+          void deleteRun(runId).catch(() => {});
+          return;
         } else if (ev.type === "error") {
+          if (typeof ev.error !== "string") throw new Error("invalid mantis error event");
           throw new Error(ev.error);
+        } else {
+          throw new Error("unexpected mantis run event");
         }
       }
-
-      if (!hasResult) {
-        throw new Error("Stream ended without terminal result event");
-      }
-
-      if (steps.length > 0) {
-        const pendingFinal = { finalText, toolCallIds };
-        for (const toolCallId of toolCallIds) pendingFinalByToolCallId.set(toolCallId, pendingFinal);
-        pruneMap(pendingFinalByToolCallId, MAX_PENDING_FINALS);
-
-        output.stopReason = "toolUse";
-        stream.push({ type: "done", reason: "toolUse", message: output });
-        stream.end?.();
-        return;
-      }
-
-      emitText(stream, finalText || "(no response)", output);
-      output.stopReason = "stop";
-      stream.push({ type: "done", reason: "stop", message: output });
-      stream.end?.();
     } catch (err: any) {
+      if (err instanceof MantisTransportError && resumedPending && !options?.signal?.aborted) {
+        restorePending(resumedPending);
+      } else if (runId) {
+        clearPendingRun(runId);
+        void deleteRun(runId).catch(() => {});
+      }
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
       output.errorMessage = err.message;
       emitText(stream, `mantis error: ${err.message}`, output);

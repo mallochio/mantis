@@ -1,4 +1,5 @@
 """Unit tests for openfugu-patch/serve.py."""
+
 from __future__ import annotations
 
 import http.client
@@ -93,9 +94,7 @@ def test_build_fugu_trace_empty():
 # ---------------------------------------------------------------------------
 def _fake_litellm_module(content: str = "ok") -> Any:
     def _completion(**kw):
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
-        )
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
 
     mod = SimpleNamespace(completion=_completion)
     return mod
@@ -103,7 +102,9 @@ def _fake_litellm_module(content: str = "ok") -> Any:
 
 def test_openrouter_trinity_worker_call(monkeypatch):
     monkeypatch.setitem(sys.modules, "litellm", _fake_litellm_module("trinity"))
-    worker = serve.OpenRouterTrinityWorker(slot_models=["claude-sonnet-5"], api_key="k", api_base="http://x")
+    worker = serve.OpenRouterTrinityWorker(
+        slot_models=["claude-sonnet-5"], api_key="k", api_base="http://x"
+    )
     result = worker("Worker", [{"role": "user", "content": "hi"}], 0)
     assert result == "trinity"
 
@@ -144,7 +145,9 @@ def test_history_worker_with_history():
     serve._history_context.calls = []
     try:
         worker = serve.HistoryWorker(FakeWorker())
-        result = worker("Worker", [{"role": "system", "content": "sys"}, {"role": "user", "content": "q2"}], 0)
+        result = worker(
+            "Worker", [{"role": "system", "content": "sys"}, {"role": "user", "content": "q2"}], 0
+        )
         assert len(serve._history_context.calls) == 1
         call = serve._history_context.calls[0]
         assert call["role"] == "Worker"
@@ -279,7 +282,13 @@ def test_verifier_rejection_forces_worker_revision():
             sample=False,
         )
         result = coord.run("answer this")
-        assert [turn.role_name for turn in result.turns] == ["Worker", "Verifier", "Worker", "Worker", "Verifier"]
+        assert [turn.role_name for turn in result.turns] == [
+            "Worker",
+            "Verifier",
+            "Worker",
+            "Worker",
+            "Verifier",
+        ]
         assert result.final == "revised"
         assert result.terminated_by == "verifier_accept"
     finally:
@@ -304,7 +313,9 @@ def test_history_worker_first_turn_no_context_prefix():
     serve._history_context.calls = []
     try:
         worker = serve.HistoryWorker(FakeWorker())
-        result = worker("Worker", [{"role": "system", "content": "sys"}, {"role": "user", "content": "q2"}], 0)
+        result = worker(
+            "Worker", [{"role": "system", "content": "sys"}, {"role": "user", "content": "q2"}], 0
+        )
         assert result == "ok"
         msgs = worker._worker.calls[0][1]
         assert msgs[0] == {"role": "system", "content": "sys"}
@@ -329,7 +340,10 @@ def test_history_worker_conduct():
         worker = serve.HistoryWorker(FakeWorker())
         result = worker.conduct("model", [{"role": "user", "content": "q"}])
         assert result == "plan"
-        assert worker._worker.calls[0][2] == [{"role": "assistant", "content": "a1"}, {"role": "user", "content": "q"}]
+        assert worker._worker.calls[0][2] == [
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "q"},
+        ]
     finally:
         serve._history_context.history = []
         serve._history_context.calls = []
@@ -337,7 +351,15 @@ def test_history_worker_conduct():
 
 def test_chat_response_includes_prompt_and_model_name():
     from types import SimpleNamespace
-    turn = SimpleNamespace(t=1, agent_id=2, role_name="Thinker", reply="ok", prompt="solve it", model_name="openai/gpt-4o-mini")
+
+    turn = SimpleNamespace(
+        t=1,
+        agent_id=2,
+        role_name="Thinker",
+        reply="ok",
+        prompt="solve it",
+        model_name="openai/gpt-4o-mini",
+    )
     res = SimpleNamespace(final="final", turns=[turn], terminated_by="verifier_accept")
     body = serve._chat_response(res, "mantis")
     step = body["mantis_steps"][0]
@@ -416,11 +438,7 @@ def test_env_local_conductor(monkeypatch):
 # Conductor coordinator end-to-end
 # ---------------------------------------------------------------------------
 def test_env_conductor_coordinator_with_local(monkeypatch):
-    workflow = (
-        "model_id: [0, 1]\n"
-        "subtasks: ['plan', 'solve']\n"
-        "access_list: ['all', [0]]"
-    )
+    workflow = "model_id: [0, 1]\nsubtasks: ['plan', 'solve']\naccess_list: ['all', [0]]"
     local_conductor = MagicMock()
     local_conductor.conduct.return_value = workflow
     worker = MagicMock()
@@ -432,11 +450,7 @@ def test_env_conductor_coordinator_with_local(monkeypatch):
 
 
 def test_env_conductor_coordinator_litellm(monkeypatch):
-    workflow = (
-        "model_id: [0]\n"
-        "subtasks: ['answer']\n"
-        "access_list: ['all']"
-    )
+    workflow = "model_id: [0]\nsubtasks: ['answer']\naccess_list: ['all']"
 
     class FakeWorker:
         def __init__(self, *args, **kwargs):
@@ -537,7 +551,9 @@ def test_handler_warm_trinity_and_conductor():
         resp1 = urlopen(req1)
         body1 = json.loads(resp1.read().decode())
         assert resp1.status == 200
-        assert body1 == {"status": "ready", "mode": "trinity"}
+        assert body1["status"] == "ready"
+        assert body1["mode"] == "trinity"
+        assert body1["native_tool_runs"] is True
 
         # POST /warm with mode=conductor
         payload = json.dumps({"mode": "conductor"}).encode()
@@ -549,7 +565,9 @@ def test_handler_warm_trinity_and_conductor():
         resp2 = urlopen(req2)
         body2 = json.loads(resp2.read().decode())
         assert resp2.status == 200
-        assert body2 == {"status": "ready", "mode": "conductor"}
+        assert body2["status"] == "ready"
+        assert body2["mode"] == "conductor"
+        assert body2["native_tool_runs"] is True
 
         assert called_modes == ["trinity", "conductor"]
     finally:
@@ -610,7 +628,9 @@ def test_handler_post_too_large():
         serve.MAX_BODY_BYTES = 16
         srv, port = _start_server(serve.Handler)
         time.sleep(0.1)
-        payload = json.dumps({"model": "trinity", "messages": [{"role": "user", "content": "hello world"}]}).encode()
+        payload = json.dumps(
+            {"model": "trinity", "messages": [{"role": "user", "content": "hello world"}]}
+        ).encode()
         req = Request(
             f"http://127.0.0.1:{port}/v1/chat/completions",
             data=payload,
@@ -630,7 +650,9 @@ def test_handler_post_trinity():
         serve.get_coordinator = _fake_get_coordinator
         srv, port = _start_server(serve.Handler)
         time.sleep(0.1)
-        payload = json.dumps({"model": "trinity", "messages": [{"role": "user", "content": "2+2"}]}).encode()
+        payload = json.dumps(
+            {"model": "trinity", "messages": [{"role": "user", "content": "2+2"}]}
+        ).encode()
         req = Request(
             f"http://127.0.0.1:{port}/v1/chat/completions",
             data=payload,
@@ -652,7 +674,9 @@ def test_handler_post_conductor():
         serve.get_coordinator = _fake_get_coordinator
         srv, port = _start_server(serve.Handler)
         time.sleep(0.1)
-        payload = json.dumps({"model": "conductor", "messages": [{"role": "user", "content": "hi"}]}).encode()
+        payload = json.dumps(
+            {"model": "conductor", "messages": [{"role": "user", "content": "hi"}]}
+        ).encode()
         req = Request(
             f"http://127.0.0.1:{port}/v1/chat/completions",
             data=payload,
@@ -745,6 +769,7 @@ def test_handler_post_coordinator_error():
         class BadCoord:
             def run(self, query, verbose=False):
                 raise ValueError("boom")
+
         return BadCoord()
 
     old = serve.get_coordinator
@@ -752,7 +777,9 @@ def test_handler_post_coordinator_error():
         serve.get_coordinator = _raising_coordinator
         srv, port = _start_server(serve.Handler)
         time.sleep(0.1)
-        payload = json.dumps({"model": "trinity", "messages": [{"role": "user", "content": "hi"}]}).encode()
+        payload = json.dumps(
+            {"model": "trinity", "messages": [{"role": "user", "content": "hi"}]}
+        ).encode()
         req = Request(
             f"http://127.0.0.1:{port}/v1/chat/completions",
             data=payload,
@@ -876,9 +903,7 @@ def test_openrouter_conductor_worker_with_api_base(monkeypatch):
 
     def _completion(**kw):
         captured.update(kw)
-        return SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
-        )
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
 
     monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=_completion))
     worker = serve.OpenRouterConductorWorker(slot_models=["gpt-5.6-luna"], api_base="http://x/")
@@ -897,11 +922,7 @@ def test_conductor_coordinator_run():
         slot_models = ["a", "b"]
 
         def conduct(self, model, prompt):
-            return (
-                "model_id: [0]\n"
-                "subtasks: ['answer']\n"
-                "access_list: ['all']"
-            )
+            return "model_id: [0]\nsubtasks: ['answer']\naccess_list: ['all']"
 
         def __call__(self, sub, messages, agent_id):
             return "final answer"
@@ -1050,8 +1071,10 @@ def test_get_router_and_head(monkeypatch, tmp_path):
     try:
         serve.ROUTER = None
         serve._args = SimpleNamespace(
-            model="m", vector=str(tmp_path / "vec.npy"),
-            head=str(tmp_path / "head.npy"), max_turns=5,
+            model="m",
+            vector=str(tmp_path / "vec.npy"),
+            head=str(tmp_path / "head.npy"),
+            max_turns=5,
         )
         np.save(serve._args.vector, np.zeros(serve.HEAD_ROWS * serve.HIDDEN))
         np.save(serve._args.head, np.zeros(serve.HEAD_ROWS * serve.HIDDEN))
@@ -1075,9 +1098,9 @@ def test_get_router_and_head(monkeypatch, tmp_path):
 
 def test_load_coordinator_trinity(monkeypatch):
     monkeypatch.setattr(
-        serve, "_args",
-        SimpleNamespace(local_models=None, slot_models="a,b", max_turns=5)
+        serve, "_args", SimpleNamespace(local_models=None, slot_models="a,b", max_turns=5)
     )
+
     class FakeRouter:
         pass
 
@@ -1094,7 +1117,8 @@ def test_load_coordinator_trinity(monkeypatch):
     monkeypatch.setattr(serve, "get_router", lambda: FakeRouter())
     monkeypatch.setattr(serve, "Coordinator", FakeCoord)
     monkeypatch.setattr(
-        serve, "_worker_from_args",
+        serve,
+        "_worker_from_args",
         lambda args, mode: FakeWorker(),
     )
     monkeypatch.delenv("FUGU_LOCAL_CONDUCTOR", raising=False)
@@ -1104,9 +1128,9 @@ def test_load_coordinator_trinity(monkeypatch):
 
 def test_load_coordinator_conductor(monkeypatch):
     monkeypatch.setattr(
-        serve, "_args",
-        SimpleNamespace(local_models=None, slot_models="a,b", max_turns=5)
+        serve, "_args", SimpleNamespace(local_models=None, slot_models="a,b", max_turns=5)
     )
+
     class FakeWorker:
         slot_models = ["a", "b"]
 
@@ -1121,7 +1145,8 @@ def test_load_coordinator_conductor(monkeypatch):
             self.slot_labels = slot_labels
 
     monkeypatch.setattr(
-        serve, "_worker_from_args",
+        serve,
+        "_worker_from_args",
         lambda args, mode: FakeWorker(),
     )
     monkeypatch.setattr(serve, "EnvLocalConductor", FakeLocalConductor)
@@ -1133,8 +1158,7 @@ def test_load_coordinator_conductor(monkeypatch):
 
 def test_load_coordinator_unknown(monkeypatch):
     monkeypatch.setattr(
-        serve, "_args",
-        SimpleNamespace(local_models=None, slot_models="a,b", max_turns=5)
+        serve, "_args", SimpleNamespace(local_models=None, slot_models="a,b", max_turns=5)
     )
     with pytest.raises(ValueError):
         serve.load_coordinator("other")
@@ -1202,6 +1226,7 @@ def test_env_local_conductor_auto_mps(monkeypatch):
 # Conductor Recovery & Observability (Plan 002) Tests
 # ---------------------------------------------------------------------------
 
+
 def test_conductor_planning_planner_step_emitted():
     events = []
 
@@ -1209,11 +1234,7 @@ def test_conductor_planning_planner_step_emitted():
         slot_models = ["model-a", "model-b"]
 
         def conduct(self, model, prompt):
-            return (
-                "model_id: [0]\n"
-                "subtasks: ['step 1']\n"
-                "access_list: ['all']"
-            )
+            return "model_id: [0]\nsubtasks: ['step 1']\naccess_list: ['all']"
 
         def __call__(self, sub, messages, agent_id):
             return "subtask output"
@@ -1297,11 +1318,7 @@ def test_conductor_node_empty_retry_success():
             self.attempts = 0
 
         def conduct(self, model, prompt):
-            return (
-                "model_id: [0]\n"
-                "subtasks: ['flaky step']\n"
-                "access_list: ['all']"
-            )
+            return "model_id: [0]\nsubtasks: ['flaky step']\naccess_list: ['all']"
 
         def __call__(self, sub, messages, agent_id):
             self.attempts += 1
@@ -1351,11 +1368,7 @@ def test_conductor_node_empty_retry_exhaustion():
         slot_models = ["model-a"]
 
         def conduct(self, model, prompt):
-            return (
-                "model_id: [0]\n"
-                "subtasks: ['always empty']\n"
-                "access_list: ['all']"
-            )
+            return "model_id: [0]\nsubtasks: ['always empty']\naccess_list: ['all']"
 
         def __call__(self, sub, messages, agent_id):
             return "   "
@@ -1397,13 +1410,17 @@ def test_conductor_worker_preserves_multi_turn_history_without_feedback_leakage(
     try:
         raw_worker = HistoryCaptureWorker()
         worker = serve.HistoryWorker(raw_worker)
-        assert worker("different subtask", [{"role": "user", "content": "current node"}], 0) == "done"
+        assert (
+            worker("different subtask", [{"role": "user", "content": "current node"}], 0) == "done"
+        )
         assert raw_worker.messages == [
             {"role": "user", "content": "first request"},
             {"role": "assistant", "content": "first answer"},
             {"role": "user", "content": "current node"},
         ]
-        assert all("TRINITY FEEDBACK MUST NOT LEAK" not in m["content"] for m in raw_worker.messages)
+        assert all(
+            "TRINITY FEEDBACK MUST NOT LEAK" not in m["content"] for m in raw_worker.messages
+        )
     finally:
         serve._history_context.history = []
         serve._history_context.conductor_mode = False
@@ -1419,11 +1436,7 @@ def test_conductor_no_feedback_leakage():
             self.received_prompts = []
 
         def conduct(self, model, prompt):
-            return (
-                "model_id: [0, 0]\n"
-                "subtasks: ['step 1', 'step 2']\n"
-                "access_list: [[], [0]]"
-            )
+            return "model_id: [0, 0]\nsubtasks: ['step 1', 'step 2']\naccess_list: [[], [0]]"
 
         def __call__(self, sub, messages, agent_id):
             prompt_content = messages[-1]["content"]
@@ -1560,3 +1573,428 @@ def test_disconnect_prevents_subsequent_steps(monkeypatch):
     finally:
         serve.get_coordinator = old
         srv.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Resumable native-tool runs
+# ---------------------------------------------------------------------------
+
+
+def _run_messages(text: str = "do the task") -> list[dict[str, str]]:
+    return [{"role": "system", "content": "system"}, {"role": "user", "content": text}]
+
+
+def test_litellm_upstream_config_is_separate_from_ingress(monkeypatch):
+    monkeypatch.setenv("MANTIS_API_KEY", "ingress")
+    monkeypatch.setenv("LITELLM_KEY", "proxy")
+    monkeypatch.setenv("MANTIS_BASE_URL", "http://proxy/v1")
+    assert serve._litellm_api_key() == "proxy"
+    assert serve._litellm_base_url() == "http://proxy/v1"
+    assert serve._is_reasoning_model("openai/gpt-5.6-sol")
+    monkeypatch.delenv("LITELLM_KEY")
+    monkeypatch.delenv("MANTIS_LITELLM_API_KEY", raising=False)
+    monkeypatch.delenv("FUGU_LITELLM_API_KEY", raising=False)
+    assert serve._litellm_api_key() is None
+
+
+def test_configured_slot_models(monkeypatch):
+    monkeypatch.setattr(serve, "_args", None)
+    monkeypatch.setenv("MANTIS_WORKER_MODELS", "one, two")
+    assert serve._configured_slot_models() == ["one", "two"]
+    assert serve._configured_slot_models(["override"]) == ["override"]
+    with pytest.raises(TypeError):
+        serve._configured_slot_models("not-a-list")
+    with pytest.raises(ValueError):
+        serve._configured_slot_models([])
+
+
+def test_validate_tool_results_exact_ids():
+    expected = {"a", "b"}
+    results = [{"tool_call_id": "b", "content": "2"}, {"tool_call_id": "a", "content": "1"}]
+    assert serve._validate_tool_results(results, expected) == results
+    for invalid in (
+        None,
+        [{"tool_call_id": "a"}, {"tool_call_id": "a"}],
+        [{"tool_call_id": "a"}],
+        [{"content": "missing"}, {"tool_call_id": "b"}],
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            serve._validate_tool_results(invalid, expected)
+
+
+def test_trinity_native_tool_run_and_accept(monkeypatch):
+    roles = iter([("Worker", 0), ("Verifier", 0)])
+    monkeypatch.setattr(
+        serve,
+        "get_router",
+        lambda: SimpleNamespace(
+            route=lambda *_args, **_kwargs: dict(
+                zip(("role_name", "agent_id"), next(roles), strict=True)
+            )
+        ),
+    )
+    calls = []
+
+    def complete(model, messages, tools):
+        calls.append((model, list(messages), tools))
+        if len(calls) == 1:
+            return "", [{"id": "read-1", "name": "read", "arguments": {"path": "README.md"}}]
+        if len(calls) == 2:
+            assert messages[-1] == {"role": "tool", "tool_call_id": "read-1", "content": "file"}
+            return "answer", []
+        return "ACCEPT", []
+
+    monkeypatch.setattr(serve, "_model_completion", complete)
+    run = serve.TrinityRun(
+        "r1", _run_messages(), [{"type": "function"}], slot_models=["worker"], max_turns=4
+    )
+    assert run.advance(None)["type"] == "tool_calls"
+    worker = run.advance([{"tool_call_id": "read-1", "content": "file"}])
+    assert worker["type"] == "step_complete" and worker["reply"] == "answer"
+    verifier = run.advance(None)
+    assert verifier["role"] == "Verifier" and verifier["reply"] == "ACCEPT"
+    final = run.advance(None)
+    assert final["type"] == "final"
+    assert final["text"] == "answer"
+    assert final["terminated_by"] == "verifier_accept"
+    assert len(calls) == 3
+    assert run.advance(None)["error"] == "run already finished"
+
+
+def test_trinity_rejects_wrong_tool_result(monkeypatch):
+    monkeypatch.setattr(
+        serve,
+        "get_router",
+        lambda: SimpleNamespace(route=lambda *_a, **_k: {"role_name": "Worker", "agent_id": 0}),
+    )
+    monkeypatch.setattr(
+        serve,
+        "_model_completion",
+        lambda *_a: ("", [{"id": "expected", "name": "read", "arguments": {}}]),
+    )
+    run = serve.TrinityRun("r2", _run_messages(), [], slot_models=["worker"])
+    assert (
+        run.advance([{"tool_call_id": "early", "content": "x"}])["error"]
+        == "unexpected tool results"
+    )
+    assert run.advance(None)["type"] == "tool_calls"
+    event = run.advance([{"tool_call_id": "wrong", "content": "x"}])
+    assert event["type"] == "error" and "mismatch" in event["error"]
+
+
+def test_conductor_native_tool_run(monkeypatch):
+    monkeypatch.setattr(serve, "parse_workflow", lambda _text: ([0], ["inspect"], [[]]))
+    replies = iter(
+        [
+            ("plan", []),
+            ("", [{"id": "bash-1", "name": "bash", "arguments": {"command": "pwd"}}]),
+            ("done", []),
+        ]
+    )
+    monkeypatch.setattr(serve, "_model_completion", lambda *_a: next(replies))
+    run = serve.ConductorRun("c1", _run_messages(), [], slot_models=["worker"])
+    assert run.advance(None)["role"] == "Planner"
+    assert run.advance(None)["type"] == "tool_calls"
+    step = run.advance([{"tool_call_id": "bash-1", "content": "working-dir"}])
+    assert step["type"] == "step_complete" and step["reply"] == "done"
+    final = run.advance(None)
+    assert final["type"] == "final" and final["text"] == "done"
+
+
+def test_create_run_uses_configured_pool_and_delete(monkeypatch):
+    monkeypatch.setattr(serve, "_args", None)
+    monkeypatch.setenv("MANTIS_WORKER_MODELS", "configured-a,configured-b")
+    run = serve.create_run("trinity", {"messages": _run_messages(), "tools": []})
+    try:
+        assert run.slot_models == ["configured-a", "configured-b"]
+        assert serve.get_run(run.run_id) is run
+        assert serve.delete_run(run.run_id)
+        with pytest.raises(KeyError):
+            serve.get_run(run.run_id)
+    finally:
+        serve.delete_run(run.run_id)
+
+
+def test_create_run_validates_messages_and_slots():
+    requested = "a" * 32
+    run = serve.create_run(
+        "trinity", {"messages": _run_messages(), "slot_models": ["worker"], "run_id": requested}
+    )
+    try:
+        assert run.run_id == requested
+    finally:
+        serve.delete_run(requested)
+    with pytest.raises(ValueError):
+        serve.create_run("trinity", {"messages": _run_messages(), "run_id": "invalid"})
+    with pytest.raises(ValueError):
+        serve.create_run("trinity", {"messages": []})
+    with pytest.raises(TypeError):
+        serve.create_run("trinity", {"messages": _run_messages(), "slot_models": "bad"})
+
+
+def test_run_http_lifecycle_and_invalid_json(monkeypatch):
+    monkeypatch.setattr(serve, "_args", None)
+    monkeypatch.setenv("MANTIS_WORKER_MODELS", "worker")
+    srv, port = _start_server(serve.Handler)
+    try:
+        time.sleep(0.05)
+        headers = {"Authorization": "Bearer test-key", "Content-Type": "application/json"}
+        conn = http.client.HTTPConnection("127.0.0.1", port)
+        conn.request("POST", "/v1/runs", body="[]", headers=headers)
+        assert conn.getresponse().status == 400
+        conn.close()
+
+        conn = http.client.HTTPConnection("127.0.0.1", port)
+        conn.request(
+            "POST",
+            "/v1/runs",
+            body=json.dumps({"model": "trinity", "messages": _run_messages()}),
+            headers=headers,
+        )
+        response = conn.getresponse()
+        assert response.status == 200
+        run_id = json.loads(response.read())["run_id"]
+        conn.close()
+
+        conn = http.client.HTTPConnection("127.0.0.1", port)
+        conn.request("POST", f"/v1/runs/{run_id}/continue", body="[]", headers=headers)
+        assert conn.getresponse().status == 400
+        conn.close()
+
+        conn = http.client.HTTPConnection("127.0.0.1", port)
+        conn.request("DELETE", f"/v1/runs/{run_id}", headers=headers)
+        response = conn.getresponse()
+        assert response.status == 200 and json.loads(response.read())["deleted"] is True
+        conn.close()
+    finally:
+        srv.shutdown()
+
+
+def test_bounded_request_body_helpers():
+    handler = object.__new__(serve.Handler)
+    handler.headers = {"Content-Length": "4"}
+    handler.rfile = __import__("io").BytesIO(b"data")
+    with pytest.raises(serve.RequestBodyTooLargeError):
+        handler._read_request_body(max_bytes=3)
+
+    handler.headers = {"Transfer-Encoding": "chunked"}
+    handler.rfile = __import__("io").BytesIO(b"4\r\ndata\r\n0\r\n\r\n")
+    with pytest.raises(serve.RequestBodyTooLargeError):
+        handler._read_request_body(max_bytes=3)
+    handler.rfile = __import__("io").BytesIO(b"-1\r\n")
+    with pytest.raises(ValueError, match="negative"):
+        handler._read_request_body()
+    handler.rfile = __import__("io").BytesIO(b"4\r\nab")
+    with pytest.raises(ValueError, match="truncated"):
+        handler._read_request_body()
+    handler.rfile = __import__("io").BytesIO(b"2\r\nabXX0\r\n\r\n")
+    with pytest.raises(ValueError, match="terminator"):
+        handler._read_request_body()
+
+
+def test_convert_tools_and_model_completion(monkeypatch):
+    converted = serve._convert_tools(
+        [
+            None,
+            {},
+            {"name": "mantis_step", "parameters": {}},
+            {"name": "read", "description": "read files", "parameters": {"type": "object"}},
+            {"name": "bash"},
+            {"name": "bad", "parameters": "invalid"},
+        ]
+    )
+    assert [tool["function"]["name"] for tool in converted] == ["read", "bash"]
+    assert converted[1]["function"]["parameters"]["type"] == "object"
+    assert serve._convert_tools("bad") == []
+
+    tool_calls = [
+        SimpleNamespace(id="same", function=SimpleNamespace(name="read", arguments='{"path":"a"}')),
+        SimpleNamespace(id="same", function=SimpleNamespace(name="bash", arguments="not-json")),
+        SimpleNamespace(id=None, function=SimpleNamespace(name="edit", arguments="[]")),
+    ]
+    completion = MagicMock(
+        return_value=SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=tool_calls))]
+        )
+    )
+    monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=completion))
+    monkeypatch.setenv("LITELLM_KEY", "proxy")
+    text, calls = serve._model_completion("openai/gpt-5.6-sol", [], converted)
+    assert text == ""
+    assert len({call["id"] for call in calls}) == 3
+    assert calls[1]["arguments"] == {} and calls[2]["arguments"] == {}
+    kwargs = completion.call_args.kwargs
+    assert kwargs["api_key"] == "proxy" and kwargs["tools"] == converted
+    assert "temperature" not in kwargs
+
+
+def test_run_registry_sweep_and_capacity(monkeypatch):
+    monkeypatch.setattr(serve, "_runs", {})
+    monkeypatch.setattr(serve, "_runs_sweeper_started", True)
+    monkeypatch.setattr(serve, "MAX_RUNS", 1)
+    first = serve.NativeRun("first")
+    second = serve.NativeRun("second")
+    serve._register_run(first)
+    serve._register_run(second)
+    assert first.cancelled and serve.get_run("second") is second
+    second.last_active = 0
+    second.in_flight = 1
+    serve._sweep_runs()
+    assert serve.get_run("second") is second and not second.cancelled
+    second.in_flight = 0
+    serve._sweep_runs()
+    assert second.cancelled
+    with pytest.raises(KeyError):
+        serve.get_run("second")
+    assert not serve.delete_run("missing")
+
+
+def test_trinity_recovery_thinker_and_limits(monkeypatch):
+    run = serve.TrinityRun("recovery", _run_messages(), [], slot_models=["worker"], max_turns=1)
+    thinker = run._role_complete(
+        "Thinker",
+        0,
+        0,
+        [{"content": "think"}],
+        "<suggested_role>solver</suggested_role><suggestion>be precise</suggestion>",
+    )
+    assert thinker["role"] == "Thinker"
+    assert run.suggested_role == "Worker" and run.suggestion == "be precise"
+    assert "be precise" in run._role_prompt("Worker")
+
+    run._role_complete("Verifier", 0, 1, [{"content": "verify"}], "REJECT: fix it")
+    assert run.force_worker and "REJECT" in (run.revision_feedback or "")
+    run._role_complete("Worker", 0, 2, [{"content": "work"}], "")
+    assert run.force_worker and "no response" in (run.revision_feedback or "")
+
+    limited = serve.TrinityRun("limit", _run_messages(), [], slot_models=["worker"], max_turns=0)
+    event = limited.advance(None)
+    assert event["type"] == "final" and event["terminated_by"] == "max_turns"
+    limited.close()
+    assert limited.advance(None)["error"] == "run cancelled"
+
+    monkeypatch.setattr(
+        serve,
+        "get_router",
+        lambda: SimpleNamespace(route=lambda *_a, **_k: {"role_name": "Worker", "agent_id": 0}),
+    )
+    monkeypatch.setattr(
+        serve, "_model_completion", lambda *_a: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    failed = serve.TrinityRun("failed", _run_messages(), [], slot_models=["worker"])
+    assert failed.advance(None) == {"type": "error", "error": "boom"}
+    assert failed.cancelled
+
+
+def test_trinity_cold_roles_are_workers(monkeypatch):
+    routed = iter(["Verifier", "Thinker", "Worker"])
+    monkeypatch.setattr(
+        serve,
+        "get_router",
+        lambda: SimpleNamespace(route=lambda *_a, **_k: {"role_name": next(routed), "agent_id": 0}),
+    )
+    run = serve.TrinityRun("cold", _run_messages(), [], slot_models=["worker"])
+    assert run._route()[0] == "Worker"
+    assert run._route()[0] == "Worker"
+    run.suggested_role = "Thinker"
+    run.last_response = "answer"
+    assert run._route()[0] == "Thinker"
+
+
+def test_conductor_errors_visibility_and_state(monkeypatch):
+    run = serve.ConductorRun("errors", _run_messages(), [], slot_models=["worker"])
+    with pytest.raises(ValueError):
+        run._node_messages(0, 0, "task")
+    run._workflow = ([0, 0], ["first", "second"], [[], [0]])
+    run._outputs = ["first output"]
+    assert "first output" in run._node_messages(1, 0, "second")[0]["content"]
+
+    monkeypatch.setattr(
+        serve, "parse_workflow", lambda _text: (_ for _ in ()).throw(ValueError("bad plan"))
+    )
+    event = run._finalize_text("Planner", "bad", 0)
+    assert event["type"] == "error" and "parseable" in event["error"]
+    monkeypatch.setattr(serve, "parse_workflow", lambda _text: ([], [], []))
+    assert "malformed" in run._finalize_text("Planner", "bad", 0)["error"]
+
+    run.close()
+    assert run.advance(None)["error"] == "run cancelled"
+    finished = serve.ConductorRun("finished", _run_messages(), [], slot_models=["worker"])
+    finished.finished = True
+    assert finished.advance(None)["error"] == "run already finished"
+    unexpected = serve.ConductorRun("unexpected", _run_messages(), [], slot_models=["worker"])
+    assert unexpected.advance([{"tool_call_id": "early"}])["error"] == "unexpected tool results"
+
+    capped = serve.ConductorRun("capped", _run_messages(), [], slot_models=["worker"], max_steps=0)
+    capped._workflow = ([0], ["task"], [[]])
+    event = capped.advance(None)
+    assert event["type"] == "final" and event["terminated_by"] == "max_steps"
+
+
+def test_advance_run_idempotency(monkeypatch):
+    class CountingRun(serve.NativeRun):
+        def __init__(self):
+            super().__init__("idempotent")
+            self.calls = 0
+
+        def advance(self, tool_results):
+            self.calls += 1
+            return {"type": "step_complete", "reply": str(tool_results)}
+
+    monkeypatch.setattr(serve, "_runs", {})
+    monkeypatch.setattr(serve, "_runs_sweeper_started", True)
+    run = CountingRun()
+    serve._register_run(run)
+    first = serve.advance_run(run.run_id, [{"tool_call_id": "one"}], "request-1")
+    second = serve.advance_run(run.run_id, [{"tool_call_id": "different"}], "request-1")
+    assert first == second and run.calls == 1
+    with pytest.raises(ValueError, match="request_id"):
+        serve.advance_run(run.run_id, None, "")
+
+
+def test_learning_record_is_redacted_and_high_confidence(tmp_path, monkeypatch):
+    monkeypatch.setenv("MANTIS_LEARNING", "1")
+    monkeypatch.setenv("MANTIS_LEARNING_DIR", str(tmp_path))
+    monkeypatch.setenv("MANTIS_LEARNING_INSTANCE", "test/host")
+    run = serve.TrinityRun(
+        "learn",
+        [{"role": "user", "content": "fix tests token=secret-value"}],
+        [],
+        slot_models=[f"m{i}" for i in range(7)],
+    )
+    run.turns = [
+        {"role": "Worker", "agent_id": 3, "reply": "fixed"},
+        {"role": "Verifier", "agent_id": 1, "reply": "ACCEPT"},
+    ]
+    pending = {
+        "asst": {
+            "tool_calls": [
+                {
+                    "id": "test-1",
+                    "function": {
+                        "name": "bash",
+                        "arguments": json.dumps({"command": "python3 -m unittest -v"}),
+                    },
+                }
+            ]
+        }
+    }
+    run.record_tool_results(pending, [{"tool_call_id": "test-1", "is_error": False}])
+    serve._write_learning_record(run, {"type": "final", "terminated_by": "verifier_accept"})
+    path = tmp_path / "runs-test_host.jsonl"
+    record = json.loads(path.read_text())
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert record["trainable"] is True
+    assert record["label_worker"] == 3 and record["label_role"] == 0
+    assert record["last_test_passed"] is True
+    assert "secret-value" not in record["task"] and "[REDACTED]" in record["task"]
+    serve._write_learning_record(run, {"type": "error"})
+    assert len(path.read_text().splitlines()) == 1
+
+
+def test_learning_record_skips_ambiguous_runs(monkeypatch):
+    monkeypatch.delenv("MANTIS_LEARNING", raising=False)
+    run = serve.TrinityRun("ambiguous", _run_messages(), [], slot_models=["worker"])
+    run.turns = [{"role": "Worker", "agent_id": 0, "reply": "answer"}]
+    record = serve._learning_record(run, {"type": "final", "terminated_by": "max_turns"})
+    assert not record["trainable"] and not record["test_seen"]

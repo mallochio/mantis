@@ -69,6 +69,13 @@ fi
 
 VECTOR_FILE="${MANTIS_VECTOR:-${FUGU_VECTOR:-}}"
 [[ -f "$VECTOR_FILE" ]] || export MANTIS_VECTOR="$REPO_ROOT/artifacts/model_iter_60.npy"
+if [[ "${MANTIS_LEARNING:-0}" =~ ^(1|true|yes|on)$ ]]; then
+    LEARNING_DIR=$(python3 -c 'import os; print(os.path.expanduser(os.environ.get("MANTIS_LEARNING_DIR", "~/.local/share/mantis/learning")))')
+    if [[ -f "$LEARNING_DIR/promoted/model_iter_60.npy" ]]; then
+        export MANTIS_VECTOR="$LEARNING_DIR/promoted/model_iter_60.npy"
+        echo "[native-mantis] using promoted learning router"
+    fi
+fi
 HEAD_FILE="${MANTIS_HEAD:-${FUGU_HEAD:-}}"
 [[ -f "$HEAD_FILE" ]] || export MANTIS_HEAD="$REPO_ROOT/artifacts/router_head.npy"
 BASE_URL="${MANTIS_BASE_URL:-${FUGU_BASE_URL:-}}"
@@ -85,4 +92,11 @@ echo "[native-mantis] listening on $MANTIS_HOST:$MANTIS_PORT"
 echo "[native-mantis] press Ctrl-C to stop"
 
 export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
-exec python3 "$SERVE" --host "$MANTIS_HOST" --port "$MANTIS_PORT"
+if [[ "${MANTIS_LEARNING:-0}" =~ ^(1|true|yes|on)$ ]]; then
+    python3 "$REPO_ROOT/scripts/learn_router.py" --watch --promote &
+    LEARN_PID=$!
+    trap 'kill "$LEARN_PID" 2>/dev/null || true' EXIT INT TERM
+    python3 "$SERVE" --host "$MANTIS_HOST" --port "$MANTIS_PORT"
+else
+    exec python3 "$SERVE" --host "$MANTIS_HOST" --port "$MANTIS_PORT"
+fi
