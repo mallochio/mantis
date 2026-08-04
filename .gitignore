@@ -1,14 +1,15 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
+# Based on GitHub's Python.gitignore and Node.gitignore templates.
 
-# Cextensions
+# Python bytecode / native extensions
+__pycache__/
+*.py[codz]
+*$py.class
 *.so
 
-# Distribution / packaging
+# Python packaging
+.Python
 build/
-devel/
+develop-eggs/
 dist/
 downloads/
 eggs/
@@ -24,22 +25,40 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
 
-# Pytest & Code Coverage
-.pytest_cache/
+# Python tests, coverage, and tooling
+htmlcov/
+.tox/
+.nox/
 .coverage
 .coverage.*
+.cache/
+nosetests.xml
 coverage.xml
 *.cover
-*.py,cover
+*.py.cover
+*.lcov
+cover/
 .hypothesis/
-.nox/
-.tox/
+.pytest_cache/
 .ruff_cache/
 .mypy_cache/
-.deepeval/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.pybuilder/
+.pyright/
+.pytype/
+cython_debug/
+.ipynb_checkpoints/
 
-# Environments & Virtual Envs
+# Python environments and local package managers
+.envrc
 .venv/
 .venv*/
 venv/
@@ -47,23 +66,63 @@ venv*/
 env/
 env*/
 ENV/
+env.bak/
+venv.bak/
 .smoke-venv/
 .venv-fetch/
-
-# Environment Variables & Secrets
-.env
-.env.*
-!.env.example
+.pdm-python
+.pdm-build/
+.pixi/*
+!.pixi/config.toml
+__pypackages__/
 
 # Node.js / TypeScript
 node_modules/
+jspm_packages/
+web_modules/
+.npm/
+.pnpm-store/
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+*.tsbuildinfo
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 lerna-debug.log*
 .pnpm-debug.log*
+.nyc_output/
+coverage/
+.parcel-cache/
+.next/
+.nuxt/
+.output/
+.svelte-kit/
+.vite/
+*.tgz
 
-# OS Generated Files
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+.pypirc
+.streamlit/secrets.toml
+
+# Editors and OS files
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
+*.swp
+*.swo
+*~
 .DS_Store
 .DS_Store?
 ._*
@@ -72,34 +131,22 @@ lerna-debug.log*
 ehthumbs.db
 Thumbs.db
 
-# Editor & IDE Configs
-.vscode/*
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
-!.vscode/extensions.json
-!.vscode/*.code-snippets
-.idea/
-*.swp
-*.swo
-*~
-
-# Logs & Temporary Run Outputs
+# Project logs, scratch data, and generated outputs
 *.log
-!runs/logs/*.log
+runs/logs/
 outputs/
 /tmp/
 .scratch/
+*.bak
 
-# Model Weights & Binary Data (ignore by default; only the baseline router head is tracked)
+# Model weights and binary artifacts (baseline head is intentionally tracked)
 *.safetensors
 *.bin
 *.pt
 *.pth
 *.onnx
 *.npy
-*.bak
 !artifacts/router_head.safetensors
 
-# External Dependencies & Cloned Sub-repos
+# External cloned dependencies
 llm-router/
