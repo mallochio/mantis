@@ -73,7 +73,7 @@ def test_update_env_file(tmp_path):
     env.write_text("FOO=1\n")
     up.update_env_file(env, ["claude-sonnet-5", "glm-5.2"])
     text = env.read_text()
-    assert "FUGU_WORKER_MODELS=claude-sonnet-5,glm-5.2" in text
+    assert "MANTIS_WORKER_MODELS=claude-sonnet-5,glm-5.2" in text
 
 
 def test_update_cost_table_with_costs(tmp_path):
@@ -97,9 +97,9 @@ def test_update_cost_table_preserves_existing(tmp_path):
 
 def test_update_env_file_existing(tmp_path):
     env = tmp_path / ".env"
-    env.write_text("FUGU_WORKER_MODELS=old\nFOO=1\n")
+    env.write_text("MANTIS_WORKER_MODELS=old\nFOO=1\n")
     up.update_env_file(env, ["new-a", "new-b"])
-    assert env.read_text() == "FUGU_WORKER_MODELS=new-a,new-b\nFOO=1\n"
+    assert env.read_text() == "MANTIS_WORKER_MODELS=new-a,new-b\nFOO=1\n"
 
 
 def test_update_litellm_config_no_effort(tmp_path):
@@ -160,7 +160,7 @@ def test_main(monkeypatch, tmp_path):
         'anthropic/claude-sonnet-5|medium,deepseek/deepseek-v4|none"'
     )
     assert expected_pool in router.read_text()
-    assert "FUGU_WORKER_MODELS=claude-sonnet-5-medium,deepseek-v4" in env.read_text()
+    assert "MANTIS_WORKER_MODELS=claude-sonnet-5-medium,deepseek-v4" in env.read_text()
 
 
 def test_update_litellm_config_no_marker(tmp_path):

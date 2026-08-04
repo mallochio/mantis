@@ -76,9 +76,9 @@ docker compose -f docker-compose.yml -f docker-compose.native-openfugu.yml up -d
 
 Override with env vars:
 ```bash
-FUGU_CONDUCTOR_DEVICE=mps               # or cuda:0 / cpu
-FUGU_CONDUCTOR_DTYPE=bfloat16           # or float32
-FUGU_CONDUCTOR_MAX_NEW=512
+MANTIS_CONDUCTOR_DEVICE=mps               # or cuda:0 / cpu
+MANTIS_CONDUCTOR_DTYPE=bfloat16           # or float32
+MANTIS_CONDUCTOR_MAX_NEW=512
 ```
 
 ## Model knobs (set in `.env` or your shell, e.g. `.zshrc`)
@@ -91,22 +91,22 @@ All model selection is env-driven. Export the variables before `docker compose u
 | `OPENCODE_GO_API_KEY` | API key for optional opencode-* LiteLLM aliases | optional |
 | `OPENAI_API_KEY` | OpenAI key for `llm-router` embeddings only | required for router |
 | `LITELLM_KEY` | Shared internal bearer token for router/mantis | `change-me` |
-| `FUGU_API_KEY` | Same token, used by the pi extension and `serve.py` auth | `${LITELLM_KEY}` |
+| `MANTIS_API_KEY` | Same token, used by the pi extension and `serve.py` auth | `${LITELLM_KEY}` |
 | `EXPENSIVE_MODEL` / `CHEAP_MODEL` | Router cheap/expensive targets (LiteLLM aliases) | `gpt-5.6-sol-medium` / `gpt-5.6-luna-max` |
-| `FUGU_MODEL` | TRINITY router backbone (Qwen3-0.6B) | `Qwen/Qwen3-0.6B` |
-| `FUGU_VECTOR` | TRINITY SVF+head vector (built from `router_head.safetensors` at build time) | `/app/artifacts/model_iter_60.npy` in Docker; `artifacts/model_iter_60.npy` in native |
-| `FUGU_HEAD` | Optional per-step head override | unset |
-| `FUGU_WORKER_MODEL` / `FUGU_WORKER_MODELS` | Worker pool CSV for TRINITY/Conductor (LiteLLM aliases) | `gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-medium,deepseek-v4-flash-0731-xhigh,claude-opus-5-medium,claude-sonnet-5-medium,gemini-3.1-pro-preview-high` |
-| `FUGU_LOCAL_MODELS` | Local HF worker models CSV (overrides LiteLLM pool) | unset |
-| `FUGU_CONDUCTOR_MODEL` | Conductor planning model via LiteLLM. `gpt-5.6-luna-max` follows the three-list DAG format; `claude-opus-5-medium` tends to answer directly instead. | `gpt-5.6-luna-max` |
-| `FUGU_LOCAL_CONDUCTOR` | HF id/path to a local Llama-3.2-3B Conductor. **Archived/experimental** — both the public base and retrained checkpoints failed format validation in this repo. | unset |
-| `FUGU_CONDUCTOR_DEVICE` | Device for local Conductor (`cpu`, `mps`, `cuda:0`) | auto-detected; `cpu` fallback |
-| `FUGU_CONDUCTOR_DTYPE` | Torch dtype for local Conductor | `bfloat16` on mps/cuda, `float32` on cpu |
-| `FUGU_CONDUCTOR_MAX_NEW` | Max new tokens for local Conductor | `512` |
-| `FUGU_MAX_TURNS` | TRINITY loop limit | `5` |
-| `MANTIS_WORKER_TIMEOUT` / `FUGU_WORKER_TIMEOUT` | LiteLLM worker completion call timeout in seconds | `240` |
-| `FUGU_AUTO_THRESHOLD` | Pi `/fugu auto` gate (score >= threshold -> conductor) | `6` |
-| `MANTIS_CONTEXT_WINDOW` / `FUGU_CONTEXT_WINDOW` | Advertised context window for all provider modes in tokens. Operators should set this to the smallest effective worker window leaving output reserve intact. | `256000` |
+| `MANTIS_MODEL` | TRINITY router backbone (Qwen3-0.6B) | `Qwen/Qwen3-0.6B` |
+| `MANTIS_VECTOR` | TRINITY SVF+head vector (built from `router_head.safetensors` at build time) | `/app/artifacts/model_iter_60.npy` in Docker; `artifacts/model_iter_60.npy` in native |
+| `MANTIS_HEAD` | Optional per-step head override | unset |
+| `MANTIS_WORKER_MODEL` / `MANTIS_WORKER_MODELS` | Worker pool CSV for TRINITY/Conductor (LiteLLM aliases) | `gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-medium,deepseek-v4-flash-0731-xhigh,claude-opus-5-medium,claude-sonnet-5-medium,gemini-3.1-pro-preview-high` |
+| `MANTIS_LOCAL_MODELS` | Local HF worker models CSV (overrides LiteLLM pool) | unset |
+| `MANTIS_CONDUCTOR_MODEL` | Conductor planning model via LiteLLM. `gpt-5.6-luna-max` follows the three-list DAG format; `claude-opus-5-medium` tends to answer directly instead. | `gpt-5.6-luna-max` |
+| `MANTIS_LOCAL_CONDUCTOR` | HF id/path to a local Llama-3.2-3B Conductor. **Archived/experimental** — both the public base and retrained checkpoints failed format validation in this repo. | unset |
+| `MANTIS_CONDUCTOR_DEVICE` | Device for local Conductor (`cpu`, `mps`, `cuda:0`) | auto-detected; `cpu` fallback |
+| `MANTIS_CONDUCTOR_DTYPE` | Torch dtype for local Conductor | `bfloat16` on mps/cuda, `float32` on cpu |
+| `MANTIS_CONDUCTOR_MAX_NEW` | Max new tokens for local Conductor | `512` |
+| `MANTIS_MAX_TURNS` | TRINITY loop limit | `5` |
+| `MANTIS_WORKER_TIMEOUT` | LiteLLM worker completion call timeout in seconds | `240` |
+| `MANTIS_AUTO_THRESHOLD` | Pi `/fugu auto` gate (score >= threshold -> conductor) | `6` |
+| `MANTIS_CONTEXT_WINDOW` | Advertised context window for all provider modes in tokens. Operators should set this to the smallest effective worker window leaving output reserve intact. | `256000` |
 
 ### Example `.zshrc` snippet
 
@@ -116,14 +116,14 @@ export OPENAI_API_KEY="sk-..."            # only for llm-router embeddings
 export HF_TOKEN="hf-..."                  # optional, helps avoid HF rate limits
 
 # 7-slot worker pool: must match aliases in configs/litellm.yaml
-export FUGU_WORKER_MODELS="gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-medium,deepseek-v4-flash-0731-xhigh,claude-opus-5-medium,claude-sonnet-5-medium,gemini-3.1-pro-preview-high"
+export MANTIS_WORKER_MODELS="gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-medium,deepseek-v4-flash-0731-xhigh,claude-opus-5-medium,claude-sonnet-5-medium,gemini-3.1-pro-preview-high"
 
 # Optional: swap deepseek/glm to the OpenCode Go endpoint by setting OPENCODE_GO_API_KEY
-# export FUGU_WORKER_MODELS="gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-medium,opencode-deepseek-v4-flash,claude-opus-5-medium,claude-sonnet-5-medium,gemini-3.1-pro-preview-high"
+# export MANTIS_WORKER_MODELS="gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-medium,opencode-deepseek-v4-flash,claude-opus-5-medium,claude-sonnet-5-medium,gemini-3.1-pro-preview-high"
 
 # Local 3B Conductor (archived/experimental; both base and retrained checkpoints
 # failed DAG-format validation in this repo — see eval/conductor-500-diagnosis.md)
-# export FUGU_LOCAL_CONDUCTOR="di-zhang-fdu/openfugu-conductor-3b"
+# export MANTIS_LOCAL_CONDUCTOR="di-zhang-fdu/openfugu-conductor-3b"
 ```
 
 ## Artifacts: where the trained TRINITY/Conductor models live
@@ -160,10 +160,10 @@ aws s3 sync s3://sid-llm-runs/retrain-fugu-conductor/retrain-conductor-20260802_
 Set the env vars before `docker compose up` or `run_mantis_native.sh`:
 
 ```bash
-export FUGU_VECTOR="/app/artifacts/model_iter_60.npy"        # Docker path
-export FUGU_HEAD="/app/artifacts/router_head.safetensors"    # optional override
+export MANTIS_VECTOR="/app/artifacts/model_iter_60.npy"        # Docker path
+export MANTIS_HEAD="/app/artifacts/router_head.safetensors"    # optional override
 # To use the retrained Conductor instead of the base HF checkpoint:
-export FUGU_LOCAL_CONDUCTOR="/app/outputs/conductor_retrain/retrain-conductor-20260802_003213/checkpoint"
+export MANTIS_LOCAL_CONDUCTOR="/app/outputs/conductor_retrain/retrain-conductor-20260802_003213/checkpoint"
 ```
 
 In the `openfugu` container, `/app` is the repo root, so the paths above map to the local files if you copy them into `artifacts/` / `outputs/` before `docker compose build` (or use a Docker bind/volume). In native mode, `run_mantis_native.sh` automatically rewrites the Docker `/app/...` paths to repo-local paths if they do not exist.
@@ -183,7 +183,7 @@ TRINITY beats direct by **+0.322 (+56.6%)** on the auto-score rubric, at roughly
 
 ### Conductor re-eval (native CPU, no one-shot example)
 
-A second run using native `openfugu-patch/serve.py` (no Docker openfugu) with `FUGU_CONDUCTOR_DEVICE=cpu` and an assistant-prefill `Plan:\n` prompt:
+A second run using native `openfugu-patch/serve.py` (no Docker openfugu) with `MANTIS_CONDUCTOR_DEVICE=cpu` and an assistant-prefill `Plan:\n` prompt:
 
 | config | auto_score_mean | latency_mean_s | cost_sum_usd |
 |---|---|---|---|
@@ -202,7 +202,7 @@ A third run using the hosted `gpt-5.6-luna-max` as the Conductor planner (no loc
 | trinity | 0.890 | 1023.0 | $0.4563 |
 | conductor-luna | 0.626 | 1331.2 | $0.8628 |
 
-Conductor-luna had a **0% HTTP failure rate**, but its overall auto-score (**0.626**) was well below TRINITY (**0.890**) and its hard-tier score (**0.250**) was far below TRINITY's **0.714**. It was also roughly **2× the cost** of TRINITY. Per the decision rule in `eval/report-luna-conductor.md`, `FUGU_AUTO_THRESHOLD` stays at **6** — the Supra router never emits a score that high in practice, so `/fugu auto` remains on TRINITY/direct. Users can still invoke `/fugu conductor` manually for experimentation.
+Conductor-luna had a **0% HTTP failure rate**, but its overall auto-score (**0.626**) was well below TRINITY (**0.890**) and its hard-tier score (**0.250**) was far below TRINITY's **0.714**. It was also roughly **2× the cost** of TRINITY. Per the decision rule in `eval/report-luna-conductor.md`, `MANTIS_AUTO_THRESHOLD` stays at **6** — the Supra router never emits a score that high in practice, so `/fugu auto` remains on TRINITY/direct. Users can still invoke `/fugu conductor` manually for experimentation.
 
 ## Zero-touch router learning
 
@@ -382,9 +382,9 @@ A real-3B acceptance smoke on a GCP L4 spot completed successfully (see
 
 `launch/sky/retrain_fugu_conductor.yaml` defaults to a smoke:
 - `RETRAIN_STEPS=20`, `RETRAIN_LIMIT=8`, `RETRAIN_NUM_GENERATIONS=2`, `RETRAIN_PER_DEVICE_BATCH=2`
-- `FUGU_WORKER_TIMEOUT=30`, `FUGU_WORKER_MAX_TOKENS=256` to keep wall-clock/cost bounded
+- `MANTIS_WORKER_TIMEOUT=30`, `MANTIS_WORKER_MAX_TOKENS=256` to keep wall-clock/cost bounded
 - 2x A100-80GB spot (minimum; use 4x for full runs)
-- `FUGU_BASE_MODEL=di-zhang-fdu/openfugu-conductor-3b`
+- `MANTIS_BASE_MODEL=di-zhang-fdu/openfugu-conductor-3b`
 
 Outputs are saved to `s3://sid-llm-runs/retrain-fugu-conductor/<timestamp>/` with `pool.json`, `dataset.json`, `metrics.jsonl`, and the checkpoint.
 
@@ -406,7 +406,7 @@ The base `meta-llama/Llama-3.2-3B-Instruct` checkpoint and the derived `di-zhang
 
 ## Security / exposure model
 
-`openfugu-patch/serve.py` binds `0.0.0.0:8088` by default and **requires a Bearer token** on `/v1/models` and `/v1/chat/completions`. The token is read from `FUGU_API_KEY` (or `LITELLM_KEY` for backward compatibility). `serve.py` refuses to start if neither is set, rejects requests with an incorrect or missing `Authorization` header (HTTP 401), and rejects request bodies larger than `FUGU_MAX_BODY_BYTES` (default 5 MiB, HTTP 413). Health endpoints (`/health`, `/`) remain public for Docker/container probes.
+`openfugu-patch/serve.py` binds `0.0.0.0:8088` by default and **requires a Bearer token** on `/v1/models` and `/v1/chat/completions`. The token is read from `MANTIS_API_KEY` or the shared `LITELLM_KEY`. `serve.py` refuses to start if neither is set, rejects requests with an incorrect or missing `Authorization` header (HTTP 401), and rejects request bodies larger than `MANTIS_MAX_BODY_BYTES` (default 5 MiB, HTTP 413). Health endpoints (`/health`, `/`) remain public for Docker/container probes.
 
 All inter-service traffic in the Docker stack uses the same `LITELLM_KEY` value. Treat `0.0.0.0:8088` as an internal service: do not expose it to untrusted networks without an additional reverse proxy/mTLS layer.
 
@@ -426,11 +426,11 @@ See `extensions/README.md` for how to load `mantis.ts` into pi and smoke test `/
 
 ### `serve.py` exits with "FATAL: set MANTIS_API_KEY"
 
-The mantis orchestrator now refuses to start without a bearer token. Copy `.env.example` to `.env` and set both `LITELLM_KEY` and `MANTIS_API_KEY` to the same value, or just set `LITELLM_KEY` and use `MANTIS_API_KEY=${LITELLM_KEY}`. `scripts/verify.sh` and the pi extension also read `MANTIS_API_KEY` (with `FUGU_API_KEY` as a fallback).
+The mantis orchestrator now refuses to start without a bearer token. Copy `.env.example` to `.env` and set both `LITELLM_KEY` and `MANTIS_API_KEY` to the same value, or just set `LITELLM_KEY` and use `MANTIS_API_KEY=${LITELLM_KEY}`. `scripts/verify.sh` and the Pi extension also read `MANTIS_API_KEY`.
 
 ### `verify.sh` fails with HTTP 401
 
-The orchestrator requires an `Authorization: Bearer <token>` header. `scripts/verify.sh` sources `.env` and uses `MANTIS_API_KEY`/`FUGU_API_KEY`/`LITELLM_KEY`. Make sure the token you pass to `curl` matches the value set in the mantis container/process.
+The orchestrator requires an `Authorization: Bearer <token>` header. `scripts/verify.sh` sources `.env` and uses `MANTIS_API_KEY` or `LITELLM_KEY`. Make sure the token you pass to `curl` matches the value set in the mantis container/process.
 
 ### Conductor returns HTTP 500 or empty response
 
@@ -438,7 +438,7 @@ Common causes:
 
 1. **Docker Desktop memory limit (Mac)** — the Llama-3.2-3B Conductor checkpoint needs ~12 GB of RAM at `float32`. If Docker Desktop's VM is capped at ~7.7 GB the container may OOM during load or generation. Increase the VM memory limit or switch to **hybrid native-GPU mode** (`./scripts/run_mantis_native.sh`), which runs PyTorch directly on the host.
 2. **Invalid Conductor DAG** — the local checkpoint sometimes emits workflows with self/forward references, unequal-length lists, or direct answers instead of the three required lists. This is a model-output issue. Native path with `bfloat16`/GPU and an assistant `Plan:\n` prefill helps, but a checkpoint that reliably emits valid DAGs is required. See `eval/conductor-500-diagnosis.md` for the exact errors observed.
-3. **Conductor returns a plain answer instead of a DAG** — the planner model is not following the workflow format. If `FUGU_CONDUCTOR_MODEL=claude-opus-5-medium`, switch it to `gpt-5.6-luna-max`, which reliably emits the three-list `model_id / subtasks / access_list` structure. Do not set `FUGU_LOCAL_CONDUCTOR` unless you are testing the archived 3B checkpoints.
+3. **Conductor returns a plain answer instead of a DAG** — the planner model is not following the workflow format. If `MANTIS_CONDUCTOR_MODEL=claude-opus-5-medium`, switch it to `gpt-5.6-luna-max`, which reliably emits the three-list `model_id / subtasks / access_list` structure. Do not set `MANTIS_LOCAL_CONDUCTOR` unless you are testing the archived 3B checkpoints.
 4. **Litellm proxy not reachable** — in hybrid mode, the native mantis process needs `MANTIS_BASE_URL=http://127.0.0.1:3001/v1` (set by `run_mantis_native.sh` automatically). Confirm `curl http://localhost:3001/health` responds.
 
 ### TRINITY is slow on first call
@@ -465,7 +465,7 @@ Papers and checkpoints this repo relies on:
 - **Conductor** — Stefan Nielsen et al., *"Learning to Orchestrate Agents in Natural Language with the Conductor"* (arXiv:2512.04388). Describes the RL-trained Conductor LM that writes multi-step agent workflows (`model_id`, `subtasks`, `access_list`).
 - **Qwen3-0.6B** — `Qwen/Qwen3-0.6B`: TRINITY router backbone.
 - **TRINITY adapted head** — `nshkrdotcom/trinity-coordinator-adapted-qwen3-0.6b`: provides `router_head.safetensors` used by `scripts/make_vec.py` to build `artifacts/model_iter_60.npy`.
-- **OpenFugu Conductor** — `di-zhang-fdu/openfugu-conductor-3b`: the GRPO-fine-tuned Llama-3.2-3B-Instruct conductor checkpoint; set `FUGU_LOCAL_CONDUCTOR` to load it locally.
+- **OpenFugu Conductor** — `di-zhang-fdu/openfugu-conductor-3b`: the GRPO-fine-tuned Llama-3.2-3B-Instruct conductor checkpoint; set `MANTIS_LOCAL_CONDUCTOR` to load it locally.
 - **Llama-3.2-3B-Instruct** — `meta-llama/Llama-3.2-3B-Instruct`: base model for the Conductor checkpoint.
 - **Supra complexity router** — `SupraLabs/Supra-Router-51M`: the 51 M-parameter complexity/scoring model used inside `llm-router`.
 - **TerminalBench 2.1** — `zai-org/terminal-bench-2-verified`: the benchmark used for router retraining/evaluation.

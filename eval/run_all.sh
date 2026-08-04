@@ -5,7 +5,7 @@ set -euo pipefail
 # config block. Safe to re-run: it truncates eval/results.jsonl first.
 #
 # Conductor-luna uses the LiteLLM planner (gpt-5.6-luna-max) instead of a
-# local Llama-3.2-3B checkpoint. Set FUGU_LOCAL_CONDUCTOR to empty so the
+# local Llama-3.2-3B checkpoint. Set MANTIS_LOCAL_CONDUCTOR to empty so the
 # orchestrator falls back to the hosted planner model.
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -19,7 +19,7 @@ if [ -f .env ]; then
 fi
 
 export DIRECT_MODEL="${DIRECT_MODEL:-gpt-5.6-luna-max}"
-export FUGU_WORKER_MODELS="${FUGU_WORKER_MODELS:-gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-medium,deepseek-v4-flash-0731-xhigh,claude-opus-5-medium,claude-sonnet-5-medium,gemini-3.1-pro-preview-high}"
+export MANTIS_WORKER_MODELS="${MANTIS_WORKER_MODELS:-gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-medium,deepseek-v4-flash-0731-xhigh,claude-opus-5-medium,claude-sonnet-5-medium,gemini-3.1-pro-preview-high}"
 
 rm -f eval/results.jsonl eval/results-scored.jsonl eval/report.md
 
@@ -63,10 +63,10 @@ echo "[run_all] trinity"
 python3 eval/run_eval.py --config trinity --fixtures eval/fixtures.jsonl --output eval/results.jsonl --timeout 300
 
 echo "[run_all] restarting openfugu for conductor-old..."
-FUGU_LOCAL_CONDUCTOR=di-zhang-fdu/openfugu-conductor-3b \
-FUGU_CONDUCTOR_MODEL=gpt-5.6-luna-max \
-FUGU_CONDUCTOR_DTYPE=float32 \
-FUGU_CONDUCTOR_MAX_NEW=128 \
+MANTIS_LOCAL_CONDUCTOR=di-zhang-fdu/openfugu-conductor-3b \
+MANTIS_CONDUCTOR_MODEL=gpt-5.6-luna-max \
+MANTIS_CONDUCTOR_DTYPE=float32 \
+MANTIS_CONDUCTOR_MAX_NEW=128 \
 docker compose up -d --force-recreate --no-deps openfugu
 
 wait_for http://localhost:8088/health 180
@@ -83,10 +83,10 @@ echo "[run_all] conductor-new"
 python3 eval/run_eval.py --config conductor-new --fixtures eval/fixtures.jsonl --output eval/results.jsonl --timeout 300
 
 echo "[run_all] restarting openfugu for conductor-luna (LiteLLM planner)..."
-FUGU_LOCAL_CONDUCTOR= \
-FUGU_CONDUCTOR_MODEL=gpt-5.6-luna-max \
-FUGU_CONDUCTOR_DTYPE=float32 \
-FUGU_CONDUCTOR_MAX_NEW=128 \
+MANTIS_LOCAL_CONDUCTOR= \
+MANTIS_CONDUCTOR_MODEL=gpt-5.6-luna-max \
+MANTIS_CONDUCTOR_DTYPE=float32 \
+MANTIS_CONDUCTOR_MAX_NEW=128 \
 docker compose up -d --force-recreate --no-deps openfugu
 
 wait_for http://localhost:8088/health 180

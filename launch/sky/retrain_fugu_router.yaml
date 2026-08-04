@@ -29,8 +29,8 @@ envs:
   RETRAIN_COST_TABLE: "configs/worker-costs.json"
   RETRAIN_LIMIT: "200"
   RETRAIN_EPOCHS: "30"
-  FUGU_MODEL: "Qwen/Qwen3-0.6B"
-  FUGU_VECTOR: "/tmp/model_iter_60.npy"
+  MANTIS_MODEL: "Qwen/Qwen3-0.6B"
+  MANTIS_VECTOR: "/tmp/model_iter_60.npy"
   OUTPUT_ROOT: "/tmp/fugu-outputs/retrain-fugu-router"
   S3_OUTPUT_ROOT: "s3://sid-llm-runs/retrain-fugu-router"
 
@@ -60,7 +60,7 @@ run: |
   mkdir -p "$RETRAIN_OUTPUT_DIR"
 
   # Pull the starting vector from S3 (workdir may not sync the .npy binary).
-  aws s3 cp --quiet s3://sid-llm-runs/fugu-artifacts/model_iter_60.npy "$FUGU_VECTOR"
+  aws s3 cp --quiet s3://sid-llm-runs/fugu-artifacts/model_iter_60.npy "$MANTIS_VECTOR"
 
   python3 scripts/retrain_router_pool.py \
     --pool "$RETRAIN_WORKER_MODELS" \
@@ -74,8 +74,8 @@ run: |
     --max-tokens "$RETRAIN_MAX_TOKENS" \
     --timeout "$RETRAIN_TIMEOUT" \
     --cost-table "$RETRAIN_COST_TABLE" \
-    --fugu-model "$FUGU_MODEL" \
-    --fugu-vector "$FUGU_VECTOR" \
+    --fugu-model "$MANTIS_MODEL" \
+    --fugu-vector "$MANTIS_VECTOR" \
     --device auto
 
   echo "Router retraining complete. Outputs in $RETRAIN_OUTPUT_DIR"

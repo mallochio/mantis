@@ -21,8 +21,8 @@ if aws s3 ls "$S3_SRC/model_iter_60.npy" >/dev/null 2>&1; then
     aws s3 cp "$S3_SRC/router_head.npy" "$DIR/artifacts/router_head.npy"
 else
     echo "S3 artifacts not reachable; rebuilding base vector from router_head.safetensors ..."
-    FUGU_ROUTER_HEAD="${FUGU_ROUTER_HEAD:-$REPO_ROOT/artifacts/router_head.safetensors}" \
-    FUGU_VECTOR_OUT="$DIR/artifacts/model_iter_60.npy" \
+    MANTIS_ROUTER_HEAD="${MANTIS_ROUTER_HEAD:-$REPO_ROOT/artifacts/router_head.safetensors}" \
+    MANTIS_VECTOR_OUT="$DIR/artifacts/model_iter_60.npy" \
         python3 "$REPO_ROOT/scripts/make_vec.py"
 fi
 
@@ -35,6 +35,6 @@ else
 fi
 
 echo "Done. Set these in .env before docker compose up:"
-echo "  FUGU_VECTOR=$DIR/artifacts/model_iter_60.npy"
-echo "  FUGU_HEAD=$DIR/artifacts/router_head.npy  (or $DIR/artifacts/router_head.safetensors)"
-echo "  FUGU_LOCAL_CONDUCTOR=$DIR/outputs/conductor_retrain/retrain-conductor-20260802_003213/checkpoint"
+echo "  MANTIS_VECTOR=$DIR/artifacts/model_iter_60.npy"
+echo "  MANTIS_HEAD=$DIR/artifacts/router_head.npy  (or $DIR/artifacts/router_head.safetensors)"
+echo "  MANTIS_LOCAL_CONDUCTOR=$DIR/outputs/conductor_retrain/retrain-conductor-20260802_003213/checkpoint"

@@ -11,13 +11,13 @@ Conductor device: `cpu`, dtype: `float32` (from `.env`)
    ```json
    {"model":"conductor","messages":[{"role":"user","content":"what does git rerere do?"}],"max_tokens":256}
    ```
-3. Tested three conductor configurations by varying `FUGU_LOCAL_CONDUCTOR`.
+3. Tested three conductor configurations by varying `MANTIS_LOCAL_CONDUCTOR`.
 
 ## Results
 
 ### A. No local checkpoint (LiteLLM planner only)
 
-`FUGU_LOCAL_CONDUCTOR` unset.
+`MANTIS_LOCAL_CONDUCTOR` unset.
 
 - HTTP status: **200**
 - `fugu_trace`: `steps:3:conductor`
@@ -28,7 +28,7 @@ This shows the orchestration code and worker calls work fine when the planner is
 
 ### B. Base checkpoint `di-zhang-fdu/openfugu-conductor-3b`
 
-`FUGU_LOCAL_CONDUCTOR=di-zhang-fdu/openfugu-conductor-3b`
+`MANTIS_LOCAL_CONDUCTOR=di-zhang-fdu/openfugu-conductor-3b`
 
 - HTTP status: **500**
 - Response body:
@@ -41,7 +41,7 @@ This shows the orchestration code and worker calls work fine when the planner is
 
 ### C. Retrained checkpoint `outputs/conductor_retrain/retrain-conductor-20260802_003213/checkpoint`
 
-`FUGU_LOCAL_CONDUCTOR=/app/checkpoint` (mounted via `eval/docker-compose.conductor.yml`)
+`MANTIS_LOCAL_CONDUCTOR=/app/checkpoint` (mounted via `eval/docker-compose.conductor.yml`)
 
 - HTTP status: **500**
 - Response body (truncated):

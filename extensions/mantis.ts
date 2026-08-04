@@ -72,7 +72,6 @@ const WORKER_NAMES: Record<number, string> = {
 
 function getApiKey(): string {
   if (process.env.MANTIS_API_KEY) return process.env.MANTIS_API_KEY;
-  if (process.env.FUGU_API_KEY) return process.env.FUGU_API_KEY;
   if (process.env.LITELLM_KEY) return process.env.LITELLM_KEY;
 
   const envPaths = [
@@ -91,7 +90,7 @@ function getApiKey(): string {
           const [key, ...valParts] = trimmed.split("=");
           const k = key.trim();
           const v = valParts.join("=").trim().replace(/^["']|["']$/g, "");
-          if (k === "MANTIS_API_KEY" || k === "FUGU_API_KEY" || k === "LITELLM_KEY") {
+          if (k === "MANTIS_API_KEY" || k === "LITELLM_KEY") {
             if (v) return v;
           }
         }
@@ -105,7 +104,7 @@ function getApiKey(): string {
 }
 
 export function getMantisContextWindow(): number {
-  const envVal = process.env.MANTIS_CONTEXT_WINDOW ?? process.env.FUGU_CONTEXT_WINDOW;
+  const envVal = process.env.MANTIS_CONTEXT_WINDOW;
   if (envVal) {
     const trimmed = envVal.trim();
     if (/^\d+$/.test(trimmed)) {
@@ -119,14 +118,14 @@ export function getMantisContextWindow(): number {
 }
 
 function getMantisUrl(): string {
-  return process.env.MANTIS_URL ?? process.env.FUGU_URL ?? "http://127.0.0.1:8088/v1";
+  return process.env.MANTIS_URL ?? "http://127.0.0.1:8088/v1";
 }
 
 function getRouterUrl(): string {
-  return process.env.MANTIS_ROUTER_URL ?? process.env.FUGU_ROUTER_URL ?? "http://127.0.0.1:5500/v1";
+  return process.env.MANTIS_ROUTER_URL ?? "http://127.0.0.1:5500/v1";
 }
 
-const AUTO_THRESHOLD = parseInt(process.env.MANTIS_AUTO_THRESHOLD ?? process.env.FUGU_AUTO_THRESHOLD ?? "6", 10);
+const AUTO_THRESHOLD = parseInt(process.env.MANTIS_AUTO_THRESHOLD ?? "6", 10);
 
 const ROUTING_LOG_DIR = path.join(os.homedir(), ".config", "mantis");
 const ROUTING_LOG_PATH = path.join(ROUTING_LOG_DIR, "routing-log.jsonl");
@@ -853,7 +852,7 @@ function mantisStreamSimple(
 
 export default function (pi: ExtensionAPI) {
   // Ensure pi's auth resolver can find a MANTIS_API_KEY even if the user only
-  // configured FUGU_API_KEY / LITELLM_KEY in the environment or .env file.
+  // configured MANTIS_API_KEY / LITELLM_KEY in the environment or .env file.
   const apiKey = getApiKey();
   if (apiKey) {
     process.env.MANTIS_API_KEY = apiKey;

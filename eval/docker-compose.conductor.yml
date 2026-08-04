@@ -4,9 +4,9 @@
 services:
   openfugu:
     environment:
-      FUGU_LOCAL_CONDUCTOR: /app/checkpoint
-      FUGU_CONDUCTOR_MODEL: gpt-5.6-luna-max
-      FUGU_CONDUCTOR_DTYPE: float32
-      FUGU_CONDUCTOR_MAX_NEW: 128
+      MANTIS_LOCAL_CONDUCTOR: /app/checkpoint
+      MANTIS_CONDUCTOR_MODEL: gpt-5.6-luna-max
+      MANTIS_CONDUCTOR_DTYPE: float32
+      MANTIS_CONDUCTOR_MAX_NEW: 128
     volumes:
       - ./outputs/conductor_retrain/retrain-conductor-20260802_003213/checkpoint:/app/checkpoint:ro

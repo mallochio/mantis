@@ -60,21 +60,11 @@ from ultra import LiteLLMWorker as _ConductorLiteLLMWorker
 
 ROUTER: FuguRouter | None = None
 _router_lock = threading.Lock()
-MODEL_NAME = os.environ.get("MANTIS_MODEL_NAME", os.environ.get("FUGU_MODEL_NAME", "mantis"))
+MODEL_NAME = os.environ.get("MANTIS_MODEL_NAME", "mantis")
 MAX_TURNS = 5
 # Reject bodies larger than this many bytes.
-MAX_BODY_BYTES = int(
-    os.environ.get(
-        "MANTIS_MAX_BODY_BYTES",
-        os.environ.get("FUGU_MAX_BODY_BYTES", str(5 * 1024 * 1024)),
-    )
-)
-WORKER_TIMEOUT = float(
-    os.environ.get(
-        "MANTIS_WORKER_TIMEOUT",
-        os.environ.get("FUGU_WORKER_TIMEOUT", "240"),
-    )
-)
+MAX_BODY_BYTES = int(os.environ.get("MANTIS_MAX_BODY_BYTES", str(5 * 1024 * 1024)))
+WORKER_TIMEOUT = float(os.environ.get("MANTIS_WORKER_TIMEOUT", "240"))
 
 # Aliases that carry a LiteLLM reasoning_effort parameter. OpenRouter/LiteLLM
 # reject temperature != 1 for these models.
@@ -111,17 +101,11 @@ def _is_reasoning_model(model: str) -> bool:
 
 def _litellm_api_key() -> str | None:
     """Return the upstream proxy key, independent from Mantis ingress auth."""
-    return (
-        os.environ.get("MANTIS_LITELLM_API_KEY")
-        or os.environ.get("FUGU_LITELLM_API_KEY")
-        or os.environ.get("LITELLM_KEY")
-    )
+    return os.environ.get("MANTIS_LITELLM_API_KEY") or os.environ.get("LITELLM_KEY")
 
 
 def _litellm_base_url() -> str:
-    return os.environ.get(
-        "MANTIS_BASE_URL", os.environ.get("FUGU_BASE_URL", "http://127.0.0.1:3001/v1")
-    )
+    return os.environ.get("MANTIS_BASE_URL", "http://127.0.0.1:3001/v1")
 
 
 def _build_litellm_kwargs(
@@ -569,9 +553,7 @@ def _chat_response(result: Any, model: str) -> dict:
 
 def _resolve_conductor_model(worker) -> str:
     """Pick the model used for the Conductor planning call."""
-    conductor_model = os.environ.get(
-        "MANTIS_CONDUCTOR_MODEL", os.environ.get("FUGU_CONDUCTOR_MODEL")
-    )
+    conductor_model = os.environ.get("MANTIS_CONDUCTOR_MODEL")
     if conductor_model is None and getattr(worker, "slot_models", None):
         conductor_model = worker.slot_models[0]
     if conductor_model is None:
@@ -738,9 +720,9 @@ def choose_conductor_dtype(device: str, torch_module: Any, env_dtype: str | None
 class EnvLocalConductor:
     """Load a GRPO-trained Conductor checkpoint locally with transformers.
 
-    Env overrides: FUGU_CONDUCTOR_DEVICE (cpu/cuda:0/mps/auto),
-                    FUGU_CONDUCTOR_DTYPE (float32/bfloat16/float16),
-                    FUGU_CONDUCTOR_MAX_NEW.
+    Env overrides: MANTIS_CONDUCTOR_DEVICE (cpu/cuda:0/mps/auto),
+                    MANTIS_CONDUCTOR_DTYPE (float32/bfloat16/float16),
+                    MANTIS_CONDUCTOR_MAX_NEW.
     Defaults to bfloat16 on mps/cuda and float32 on cpu."""
 
     def __init__(self, ckpt: str, device: str | None = None, max_new: int | None = None) -> None:
@@ -749,14 +731,14 @@ class EnvLocalConductor:
 
         self.torch = _torch
         self.ckpt = ckpt
-        env_device = device if device is not None else os.environ.get("FUGU_CONDUCTOR_DEVICE")
+        env_device = device if device is not None else os.environ.get("MANTIS_CONDUCTOR_DEVICE")
         self.device = choose_conductor_device(_torch, env_device)
-        self.max_new = max_new or int(os.environ.get("FUGU_CONDUCTOR_MAX_NEW", "512"))
-        dtype_env = os.environ.get("FUGU_CONDUCTOR_DTYPE")
+        self.max_new = max_new or int(os.environ.get("MANTIS_CONDUCTOR_MAX_NEW", "512"))
+        dtype_env = os.environ.get("MANTIS_CONDUCTOR_DTYPE")
         self.dtype = choose_conductor_dtype(self.device, _torch, dtype_env)
-        self.temperature = float(os.environ.get("FUGU_CONDUCTOR_TEMPERATURE", "0.7"))
-        self.top_p = float(os.environ.get("FUGU_CONDUCTOR_TOP_P", "0.9"))
-        do_sample_env = os.environ.get("FUGU_CONDUCTOR_DO_SAMPLE")
+        self.temperature = float(os.environ.get("MANTIS_CONDUCTOR_TEMPERATURE", "0.7"))
+        self.top_p = float(os.environ.get("MANTIS_CONDUCTOR_TOP_P", "0.9"))
+        do_sample_env = os.environ.get("MANTIS_CONDUCTOR_DO_SAMPLE")
         if do_sample_env:
             self.do_sample = do_sample_env.lower() not in ("0", "false", "no", "")
         else:
@@ -930,18 +912,14 @@ class Handler(BaseHTTPRequestHandler):
         return bytes(body)
 
     def _auth_token(self) -> str | None:
-        return (
-            os.environ.get("MANTIS_API_KEY")
-            or os.environ.get("FUGU_API_KEY")
-            or os.environ.get("LITELLM_KEY")
-        )
+        return os.environ.get("MANTIS_API_KEY") or os.environ.get("LITELLM_KEY")
 
     def _check_auth(self) -> bool:
         expected = self._auth_token()
         if not expected:
             self._send(
                 500,
-                {"error": "MANTIS_API_KEY (or FUGU_API_KEY / LITELLM_KEY) is not configured"},
+                {"error": "MANTIS_API_KEY or LITELLM_KEY is not configured"},
             )
             return False
         auth = self.headers.get("Authorization", "")
@@ -1245,26 +1223,22 @@ def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Serve Mantis as one OpenAI-compatible model.")
     ap.add_argument(
         "--model",
-        default=os.environ.get("MANTIS_MODEL", os.environ.get("FUGU_MODEL", "Qwen/Qwen3-0.6B")),
+        default=os.environ.get("MANTIS_MODEL", "Qwen/Qwen3-0.6B"),
         help="Qwen3-0.6B dir or HF id",
     )
     ap.add_argument(
         "--vector",
-        default=os.environ.get("MANTIS_VECTOR", os.environ.get("FUGU_VECTOR", "model_iter_60.npy")),
+        default=os.environ.get("MANTIS_VECTOR", "model_iter_60.npy"),
         help="base vector (19456) — SVF + head",
     )
     ap.add_argument(
         "--head",
-        default=os.environ.get("MANTIS_HEAD", os.environ.get("FUGU_HEAD")),
+        default=os.environ.get("MANTIS_HEAD"),
         help="optional trained head-only vector/safetensors; overrides the "
         "head from --vector after SVF is applied",
     )
-    default_workers = os.environ.get(
-        "MANTIS_WORKER_MODELS",
-        os.environ.get(
-            "FUGU_WORKER_MODELS",
-            os.environ.get("MANTIS_WORKER_MODEL", os.environ.get("FUGU_WORKER_MODEL")),
-        ),
+    default_workers = os.environ.get("MANTIS_WORKER_MODELS") or os.environ.get(
+        "MANTIS_WORKER_MODEL"
     )
     ap.add_argument(
         "--slot-models",
@@ -1275,23 +1249,23 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--local-models",
         metavar="CSV",
-        default=os.environ.get("MANTIS_LOCAL_MODELS", os.environ.get("FUGU_LOCAL_MODELS")),
+        default=os.environ.get("MANTIS_LOCAL_MODELS"),
         help="local HF worker model paths (CSV). "
         "Optional 'path@device' per entry; also MANTIS_LOCAL_MODELS",
     )
     ap.add_argument(
         "--host",
-        default=os.environ.get("MANTIS_HOST", os.environ.get("FUGU_HOST", "0.0.0.0")),  # noqa: S104
+        default=os.environ.get("MANTIS_HOST", "0.0.0.0"),  # noqa: S104
     )
     ap.add_argument(
         "--port",
         type=int,
-        default=int(os.environ.get("MANTIS_PORT", os.environ.get("FUGU_PORT", "8088"))),
+        default=int(os.environ.get("MANTIS_PORT", "8088")),
     )
     ap.add_argument(
         "--max-turns",
         type=int,
-        default=int(os.environ.get("MANTIS_MAX_TURNS", os.environ.get("FUGU_MAX_TURNS", "5"))),
+        default=int(os.environ.get("MANTIS_MAX_TURNS", "5")),
     )
     _args = ap.parse_args()
     return _args
@@ -1303,7 +1277,7 @@ def get_router() -> FuguRouter:
         with _router_lock:
             if ROUTER is None:
                 args = _parse_args()
-                device = os.environ.get("MANTIS_DEVICE", os.environ.get("FUGU_DEVICE"))
+                device = os.environ.get("MANTIS_DEVICE")
                 print(f"[serve] loading TRINITY router ({args.model}) ...", flush=True)
                 router = FuguRouter(args.model, args.vector, device=device, seed=0)
                 if args.head:  # layer a trained head over base SVF
@@ -1380,7 +1354,7 @@ def load_coordinator(mode: str):
         return Coordinator(
             RejectAwareRouter(get_router()), worker, max_turns=args.max_turns, sample=True
         )
-    local_ckpt = os.environ.get("MANTIS_LOCAL_CONDUCTOR", os.environ.get("FUGU_LOCAL_CONDUCTOR"))
+    local_ckpt = os.environ.get("MANTIS_LOCAL_CONDUCTOR")
     conductor = EnvLocalConductor(local_ckpt) if local_ckpt else None
     return EnvConductorCoordinator(
         worker, conductor=conductor, slot_labels=getattr(worker, "slot_models", None)
@@ -1397,15 +1371,10 @@ def get_coordinator(mode: str):
 
 def main() -> None:
     args = _parse_args()
-    token = (
-        os.environ.get("MANTIS_API_KEY")
-        or os.environ.get("FUGU_API_KEY")
-        or os.environ.get("LITELLM_KEY")
-    )
+    token = os.environ.get("MANTIS_API_KEY") or os.environ.get("LITELLM_KEY")
     if not token:
         print(
-            "[serve] FATAL: set MANTIS_API_KEY (or FUGU_API_KEY / LITELLM_KEY)"
-            " before starting the server",
+            "[serve] FATAL: set MANTIS_API_KEY or LITELLM_KEY before starting the server",
             flush=True,
         )
         raise SystemExit(1)
@@ -1425,15 +1394,9 @@ def main() -> None:
 # Each HTTP call advances the run by exactly one model invocation; events tell
 # Pi whether to execute tools, acknowledge a completed role step, or return a
 # final answer. State lives only in the bounded in-memory registry below.
-RUN_TTL = float(os.environ.get("MANTIS_RUN_TTL", os.environ.get("FUGU_RUN_TTL", "600")))
-MAX_TOOL_ROUNDS = int(
-    os.environ.get(
-        "MANTIS_MAX_TOOL_ROUNDS_PER_STEP", os.environ.get("FUGU_MAX_TOOL_ROUNDS_PER_STEP", "8")
-    )
-)
-MAX_RUNS = int(
-    os.environ.get("MANTIS_MAX_CONCURRENT_RUNS", os.environ.get("FUGU_MAX_CONCURRENT_RUNS", "32"))
-)
+RUN_TTL = float(os.environ.get("MANTIS_RUN_TTL", "600"))
+MAX_TOOL_ROUNDS = int(os.environ.get("MANTIS_MAX_TOOL_ROUNDS_PER_STEP", "8"))
+MAX_RUNS = int(os.environ.get("MANTIS_MAX_CONCURRENT_RUNS", "32"))
 RUN_MAX_MSG_BYTES = 400_000
 
 _runs: dict[str, NativeRun] = {}
@@ -1582,12 +1545,10 @@ def _configured_slot_models(override: Any = None) -> list[str]:
     value = override
     if value is None:
         configured = getattr(_args, "slot_models", None) if _args is not None else None
-        configured = configured or os.environ.get(
-            "MANTIS_WORKER_MODELS",
-            os.environ.get(
-                "FUGU_WORKER_MODELS",
-                os.environ.get("MANTIS_WORKER_MODEL", os.environ.get("FUGU_WORKER_MODEL")),
-            ),
+        configured = (
+            configured
+            or os.environ.get("MANTIS_WORKER_MODELS")
+            or os.environ.get("MANTIS_WORKER_MODEL")
         )
         value = configured.split(",") if configured else list(DEFAULT_SLOT_LABELS)
     if not isinstance(value, list):

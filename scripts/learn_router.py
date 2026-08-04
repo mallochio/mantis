@@ -34,7 +34,7 @@ def learning_dir() -> Path:
 
 
 def worker_pool() -> list[str]:
-    raw = os.environ.get("MANTIS_WORKER_MODELS") or os.environ.get("FUGU_WORKER_MODELS", "")
+    raw = os.environ.get("MANTIS_WORKER_MODELS", "")
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
@@ -186,13 +186,10 @@ def train_once(args: argparse.Namespace) -> dict[str, Any]:
         except (json.JSONDecodeError, OSError):
             pass
 
-    model = os.environ.get("MANTIS_MODEL", os.environ.get("FUGU_MODEL", "Qwen/Qwen3-0.6B"))
+    model = os.environ.get("MANTIS_MODEL", "Qwen/Qwen3-0.6B")
     vector = Path(
         os.path.expanduser(
-            os.environ.get(
-                "MANTIS_VECTOR",
-                os.environ.get("FUGU_VECTOR", str(ROOT / "artifacts/model_iter_60.npy")),
-            )
+            os.environ.get("MANTIS_VECTOR", str(ROOT / "artifacts/model_iter_60.npy"))
         )
     )
     device = os.environ.get("MANTIS_LEARNING_DEVICE", "cpu")

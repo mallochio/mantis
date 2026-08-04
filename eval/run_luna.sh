@@ -14,11 +14,11 @@ if [ -f .env ]; then
 fi
 
 export DIRECT_MODEL="${DIRECT_MODEL:-gpt-5.6-luna-max}"
-export FUGU_WORKER_MODELS="${FUGU_WORKER_MODELS:-gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-medium,deepseek-v4-flash-0731-xhigh,claude-opus-5-medium,claude-sonnet-5-medium,gemini-3.1-pro-preview-high}"
+export MANTIS_WORKER_MODELS="${MANTIS_WORKER_MODELS:-gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-medium,deepseek-v4-flash-0731-xhigh,claude-opus-5-medium,claude-sonnet-5-medium,gemini-3.1-pro-preview-high}"
 
 # Force the LiteLLM planner and clear any local Conductor checkpoint.
-export FUGU_LOCAL_CONDUCTOR=""
-export FUGU_CONDUCTOR_MODEL="${FUGU_CONDUCTOR_MODEL:-gpt-5.6-luna-max}"
+export MANTIS_LOCAL_CONDUCTOR=""
+export MANTIS_CONDUCTOR_MODEL="${MANTIS_CONDUCTOR_MODEL:-gpt-5.6-luna-max}"
 
 wait_for() {
   local url="$1"

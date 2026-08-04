@@ -87,14 +87,14 @@ def test_choose_dtype_env_override():
 
 
 def test_env_vars_are_respected(monkeypatch: pytest.MonkeyPatch):
-    """EnvLocalConductor propagates FUGU_CONDUCTOR_DEVICE and FUGU_CONDUCTOR_DTYPE."""
+    """EnvLocalConductor propagates MANTIS_CONDUCTOR_DEVICE and MANTIS_CONDUCTOR_DTYPE."""
     serve = _load_serve_module()
-    monkeypatch.setenv("FUGU_CONDUCTOR_DEVICE", "cuda:0")
-    monkeypatch.setenv("FUGU_CONDUCTOR_DTYPE", "float16")
+    monkeypatch.setenv("MANTIS_CONDUCTOR_DEVICE", "cuda:0")
+    monkeypatch.setenv("MANTIS_CONDUCTOR_DTYPE", "float16")
 
     torch = _mock_torch(mps=False, cuda=False)
-    env_device = os.environ.get("FUGU_CONDUCTOR_DEVICE")
-    env_dtype = os.environ.get("FUGU_CONDUCTOR_DTYPE")
+    env_device = os.environ.get("MANTIS_CONDUCTOR_DEVICE")
+    env_dtype = os.environ.get("MANTIS_CONDUCTOR_DTYPE")
     device = serve.choose_conductor_device(torch, env_device)
     dtype = serve.choose_conductor_dtype(device, torch, env_dtype)
     assert device == "cuda:0"

@@ -20,7 +20,6 @@ import serve
 import torch
 
 os.environ["MANTIS_API_KEY"] = "test-key"
-os.environ["FUGU_API_KEY"] = "test-key"
 
 
 # ---------------------------------------------------------------------------
@@ -53,14 +52,12 @@ def test_resolve_conductor_model_env(monkeypatch):
 
 def test_resolve_conductor_model_from_slot_models(monkeypatch):
     monkeypatch.delenv("MANTIS_CONDUCTOR_MODEL", raising=False)
-    monkeypatch.delenv("FUGU_CONDUCTOR_MODEL", raising=False)
     worker = SimpleNamespace(slot_models=["slot-0", "slot-1"])
     assert serve._resolve_conductor_model(worker) == "slot-0"
 
 
 def test_resolve_conductor_model_default(monkeypatch):
     monkeypatch.delenv("MANTIS_CONDUCTOR_MODEL", raising=False)
-    monkeypatch.delenv("FUGU_CONDUCTOR_MODEL", raising=False)
     assert serve._resolve_conductor_model(SimpleNamespace()) == "openai/gpt-4o-mini"
 
 
@@ -462,7 +459,7 @@ def test_env_conductor_coordinator_litellm(monkeypatch):
         def __call__(self, sub, messages, agent_id):
             return "done"
 
-    monkeypatch.setenv("FUGU_CONDUCTOR_MODEL", "gpt-5.6-luna")
+    monkeypatch.setenv("MANTIS_CONDUCTOR_MODEL", "gpt-5.6-luna")
     coord = serve.EnvConductorCoordinator(FakeWorker())
     res = coord.run("query")
     assert res.final == "done"
@@ -969,7 +966,7 @@ def test_env_local_conductor_auto_cpu(monkeypatch):
     monkeypatch.setitem(sys.modules, "transformers", fake)
     monkeypatch.setattr("torch.cuda.is_available", lambda: False)
     monkeypatch.setattr("torch.backends.mps.is_available", lambda: False)
-    monkeypatch.delenv("FUGU_CONDUCTOR_DEVICE", raising=False)
+    monkeypatch.delenv("MANTIS_CONDUCTOR_DEVICE", raising=False)
     conductor = serve.EnvLocalConductor("/ckpt", device=None)
     assert conductor.device == "cpu"
     assert conductor.dtype == torch.float32
@@ -978,7 +975,7 @@ def test_env_local_conductor_auto_cpu(monkeypatch):
 def test_env_local_conductor_dtype_env(monkeypatch):
     fake = _fake_transformers_module(torch.tensor([[1, 2, 3]]))
     monkeypatch.setitem(sys.modules, "transformers", fake)
-    monkeypatch.setenv("FUGU_CONDUCTOR_DTYPE", "float32")
+    monkeypatch.setenv("MANTIS_CONDUCTOR_DTYPE", "float32")
     conductor = serve.EnvLocalConductor("/ckpt", device="cpu")
     assert conductor.dtype == torch.float32
 
@@ -1121,7 +1118,7 @@ def test_load_coordinator_trinity(monkeypatch):
         "_worker_from_args",
         lambda args, mode: FakeWorker(),
     )
-    monkeypatch.delenv("FUGU_LOCAL_CONDUCTOR", raising=False)
+    monkeypatch.delenv("MANTIS_LOCAL_CONDUCTOR", raising=False)
     coord = serve.load_coordinator("trinity")
     assert coord.max_turns == serve.MAX_TURNS
 
@@ -1151,7 +1148,7 @@ def test_load_coordinator_conductor(monkeypatch):
     )
     monkeypatch.setattr(serve, "EnvLocalConductor", FakeLocalConductor)
     monkeypatch.setattr(serve, "EnvConductorCoordinator", FakeCoord)
-    monkeypatch.setenv("FUGU_LOCAL_CONDUCTOR", "di-zhang-fdu/openfugu-conductor-3b")
+    monkeypatch.setenv("MANTIS_LOCAL_CONDUCTOR", "di-zhang-fdu/openfugu-conductor-3b")
     coord = serve.load_coordinator("conductor")
     assert isinstance(coord.conductor, FakeLocalConductor)
 
@@ -1217,7 +1214,7 @@ def test_env_local_conductor_auto_mps(monkeypatch):
     monkeypatch.setitem(sys.modules, "transformers", fake)
     monkeypatch.setattr("torch.cuda.is_available", lambda: False)
     monkeypatch.setattr("torch.backends.mps.is_available", lambda: True)
-    monkeypatch.delenv("FUGU_CONDUCTOR_DEVICE", raising=False)
+    monkeypatch.delenv("MANTIS_CONDUCTOR_DEVICE", raising=False)
     conductor = serve.EnvLocalConductor("/ckpt", device=None)
     assert conductor.device == "mps"
 
@@ -1593,7 +1590,6 @@ def test_litellm_upstream_config_is_separate_from_ingress(monkeypatch):
     assert serve._is_reasoning_model("openai/gpt-5.6-sol")
     monkeypatch.delenv("LITELLM_KEY")
     monkeypatch.delenv("MANTIS_LITELLM_API_KEY", raising=False)
-    monkeypatch.delenv("FUGU_LITELLM_API_KEY", raising=False)
     assert serve._litellm_api_key() is None
 
 

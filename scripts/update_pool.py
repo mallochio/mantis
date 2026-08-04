@@ -10,7 +10,7 @@ This updates:
 - configs/litellm.yaml      (LiteLLM aliases used by the runtime orchestrator)
 - configs/worker-costs.json (per-task cost estimates for cost-aware router labels)
 - launch/sky/*.yaml         (RETRAIN_WORKER_MODELS defaults, optional)
-- .env/.env.example         (FUGU_WORKER_MODELS alias list, optional)
+- .env/.env.example         (MANTIS_WORKER_MODELS alias list, optional)
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ def normalize_model_id(model: str) -> str:
     """Turn an alias or openrouter/... id into a full OpenRouter model id."""
     model = model.strip()
     if model.startswith("openrouter/"):
-        return model[len("openrouter/"):]
+        return model[len("openrouter/") :]
     if "/" in model:
         return model
     for prefix, provider in KNOWN_PREFIXES.items():
@@ -132,7 +132,8 @@ def fetch_openrouter_costs(api_key: str | None) -> dict[str, dict[str, float]]:
         req.add_header("Authorization", f"Bearer {api_key}")
     try:
         with urllib.request.urlopen(  # noqa: S310
-            req, timeout=60,
+            req,
+            timeout=60,
         ) as resp:
             data = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
@@ -187,10 +188,10 @@ def update_yaml_env(path: Path, pool_csv: str) -> None:
 def update_env_file(path: Path, aliases: list[str]) -> None:
     aliases_csv = ",".join(aliases)
     text = path.read_text() if path.exists() else ""
-    if "FUGU_WORKER_MODELS=" in text:
-        text = re.sub(r"FUGU_WORKER_MODELS=.*", f"FUGU_WORKER_MODELS={aliases_csv}", text)
+    if "MANTIS_WORKER_MODELS=" in text:
+        text = re.sub(r"MANTIS_WORKER_MODELS=.*", f"MANTIS_WORKER_MODELS={aliases_csv}", text)
     else:
-        text += f"\nFUGU_WORKER_MODELS={aliases_csv}\n"
+        text += f"\nMANTIS_WORKER_MODELS={aliases_csv}\n"
     path.write_text(text)
 
 
@@ -200,7 +201,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--fetch-costs", action="store_true", help="Fetch OpenRouter prices")
     parser.add_argument("--litellm-config", default=str(REPO_ROOT / "configs" / "litellm.yaml"))
     parser.add_argument("--worker-costs", default=str(REPO_ROOT / "configs" / "worker-costs.json"))
-    parser.add_argument("--env-file", help="Update FUGU_WORKER_MODELS in this .env file")
+    parser.add_argument("--env-file", help="Update MANTIS_WORKER_MODELS in this .env file")
     parser.add_argument(
         "--update-yamls",
         action="store_true",
@@ -242,7 +243,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.update_yamls:
         print("\nSkyPilot YAMLs updated with the new pool.")
     if args.env_file:
-        print(f"\nFUGU_WORKER_MODELS updated in {args.env_file}: {','.join(aliases)}")
+        print(f"\nMANTIS_WORKER_MODELS updated in {args.env_file}: {','.join(aliases)}")
     if not costs:
         print("\n[note] --fetch-costs not used; cost table preserved.")
         print("      Add missing entries before a cost-mode retrain.")

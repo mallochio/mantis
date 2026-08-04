@@ -18,6 +18,7 @@ The pool format is identical to scripts/retrain_router_pool.py. Worker calls dur
 rollout DAG execution reuse retrain_router_pool.OpenRouterWorker, so the same
 OpenRouter key and routing aliases apply.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -107,9 +108,7 @@ def _load_records(dataset: str, limit: int, seed: int) -> list[Any]:
     if "toolscale" in dataset.lower():
         train, _ = load_toolscale_tasks(limit=limit, seed=seed, val_frac=0.0)
         return cast(list[Any], train)
-    train, _ = load_terminalbench_tasks(
-        dataset, limit=limit, seed=seed, val_frac=0.0
-    )
+    train, _ = load_terminalbench_tasks(dataset, limit=limit, seed=seed, val_frac=0.0)
     return cast(list[Any], train)
 
 
@@ -168,15 +167,10 @@ def _build_dataset(
     """Return a HuggingFace `Dataset` with `prompt` and `expected` columns."""
     from datasets import Dataset
 
-    prompts = [
-        _build_prompt(r["task"], tokenizer, slot_labels, max_prompt_length)
-        for r in records
-    ]
+    prompts = [_build_prompt(r["task"], tokenizer, slot_labels, max_prompt_length) for r in records]
     expected = [r["expected"] for r in records]
     tasks = [r["task"] for r in records]
-    return Dataset.from_dict(
-        {"prompt": prompts, "expected": expected, "task": tasks}
-    )
+    return Dataset.from_dict({"prompt": prompts, "expected": expected, "task": tasks})
 
 
 # ---------------------------------------------------------------------------
@@ -289,23 +283,17 @@ def make_reward_functions(worker: Any, slot_labels: list[str]):
     def conductor_format_reward(completions: list[str], **kwargs: Any) -> list[float]:
         return [_format_reward_one(c) for c in completions]
 
-    def conductor_action_reward(
-        completions: list[str], **kwargs: Any
-    ) -> list[float]:
+    def conductor_action_reward(completions: list[str], **kwargs: Any) -> list[float]:
         return [_action_reward_one(c, slot_labels) for c in completions]
 
-    def conductor_outcome_reward(
-        completions: list[str], **kwargs: Any
-    ) -> list[float]:
+    def conductor_outcome_reward(completions: list[str], **kwargs: Any) -> list[float]:
         expected = kwargs.get("expected") or [None] * len(completions)
         # Execute independent rollout DAGs concurrently.
         max_workers = min(len(completions), 8)
         results: list[float] = [0.0] * len(completions)
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {
-                ex.submit(
-                    _outcome_reward_one, c, e, worker, slot_labels
-                ): i
+                ex.submit(_outcome_reward_one, c, e, worker, slot_labels): i
                 for i, (c, e) in enumerate(zip(completions, expected, strict=False))
             }
             for fut in as_completed(futures):
@@ -337,9 +325,7 @@ class MetricsJSONLCallback:
                 f.write(json.dumps(rec, default=str) + "\n")
 
 
-def _write_configs(
-    out: Path, args: argparse.Namespace, pool_specs: list[str], loaded: int
-) -> None:
+def _write_configs(out: Path, args: argparse.Namespace, pool_specs: list[str], loaded: int) -> None:
     (out / "pool.json").write_text(
         json.dumps(
             {
@@ -439,7 +425,7 @@ def _acceptance_generation(
             temperature=max(temperature, 0.01),
             pad_token_id=tokenizer.eos_token_id,
         )
-    completion_ids = outputs[0, inputs["input_ids"].shape[1]:]
+    completion_ids = outputs[0, inputs["input_ids"].shape[1] :]
     completion = tokenizer.decode(completion_ids, skip_special_tokens=True)
     reward = _format_reward_one(completion)
     return completion, reward
@@ -459,9 +445,9 @@ def main() -> None:
     per_dev = _env_int("RETRAIN_PER_DEVICE_BATCH", "2")
     max_prompt = _env_int("RETRAIN_MAX_PROMPT_LENGTH", "1024")
     max_comp = _env_int("RETRAIN_MAX_COMPLETION_LENGTH", "384")
-    worker_timeout = _env_int("FUGU_WORKER_TIMEOUT", "120")
-    worker_max_tokens = _env_int("FUGU_WORKER_MAX_TOKENS", "512")
-    mock_worker = os.environ.get("FUGU_CONDUCTOR_MOCK_WORKER") == "1"
+    worker_timeout = _env_int("MANTIS_WORKER_TIMEOUT", "120")
+    worker_max_tokens = _env_int("MANTIS_WORKER_MAX_TOKENS", "512")
+    mock_worker = os.environ.get("MANTIS_CONDUCTOR_MOCK_WORKER") == "1"
     temperature = float(os.environ.get("RETRAIN_TEMPERATURE", "0.6"))
     top_p = float(os.environ.get("RETRAIN_TOP_P", "0.9"))
     top_k = int(os.environ.get("RETRAIN_TOP_K", "50"))
@@ -470,7 +456,7 @@ def main() -> None:
 
     parser.add_argument("--pool", required=True, help="model|effort CSV (same as router retrain)")
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
-    parser.add_argument("--base", default=os.environ.get("FUGU_BASE_MODEL", DEFAULT_BASE))
+    parser.add_argument("--base", default=os.environ.get("MANTIS_BASE_MODEL", DEFAULT_BASE))
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--num-generations", type=int, default=None)

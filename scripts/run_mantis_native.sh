@@ -38,7 +38,7 @@ set -a
 source "$REPO_ROOT/.env"
 set +a
 
-CONDUCTOR_DEV="${MANTIS_CONDUCTOR_DEVICE:-${FUGU_CONDUCTOR_DEVICE:-}}"
+CONDUCTOR_DEV="${MANTIS_CONDUCTOR_DEVICE:-}"
 # Auto-detect device unless explicitly set.
 if [[ -z "$CONDUCTOR_DEV" || "$CONDUCTOR_DEV" == "auto" ]]; then
     CONDUCTOR_DEV=$(python3 - <<'PY'
@@ -52,22 +52,19 @@ else:
 PY
     )
     export MANTIS_CONDUCTOR_DEVICE="$CONDUCTOR_DEV"
-    export FUGU_CONDUCTOR_DEVICE="$CONDUCTOR_DEV"
 fi
 
-CONDUCTOR_DT="${MANTIS_CONDUCTOR_DTYPE:-${FUGU_CONDUCTOR_DTYPE:-}}"
+CONDUCTOR_DT="${MANTIS_CONDUCTOR_DTYPE:-}"
 # Default dtype: bfloat16 on mps/cuda, float32 on cpu unless user overrides.
 if [[ -z "$CONDUCTOR_DT" ]]; then
     if [[ "$CONDUCTOR_DEV" == mps || "$CONDUCTOR_DEV" == cuda* ]]; then
         export MANTIS_CONDUCTOR_DTYPE=bfloat16
-        export FUGU_CONDUCTOR_DTYPE=bfloat16
     else
         export MANTIS_CONDUCTOR_DTYPE=float32
-        export FUGU_CONDUCTOR_DTYPE=float32
     fi
 fi
 
-VECTOR_FILE="${MANTIS_VECTOR:-${FUGU_VECTOR:-}}"
+VECTOR_FILE="${MANTIS_VECTOR:-}"
 [[ -f "$VECTOR_FILE" ]] || export MANTIS_VECTOR="$REPO_ROOT/artifacts/model_iter_60.npy"
 if [[ "${MANTIS_LEARNING:-0}" =~ ^(1|true|yes|on)$ ]]; then
     LEARNING_DIR=$(python3 -c 'import os; print(os.path.expanduser(os.environ.get("MANTIS_LEARNING_DIR", "~/.local/share/mantis/learning")))')
@@ -76,13 +73,13 @@ if [[ "${MANTIS_LEARNING:-0}" =~ ^(1|true|yes|on)$ ]]; then
         echo "[native-mantis] using promoted learning router"
     fi
 fi
-HEAD_FILE="${MANTIS_HEAD:-${FUGU_HEAD:-}}"
+HEAD_FILE="${MANTIS_HEAD:-}"
 [[ -f "$HEAD_FILE" ]] || export MANTIS_HEAD="$REPO_ROOT/artifacts/router_head.npy"
-BASE_URL="${MANTIS_BASE_URL:-${FUGU_BASE_URL:-}}"
+BASE_URL="${MANTIS_BASE_URL:-}"
 [[ -n "$BASE_URL" ]] || export MANTIS_BASE_URL="http://127.0.0.1:3001/v1"
 
-HOST_VAL="${MANTIS_HOST:-${FUGU_HOST:-0.0.0.0}}"
-PORT_VAL="${MANTIS_PORT:-${FUGU_PORT:-8088}}"
+HOST_VAL="${MANTIS_HOST:-0.0.0.0}"
+PORT_VAL="${MANTIS_PORT:-8088}"
 
 export MANTIS_HOST="$HOST_VAL"
 export MANTIS_PORT="$PORT_VAL"

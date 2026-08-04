@@ -6,7 +6,7 @@ if [[ -f .env ]]; then
     set -a; source .env; set +a
 fi
 
-TOKEN="${MANTIS_API_KEY:-${FUGU_API_KEY:-${LITELLM_KEY:-}}}"
+TOKEN="${MANTIS_API_KEY:-${LITELLM_KEY:-}}"
 if [[ -z "$TOKEN" ]]; then
     echo "ERROR: set MANTIS_API_KEY or LITELLM_KEY in .env" >&2
     exit 1

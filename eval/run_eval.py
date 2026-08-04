@@ -16,7 +16,7 @@ Cost estimation method:
 - "trinity": parse fugu_trace (e.g. "Worker(3)->Thinker(1)->Verifier(1):...").
   Every "Role(slot)" arrow is one worker call; cost = sum(slot model cost).
 - "conductor", "conductor-old", "conductor-new", "conductor-luna": fugu_trace
-  is "steps:N:conductor". Cost = 1 planning call at FUGU_CONDUCTOR_MODEL cost
+  is "steps:N:conductor". Cost = 1 planning call at MANTIS_CONDUCTOR_MODEL cost
   plus N step calls at the average pool worker cost. This is an upper-bound;
   the actual DAG may call multiple workers per step. If the trace cannot be
   parsed we fall back to usage.fugu_turns.
@@ -56,7 +56,7 @@ def load_worker_costs(path: Path) -> dict[str, float]:
 
 
 def slot_models_from_env() -> list[str]:
-    raw = os.environ.get("FUGU_WORKER_MODELS") or os.environ.get("FUGU_WORKER_MODEL") or ""
+    raw = os.environ.get("MANTIS_WORKER_MODELS") or os.environ.get("MANTIS_WORKER_MODEL") or ""
     return [m.strip() for m in raw.split(",") if m.strip()]
 
 
@@ -122,7 +122,7 @@ def estimate_cost(
     steps = parse_conductor_trace(trace or "")
     if not steps:
         steps = turns
-    conductor_model = os.environ.get("FUGU_CONDUCTOR_MODEL", "gpt-5.6-luna-max")
+    conductor_model = os.environ.get("MANTIS_CONDUCTOR_MODEL", "gpt-5.6-luna-max")
     plan_cost = model_cost(conductor_model, costs, alias_map)
     step_cost = steps * pool_avg
     return plan_cost + step_cost, steps + 1
@@ -169,11 +169,11 @@ def main() -> None:
     parser.add_argument("--openfugu-url", default="http://localhost:8088/v1/chat/completions")
     parser.add_argument(
         "--api-key",
-        default=os.environ.get("LITELLM_KEY") or os.environ.get("FUGU_API_KEY"),
+        default=os.environ.get("LITELLM_KEY") or os.environ.get("MANTIS_API_KEY"),
     )
     args = parser.parse_args()
     if not args.api_key:
-        parser.error("set LITELLM_KEY or FUGU_API_KEY in the environment")
+        parser.error("set LITELLM_KEY or MANTIS_API_KEY in the environment")
 
     costs = load_worker_costs(REPO / "configs" / "worker-costs.json")
     alias_map = load_litellm_alias_map(REPO / "configs" / "litellm.yaml")

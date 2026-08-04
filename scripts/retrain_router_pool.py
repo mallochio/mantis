@@ -40,8 +40,8 @@ Label modes:
 Environment:
   OPENROUTER_API_KEY  required for worker calls
   HF_TOKEN            optional, avoids HF rate limits / gates Qwen3-0.6B
-  FUGU_MODEL          Qwen3-0.6B dir or HF id (default Qwen/Qwen3-0.6B)
-  FUGU_VECTOR         existing TRINITY vector (default ./artifacts/model_iter_60.npy)
+  MANTIS_MODEL          Qwen3-0.6B dir or HF id (default Qwen/Qwen3-0.6B)
+  MANTIS_VECTOR         existing TRINITY vector (default ./artifacts/model_iter_60.npy)
   RETRAIN_WORKER_MODELS  optional override of --pool. Each entry can append
                          '|reasoning_effort' (e.g. 'openai/gpt-5.6-terra|xhigh').
   RETRAIN_LIMIT       optional override of --limit
@@ -50,6 +50,7 @@ Environment:
   RETRAIN_QUALITY_TOLERANCE  default 0.05
   RETRAIN_MAX_WORKER_CONCURRENCY  default 3
 """
+
 from __future__ import annotations
 
 import argparse
@@ -130,7 +131,7 @@ def normalize_model_id(model: str) -> str:
     """Turn an alias or openrouter/... id into a full OpenRouter model id."""
     model = model.strip()
     if model.startswith("openrouter/"):
-        return model[len("openrouter/"):]
+        return model[len("openrouter/") :]
     if "/" in model:
         return model
     for prefix, provider in KNOWN_PREFIXES.items():
@@ -965,12 +966,8 @@ def _parse_retrain_args(argv=None) -> argparse.Namespace:
         default="s3://external-datasets-archive/terminal-bench-2.1/",
         help="Dataset to train on. 'nvidia/ToolScale' or a TerminalBench 2.1 source.",
     )
-    ap.add_argument(
-        "--limit", type=int, default=int(os.environ.get("RETRAIN_LIMIT", "200"))
-    )
-    ap.add_argument(
-        "--epochs", type=int, default=int(os.environ.get("RETRAIN_EPOCHS", "30"))
-    )
+    ap.add_argument("--limit", type=int, default=int(os.environ.get("RETRAIN_LIMIT", "200")))
+    ap.add_argument("--epochs", type=int, default=int(os.environ.get("RETRAIN_EPOCHS", "30")))
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--alpha", type=float, default=0.1, help="role-loss weight")
     ap.add_argument("--l2", type=float, default=0.01, help="L2 regularization toward original head")
@@ -1024,9 +1021,9 @@ def _parse_retrain_args(argv=None) -> argparse.Namespace:
         help="Cache worker responses to avoid re-calling the API",
     )
     ap.add_argument("--device", default="auto")
-    ap.add_argument("--fugu-model", default=os.environ.get("FUGU_MODEL", "Qwen/Qwen3-0.6B"))
+    ap.add_argument("--fugu-model", default=os.environ.get("MANTIS_MODEL", "Qwen/Qwen3-0.6B"))
     default_vec = str(REPO_ROOT / "artifacts" / "model_iter_60.npy")
-    ap.add_argument("--fugu-vector", default=os.environ.get("FUGU_VECTOR", default_vec))
+    ap.add_argument("--fugu-vector", default=os.environ.get("MANTIS_VECTOR", default_vec))
     args = ap.parse_args(argv)
 
     if not args.pool:
