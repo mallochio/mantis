@@ -204,6 +204,52 @@ A third run using the hosted `gpt-5.6-luna-max` as the Conductor planner (no loc
 
 Conductor-luna had a **0% HTTP failure rate**, but its overall auto-score (**0.626**) was well below TRINITY (**0.890**) and its hard-tier score (**0.250**) was far below TRINITY's **0.714**. It was also roughly **2× the cost** of TRINITY. Per the decision rule in `eval/report-luna-conductor.md`, `MANTIS_AUTO_THRESHOLD` stays at **6** — the Supra router never emits a score that high in practice, so `/fugu auto` remains on TRINITY/direct. Users can still invoke `/fugu conductor` manually for experimentation.
 
+## Logging and data storage
+
+Persistent application logs and training data use one host-visible root:
+
+```text
+~/.local/share/mantis/
+├── router/                     # Companion llm-router service
+│   ├── decisions.log           # Route metadata; prompts truncated to 200 characters
+│   ├── training.jsonl          # Full prompts when ROUTELLM_TRAINING_LOG=1
+│   ├── pseudo-labels.jsonl     # Generated manually by pseudo_label.py
+│   ├── server.out
+│   └── server.err
+├── learning/
+│   └── runs-<hostname>.jsonl   # Redacted Mantis tasks and outcome labels
+└── startup/
+    └── mantis.log              # Local StartupFolder launcher, when installed
+```
+
+| Data | Control | Default |
+|---|---|---|
+| Mantis learning records | `MANTIS_LEARNING=1|0` | Off |
+| Full router prompt capture | `ROUTELLM_TRAINING_LOG=1|0` | Off |
+| Router decision log | Always written by `llm-router` | On |
+| Pseudo-label output | Run `pseudo_label.py` manually | Not scheduled |
+| Container stdout/stderr | Docker logging | On |
+
+Set `MANTIS_LEARNING_HOST_DIR` to move the Docker learning directory. Native
+runs use `MANTIS_LEARNING_DIR`. The companion `llm-router` accepts
+`MANTIS_DATA_DIR` to move its `router/` directory; its default is
+`~/.local/share/mantis`.
+
+Disabling either collector stops new records but does not delete existing
+files. Full prompts and redacted task text can still contain sensitive project
+information, so keep this directory access-controlled and inspect it before
+sharing.
+
+Container stdout/stderr remains Docker-managed rather than being duplicated
+under the application data directory. Compose rotates it at 10 MB with three
+files per container:
+
+```bash
+docker logs mantis-orchestrator
+docker logs -f mantis-orchestrator
+docker logs mantis-router
+```
+
 ## Zero-touch router learning
 
 Set one flag, then use Trinity normally:
