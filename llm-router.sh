@@ -21,7 +21,6 @@ if [ ! -d "$REPO_DIR" ]; then
   exit 1
 fi
 cd "$REPO_DIR"
-mkdir -p logs
 
 # Ensure system CLIs (lsof, security) are found under launchd's minimal PATH
 # as well as an interactive shell.
@@ -34,6 +33,12 @@ if [ -f "$HOME/.zshrc" ]; then
     [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && export "$name=$value"
   done < <(/bin/zsh -lc 'source "$HOME/.zshrc" >/dev/null && env')
 fi
+
+DATA_DIR="${MANTIS_DATA_DIR:-$HOME/.local/share/mantis}"
+ROUTER_LOG_DIR="$DATA_DIR/router"
+mkdir -p "$ROUTER_LOG_DIR"
+chmod 700 "$DATA_DIR" "$ROUTER_LOG_DIR"
+export MANTIS_DATA_DIR="$DATA_DIR"
 
 # --- LiteLLM proxy ---
 export LITELLM_DIR="${LITELLM_DIR:-$HOME/.config/litellm}"
@@ -106,8 +111,8 @@ if lsof -nP -iTCP:"$ROUTELLM_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   # Trust the recorded pid only if it still owns the port; otherwise take the
   # current listener so a stale/reused pid file can't kill the wrong process.
   ROUTER_PID=""
-  if [ -f logs/server.pid ]; then
-    CANDIDATE=$(cat logs/server.pid 2>/dev/null || true)
+  if [ -f "$ROUTER_LOG_DIR/server.pid" ]; then
+    CANDIDATE=$(cat "$ROUTER_LOG_DIR/server.pid" 2>/dev/null || true)
     if [ -n "${CANDIDATE:-}" ] && lsof -nP -iTCP:"$ROUTELLM_PORT" -sTCP:LISTEN -t 2>/dev/null | grep -qx "$CANDIDATE"; then
       ROUTER_PID="$CANDIDATE"
     fi
@@ -131,23 +136,23 @@ if lsof -nP -iTCP:"$ROUTELLM_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
     lsof -nP -iTCP:"$ROUTELLM_PORT" -sTCP:LISTEN >/dev/null 2>&1 || break
     sleep 0.1
   done
-  rm -f logs/server.pid
+  rm -f "$ROUTER_LOG_DIR/server.pid"
   echo "router stopped"
 fi
 
-nohup python server.py > logs/server.out 2> logs/server.err &
-echo $! > logs/server.pid
+nohup python server.py </dev/null > "$ROUTER_LOG_DIR/server.out" 2> "$ROUTER_LOG_DIR/server.err" &
+echo $! > "$ROUTER_LOG_DIR/server.pid"
 for _ in $(seq 1 600); do  # 60s — first boot downloads the Supra checkpoint
   if lsof -nP -iTCP:"$ROUTELLM_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
     if curl -fsS --max-time 2 "http://127.0.0.1:$ROUTELLM_PORT/healthz" 2>/dev/null | grep -q '"ready":true'; then
       ROUTER_PID=$(lsof -nP -iTCP:"$ROUTELLM_PORT" -sTCP:LISTEN -t 2>/dev/null | head -n1 || true)
-      echo "router running pid ${ROUTER_PID:-$(cat logs/server.pid)} on :$ROUTELLM_PORT"
+      echo "router running pid ${ROUTER_PID:-$(cat "$ROUTER_LOG_DIR/server.pid")} on :$ROUTELLM_PORT"
       exit 0
     fi
   fi
   sleep 0.1
 done
 
-echo "ERROR: router not running on :$ROUTELLM_PORT — see logs/server.err" >&2
-cat logs/server.err >&2 2>/dev/null || true
+echo "ERROR: router not running on :$ROUTELLM_PORT — see $ROUTER_LOG_DIR/server.err" >&2
+cat "$ROUTER_LOG_DIR/server.err" >&2 2>/dev/null || true
 exit 1

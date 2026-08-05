@@ -16,7 +16,7 @@ Config via env:
   ROUTELLM_SUPRA_THRESHOLD=3
   EXPENSIVE_MODEL=gpt-5.6-luna
   CHEAP_MODEL=deepseek-v4-pro
-  LOG_FILE=~/.config/llm-router/logs/decisions.log
+  LOG_FILE=~/.local/share/mantis/router/decisions.log
 """
 from __future__ import annotations
 
@@ -63,8 +63,14 @@ CHEAP = {
     "max_tokens": int(os.environ.get("CHEAP_MAX_TOKENS", str(ROUTELLM_MAX_TOKENS))),
 }
 
-LOG_PATH = Path(os.environ.get("LOG_FILE", str(Path.home()/".config/llm-router/logs/decisions.log")))
+DATA_DIR = Path(os.environ.get("MANTIS_DATA_DIR", str(Path.home()/".local/share/mantis")))
+LOG_PATH = Path(os.environ.get("LOG_FILE", str(DATA_DIR/"router/decisions.log")))
+TRAINING_LOG_ENABLED = os.environ.get("ROUTELLM_TRAINING_LOG", "0").lower() in {"1", "true", "yes", "on"}
+TRAINING_LOG_PATH = Path(os.environ.get("TRAINING_LOG_FILE", str(DATA_DIR/"router/training.jsonl")))
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+if TRAINING_LOG_ENABLED:
+    TRAINING_LOG_PATH.touch(mode=0o600, exist_ok=True)
+    TRAINING_LOG_PATH.chmod(0o600)
 
 _cached_context_window = None
 
@@ -289,6 +295,10 @@ def _log(
     }
     with LOG_PATH.open("a") as f:
         f.write(json.dumps(row) + "\n")
+    if TRAINING_LOG_ENABLED:
+        row["prompt"] = prompt
+        with TRAINING_LOG_PATH.open("a") as f:
+            f.write(json.dumps(row) + "\n")
 
 
 _READY = False

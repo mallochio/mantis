@@ -62,6 +62,18 @@ server.py (:5500)
 `http://127.0.0.1:3001` when it is not already healthy, then starts the
 RouteLLM compatibility endpoint at `:5500`.
 
+## Training data
+
+Full router prompts are collected in
+`~/.local/share/mantis/router/training.jsonl` only when
+`ROUTELLM_TRAINING_LOG=1`. Change it to `0` and restart `llm-router.sh` to
+stop collection. `~/.local/share/mantis/router/decisions.log` remains the
+operational log and stores only the first 200 prompt characters.
+
+Run `./.venv/bin/python pseudo_label.py` to write deduplicated Supra labels to
+`~/.local/share/mantis/router/pseudo-labels.jsonl`. Training files are local,
+mode `0600`, and outside the repository.
+
 ## Response headers
 
 Every response includes:
