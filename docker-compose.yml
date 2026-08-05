@@ -71,8 +71,13 @@ services:
       MANTIS_LEARNING_MIN_IMPROVEMENT: ${MANTIS_LEARNING_MIN_IMPROVEMENT:-0.02}
     volumes:
       - hf-cache:/root/.cache/huggingface
-      - ${MANTIS_LEARNING_HOST_DIR:-mantis-learning}:/app/learning
+      - ${MANTIS_LEARNING_HOST_DIR:-${HOME}/.local/share/mantis/learning}:/app/learning
       - ./artifacts:/app/artifacts:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     depends_on:
       litellm:
         condition: service_healthy
@@ -84,4 +89,3 @@ networks:
 
 volumes:
   hf-cache:
-  mantis-learning:

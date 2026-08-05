@@ -214,7 +214,9 @@ MANTIS_LEARNING=1
 ```
 
 Mantis writes one append-only `runs-<hostname>.jsonl` file per machine under
-`~/.local/share/mantis/learning` (a persistent Docker volume in all-Docker mode).
+`~/.local/share/mantis/learning`. Docker bind-mounts that host directory at
+`/app/learning`; container stdout/stderr stays in Docker with three rotating
+10 MB files.
 Records contain redacted task text, route/model ids, test/verifier outcomes, and timing;
 tool outputs are not stored. Task text itself may contain sensitive project details, so review it
 before sharing the directory outside your team. A high-confidence pseudo-label requires
