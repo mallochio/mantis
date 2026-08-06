@@ -234,6 +234,10 @@ def _advance(request: ChatRequest, body: dict[str, Any]) -> tuple[Any, str, dict
         event = serve._advance_to_boundary(run_id, tool_results)
     if event.get("type") == "error":
         raise RuntimeError(str(event.get("error", "orchestration failed")))
+    # Redis-backed stores deserialize a fresh run object on every advance.
+    # Reload so response metadata and aggregate usage come from the updated state.
+    if serve.RUN_STORE == "redis":
+        run = serve.get_run(run_id)
     return run, run_id, event
 
 

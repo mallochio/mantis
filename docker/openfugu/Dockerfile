@@ -3,7 +3,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y git curl && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir torch --extra-index-url https://download.pytorch.org/whl/cpu
-RUN pip install --no-cache-dir 'transformers>=4.52,<5' accelerate safetensors huggingface_hub fastapi httpx jsonschema uvicorn
+RUN pip install --no-cache-dir 'transformers>=4.52,<5' accelerate safetensors huggingface_hub fastapi httpx jsonschema uvicorn 'redis>=5,<7'
 COPY ./OpenFugu /app
 COPY ./openfugu-patch/serve.py /app/openfugu/serve.py
 COPY ./openfugu-patch/api.py /app/openfugu/api.py

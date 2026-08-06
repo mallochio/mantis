@@ -18,12 +18,14 @@ import argparse
 import hashlib
 import json
 import os
+import pickle
 import re
 import socket
 import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -1236,13 +1238,88 @@ RUN_TTL = float(os.environ.get("MANTIS_RUN_TTL", "600"))
 MAX_TOOL_ROUNDS = int(os.environ.get("MANTIS_MAX_TOOL_ROUNDS_PER_STEP", "8"))
 MAX_RUNS = int(os.environ.get("MANTIS_MAX_CONCURRENT_RUNS", "32"))
 RUN_MAX_MSG_BYTES = 400_000
+RUN_STORE = os.environ.get("MANTIS_RUN_STORE", "memory").lower()
+if RUN_STORE not in {"memory", "redis"}:
+    raise ValueError("MANTIS_RUN_STORE must be memory or redis")
+REDIS_URL = os.environ.get("MANTIS_REDIS_URL", "")
+_REDIS_PREFIX = os.environ.get("MANTIS_REDIS_PREFIX", "mantis:run:")
+REDIS_LOCK_TIMEOUT = max(300, int(WORKER_TIMEOUT * MAX_TURNS + 60))
+_redis_client: Any | None = None
 
 _runs: dict[str, NativeRun] = {}
 _runs_lock = threading.Lock()
 _runs_sweeper_started = False
 
 
+def _redis() -> Any:
+    global _redis_client
+    if _redis_client is None:
+        if not REDIS_URL:
+            raise RuntimeError("MANTIS_REDIS_URL is required when MANTIS_RUN_STORE=redis")
+        try:
+            import redis
+        except ImportError as error:
+            raise RuntimeError("install the redis extra to use MANTIS_RUN_STORE=redis") from error
+        _redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=False)
+    return _redis_client
+
+
+def _redis_key(run_id: str) -> str:
+    return f"{_REDIS_PREFIX}{run_id}"
+
+
+def _redis_index_key() -> str:
+    return f"{_REDIS_PREFIX}index"
+
+
+def _redis_get(run_id: str) -> NativeRun | None:
+    raw = _redis().get(_redis_key(run_id))
+    return pickle.loads(raw) if raw else None  # noqa: S301 - Redis is a trusted deployment dependency
+
+
+def _redis_put(run: NativeRun) -> None:
+    client = _redis()
+    payload = pickle.dumps(run, protocol=pickle.HIGHEST_PROTOCOL)
+    client.setex(_redis_key(run.run_id), max(1, int(RUN_TTL)), payload)
+    client.sadd(_redis_index_key(), run.run_id)
+    client.expire(_redis_index_key(), max(1, int(RUN_TTL)))
+
+
+@contextmanager
+def _redis_run_lock(run_id: str):
+    lock = _redis().lock(f"{_REDIS_PREFIX}lock:{run_id}", timeout=REDIS_LOCK_TIMEOUT)
+    acquired = lock.acquire(blocking=True, blocking_timeout=REDIS_LOCK_TIMEOUT)
+    if not acquired:
+        raise RunCapacityError("Mantis run is busy")
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+@contextmanager
+def _redis_registry_lock():
+    lock = _redis().lock(f"{_REDIS_PREFIX}registry-lock", timeout=60)
+    acquired = lock.acquire(blocking=True, blocking_timeout=60)
+    if not acquired:
+        raise RunCapacityError("Mantis tool-run registry is busy")
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 def _sweep_runs() -> None:
+    if RUN_STORE == "redis":
+        client = _redis()
+        now = time.time()
+        for raw_id in client.smembers(_redis_index_key()):
+            run_id = raw_id.decode() if isinstance(raw_id, bytes) else str(raw_id)
+            run = _redis_get(run_id)
+            if run is None or now - run.last_active > RUN_TTL:
+                client.delete(_redis_key(run_id))
+                client.srem(_redis_index_key(), run_id)
+        return
     now = time.time()
     stale = [
         rid for rid, run in _runs.items() if run.in_flight == 0 and now - run.last_active > RUN_TTL
@@ -1269,6 +1346,17 @@ def _ensure_runs_sweeper() -> None:
 
 
 def _register_run(run: NativeRun) -> str:
+    if RUN_STORE == "redis":
+        with _redis_registry_lock():
+            client = _redis()
+            if _redis_get(run.run_id) is not None:
+                raise ValueError("run id already exists")
+            if client.scard(_redis_index_key()) >= MAX_RUNS:
+                _sweep_runs()
+            if client.scard(_redis_index_key()) >= MAX_RUNS:
+                raise RunCapacityError("Mantis tool-run capacity is full")
+            _redis_put(run)
+        return cast(str, run.run_id)
     with _runs_lock:
         _ensure_runs_sweeper()
         if run.run_id in _runs:
@@ -1497,6 +1585,18 @@ class NativeRun:
             "total_tokens": 0,
         }
         self.usage_models: dict[str, dict[str, int]] = {}
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state.pop("lock", None)
+        state.pop("request_lock", None)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self.lock = threading.Lock()
+        self.request_lock = threading.Lock()
+        self.request_events = getattr(self, "request_events", {})
 
     def add_usage(self, usage: Any, model: str | None = None) -> None:
         if not isinstance(usage, dict):
@@ -2174,36 +2274,46 @@ def create_run(mode: str, body: dict[str, Any]) -> NativeRun:
 
 
 def get_run(run_id: str) -> NativeRun:
-    with _runs_lock:
-        run = _runs.get(run_id)
+    run = _redis_get(run_id) if RUN_STORE == "redis" else _runs.get(run_id)
     if run is None:
         raise KeyError(f"unknown or expired run: {run_id}")
     return run
 
 
 def advance_run(run_id: str, tool_results: Any, request_id: Any = None) -> dict[str, Any]:
-    with _runs_lock:
-        run = _runs.get(run_id)
-        if run is None:
-            raise KeyError(f"unknown or expired run: {run_id}")
+    lock = _redis_run_lock(run_id) if RUN_STORE == "redis" else nullcontext()
+    with lock:
+        run = get_run(run_id)
         run.in_flight += 1
-    try:
-        _history_context.active_run = run
-        event = run.advance_idempotent(tool_results, request_id)
-        if event.get("type") in ("final", "error"):
-            _write_learning_record(run, event)
-        return event
-    finally:
-        _history_context.active_run = None
-        with _runs_lock:
+        if RUN_STORE == "redis":
+            _redis_put(run)
+        try:
+            _history_context.active_run = run
+            event = run.advance_idempotent(tool_results, request_id)
+            if event.get("type") in ("final", "error"):
+                _write_learning_record(run, event)
+            return event
+        finally:
+            _history_context.active_run = None
             run.in_flight -= 1
             run.touch()
+            if RUN_STORE == "redis":
+                _redis_put(run)
 
 
 def delete_run(run_id: str) -> bool:
-    with _runs_lock:
-        run = _runs.pop(run_id, None)
-    if run is not None:
-        _write_learning_record(run, {"type": "error", "terminated_by": "deleted"})
-        run.close()
-    return run is not None
+    if RUN_STORE == "redis":
+        with _redis_run_lock(run_id):
+            run = _redis_get(run_id)
+            if run is None:
+                return False
+            _redis().delete(_redis_key(run_id))
+            _redis().srem(_redis_index_key(), run_id)
+    else:
+        with _runs_lock:
+            run = _runs.pop(run_id, None)
+        if run is None:
+            return False
+    _write_learning_record(run, {"type": "error", "terminated_by": "deleted"})
+    run.close()
+    return True

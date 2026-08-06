@@ -42,6 +42,9 @@ eval = [
     "requests>=2.25",
     "pyyaml>=6",
 ]
+redis = [
+    "redis>=5,<7",
+]
 dev = [
     "openai>=1.60,<3",
     "ruff>=0.5",

@@ -1,8 +1,7 @@
 # Mantis
 
-Mantis serves the trained TRINITY router and Fugu-style Conductor as ordinary
-OpenAI Chat Completions models. Any agent harness that supports OpenAI function
-tools can use it; Mantis has no harness-specific integration.
+Mantis serves the trained router and Fugu-style Conductor as ordinary
+OpenAI Chat Completions models.
 
 ## Models
 
@@ -118,14 +117,17 @@ reasoning engine or search crawler.
 | `MANTIS_MODEL` | TRINITY router backbone | `Qwen/Qwen3-0.6B` |
 | `MANTIS_VECTOR` | Trained TRINITY vector | `artifacts/model_iter_60.npy` |
 | `MANTIS_HEAD` | Optional head override | unset |
-| `MANTIS_WORKER_MODELS` | Ordered `provider/model[|effort]` pool | see `.env.example` |
+| `MANTIS_WORKER_MODELS` | Ordered provider/model[effort] pool | see `.env.example` |
 | `MANTIS_CONDUCTOR_MODEL` | Conductor planner model spec | first worker |
 | `MANTIS_LOCAL_MODELS` | Optional local HF worker pool | unset |
 | `MANTIS_LOCAL_CONDUCTOR` | Optional local Conductor checkpoint | unset |
 | `MANTIS_MAX_TURNS` | TRINITY turn cap | `5` |
 | `MANTIS_WORKER_TIMEOUT` | Downstream timeout in seconds | `240` |
 | `MANTIS_RUN_TTL` | Idle tool-run lifetime in seconds | `600` |
-| `MANTIS_MAX_CONCURRENT_RUNS` | Bounded in-memory tool-run count | `32` |
+| `MANTIS_RUN_STORE` | Run state backend: `memory` or optional `redis` | `memory` |
+| `MANTIS_REDIS_URL` | Redis URL when `MANTIS_RUN_STORE=redis` | unset |
+| `MANTIS_REDIS_PREFIX` | Key namespace for shared Redis state | `mantis:run:` |
+| `MANTIS_MAX_CONCURRENT_RUNS` | Bounded tool-run count per backend | `32` |
 | `MANTIS_MAX_CONCURRENT_REQUESTS` | Concurrent HTTP request limit; excess receives `429` | `32` |
 | `MANTIS_SSE_KEEPALIVE_SECONDS` | SSE keep-alive interval during orchestration | `10` |
 | `MANTIS_MAX_BODY_BYTES` | Maximum request body size | `52428800` |
@@ -134,9 +136,12 @@ Supported hosted model prefixes are currently `openrouter/` and `opencode-go/`.
 Reasoning effort is appended with `|`, for example
 `openrouter/openai/gpt-5.6-luna|max`.
 
-Tool runs are held in bounded process memory until completion or TTL expiry.
-Run one server replica unless you add shared state; a load balancer must use
-sticky sessions for in-flight tool loops.
+Tool runs use bounded process memory by default until completion or TTL expiry.
+For multi-replica deployment, set `MANTIS_RUN_STORE=redis`, configure
+`MANTIS_REDIS_URL`, and start the optional `redis` Compose profile:
+`docker compose --profile redis up --build`. Redis stores serialized run state
+and locks each advance, so replicas can share tool loops. Use a trusted,
+private Redis deployment; run one replica with the memory backend.
 
 ## API
 
