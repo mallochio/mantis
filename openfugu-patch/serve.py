@@ -171,7 +171,7 @@ def _provider_response(
     if not isinstance(data, dict):
         raise TypeError(f"{spec} returned a non-object response")
     if run is not None:
-        run.add_usage(data.get("usage"))
+        run.add_usage(data.get("usage"), model=body["model"])
         message = (data.get("choices") or [{}])[0].get("message", {})
         if run.capture_metadata and isinstance(message, dict):
             run.response_metadata = {
@@ -188,6 +188,60 @@ def _direct_completion(
     del timeout  # the shared client uses MANTIS_WORKER_TIMEOUT
     data = _provider_response(spec, messages, max_tokens, temperature)
     return str(data["choices"][0]["message"].get("content") or "")
+
+
+_PRICES_URL = "https://openrouter.ai/api/v1/models"
+_price_cache: dict[str, tuple[float, float]] | None = None
+
+
+def _price_entry(entry: Any) -> tuple[str, tuple[float, float]] | None:
+    """(model id, (prompt, completion) price) pair, or None for a malformed entry."""
+    try:
+        pricing = entry["pricing"]
+        return str(entry["id"]), (float(pricing["prompt"]), float(pricing["completion"]))
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _fetch_prices() -> dict[str, tuple[float, float]]:
+    """Fetch model id -> (prompt, completion) per-token USD prices; empty on any failure."""
+    try:
+        response = httpx.get(_PRICES_URL, timeout=5.0)
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        return {}
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        return {}
+    prices: dict[str, tuple[float, float]] = {}
+    for entry in data:
+        pair = _price_entry(entry)
+        if pair is not None:
+            prices[pair[0]] = pair[1]
+    return prices
+
+
+def _price_map() -> dict[str, tuple[float, float]]:
+    """Per-token USD prices keyed by model id, fetched lazily once per process."""
+    global _price_cache
+    if _price_cache is None:
+        _price_cache = _fetch_prices()
+    return _price_cache
+
+
+def _usage_cost(usage_models: dict[str, dict[str, int]]) -> float | None:
+    """Total USD cost, or None when any consumed model has no known price."""
+    if not usage_models:
+        return None
+    prices = _price_map()
+    cost = 0.0
+    for model, tokens in usage_models.items():
+        price = prices.get(model)
+        if price is None:
+            return None
+        cost += tokens["prompt_tokens"] * price[0] + tokens["completion_tokens"] * price[1]
+    return round(cost, 6)
 
 
 class RejectAwareRouter:
@@ -965,6 +1019,9 @@ def _completion_response(
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
         }
+    cost = _usage_cost(getattr(run, "usage_models", {}))
+    if cost is not None:
+        usage["cost"] = cost
     return {
         "id": completion_id,
         "object": "chat.completion",
@@ -1396,8 +1453,9 @@ class NativeRun:
             "completion_tokens": 0,
             "total_tokens": 0,
         }
+        self.usage_models: dict[str, dict[str, int]] = {}
 
-    def add_usage(self, usage: Any) -> None:
+    def add_usage(self, usage: Any, model: str | None = None) -> None:
         if not isinstance(usage, dict):
             return
         for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
@@ -1410,6 +1468,14 @@ class NativeRun:
             for key, value in details.items():
                 if isinstance(value, int) and value >= 0:
                     target[key] = target.get(key, 0) + value
+        if model:
+            model_usage = self.usage_models.setdefault(
+                model, {"prompt_tokens": 0, "completion_tokens": 0}
+            )
+            for key in ("prompt_tokens", "completion_tokens"):
+                value = usage.get(key)
+                if isinstance(value, int) and value >= 0:
+                    model_usage[key] += value
 
     def validate_output(self, text: str) -> None:
         if not self.response_format:
