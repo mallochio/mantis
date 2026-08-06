@@ -29,6 +29,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import httpx
+import jsonschema
 import numpy as np
 import torch
 
@@ -149,9 +150,12 @@ def _provider_response(
     if tools:
         body["tools"] = tools
     run = getattr(_history_context, "active_run", None)
-    tool_choice = getattr(run, "tool_choice", None)
+    tool_choice = getattr(run, "active_tool_choice", None)
     if tool_choice is not None:
         body["tool_choice"] = tool_choice
+    response_format = getattr(run, "active_response_format", None)
+    if response_format is not None:
+        body["response_format"] = response_format
     try:
         response = _provider_client.post(url, headers=headers, json=body)
         response.raise_for_status()
@@ -784,7 +788,7 @@ class EnvConductorCoordinator(ConductorCoordinator):
 
 
 def _split_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
-    """Return (query, history) where query is the last user message."""
+    """Return the text query and history; multimodal content stays in the run."""
     last_user_idx = -1
     for i in range(len(messages) - 1, -1, -1):
         if messages[i].get("role") == "user":
@@ -792,7 +796,7 @@ def _split_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str,
             break
     if last_user_idx == -1:
         return "", messages
-    return messages[last_user_idx].get("content", ""), messages[:last_user_idx]
+    return _message_text(messages[last_user_idx].get("content")), messages[:last_user_idx]
 
 
 def _json_object(raw: bytes) -> dict[str, Any]:
@@ -812,6 +816,24 @@ def _message_text(content: Any) -> str:
             if isinstance(part, dict) and part.get("type") in ("text", "input_text")
         )
     return "" if content is None else str(content)
+
+
+def _with_images(text: str, content: Any) -> Any:
+    if not isinstance(content, list):
+        return text
+    images = [
+        part
+        for part in content
+        if isinstance(part, dict) and part.get("type") == "image_url"
+    ]
+    return [{"type": "text", "text": text}, *images] if images else text
+
+
+def _last_user_content(messages: list[dict[str, Any]]) -> Any:
+    return next(
+        (message.get("content") for message in reversed(messages) if message.get("role") == "user"),
+        "",
+    )
 
 
 def _mode_for_model(model: Any) -> str:
@@ -1350,6 +1372,9 @@ class NativeRun:
         self.learning_logged = False
         self.in_flight = 0
         self.tool_choice: Any = None
+        self.active_tool_choice: Any = None
+        self.response_format: dict[str, Any] | None = None
+        self.active_response_format: dict[str, Any] | None = None
         self.usage: dict[str, Any] = {
             "prompt_tokens": 0,
             "completion_tokens": 0,
@@ -1369,6 +1394,21 @@ class NativeRun:
             for key, value in details.items():
                 if isinstance(value, int) and value >= 0:
                     target[key] = target.get(key, 0) + value
+
+    def validate_output(self, text: str) -> None:
+        if not self.response_format:
+            return
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"structured output is not valid JSON: {error.msg}") from error
+        if self.response_format.get("type") == "json_schema":
+            schema = self.response_format.get("json_schema", {}).get("schema", {})
+            try:
+                jsonschema.validate(value, schema)
+            except jsonschema.ValidationError as error:
+                message = f"structured output does not match schema: {error.message}"
+                raise ValueError(message) from error
 
     def touch(self) -> None:
         self.last_active = time.time()
@@ -1441,6 +1481,7 @@ class TrinityRun(NativeRun):
         self.max_turns = max_turns
         query, history = _split_messages(messages)
         self.query = query or ""
+        self.query_content = _last_user_content(messages)
         self.history = history
         self.obs = self.query
         self.ref_id = 0
@@ -1519,7 +1560,14 @@ class TrinityRun(NativeRun):
                 f"Revise the answer to address this verifier feedback:\n{self.revision_feedback}"
             )
             self.revision_feedback = None
-        msgs.append({"role": "user", "content": user_content})
+        msgs.append(
+            {
+                "role": "user",
+                "content": _with_images(user_content, self.query_content)
+                if role == "Worker"
+                else user_content,
+            }
+        )
         return msgs
 
     def _role_complete(self, role: str, agent_id: int, turn: int, messages: list, reply: str):
@@ -1563,7 +1611,15 @@ class TrinityRun(NativeRun):
 
     def _run_model(self, role: str, agent_id: int, turn: int, messages: list):
         model = self._model_name(agent_id)
-        text, calls = _model_completion(model, messages, self.tools)
+        self.active_response_format = self.response_format if role == "Worker" else None
+        self.active_tool_choice = (
+            self.tool_choice if role == "Worker" and self._tool_rounds == 0 else None
+        )
+        try:
+            text, calls = _model_completion(model, messages, self.tools)
+        finally:
+            self.active_response_format = None
+            self.active_tool_choice = None
         if calls:
             asst: dict[str, Any] = {
                 "role": "assistant",
@@ -1709,6 +1765,7 @@ class ConductorRun(NativeRun):
         self.max_steps = max_steps
         query, history = _split_messages(messages)
         self.query = query or ""
+        self.query_content = _last_user_content(messages)
         self.history = history
         self.conductor_model = _resolve_conductor_model(
             SimpleNamespace(slot_models=self.slot_models)
@@ -1748,11 +1805,24 @@ class ConductorRun(NativeRun):
             if ctx
             else f"Your subtask: {sub}"
         )
-        return [{"role": "user", "content": user}]
+        return [{"role": "user", "content": _with_images(user, self.query_content)}]
 
     def _run_model(self, role: str, model: str, messages: list) -> dict[str, Any]:
         seq = len(self.steps)
-        text, calls = _model_completion(model, messages, self.tools)
+        is_final_worker = bool(
+            role == "Worker"
+            and self._workflow is not None
+            and self._next_node >= len(self._workflow[1])
+        )
+        self.active_response_format = self.response_format if is_final_worker else None
+        self.active_tool_choice = (
+            self.tool_choice if role == "Worker" and self._tool_rounds == 0 else None
+        )
+        try:
+            text, calls = _model_completion(model, messages, self.tools)
+        finally:
+            self.active_response_format = None
+            self.active_tool_choice = None
         if calls:
             asst = {
                 "role": "assistant",
@@ -1946,6 +2016,7 @@ def create_run(mode: str, body: dict[str, Any]) -> NativeRun:
     else:
         run = TrinityRun(run_id, messages, tools, slot_models=slot_models)
     run.tool_choice = body.get("tool_choice")
+    run.response_format = body.get("response_format")
     _register_run(run)
     return run
 

@@ -135,6 +135,12 @@ def test_direct_provider_completions(monkeypatch):
 
 def test_split_messages():
     assert serve._split_messages([{"role": "user", "content": "hi"}]) == ("hi", [])
+    content = [
+        {"type": "text", "text": "inspect"},
+        {"type": "image_url", "image_url": {"url": "https://example.test/image.png"}},
+    ]
+    assert serve._split_messages([{"role": "user", "content": content}]) == ("inspect", [])
+    assert serve._with_images("worker prompt", content)[1]["type"] == "image_url"
     msgs = [
         {"role": "user", "content": "q1"},
         {"role": "assistant", "content": "a1"},

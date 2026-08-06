@@ -25,6 +25,7 @@ def _run():
         terminated_by="verifier_accept",
         turns=[],
         usage={"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12},
+        validate_output=lambda _text: None,
     )
 
 
@@ -164,6 +165,25 @@ def test_api_maps_run_errors(client, monkeypatch):
         assert response.status_code == status
 
 
+def test_structured_output_validation():
+    run = serve.NativeRun("structured")
+    run.response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "schema": {
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
+            }
+        },
+    }
+    run.validate_output('{"ok":true}')
+    with pytest.raises(ValueError, match="valid JSON"):
+        run.validate_output("nope")
+    with pytest.raises(ValueError, match="match schema"):
+        run.validate_output('{"ok":"yes"}')
+
+
 def test_usage_accumulator():
     run = serve.NativeRun("usage")
     run.add_usage(None)
@@ -189,6 +209,72 @@ def test_usage_accumulator():
         "total_tokens": 14,
         "completion_tokens_details": {"reasoning_tokens": 5},
     }
+
+
+def test_multimodal_and_structured_request_contract(client, monkeypatch):
+    captured = []
+    run = _run()
+    run.validate_output = lambda text: captured.append(("validated", text))
+
+    def create(_mode, body):
+        captured.append(body)
+        return run
+
+    monkeypatch.setattr(serve, "create_run", create)
+    monkeypatch.setattr(
+        serve, "_advance_to_boundary", lambda *_a: {"type": "final", "text": '{"ok":true}'}
+    )
+    monkeypatch.setattr(serve, "delete_run", lambda *_a: True)
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "mantis",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                    ],
+                }
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"ok": {"type": "boolean"}},
+                        "required": ["ok"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        },
+    )
+    assert response.status_code == 200
+    body = captured[0]
+    assert body["messages"][0]["content"][1]["type"] == "image_url"
+    assert body["response_format"]["json_schema"]["schema"]["required"] == ["ok"]
+    assert captured[1] == ("validated", '{"ok":true}')
+
+
+def test_invalid_structured_output_returns_502(client, monkeypatch):
+    run = _run()
+    run.validate_output = lambda _text: (_ for _ in ()).throw(ValueError("schema mismatch"))
+    monkeypatch.setattr(serve, "create_run", lambda *_a: run)
+    monkeypatch.setattr(
+        serve, "_advance_to_boundary", lambda *_a: {"type": "final", "text": "bad"}
+    )
+    monkeypatch.setattr(serve, "delete_run", lambda *_a: True)
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={"model": "mantis", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 502
+    assert "schema mismatch" in response.json()["error"]["message"]
 
 
 def test_capacity_returns_429(client, monkeypatch):

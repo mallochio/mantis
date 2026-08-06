@@ -45,11 +45,32 @@ class NamedToolChoice(BaseModel):
     function: FunctionChoice
 
 
+class TextPart(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["text"]
+    text: str
+
+
+class ImageURL(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(min_length=1)
+    detail: Literal["auto", "low", "high"] | None = None
+
+
+class ImagePart(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["image_url"]
+    image_url: ImageURL
+
+
 class Message(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     role: Literal["system", "developer", "user", "assistant", "tool"]
-    content: Any = None
+    content: str | list[TextPart | ImagePart] | None = None
     tool_call_id: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
 
@@ -60,6 +81,28 @@ class Message(BaseModel):
         if self.role != "assistant" and self.tool_calls is not None:
             raise ValueError("tool_calls are only valid on assistant messages")
         return self
+
+
+class JsonSchemaDefinition(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1)
+    description: str | None = None
+    schema_: dict[str, Any] = Field(alias="schema")
+    strict: bool = True
+
+
+class JsonSchemaFormat(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["json_schema"]
+    json_schema: JsonSchemaDefinition
+
+
+class JsonObjectFormat(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["json_object"]
 
 
 class StreamOptions(BaseModel):
@@ -77,6 +120,7 @@ class ChatRequest(BaseModel):
     tool_choice: Literal["auto", "none", "required"] | NamedToolChoice | None = None
     stream: bool = False
     stream_options: StreamOptions | None = None
+    response_format: JsonSchemaFormat | JsonObjectFormat | None = None
 
     @model_validator(mode="after")
     def validate_tools(self) -> ChatRequest:
@@ -128,7 +172,7 @@ def _advance(request: ChatRequest, body: dict[str, Any]) -> tuple[Any, str, dict
 
 
 def _complete(request: ChatRequest) -> dict[str, Any]:
-    body = request.model_dump(exclude_none=True)
+    body = request.model_dump(exclude_none=True, by_alias=True)
     run_id: str | None = None
     try:
         run, run_id, event = _advance(request, body)
@@ -142,6 +186,12 @@ def _complete(request: ChatRequest) -> dict[str, Any]:
         if run_id:
             serve.delete_run(run_id)
         raise HTTPException(502, str(error)) from error
+    if event.get("type") == "final":
+        try:
+            run.validate_output(str(event.get("text", "")))
+        except ValueError as error:
+            serve.delete_run(run_id)
+            raise HTTPException(502, str(error)) from error
     response = serve._completion_response(request.model, body["messages"], run, event)
     if event.get("type") == "final":
         serve.delete_run(run_id)

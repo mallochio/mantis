@@ -62,7 +62,9 @@ finishes; responses include `X-Mantis-Streaming: buffered`.
 
 ## Agent tools
 
-Send normal OpenAI function tools. Mantis may return `finish_reason: "tool_calls"`.
+Send normal OpenAI function tools. Mantis supports `tool_choice` values `auto`,
+`none`, `required`, and a named function, and may return
+`finish_reason: "tool_calls"`.
 The harness executes those calls and sends the assistant tool-call message plus
 `role: "tool"` results back to the same `/v1/chat/completions` endpoint. The
 opaque tool-call IDs carry the temporary run identity, so no custom continuation
@@ -89,6 +91,16 @@ response = client.chat.completions.create(
 
 The calling harness owns tool execution and its filesystem/network permissions.
 Mantis only chooses and orchestrates models.
+
+## Images and structured output
+
+User messages may contain standard OpenAI `text` and `image_url` parts. Mantis
+routes on text and preserves images for worker calls. Workers must support the
+image format you send.
+
+`response_format` accepts `json_object` or `json_schema`. Mantis forwards the
+format to answer-producing workers and validates the final JSON with
+`jsonschema`; invalid output fails instead of being returned as structured data.
 
 ## Configuration
 
