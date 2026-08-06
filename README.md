@@ -1,6 +1,6 @@
 # Mantis
 
-Mantis serves the trained router and Fugu-style Conductor as ordinary
+Mantis serves a trained router and Fugu-style Conductor as ordinary
 OpenAI Chat Completions models.
 
 ## Models
