@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import Any
 
 import requests
-
 from score import score_response
 
 REPO = Path(__file__).resolve().parent.parent
@@ -44,7 +43,8 @@ FUGU_DEFAULTS = {
 }
 
 
-def run_target(name: str, cfg: dict[str, str], fx: dict[str, Any], timeout: float) -> dict[str, Any]:
+def run_target(name: str, cfg: dict[str, str], fx: dict[str, Any], timeout: float) -> dict[str,
+            Any]:
     rec: dict[str, Any] = {
         "id": fx["id"],
         "target": name,
@@ -78,7 +78,8 @@ def run_target(name: str, cfg: dict[str, str], fx: dict[str, Any], timeout: floa
             data.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
         )
         usage = data.get("usage") or {}
-        rec["usage"] = {k: usage[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens") if k in usage}
+        rec["usage"] = {k: usage[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens")
+        if k in usage}
         if isinstance(usage.get("cost"), (int, float)):
             rec["cost_usd"] = round(float(usage["cost"]), 6)
     except requests.exceptions.Timeout:
@@ -109,7 +110,10 @@ def summarize(results: list[dict[str, Any]], output: str) -> None:
         "Scoring: keyword hit rate on `expect` terms (eval/score.py)."
     )
     lines.append("")
-    header = f"| target | success | score | cost $ | score/$ | latency s (med/p95) | completion tokens (med) |"
+    header = (
+        "| target | success | score | cost $ | score/$ | latency s (med/p95) | "
+        "completion tokens (med) |"
+    )
     lines.append(header)
     lines.append("|---|---|---|---|---|---|---|")
     for t in targets:
@@ -178,14 +182,17 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.summarize:
-        results = [json.loads(line) for line in Path(args.results).read_text().splitlines() if line.strip()]
+        results = [json.loads(line) for line in Path(args.results).read_text().splitlines() if
+    line.strip()]
         summarize(results, args.report)
         return
 
     targets = {}
     for name in (t.strip() for t in args.targets.split(",") if t.strip()):
         if name == "mantis":
-            targets[name] = {"url": args.mantis_url, "key_env": "MANTIS_API_KEY", "model": args.mantis_model}
+            targets[name] = {
+                "url": args.mantis_url, "key_env": "MANTIS_API_KEY", "model": args.mantis_model
+            }
         elif name == "openrouter-fugu":
             targets[name] = dict(FUGU_DEFAULTS)
         else:
@@ -194,7 +201,11 @@ def main() -> None:
         if cfg["key_env"] not in os.environ:
             raise SystemExit(f"{cfg['key_env']} is not set")
 
-    fixtures = [json.loads(line) for line in Path(args.fixtures).read_text().splitlines() if line.strip()]
+    fixtures = [
+        json.loads(line)
+        for line in Path(args.fixtures).read_text().splitlines()
+        if line.strip()
+    ]
     out_path = Path(args.output)
     out_path.write_text("")  # fresh run
 
