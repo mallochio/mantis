@@ -146,6 +146,7 @@ sticky sessions for in-flight tool loops.
 - `POST /v1/chat/completions` — authenticated OpenAI-compatible completion
 
 Internal routing and worker metadata are not returned to clients.
+`/v1/models` descriptors report `context_length` and `max_completion_tokens`, both env-configurable via `MANTIS_CONTEXT_LENGTH` and `MANTIS_MAX_COMPLETION_TOKENS`; downstream cost is reported per request in `usage.cost`.
 
 ## Artifacts
 
