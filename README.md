@@ -128,7 +128,7 @@ reasoning engine or search crawler.
 | `MANTIS_MAX_CONCURRENT_RUNS` | Bounded in-memory tool-run count | `32` |
 | `MANTIS_MAX_CONCURRENT_REQUESTS` | Concurrent HTTP request limit; excess receives `429` | `32` |
 | `MANTIS_SSE_KEEPALIVE_SECONDS` | SSE keep-alive interval during orchestration | `10` |
-| `MANTIS_MAX_BODY_BYTES` | Maximum request body size | `5242880` |
+| `MANTIS_MAX_BODY_BYTES` | Maximum request body size | `52428800` |
 
 Supported hosted model prefixes are currently `openrouter/` and `opencode-go/`.
 Reasoning effort is appended with `|`, for example
