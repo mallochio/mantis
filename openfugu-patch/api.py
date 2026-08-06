@@ -263,24 +263,56 @@ def _complete(request: ChatRequest) -> dict[str, Any]:
     return response
 
 
+def _text_chunks(text: str, size: int = 64) -> Iterator[str]:
+    while len(text) > size:
+        split = max(text.rfind(char, 0, size + 1) for char in " \n\t")
+        if split <= 0:
+            split = size
+        yield text[:split]
+        text = text[split:]
+    if text:
+        yield text
+
+
 def _sse(body: dict[str, Any], include_usage: bool) -> Iterator[bytes]:
     choice = body["choices"][0]
     message = choice["message"]
-    delta: dict[str, Any] = {"role": "assistant"}
-    if message.get("tool_calls"):
-        delta["tool_calls"] = [
-            {**call, "index": index} for index, call in enumerate(message["tool_calls"])
-        ]
-    else:
-        delta["content"] = message.get("content") or ""
     base = {
         "id": body["id"],
         "object": "chat.completion.chunk",
         "created": body["created"],
         "model": body["model"],
     }
-    yield f"data: {json.dumps({**base, 'choices': [{'index': 0, 'delta': delta, 'finish_reason': None}]})}\n\n".encode()
-    yield f"data: {json.dumps({**base, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': choice['finish_reason']}]})}\n\n".encode()
+
+    def chunk(delta: dict[str, Any], finish_reason: Any = None) -> bytes:
+        choices = [{"index": 0, "delta": delta, "finish_reason": finish_reason}]
+        return f"data: {json.dumps({**base, 'choices': choices})}\n\n".encode()
+
+    if message.get("tool_calls"):
+        yield chunk(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {**call, "index": index}
+                    for index, call in enumerate(message["tool_calls"])
+                ],
+            }
+        )
+    else:
+        deltas: list[dict[str, Any]] = []
+        reasoning = message.get("reasoning")
+        if isinstance(reasoning, str) and reasoning:
+            deltas.append({"reasoning": reasoning})
+        details = message.get("reasoning_details")
+        if isinstance(details, list) and details:
+            deltas.append({"reasoning_details": details})
+        content = str(message.get("content") or "")
+        deltas.extend({"content": part} for part in _text_chunks(content))
+        if not deltas:
+            deltas.append({"content": ""})
+        for number, delta in enumerate(deltas):
+            yield chunk({"role": "assistant", **delta} if number == 0 else delta)
+    yield chunk({}, choice["finish_reason"])
     if include_usage:
         yield f"data: {json.dumps({**base, 'choices': [], 'usage': body['usage']})}\n\n".encode()
     yield b"data: [DONE]\n\n"
