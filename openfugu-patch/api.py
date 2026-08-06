@@ -307,6 +307,9 @@ def _sse(body: dict[str, Any], include_usage: bool) -> Iterator[bytes]:
         details = message.get("reasoning_details")
         if isinstance(details, list) and details:
             deltas.append({"reasoning_details": details})
+        deltas.extend(
+            {key: message[key]} for key in ("annotations", "citations") if message.get(key)
+        )
         content = str(message.get("content") or "")
         deltas.extend({"content": part} for part in _text_chunks(content))
         if not deltas:

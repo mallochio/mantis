@@ -97,6 +97,19 @@ def test_reasoning_deltas_precede_content(client, monkeypatch):
     assert all("role" not in delta for delta in deltas[1:])
 
 
+def test_search_metadata_streams_before_content(client, monkeypatch):
+    annotations = [{"type": "url_citation", "url_citation": {"url": "https://ex.test"}}]
+    citations = ["https://ex.test"]
+    run = _run(response_metadata={"annotations": annotations, "citations": citations})
+    response = _stream(client, monkeypatch, {"type": "final", "text": "cited answer"}, run)
+    assert response.status_code == 200
+    deltas = _deltas(response)
+    assert deltas[0] == {"role": "assistant", "annotations": annotations}
+    assert deltas[1] == {"citations": citations}
+    first_content = next(i for i, delta in enumerate(deltas) if "content" in delta)
+    assert first_content == 2
+
+
 def test_stream_include_usage_appends_usage_chunk(client, monkeypatch):
     run = _run()
     response = _stream(
