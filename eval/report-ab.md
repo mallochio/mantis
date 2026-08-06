@@ -36,24 +36,26 @@ Fixtures: 16 tasks x 2 targets. Scoring: keyword hit rate on `expect` terms (eva
 
 ## Notes
 
-- **fugu-ultra leg could not run from this machine.** OpenRouter accepts the
-  key (control call to `openai/gpt-5.6-luna` returned 200), but Sakana AI
-  blocks fugu-ultra at the provider level for this region:
-  `403 "sakana/fugu-ultra is not available in your region: Sakana AI blocks
-  requests originating from your location."` Both slugs
-  (`sakana/fugu-ultra`, `sakana/fugu-ultra-20260615`) are affected. Re-run
-  from an allowed region (US/EU) to complete the A/B:
-  `uv run --extra eval python eval/ab_compare.py --targets mantis,openrouter-fugu`
+- **Region workaround:** sakana/fugu-ultra provider-blocks the dev machine's
+  region (403 "not available in your region"), so the fugu leg ran from GCP
+  `us-central1` via `launch/sky/ab_fugu_region.yaml` (`sky launch --down`, a
+  spot `n4-highcpu-2`; local file_mounts only — no object-storage bucket was
+  created). Cluster auto-tore down at job end.
 - **Method:** identical fixtures (`eval/fixtures.jsonl`), non-streaming calls,
-  keyword hit-rate scoring (`eval/score.py`), wall-clock latency, and the real
-  per-request USD cost reported in each response's `usage.cost`.
-- **Empty-final bug found and fixed during this run:** 5/16 mantis answers
-  were empty (workers with reasoning effort consumed the budget and returned
-  `content: null`). Fix: `_final()` walks back to the last non-empty reply
-  (TrinityRun and ConductorRun); regression tests in
-  `tests/test_empty_final.py`. After the fix the six affected fixtures all
-  return content; overall score rose 0.56 -> 0.92.
-- **Latency:** median 61.8 s includes orchestration (TRINITY routing +
-  verifier + reasoning-effort workers at 4096 internal max tokens). p95 300 s
-  is dominated by one slow cold run (t04, 300 s). Token spend (median 5183
-  completion tokens per task) reflects reasoning-heavy workers.
+  keyword hit-rate scoring (`eval/score.py`), wall-clock latency, real
+  per-request USD cost from each response's `usage.cost`. Mantis leg ran on
+  the dev host; fugu leg on the GCP VM. fugu-ultra used its defaults
+  (mandatory reasoning, effort xhigh); mantis used its configured pool
+  (reasoning-effort workers, internal 4096-token cap).
+- **Result:** near-parity on score (mantis 0.92 vs fugu 0.87), with mantis
+  5x cheaper ($0.37 vs $1.86 for 16 tasks) and 5x better score-per-dollar
+  (2.5 vs 0.5). fugu-ultra is faster on median latency (37 s vs 62 s) and
+  emits fewer completion tokens (2.1k vs 5.2k median) — both artifacts of
+  fugu-ultra's mandatory xhigh reasoning, which also drives its 5x cost.
+- **Caveats:** 16 fixtures, keyword scoring, one run each; mantis latency
+  includes TRINITY/verifier orchestration and a cold t04 (300 s). Read as a
+  directional cost-quality comparison, not a benchmark headline.
+- **Empty-final bug found and fixed during this work:** 5/16 mantis answers
+  were empty (reasoning workers returned `content: null`); `_final()` now
+  walks back to the last non-empty reply (see tests/test_empty_final.py).
+  Score rose 0.56 -> 0.92 after the fix.
