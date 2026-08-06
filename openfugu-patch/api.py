@@ -105,6 +105,14 @@ class JsonObjectFormat(BaseModel):
     type: Literal["json_object"]
 
 
+class ReasoningOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+    max_tokens: int | None = Field(default=None, ge=1)
+    exclude: bool | None = None
+
+
 class StreamOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -121,6 +129,11 @@ class ChatRequest(BaseModel):
     stream: bool = False
     stream_options: StreamOptions | None = None
     response_format: JsonSchemaFormat | JsonObjectFormat | None = None
+    max_tokens: int | None = Field(default=None, ge=1)
+    max_completion_tokens: int | None = Field(default=None, ge=1)
+    reasoning: ReasoningOptions | None = None
+    reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+    web_search_options: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def validate_tools(self) -> ChatRequest:
@@ -132,6 +145,10 @@ class ChatRequest(BaseModel):
                 raise ValueError("tool_choice function must be present in tools")
         if self.stream_options is not None and not self.stream:
             raise ValueError("stream_options requires stream=true")
+        if self.max_tokens is not None and self.max_completion_tokens is not None:
+            raise ValueError("set only one of max_tokens or max_completion_tokens")
+        if self.reasoning is not None and self.reasoning_effort is not None:
+            raise ValueError("set reasoning.effort or reasoning_effort, not both")
         return self
 
 

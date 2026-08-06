@@ -63,18 +63,22 @@ def test_auth_health_and_validation(client, monkeypatch):
             json={"model": "mantis", "messages": [message]},
         )
         assert response.status_code == 422
-    assert (
-        client.post(
+    invalid_requests = [
+        {"stream_options": {"include_usage": True}},
+        {"max_tokens": 1, "max_completion_tokens": 1},
+        {"reasoning": {"effort": "high"}, "reasoning_effort": "high"},
+    ]
+    for extra in invalid_requests:
+        response = client.post(
             "/v1/chat/completions",
             headers=_headers(),
             json={
                 "model": "mantis",
                 "messages": [{"role": "user", "content": "hi"}],
-                "stream_options": {"include_usage": True},
+                **extra,
             },
-        ).status_code
-        == 422
-    )
+        )
+        assert response.status_code == 422
 
 
 def test_completion_uses_aggregate_usage_and_hides_trace(client, monkeypatch):
@@ -209,6 +213,25 @@ def test_usage_accumulator():
         "total_tokens": 14,
         "completion_tokens_details": {"reasoning_tokens": 5},
     }
+
+
+def test_request_controls_are_stored_on_run():
+    body = {
+        "messages": [{"role": "user", "content": "answer"}],
+        "slot_models": ["worker"],
+        "max_completion_tokens": 123,
+        "reasoning": {"effort": "high", "exclude": True},
+        "web_search_options": {"search_context_size": "low"},
+    }
+    run = serve.create_run("trinity", body)
+    try:
+        assert run.controls == {
+            "max_tokens": 123,
+            "reasoning": {"effort": "high", "exclude": True},
+            "web_search_options": {"search_context_size": "low"},
+        }
+    finally:
+        serve.delete_run(run.run_id)
 
 
 def test_multimodal_and_structured_request_contract(client, monkeypatch):

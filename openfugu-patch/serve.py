@@ -156,6 +156,7 @@ def _provider_response(
     response_format = getattr(run, "active_response_format", None)
     if response_format is not None:
         body["response_format"] = response_format
+    body.update(getattr(run, "active_controls", None) or {})
     try:
         response = _provider_client.post(url, headers=headers, json=body)
         response.raise_for_status()
@@ -1375,6 +1376,8 @@ class NativeRun:
         self.active_tool_choice: Any = None
         self.response_format: dict[str, Any] | None = None
         self.active_response_format: dict[str, Any] | None = None
+        self.controls: dict[str, Any] = {}
+        self.active_controls: dict[str, Any] = {}
         self.usage: dict[str, Any] = {
             "prompt_tokens": 0,
             "completion_tokens": 0,
@@ -1615,11 +1618,13 @@ class TrinityRun(NativeRun):
         self.active_tool_choice = (
             self.tool_choice if role == "Worker" and self._tool_rounds == 0 else None
         )
+        self.active_controls = self.controls if role == "Worker" else {}
         try:
             text, calls = _model_completion(model, messages, self.tools)
         finally:
             self.active_response_format = None
             self.active_tool_choice = None
+            self.active_controls = {}
         if calls:
             asst: dict[str, Any] = {
                 "role": "assistant",
@@ -1818,11 +1823,13 @@ class ConductorRun(NativeRun):
         self.active_tool_choice = (
             self.tool_choice if role == "Worker" and self._tool_rounds == 0 else None
         )
+        self.active_controls = self.controls if role == "Worker" else {}
         try:
             text, calls = _model_completion(model, messages, self.tools)
         finally:
             self.active_response_format = None
             self.active_tool_choice = None
+            self.active_controls = {}
         if calls:
             asst = {
                 "role": "assistant",
@@ -2017,6 +2024,15 @@ def create_run(mode: str, body: dict[str, Any]) -> NativeRun:
         run = TrinityRun(run_id, messages, tools, slot_models=slot_models)
     run.tool_choice = body.get("tool_choice")
     run.response_format = body.get("response_format")
+    output_limit = body.get("max_completion_tokens", body.get("max_tokens"))
+    if output_limit is not None:
+        run.controls["max_tokens"] = output_limit
+    if body.get("reasoning"):
+        run.controls["reasoning"] = body["reasoning"]
+    elif body.get("reasoning_effort") is not None:
+        run.controls["reasoning_effort"] = body["reasoning_effort"]
+    if body.get("web_search_options") is not None:
+        run.controls["web_search_options"] = body["web_search_options"]
     _register_run(run)
     return run
 

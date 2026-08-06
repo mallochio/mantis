@@ -102,6 +102,11 @@ image format you send.
 format to answer-producing workers and validates the final JSON with
 `jsonschema`; invalid output fails instead of being returned as structured data.
 
+Standard `max_tokens`/`max_completion_tokens`, `reasoning`/`reasoning_effort`,
+and `web_search_options` controls are passed to answer workers. Support depends
+on the configured provider and worker model; Mantis does not implement its own
+reasoning engine or search crawler.
+
 ## Configuration
 
 | Variable | Purpose | Default |
@@ -135,10 +140,8 @@ sticky sessions for in-flight tool loops.
 - `GET /health` — public health check
 - `GET /v1/models` — authenticated model list
 - `POST /v1/chat/completions` — authenticated OpenAI-compatible completion
-- `GET|POST /v1/warm?mode=trinity|conductor` — preload a coordinator
 
-The optional top-level `mantis` response field contains compact orchestration
-metadata. Standard clients safely ignore it.
+Internal routing and worker metadata are not returned to clients.
 
 ## Artifacts
 
@@ -156,13 +159,14 @@ Large checkpoints and generated outputs remain outside Git.
 ## Verify
 
 ```bash
-python -m pytest -q
-python -m ruff check .
+uv run pytest tests -q
+uv run ruff check .
+uv run mypy openfugu-patch scripts --exclude outputs
 ./scripts/verify.sh
 ```
 
-`tests/test_serve.py` checks ordinary completions, standard tool-call
-continuation, authentication, request limits, and OpenAI SSE framing.
+`tests/test_api.py` and `tests/test_serve.py` check completions, tools, images,
+structured output, usage, authentication, request limits, and SSE framing.
 
 ## Security
 
