@@ -15,6 +15,7 @@ from typing import Any, Literal, cast
 
 import serve
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi import Request as HttpRequest
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -241,7 +242,33 @@ def _advance(request: ChatRequest, body: dict[str, Any]) -> tuple[Any, str, dict
     return run, run_id, event
 
 
-def _complete(request: ChatRequest) -> dict[str, Any]:
+_DETAIL_LEVELS = ("none", "summary", "debug")
+
+
+def _detail_level(headers: dict[str, str] | None) -> str:
+    value = (headers or {}).get("x-mantis-details", "none").strip().lower()
+    if value == "debug" and os.environ.get("MANTIS_ALLOW_DEBUG_TRACE", "0") != "1":
+        return "summary"
+    return value if value in _DETAIL_LEVELS else "none"
+
+
+def _mantis_headers(mantis: dict[str, Any], body: dict[str, Any]) -> dict[str, str]:
+    headers = {
+        "X-Mantis-Run-Id": str(mantis.get("run_id", "")),
+        "X-Mantis-Mode": str(mantis.get("mode", "")),
+        "X-Mantis-Outcome": str(mantis.get("outcome", "")),
+    }
+    duration = mantis.get("duration_ms")
+    if isinstance(duration, (int, float)):
+        headers["X-Mantis-Duration-Ms"] = str(int(duration))
+    cost = mantis.get("usage", {}).get("total")
+    if isinstance(cost, (int, float)):
+        headers["X-Mantis-Cost-Usd"] = f"{cost:.6f}"
+    return headers
+
+
+def _complete(request: ChatRequest, headers: dict[str, str] | None = None) -> dict[str, Any]:
+    detail_level = _detail_level(headers)
     body = request.model_dump(exclude_none=True, by_alias=True)
     run_id: str | None = None
     try:
@@ -262,7 +289,9 @@ def _complete(request: ChatRequest) -> dict[str, Any]:
         except ValueError as error:
             serve.delete_run(run_id)
             raise HTTPException(502, str(error)) from error
-    response = serve._completion_response(request.model, body["messages"], run, event)
+    response = serve._completion_response(
+        request.model, body["messages"], run, event, details=detail_level
+    )
     if event.get("type") == "final":
         serve.delete_run(run_id)
     return response
@@ -323,17 +352,21 @@ def _sse(body: dict[str, Any], include_usage: bool) -> Iterator[bytes]:
     yield chunk({}, choice["finish_reason"])
     if include_usage:
         yield f"data: {json.dumps({**base, 'choices': [], 'usage': body['usage']})}\n\n".encode()
+    if body.get("mantis"):
+        yield f"data: {json.dumps({**base, 'choices': [], 'mantis': body['mantis']})}\n\n".encode()
     yield b"data: [DONE]\n\n"
 
 
-def _stream(request: ChatRequest) -> Iterator[bytes]:
+def _stream(request: ChatRequest, headers: dict[str, str] | None = None) -> Iterator[bytes]:
     results: queue.Queue[dict[str, Any] | HTTPException] = queue.Queue(maxsize=1)
 
     def complete() -> None:
         try:
-            results.put(_complete(request))
+            results.put(_complete(request, headers))
         except HTTPException as error:
             results.put(error)
+        except Exception as error:  # noqa: BLE001 - never leave the stream hanging
+            results.put(HTTPException(502, f"orchestration failed: {error}"))
         finally:
             _capacity.release()
 
@@ -424,19 +457,23 @@ def models() -> dict[str, Any]:
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(_authorize)])
-def chat(request: ChatRequest, response: Response) -> Response:
+def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Response:
     request_id = uuid.uuid4().hex
     response.headers["X-Request-Id"] = request_id
+    headers = dict(http.headers)
     if not _capacity.acquire(blocking=False):
         return _error(429, "Mantis is at capacity", "rate_limit_error")
     if request.stream:
         return StreamingResponse(
-            _stream(request),
+            _stream(request, headers),
             media_type="text/event-stream",
             headers={"X-Request-Id": request_id, "X-Mantis-Streaming": "buffered"},
         )
     try:
-        body = _complete(request)
-        return JSONResponse(body, headers={"X-Request-Id": request_id})
+        body = _complete(request, headers)
+        extra = _mantis_headers(body.get("mantis", {}), body) if body.get("mantis") else {}
+        return JSONResponse(
+            body, headers={"X-Request-Id": request_id, **extra}
+        )
     finally:
         _capacity.release()

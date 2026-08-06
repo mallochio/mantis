@@ -209,8 +209,24 @@ def _provider_response(
                     f"{attempt} returned HTTP {status}: {error.response.text[:500]}"
                 ) from error
             failures.append(f"{attempt}: HTTP {status}")
+            run_record = getattr(_history_context, "active_run", None)
+            if run_record is not None:
+                run_record.record_activity(
+                    "failover",
+                    model=attempt,
+                    status="failed",
+                    attempt=index + 1,
+                )
         except (httpx.TimeoutException, httpx.ConnectError) as error:
             failures.append(f"{attempt}: {type(error).__name__}")
+            run_record = getattr(_history_context, "active_run", None)
+            if run_record is not None:
+                run_record.record_activity(
+                    "failover",
+                    model=attempt,
+                    status="failed",
+                    attempt=index + 1,
+                )
     else:
         raise RuntimeError(f"{spec} failed on every pool worker: " + "; ".join(failures))
     if not isinstance(data, dict):
@@ -287,6 +303,120 @@ def _usage_cost(usage_models: dict[str, dict[str, int]]) -> float | None:
             return None
         cost += tokens["prompt_tokens"] * price[0] + tokens["completion_tokens"] * price[1]
     return round(cost, 6)
+
+
+def _activity_summary(activity_type: str, role: str | None = None) -> str:
+    """Deterministic one-line label for an orchestration activity."""
+    label = {
+        "step": {
+            "Planner": "Planned the workflow",
+            "Thinker": "Analyzed the task",
+            "Verifier": "Verified the answer",
+            "Worker": "Drafted the answer",
+        }.get(role or "", "Called a model"),
+        "tool_call": "Requested a tool call",
+        "tool_result": "Processed a tool result",
+        "failover": "Provider failed; switched to the next configured model",
+        "verify_accept": "Final answer accepted by verifier",
+        "verify_reject": "Verifier rejected the draft; requesting revision",
+        "retry": "Retrying the step",
+        "complete": "Run completed",
+        "error": "Run ended with an error",
+    }.get(activity_type, "Orchestration step")
+    return label
+
+
+def _cost_breakdown(usage_models: dict[str, dict[str, int]]) -> dict[str, Any]:
+    """Per-model and aggregate cost with an explicit known flag."""
+    if not usage_models:
+        return {"total": None, "known": False, "source": "unavailable", "models": []}
+    prices = _price_map()
+    models: list[dict[str, Any]] = []
+    total = 0.0
+    known = True
+    for model, tokens in usage_models.items():
+        price = prices.get(model)
+        if price is None:
+            known = False
+            models.append(
+                {
+                    "model": model,
+                    "prompt_tokens": tokens["prompt_tokens"],
+                    "completion_tokens": tokens["completion_tokens"],
+                    "cost": None,
+                    "source": "unknown",
+                }
+            )
+            continue
+        cost = tokens["prompt_tokens"] * price[0] + tokens["completion_tokens"] * price[1]
+        total += cost
+        models.append(
+            {
+                "model": model,
+                "prompt_tokens": tokens["prompt_tokens"],
+                "completion_tokens": tokens["completion_tokens"],
+                "cost": round(cost, 6),
+                "source": "price_table",
+            }
+        )
+    return {
+        "total": round(total, 6) if known else None,
+        "known": known,
+        "source": "price_table" if known else "partial",
+        "models": models,
+    }
+
+
+def _run_mantis_details(run: Any, level: str) -> dict[str, Any]:
+    """Build the additive `mantis` response object for the given detail level."""
+    steps = list(getattr(run, "turns", getattr(run, "steps", [])))
+    recorded = list(getattr(run, "_activity", []))
+    activity: list[dict[str, Any]] = []
+    if recorded:
+        keep = None if level == "debug" else ("type", "role", "model", "status", "summary")
+        activity = [
+            dict(entry) if keep is None else {k: v for k, v in entry.items() if k in keep}
+            for entry in recorded
+            if any(v is not None for v in entry.values())
+        ]
+    else:
+        for step in steps:
+            role = str(step.get("role", ""))
+            entry = {
+                "type": "step",
+                "role": role,
+                "model": step.get("model_name"),
+                "status": "completed",
+                "summary": _activity_summary("step", role),
+            }
+            activity.append(entry)
+        activity.extend(
+            {
+                "type": "tool_result",
+                "status": "failed" if item.get("is_error") else "completed",
+                "summary": _activity_summary("tool_result"),
+            }
+            for item in getattr(run, "tool_observations", [])
+        )
+    if activity and activity[-1].get("type") != "complete":
+        activity.append(
+            {
+                "type": "complete",
+                "status": "completed",
+                "summary": _activity_summary("complete"),
+            }
+        )
+    started = getattr(run, "_started_monotonic", None)
+    duration_ms = round((time.monotonic() - started) * 1000.0, 1) if started else None
+    outcome = str(getattr(run, "terminated_by", "") or "")
+    return {
+        "run_id": getattr(run, "run_id", ""),
+        "mode": getattr(run, "kind", ""),
+        "outcome": outcome,
+        "duration_ms": duration_ms,
+        "activity": activity,
+        "usage": _cost_breakdown(getattr(run, "usage_models", {})),
+    }
 
 
 class RejectAwareRouter:
@@ -1030,7 +1160,11 @@ def _run_trace(run: Any) -> dict[str, Any]:
 
 
 def _completion_response(
-    model: str, messages: list[dict[str, Any]], run: Any, event: dict[str, Any]
+    model: str,
+    messages: list[dict[str, Any]],
+    run: Any,
+    event: dict[str, Any],
+    details: str = "none",
 ) -> dict[str, Any]:
     completion_id = "chatcmpl-" + uuid.uuid4().hex[:24]
     message: dict[str, Any] = {"role": "assistant", "content": None}
@@ -1067,7 +1201,7 @@ def _completion_response(
     cost = _usage_cost(getattr(run, "usage_models", {}))
     if cost is not None:
         usage["cost"] = cost
-    return {
+    body: dict[str, Any] = {
         "id": completion_id,
         "object": "chat.completion",
         "created": int(time.time()),
@@ -1075,6 +1209,9 @@ def _completion_response(
         "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
         "usage": usage,
     }
+    if details != "none":
+        body["mantis"] = _run_mantis_details(run, details)
+    return body
 
 
 
@@ -1585,6 +1722,32 @@ class NativeRun:
             "total_tokens": 0,
         }
         self.usage_models: dict[str, dict[str, int]] = {}
+        self._activity: list[dict[str, Any]] = []
+        self._started_monotonic = time.monotonic()
+
+    def record_activity(
+        self,
+        activity_type: str,
+        *,
+        role: str | None = None,
+        model: str | None = None,
+        status: str = "completed",
+        duration_ms: float | None = None,
+        summary: str | None = None,
+        attempt: int | None = None,
+    ) -> None:
+        entry: dict[str, Any] = {
+            "type": activity_type,
+            "role": role,
+            "model": model,
+            "status": status,
+            "summary": summary or _activity_summary(activity_type, role),
+        }
+        if duration_ms is not None:
+            entry["duration_ms"] = round(duration_ms, 1)
+        if attempt is not None:
+            entry["attempt"] = attempt
+        self._activity.append(entry)
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
@@ -1842,14 +2005,32 @@ class TrinityRun(NativeRun):
         )
         self.active_controls = self.controls if role == "Worker" else {}
         self.capture_metadata = role == "Worker"
+        started = time.monotonic()
         try:
             text, calls = _model_completion(model, messages, self.tools)
+            duration_ms = (time.monotonic() - started) * 1000.0
+        except Exception:
+            self.record_activity(
+                "step",
+                role=role,
+                model=model,
+                status="failed",
+                duration_ms=(time.monotonic() - started) * 1000.0,
+            )
+            raise
         finally:
             self.active_response_format = None
             self.active_tool_choice = None
             self.active_controls = {}
             self.capture_metadata = False
+        self.record_activity(
+            "step",
+            role=role,
+            model=model,
+            duration_ms=duration_ms,
+        )
         if calls:
+            self.record_activity("tool_call", role=role, model=model)
             asst: dict[str, Any] = {
                 "role": "assistant",
                 "content": text,
@@ -1882,6 +2063,13 @@ class TrinityRun(NativeRun):
             raise RuntimeError("no pending tool call")  # noqa: TRY301
         tool_results = _validate_tool_results(tool_results, self._expected_ids)
         self.record_tool_results(pending, tool_results)
+        failed = any(bool(result.get("is_error")) for result in tool_results)
+        self.record_activity(
+            "tool_result",
+            role=str(pending.get("role") or ""),
+            model=str(pending.get("model") or pending.get("model_name") or ""),
+            status="failed" if failed else "completed",
+        )
         self._tool_rounds += 1
         if self._tool_rounds > MAX_TOOL_ROUNDS:
             raise ValueError(f"exceeded max tool rounds per step ({MAX_TOOL_ROUNDS})")
@@ -2057,14 +2245,32 @@ class ConductorRun(NativeRun):
         )
         self.active_controls = self.controls if role == "Worker" else {}
         self.capture_metadata = is_final_worker
+        started = time.monotonic()
         try:
             text, calls = _model_completion(model, messages, self.tools)
+            duration_ms = (time.monotonic() - started) * 1000.0
+        except Exception:
+            self.record_activity(
+                "step",
+                role=role,
+                model=model,
+                status="failed",
+                duration_ms=(time.monotonic() - started) * 1000.0,
+            )
+            raise
         finally:
             self.active_response_format = None
             self.active_tool_choice = None
             self.active_controls = {}
             self.capture_metadata = False
+        self.record_activity(
+            "step",
+            role=role,
+            model=model,
+            duration_ms=duration_ms,
+        )
         if calls:
+            self.record_activity("tool_call", role=role, model=model)
             asst = {
                 "role": "assistant",
                 "content": text,
@@ -2155,6 +2361,13 @@ class ConductorRun(NativeRun):
             raise RuntimeError("no pending tool call")  # noqa: TRY301
         tool_results = _validate_tool_results(tool_results, self._expected_ids)
         self.record_tool_results(pending, tool_results)
+        failed = any(bool(result.get("is_error")) for result in tool_results)
+        self.record_activity(
+            "tool_result",
+            role=str(pending.get("role") or ""),
+            model=str(pending.get("model") or pending.get("model_name") or ""),
+            status="failed" if failed else "completed",
+        )
         self._tool_rounds += 1
         if self._tool_rounds > MAX_TOOL_ROUNDS:
             raise ValueError(f"exceeded max tool rounds per step ({MAX_TOOL_ROUNDS})")

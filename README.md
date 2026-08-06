@@ -127,6 +127,7 @@ reasoning engine or search crawler.
 | `MANTIS_RUN_STORE` | Run state backend: `memory` or optional `redis` | `memory` |
 | `MANTIS_REDIS_URL` | Redis URL when `MANTIS_RUN_STORE=redis` | unset |
 | `MANTIS_REDIS_PREFIX` | Key namespace for shared Redis state | `mantis:run:` |
+| `MANTIS_ALLOW_DEBUG_TRACE` | Allow `X-Mantis-Details: debug` responses | `0` |
 | `MANTIS_MAX_CONCURRENT_RUNS` | Bounded tool-run count per backend | `32` |
 | `MANTIS_MAX_CONCURRENT_REQUESTS` | Concurrent HTTP request limit; excess receives `429` | `32` |
 | `MANTIS_SSE_KEEPALIVE_SECONDS` | SSE keep-alive interval during orchestration | `10` |
@@ -150,7 +151,42 @@ private Redis deployment; run one replica with the memory backend.
 - `GET /v1/models` — authenticated model list
 - `POST /v1/chat/completions` — authenticated OpenAI-compatible completion
 
-Internal routing and worker metadata are not returned to clients.
+By default the response is a plain OpenAI-compatible completion; internal
+routing and worker metadata are not returned. Send the opt-in header
+`X-Mantis-Details: summary` to add a deterministic orchestration summary in a
+`mantis` response object and matching `X-Mantis-Run-Id` / `X-Mantis-Mode` /
+`X-Mantis-Outcome` / `X-Mantis-Duration-Ms` / `X-Mantis-Cost-Usd` response
+headers:
+
+```json
+{
+  "mantis": {
+    "run_id": "...",
+    "mode": "trinity",
+    "outcome": "verifier_accept",
+    "duration_ms": 18420.0,
+    "activity": [
+      {"type": "step", "role": "Worker", "model": "...", "status": "completed", "summary": "Drafted the answer"},
+      {"type": "complete", "status": "completed", "summary": "Run completed"}
+    ],
+    "usage": {
+      "total": 0.0142,
+      "known": true,
+      "source": "price_table",
+      "models": [{"model": "...", "prompt_tokens": 5, "completion_tokens": 7, "cost": 0.0142, "source": "price_table"}]
+    }
+  }
+}
+```
+
+Activity summaries are derived deterministically from orchestration events
+(model calls, tool calls/results, retries/failovers, verification outcomes).
+They are not model-generated reasoning and contain no prompts, completions, or
+tool payloads. `X-Mantis-Details: debug` additionally exposes per-step timing
+and failover attempts; it is gated behind `MANTIS_ALLOW_DEBUG_TRACE=1`.
+Streaming requests with `stream_options.include_usage` emit a final `mantis`
+SSE frame before `[DONE]` when details are requested.
+
 `/v1/models` descriptors report `context_length` and `max_completion_tokens`, both env-configurable via `MANTIS_CONTEXT_LENGTH` and `MANTIS_MAX_COMPLETION_TOKENS`; downstream cost is reported per request in `usage.cost`.
 
 ## Artifacts
