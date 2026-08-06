@@ -1,5 +1,7 @@
 """Provider-facing HTTP contract tests."""
 
+import json
+import time
 from types import SimpleNamespace
 
 import api
@@ -41,7 +43,7 @@ def test_auth_health_and_validation(client, monkeypatch):
         headers=_headers(),
         json={"model": "mantis", "messages": [], "unknown": True},
     )
-    assert bad.status_code == 422
+    assert bad.status_code == 400
     no_tools = client.post(
         "/v1/chat/completions",
         headers=_headers(),
@@ -51,7 +53,7 @@ def test_auth_health_and_validation(client, monkeypatch):
             "tool_choice": "required",
         },
     )
-    assert no_tools.status_code == 422
+    assert no_tools.status_code == 400
     invalid_role_fields = [
         {"role": "tool", "content": "x"},
         {"role": "user", "content": "x", "tool_calls": []},
@@ -62,7 +64,7 @@ def test_auth_health_and_validation(client, monkeypatch):
             headers=_headers(),
             json={"model": "mantis", "messages": [message]},
         )
-        assert response.status_code == 422
+        assert response.status_code == 400
     invalid_requests = [
         {"stream_options": {"include_usage": True}},
         {"max_tokens": 1, "max_completion_tokens": 1},
@@ -78,7 +80,7 @@ def test_auth_health_and_validation(client, monkeypatch):
                 **extra,
             },
         )
-        assert response.status_code == 422
+        assert response.status_code == 400
 
 
 def test_completion_uses_aggregate_usage_and_hides_trace(client, monkeypatch):
@@ -149,6 +151,49 @@ def test_buffered_stream_includes_usage(client, monkeypatch):
     assert response.headers["x-mantis-streaming"] == "buffered"
     assert '"choices": []' in response.text
     assert response.text.endswith("data: [DONE]\n\n")
+
+
+def test_stream_sends_keepalive_while_waiting(client, monkeypatch):
+    run = _run()
+
+    def advance(*_args):
+        time.sleep(0.03)
+        return {"type": "final", "text": "answer"}
+
+    monkeypatch.setattr(api, "_KEEPALIVE_SECONDS", 0.005)
+    monkeypatch.setattr(serve, "create_run", lambda *_a: run)
+    monkeypatch.setattr(serve, "_advance_to_boundary", advance)
+    monkeypatch.setattr(serve, "delete_run", lambda *_a: True)
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "mantis",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    assert ": keep-alive\n\n" in response.text
+
+
+def test_stream_reports_errors_after_headers(client, monkeypatch):
+    monkeypatch.setattr(
+        api,
+        "_complete",
+        lambda _request: (_ for _ in ()).throw(api.HTTPException(502, "failed")),
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "mantis",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+    )
+    events = [line[6:] for line in response.text.splitlines() if line.startswith("data: {")]
+    assert json.loads(events[0])["choices"][0]["finish_reason"] == "error"
 
 
 def test_api_maps_run_errors(client, monkeypatch):
@@ -298,6 +343,19 @@ def test_invalid_structured_output_returns_502(client, monkeypatch):
     )
     assert response.status_code == 502
     assert "schema mismatch" in response.json()["error"]["message"]
+
+
+def test_body_limit_returns_413():
+    limited = api.FastAPI()
+    limited.add_middleware(api.BodyLimitMiddleware, max_bytes=10)
+
+    @limited.post("/")
+    async def endpoint():
+        return {"ok": True}
+
+    response = TestClient(limited).post("/", content=b"x" * 11)
+    assert response.status_code == 413
+    assert response.json()["error"]["type"] == "invalid_request_error"
 
 
 def test_capacity_returns_429(client, monkeypatch):

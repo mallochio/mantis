@@ -169,6 +169,13 @@ def _provider_response(
         raise TypeError(f"{spec} returned a non-object response")
     if run is not None:
         run.add_usage(data.get("usage"))
+        message = (data.get("choices") or [{}])[0].get("message", {})
+        if run.capture_metadata and isinstance(message, dict):
+            run.response_metadata = {
+                key: message[key]
+                for key in ("reasoning", "reasoning_details", "annotations", "citations")
+                if message.get(key) is not None
+            }
     return data
 
 
@@ -938,6 +945,7 @@ def _completion_response(
         completion_text = "".join(call["function"]["arguments"] for call in message["tool_calls"])
     else:
         message["content"] = str(event.get("text", ""))
+        message.update(getattr(run, "response_metadata", {}))
         finish_reason = "stop"
         completion_text = message["content"]
     usage = dict(getattr(run, "usage", {}))
@@ -1378,6 +1386,8 @@ class NativeRun:
         self.active_response_format: dict[str, Any] | None = None
         self.controls: dict[str, Any] = {}
         self.active_controls: dict[str, Any] = {}
+        self.capture_metadata = False
+        self.response_metadata: dict[str, Any] = {}
         self.usage: dict[str, Any] = {
             "prompt_tokens": 0,
             "completion_tokens": 0,
@@ -1619,12 +1629,14 @@ class TrinityRun(NativeRun):
             self.tool_choice if role == "Worker" and self._tool_rounds == 0 else None
         )
         self.active_controls = self.controls if role == "Worker" else {}
+        self.capture_metadata = role == "Worker"
         try:
             text, calls = _model_completion(model, messages, self.tools)
         finally:
             self.active_response_format = None
             self.active_tool_choice = None
             self.active_controls = {}
+            self.capture_metadata = False
         if calls:
             asst: dict[str, Any] = {
                 "role": "assistant",
@@ -1824,12 +1836,14 @@ class ConductorRun(NativeRun):
             self.tool_choice if role == "Worker" and self._tool_rounds == 0 else None
         )
         self.active_controls = self.controls if role == "Worker" else {}
+        self.capture_metadata = is_final_worker
         try:
             text, calls = _model_completion(model, messages, self.tools)
         finally:
             self.active_response_format = None
             self.active_tool_choice = None
             self.active_controls = {}
+            self.capture_metadata = False
         if calls:
             asst = {
                 "role": "assistant",

@@ -5,13 +5,15 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import queue
 import threading
 import uuid
 from collections.abc import Iterator
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import serve
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -153,8 +155,47 @@ class ChatRequest(BaseModel):
 
 
 _MAX_REQUESTS = int(os.environ.get("MANTIS_MAX_CONCURRENT_REQUESTS", "32"))
+_MAX_BODY_BYTES = int(os.environ.get("MANTIS_MAX_BODY_BYTES", str(5 * 1024 * 1024)))
+_KEEPALIVE_SECONDS = float(os.environ.get("MANTIS_SSE_KEEPALIVE_SECONDS", "10"))
 _capacity = threading.BoundedSemaphore(_MAX_REQUESTS)
+
+
+class BodyLimitMiddleware:
+    def __init__(self, app: Any, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = dict(scope.get("headers", []))
+        content_length = headers.get(b"content-length")
+        if content_length and int(content_length) > self.max_bytes:
+            await _error(413, "request body exceeds limit", "invalid_request_error")(
+                scope, receive, send
+            )
+            return
+        received = 0
+
+        async def limited_receive() -> dict:
+            nonlocal received
+            message = cast(dict[str, Any], await receive())
+            received += len(message.get("body", b""))
+            if received > self.max_bytes:
+                raise OverflowError
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send)
+        except OverflowError:
+            await _error(413, "request body exceeds limit", "invalid_request_error")(
+                scope, receive, send
+            )
+
+
 app = FastAPI(title="Mantis", version="0.3.0")
+app.add_middleware(BodyLimitMiddleware, max_bytes=_MAX_BODY_BYTES)
 
 
 def _error(status: int, message: str, error_type: str) -> JSONResponse:
@@ -238,6 +279,44 @@ def _sse(body: dict[str, Any], include_usage: bool) -> Iterator[bytes]:
     yield b"data: [DONE]\n\n"
 
 
+def _stream(request: ChatRequest) -> Iterator[bytes]:
+    results: queue.Queue[dict[str, Any] | HTTPException] = queue.Queue(maxsize=1)
+
+    def complete() -> None:
+        try:
+            results.put(_complete(request))
+        except HTTPException as error:
+            results.put(error)
+        finally:
+            _capacity.release()
+
+    threading.Thread(target=complete, daemon=True).start()
+    while True:
+        try:
+            result = results.get(timeout=_KEEPALIVE_SECONDS)
+            break
+        except queue.Empty:
+            yield b": keep-alive\n\n"
+    if isinstance(result, HTTPException):
+        payload = {
+            "error": {"message": str(result.detail), "type": "upstream_error"},
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+        }
+        yield f"data: {json.dumps(payload)}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+        return
+    yield from _sse(
+        result,
+        bool(request.stream_options and request.stream_options.include_usage),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+def validation_error(_request: Any, error: RequestValidationError) -> JSONResponse:
+    message = "; ".join(str(item.get("msg", "invalid request")) for item in error.errors())
+    return _error(400, message, "invalid_request_error")
+
+
 @app.exception_handler(HTTPException)
 def http_error(_request: Any, error: HTTPException) -> JSONResponse:
     error_type = "authentication_error" if error.status_code == 401 else "invalid_request_error"
@@ -271,14 +350,14 @@ def chat(request: ChatRequest, response: Response) -> Response:
     response.headers["X-Request-Id"] = request_id
     if not _capacity.acquire(blocking=False):
         return _error(429, "Mantis is at capacity", "rate_limit_error")
-    try:
-        body = _complete(request)
-    finally:
-        _capacity.release()
     if request.stream:
         return StreamingResponse(
-            _sse(body, bool(request.stream_options and request.stream_options.include_usage)),
+            _stream(request),
             media_type="text/event-stream",
             headers={"X-Request-Id": request_id, "X-Mantis-Streaming": "buffered"},
         )
-    return JSONResponse(body, headers={"X-Request-Id": request_id})
+    try:
+        body = _complete(request)
+        return JSONResponse(body, headers={"X-Request-Id": request_id})
+    finally:
+        _capacity.release()

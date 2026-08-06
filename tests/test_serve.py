@@ -133,6 +133,45 @@ def test_direct_provider_completions(monkeypatch):
     assert calls == [{"id": "call-1", "name": "read", "arguments": {"path": "README.md"}}]
 
 
+def test_provider_metadata_is_captured_for_public_response(monkeypatch):
+    class Response:
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "answer",
+                            "reasoning_details": [{"type": "summary", "text": "checked"}],
+                            "citations": [{"url": "https://example.test"}],
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+            }
+
+    run = serve.NativeRun("metadata")
+    run.capture_metadata = True
+    serve._history_context.active_run = run
+    monkeypatch.setenv("OPENROUTER_API_KEY", "provider-key")
+    monkeypatch.setattr(serve, "_provider_client", SimpleNamespace(post=lambda *_a, **_k: Response()))
+    try:
+        serve._provider_response("openrouter/model", [], 10, 0.7)
+    finally:
+        serve._history_context.active_run = None
+    body = serve._completion_response(
+        "mantis", [], run, {"type": "final", "text": "answer"}
+    )
+    message = body["choices"][0]["message"]
+    assert message["reasoning_details"][0]["text"] == "checked"
+    assert message["citations"][0]["url"] == "https://example.test"
+
+
 def test_split_messages():
     assert serve._split_messages([{"role": "user", "content": "hi"}]) == ("hi", [])
     content = [

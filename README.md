@@ -56,9 +56,10 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-`stream=True` returns standard `text/event-stream` Chat Completions chunks and
-ends with `data: [DONE]`. Streaming is currently buffered until orchestration
-finishes; responses include `X-Mantis-Streaming: buffered`.
+`stream=True` returns standard `text/event-stream` Chat Completions chunks,
+sends SSE keep-alive comments during hidden orchestration, and ends with
+`data: [DONE]`. Answer content is buffered until orchestration verifies the
+final response; responses include `X-Mantis-Streaming: buffered`.
 
 ## Agent tools
 
@@ -126,6 +127,8 @@ reasoning engine or search crawler.
 | `MANTIS_RUN_TTL` | Idle tool-run lifetime in seconds | `600` |
 | `MANTIS_MAX_CONCURRENT_RUNS` | Bounded in-memory tool-run count | `32` |
 | `MANTIS_MAX_CONCURRENT_REQUESTS` | Concurrent HTTP request limit; excess receives `429` | `32` |
+| `MANTIS_SSE_KEEPALIVE_SECONDS` | SSE keep-alive interval during orchestration | `10` |
+| `MANTIS_MAX_BODY_BYTES` | Maximum request body size | `5242880` |
 
 Supported hosted model prefixes are currently `openrouter/` and `opencode-go/`.
 Reasoning effort is appended with `|`, for example
