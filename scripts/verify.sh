@@ -9,16 +9,20 @@ TOKEN="${MANTIS_API_KEY:-}"
 [[ -n "$TOKEN" ]] || { echo "ERROR: set MANTIS_API_KEY" >&2; exit 1; }
 BASE="${MANTIS_URL:-http://127.0.0.1:8088/v1}"
 
-echo "1/3 health..."
+echo "1/4 health..."
 curl -fsS "${BASE%/v1}/health" | grep -q '"status": "ok"\|"status":"ok"'
 echo "  OK"
 
-echo "2/3 models..."
+echo "2/4 readiness..."
+curl -fsS "${BASE%/v1}/ready" | grep -q '"status": "ready"\|"status":"ready"'
+echo "  OK"
+
+echo "3/4 models..."
 curl -fsS "$BASE/models" -H "Authorization: Bearer $TOKEN" \
   | grep -q 'mantis-ultra'
 echo "  OK"
 
-echo "3/3 chat completions..."
+echo "4/4 chat completions..."
 curl -fsS "$BASE/chat/completions" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \

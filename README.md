@@ -140,7 +140,8 @@ sticky sessions for in-flight tool loops.
 
 ## API
 
-- `GET /health` — public health check
+- `GET /health` — public liveness check
+- `GET /ready` — public configuration readiness check
 - `GET /v1/models` — authenticated model list
 - `POST /v1/chat/completions` — authenticated OpenAI-compatible completion
 

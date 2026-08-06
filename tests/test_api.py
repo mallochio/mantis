@@ -8,6 +8,7 @@ import api
 import pytest
 import serve
 from fastapi.testclient import TestClient
+from openai import OpenAI
 
 
 @pytest.fixture
@@ -33,9 +34,11 @@ def _run():
 
 def test_auth_health_and_validation(client, monkeypatch):
     assert client.get("/health").status_code == 200
+    assert client.get("/ready").status_code == 200
     assert client.get("/v1/models").status_code == 401
     assert client.get("/v1/models", headers=_headers()).status_code == 200
     monkeypatch.delenv("MANTIS_API_KEY")
+    assert client.get("/ready").status_code == 503
     assert client.get("/v1/models", headers=_headers()).status_code == 503
     monkeypatch.setenv("MANTIS_API_KEY", "test-key")
     bad = client.post(
@@ -356,6 +359,24 @@ def test_body_limit_returns_413():
     response = TestClient(limited).post("/", content=b"x" * 11)
     assert response.status_code == 413
     assert response.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_official_openai_sdk_contract(client, monkeypatch):
+    run = _run()
+    monkeypatch.setattr(serve, "create_run", lambda *_a: run)
+    monkeypatch.setattr(
+        serve, "_advance_to_boundary", lambda *_a: {"type": "final", "text": "answer"}
+    )
+    monkeypatch.setattr(serve, "delete_run", lambda *_a: True)
+    sdk = OpenAI(api_key="test-key", base_url="http://testserver/v1", http_client=client)
+    completion = sdk.chat.completions.create(
+        model="mantis", messages=[{"role": "user", "content": "hi"}]
+    )
+    assert completion.choices[0].message.content == "answer"
+    with sdk.chat.completions.create(
+        model="mantis", messages=[{"role": "user", "content": "hi"}], stream=True
+    ) as stream:
+        assert "".join(chunk.choices[0].delta.content or "" for chunk in stream) == "answer"
 
 
 def test_capacity_returns_429(client, monkeypatch):

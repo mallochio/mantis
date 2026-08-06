@@ -156,7 +156,10 @@ def _provider_response(
     response_format = getattr(run, "active_response_format", None)
     if response_format is not None:
         body["response_format"] = response_format
-    body.update(getattr(run, "active_controls", None) or {})
+    controls = getattr(run, "active_controls", None) or {}
+    if "reasoning" in controls:
+        body.pop("reasoning_effort", None)
+    body.update(controls)
     try:
         response = _provider_client.post(url, headers=headers, json=body)
         response.raise_for_status()

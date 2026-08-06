@@ -42,6 +42,7 @@ eval = [
     "pyyaml>=6",
 ]
 dev = [
+    "openai>=1.60,<3",
     "ruff>=0.5",
     "mypy>=1.11",
     "pytest>=8",

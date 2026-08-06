@@ -8,7 +8,8 @@ import os
 import queue
 import threading
 import uuid
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from typing import Any, Literal, cast
 
 import serve
@@ -194,7 +195,13 @@ class BodyLimitMiddleware:
             )
 
 
-app = FastAPI(title="Mantis", version="0.3.0")
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    yield
+    serve._provider_client.close()
+
+
+app = FastAPI(title="Mantis", version="0.3.0", lifespan=lifespan)
 app.add_middleware(BodyLimitMiddleware, max_bytes=_MAX_BODY_BYTES)
 
 
@@ -331,6 +338,14 @@ def http_error(_request: Any, error: HTTPException) -> JSONResponse:
 def health(response: Response) -> dict[str, Any]:
     response.headers["X-Request-Id"] = uuid.uuid4().hex
     return {"status": "ok", "model": serve.MODEL_NAME}
+
+
+@app.get("/ready")
+def ready(response: Response) -> dict[str, Any]:
+    response.headers["X-Request-Id"] = uuid.uuid4().hex
+    if not os.environ.get("MANTIS_API_KEY"):
+        raise HTTPException(503, "MANTIS_API_KEY is not configured")
+    return {"status": "ready", "model": serve.MODEL_NAME}
 
 
 @app.get("/v1/models", dependencies=[Depends(_authorize)])
