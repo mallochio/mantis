@@ -40,40 +40,6 @@ mkdir -p "$ROUTER_LOG_DIR"
 chmod 700 "$DATA_DIR" "$ROUTER_LOG_DIR"
 export MANTIS_DATA_DIR="$DATA_DIR"
 
-# --- LiteLLM proxy ---
-export LITELLM_DIR="${LITELLM_DIR:-$HOME/.config/litellm}"
-export LITELLM_BASE="${LITELLM_BASE:-http://127.0.0.1:3001/v1}"
-export LITELLM_KEY="${LITELLM_KEY:-sk-mundial}"
-export LITELLM_AUTO_START="${LITELLM_AUTO_START:-1}"
-LITELLM_HEALTH_URL="${LITELLM_BASE%/v1}/health/liveliness"
-
-if ! curl -fsS --max-time 3 "$LITELLM_HEALTH_URL" >/dev/null 2>&1; then
-  case "$LITELLM_BASE" in
-    http://127.0.0.1:3001/v1|http://localhost:3001/v1)
-      if [ "$LITELLM_AUTO_START" = "1" ]; then
-        if ! command -v docker >/dev/null 2>&1; then
-          echo 'ERROR: LiteLLM is down and Docker is not installed.' >&2
-          exit 1
-        fi
-        if [ ! -f "$LITELLM_DIR/docker-compose.yml" ]; then
-          echo "ERROR: LiteLLM compose file not found: $LITELLM_DIR/docker-compose.yml" >&2
-          exit 1
-        fi
-        echo "LiteLLM is down — starting it from $LITELLM_DIR"
-        (cd "$LITELLM_DIR" && docker compose up -d)
-        for _ in $(seq 1 60); do
-          curl -fsS --max-time 2 "$LITELLM_HEALTH_URL" >/dev/null 2>&1 && break
-          sleep 1
-        done
-      fi
-      ;;
-  esac
-fi
-if ! curl -fsS --max-time 3 "$LITELLM_HEALTH_URL" >/dev/null 2>&1; then
-  echo "ERROR: LiteLLM proxy is not healthy at $LITELLM_HEALTH_URL" >&2
-  exit 1
-fi
-
 # --- router ---
 . ./.venv/bin/activate
 # MF scoring uses OpenAI text-embedding-3-small; retrieve the key only here.
@@ -84,16 +50,24 @@ if [ -z "${OPENAI_API_KEY:-}" ]; then
   echo 'ERROR: OPENAI_API_KEY not set and not found in Keychain; MF scoring needs it for embeddings.' >&2
   exit 1
 fi
-export EXPENSIVE_BASE="${EXPENSIVE_BASE:-$LITELLM_BASE}"
-export EXPENSIVE_KEY="${EXPENSIVE_KEY:-$LITELLM_KEY}"
-export EXPENSIVE_MODEL="${EXPENSIVE_MODEL:-gpt-5.6-luna}"
-export EXPENSIVE_REASONING_EFFORT="${EXPENSIVE_REASONING_EFFORT:-xhigh}"
-export CHEAP_BASE="${CHEAP_BASE:-$LITELLM_BASE}"
-export CHEAP_KEY="${CHEAP_KEY:-$LITELLM_KEY}"
-export CHEAP_MODEL="${CHEAP_MODEL:-deepseek-v4-pro}"
-export CHEAP_REASONING_EFFORT="${CHEAP_REASONING_EFFORT:-xhigh}"
+export EXPENSIVE_BASE="${EXPENSIVE_BASE:-https://openrouter.ai/api/v1}"
+export EXPENSIVE_KEY="${EXPENSIVE_KEY:-${OPENROUTER_API_KEY:-}}"
+export EXPENSIVE_MODEL="${EXPENSIVE_MODEL:-openai/gpt-5.6-sol}"
+export EXPENSIVE_REASONING_EFFORT="${EXPENSIVE_REASONING_EFFORT:-medium}"
+export CHEAP_BASE="${CHEAP_BASE:-https://opencode.ai/zen/go/v1}"
+export CHEAP_KEY="${CHEAP_KEY:-${OPENCODE_API_KEY:-}}"
+export CHEAP_MODEL="${CHEAP_MODEL:-deepseek-v4-flash}"
+export CHEAP_REASONING_EFFORT="${CHEAP_REASONING_EFFORT:-}"
 export CHEAP_MAX_TOKENS="${CHEAP_MAX_TOKENS:-131072}"
-export ROUTELLM_CONTEXT_WINDOW="${ROUTELLM_CONTEXT_WINDOW:-auto}"
+if [ -z "$EXPENSIVE_KEY" ]; then
+  echo 'ERROR: EXPENSIVE_KEY or OPENROUTER_API_KEY required for the expensive backend.' >&2
+  exit 1
+fi
+if [ -z "$CHEAP_KEY" ]; then
+  echo 'ERROR: CHEAP_KEY or OPENCODE_API_KEY required for the cheap backend.' >&2
+  exit 1
+fi
+export ROUTELLM_CONTEXT_WINDOW="${ROUTELLM_CONTEXT_WINDOW:-262144}"
 export ROUTELLM_MAX_TOKENS="${ROUTELLM_MAX_TOKENS:-131072}"
 export ROUTELLM_ROUTER="${ROUTELLM_ROUTER:-mf}"
 # 0.156 = calibrated for 30% strong-model calls via RouteLLM.

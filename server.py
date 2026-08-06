@@ -1,28 +1,30 @@
 """RouteLLM coding-router server.
 
 Exposes one OpenAI-compatible model ("auto"). Requests are scored by the
-RouteLLM MF+Supra router and forwarded through a local LiteLLM proxy, which
-handles provider normalization, Responses API translation, and retries.
+RouteLLM MF+Supra router and forwarded directly to OpenRouter or OpenCode Go.
 
 Config via env:
   ROUTELLM_HOST=127.0.0.1
   ROUTELLM_PORT=5500
   ROUTELLM_KEY=sk-route-local          # bearer token clients must present
-  LITELLM_BASE=http://127.0.0.1:3001/v1
-  LITELLM_KEY=sk-mundial
+  EXPENSIVE_BASE=https://openrouter.ai/api/v1
+  EXPENSIVE_KEY=...
+  CHEAP_BASE=https://opencode.ai/zen/go/v1
+  CHEAP_KEY=...
   ROUTELLM_THRESHOLD=0.156
   ROUTELLM_ROUTER=mf
   ROUTELLM_USE_SUPRA=1
   ROUTELLM_SUPRA_THRESHOLD=3
-  EXPENSIVE_MODEL=gpt-5.6-luna
-  CHEAP_MODEL=deepseek-v4-pro
-  LOG_FILE=~/.local/share/mantis/router/decisions.log
+  EXPENSIVE_MODEL=openai/gpt-5.6-sol
+  CHEAP_MODEL=deepseek-v4-flash
+  LOG_FILE=~/.config/llm-router/logs/decisions.log
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from functools import lru_cache
@@ -46,20 +48,17 @@ ROUTELLM_CONTEXT_WINDOW = os.environ.get("ROUTELLM_CONTEXT_WINDOW", "auto")
 ROUTELLM_MAX_TOKENS = int(os.environ.get("ROUTELLM_MAX_TOKENS", "131072"))
 MODEL_ID = "auto"
 
-LITELLM_BASE = os.environ.get("LITELLM_BASE", "http://127.0.0.1:3001/v1")
-LITELLM_KEY = os.environ.get("LITELLM_KEY", "sk-mundial")
-
 EXPENSIVE = {
-    "base": os.environ.get("EXPENSIVE_BASE", LITELLM_BASE),
-    "key": os.environ.get("EXPENSIVE_KEY", LITELLM_KEY),
-    "model": os.environ.get("EXPENSIVE_MODEL", "gpt-5.6-luna"),
-    "effort": os.environ.get("EXPENSIVE_REASONING_EFFORT", "xhigh"),
+    "base": os.environ.get("EXPENSIVE_BASE", "https://openrouter.ai/api/v1"),
+    "key": os.environ.get("EXPENSIVE_KEY", ""),
+    "model": os.environ.get("EXPENSIVE_MODEL", "openai/gpt-5.6-sol"),
+    "effort": os.environ.get("EXPENSIVE_REASONING_EFFORT", "medium"),
 }
 CHEAP = {
-    "base": os.environ.get("CHEAP_BASE", LITELLM_BASE),
-    "key": os.environ.get("CHEAP_KEY", LITELLM_KEY),
-    "model": os.environ.get("CHEAP_MODEL", "deepseek-v4-pro"),
-    "effort": os.environ.get("CHEAP_REASONING_EFFORT", "xhigh"),
+    "base": os.environ.get("CHEAP_BASE", "https://opencode.ai/zen/go/v1"),
+    "key": os.environ.get("CHEAP_KEY", ""),
+    "model": os.environ.get("CHEAP_MODEL", "deepseek-v4-flash"),
+    "effort": os.environ.get("CHEAP_REASONING_EFFORT", "none"),
     "max_tokens": int(os.environ.get("CHEAP_MAX_TOKENS", str(ROUTELLM_MAX_TOKENS))),
 }
 
@@ -236,6 +235,48 @@ def _backend_for(decision: str) -> dict:
     return EXPENSIVE if decision == "expensive" else CHEAP
 
 
+_REFUSAL_RE = re.compile(
+    r"cannot (assist|help|comply)|i('| a)?m sorry|not (able|allowed) to (assist|help)|can('| no)t (assist|help)",
+    re.I,
+)
+
+
+def _safe_json(content: bytes) -> dict:
+    try:
+        data = json.loads(content)
+        return data if isinstance(data, dict) else {"error": {"message": content.decode(errors="replace")[:500]}}
+    except Exception:
+        return {"error": {"message": content.decode(errors="replace")[:500]}}
+
+
+def _is_refusal(status: int, data: dict) -> bool:
+    """True when an upstream response is a refusal we should retry on the other model."""
+    s = ""
+    err = data.get("error")
+    if isinstance(err, dict):
+        s += f"{err.get('message','')} {err.get('code','')} {err.get('type','')}"
+    elif err:
+        s += str(err)
+    choices = data.get("choices") or []
+    if choices:
+        fr = choices[0].get("finish_reason")
+        if fr == "content_filter":
+            return True
+        msg = choices[0].get("message")
+        if isinstance(msg, dict):
+            s += f" {msg.get('content') or ''} {msg.get('reasoning_content') or ''}"
+    if status != 200 and re.search(r"content[\s_-]?filter", s, re.I):
+        return True
+    return bool(_REFUSAL_RE.search(s))
+
+
+def _do_post(backend: dict, out_body: dict):
+    url = backend["base"].rstrip("/") + "/chat/completions"
+    headers = {"Authorization": f"Bearer {backend['key']}", "Content-Type": "application/json"}
+    with httpx.Client(timeout=None) as c:
+        return c.post(url, json=out_body, headers=headers)
+
+
 def _build_outgoing_body(body: dict, backend: dict) -> dict:
     out_body = dict(body)
     if isinstance(out_body.get("messages"), list):
@@ -325,7 +366,7 @@ app = FastAPI(title="RouteLLM coding-router", lifespan=lifespan)
 @app.get("/healthz")
 async def healthz():
     return {"ok": _READY, "router": ROUTER_NAME, "threshold": THRESHOLD,
-            "backend": "litellm", "ready": _READY}
+            "backend": "direct", "ready": _READY}
 
 
 @app.get("/v1/models")
@@ -374,7 +415,37 @@ async def chat_completions(request: Request, authorization: str | None = Header(
             try:
                 with client.stream("POST", url, json=out_body, headers=headers) as resp:
                     if resp.status_code != 200:
+                        # Refusal/content-filter surfaced as an HTTP error: retry the other model.
                         err = resp.read()
+                        if _is_refusal(resp.status_code, _safe_json(err)):
+                            flip = "cheap" if decision == "expensive" else "expensive"
+                            fb = _backend_for(flip)
+                            fb_url = fb["base"].rstrip("/") + "/chat/completions"
+                            fb_headers = {"Authorization": f"Bearer {fb['key']}", "Content-Type": "application/json"}
+                            with client.stream("POST", fb_url, json=_build_outgoing_body(body, fb), headers=fb_headers) as resp:
+                                if resp.status_code == 200:
+                                    # route_hdr was already sealed by StreamingResponse;
+                                    # the fallback is only visible in decisions.log.
+                                    for line in resp.iter_lines():
+                                        if ttfb is None:
+                                            ttfb = int((time.time() - t0) * 1000)
+                                        if line:
+                                            sline = line.strip()
+                                            if sline == "data: [DONE]":
+                                                saw_done = True
+                                            elif sline.startswith("data: "):
+                                                try:
+                                                    payload = json.loads(sline[6:])
+                                                    ch = payload.get("choices")
+                                                    if isinstance(ch, list) and ch and ch[0].get("finish_reason") is not None:
+                                                        saw_finish_reason = True
+                                                except Exception:
+                                                    pass
+                                            yield (line + "\n").encode()
+                                        else:
+                                            yield b"\n"
+                                    _log(flip, score, fb["model"], prompt, ttfb, supra_complexity, supra_ms)
+                                    return
                         yield b'data: ' + json.dumps({"error": {"status": resp.status_code, "message": err.decode(errors="replace")[:500]}}).encode() + b'\n\ndata: [DONE]\n\n'
                         return
                     for line in resp.iter_lines():
@@ -413,10 +484,18 @@ async def chat_completions(request: Request, authorization: str | None = Header(
         return StreamingResponse(gen(), media_type="text/event-stream", headers=route_hdr)
 
     t0 = time.time()
-    with httpx.Client(timeout=None) as c:
-        resp = c.post(url, json=out_body, headers=headers)
+    resp = _do_post(backend, out_body)
     ttfb = int((time.time() - t0) * 1000)
-    _log(decision, score, backend["model"], prompt, ttfb, supra_complexity, supra_ms)
+    if _is_refusal(resp.status_code, _safe_json(resp.content)):
+        flip = "cheap" if decision == "expensive" else "expensive"
+        fb = _backend_for(flip)
+        t0 = time.time()
+        resp = _do_post(fb, _build_outgoing_body(body, fb))
+        ttfb = int((time.time() - t0) * 1000)
+        decision = flip
+        route_hdr["x-route-fallback"] = "true"
+        route_hdr["x-route-model"] = fb["model"]
+    _log(decision, score, route_hdr["x-route-model"], prompt, ttfb, supra_complexity, supra_ms)
     return Response(content=resp.content, status_code=resp.status_code,
                     media_type="application/json", headers=route_hdr)
 
