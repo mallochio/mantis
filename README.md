@@ -81,7 +81,24 @@ Every response includes:
 - `x-route-decision: expensive|cheap`
 - `x-route-score: 0.1234` (MF win-rate)
 - `x-route-supra-complexity: 3` (1-5, when Supra is enabled)
+- `x-route-supra-ms: 41` (Supra scoring latency, when Supra ran)
 - `x-route-model: deepseek-v4-pro|gpt-5.6-luna` (LiteLLM model group selected)
+
+Non-streaming responses additionally include:
+
+- `x-route-ttfb-ms: 1234` (upstream time-to-first-byte)
+- `x-route-cost-usd: 0.004210` (provider-billed cost, when the upstream reports
+  `usage.cost`; OpenRouter backends ask for it via `usage.include`)
+- `x-route-fallback: true` (when a refusal retried on the other model)
+
+For streamed responses these facts are sealed before headers are known; the
+`decisions.log` row records `ttfb_ms`, `cost_usd`, and `usage` instead.
+
+## Limits and timeouts
+
+- Request bodies over `ROUTELLM_MAX_BODY_BYTES` (default 50 MiB) get 413.
+- Upstream calls time out after `ROUTELLM_TIMEOUT_S` (default 600s, 10s connect)
+  so a stalled provider cannot pin the router.
 
 ## Request handling
 

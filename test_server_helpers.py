@@ -1,4 +1,26 @@
-from server import _build_outgoing_body, _decide_cached, _is_refusal, _normalize_messages_for_backend, _parse_supra_complexity
+# Network guard: tests must never touch real providers. Block non-loopback
+# traffic on the paths server.py uses, before importing it, so a missed mock
+# fails loudly instead of making billed API calls.
+import httpx as _httpx
+
+
+def _blocked(*_args, **_kwargs):
+    raise RuntimeError("network access is blocked in tests")
+
+
+_httpx.get = _blocked
+_httpx.Client.post = _blocked
+_httpx.Client.stream = _blocked
+
+from server import (  # noqa: E402
+    _body_too_large,
+    _build_outgoing_body,
+    _decide_cached,
+    _extract_cost,
+    _is_refusal,
+    _normalize_messages_for_backend,
+    _parse_supra_complexity,
+)
 
 
 def demo():
@@ -63,6 +85,26 @@ def demo():
     body_copy = dict(body_before)
     _build_outgoing_body(body_before, backend_deepseek)
     assert body_before == body_copy
+
+    # 6. usage_include asks OpenRouter for billed cost; absent otherwise, never clobbers
+    backend_or = {"model": "gpt-5.6-luna", "effort": "", "max_tokens": None, "usage_include": True}
+    out6 = _build_outgoing_body({"model": "auto"}, backend_or)
+    assert out6["usage"] == {"include": True}
+    assert "usage" not in _build_outgoing_body({"model": "auto"}, backend_deepseek)
+    out6b = _build_outgoing_body({"model": "auto", "usage": {"include": False}}, backend_or)
+    assert out6b["usage"] == {"include": False}
+
+    # _extract_cost: provider-billed cost from usage.cost only
+    assert _extract_cost({"usage": {"cost": 0.0042}}) == 0.0042
+    assert _extract_cost({"usage": {"prompt_tokens": 10}}) is None
+    assert _extract_cost({"usage": {"cost": "nope"}}) is None
+    assert _extract_cost({}) is None
+
+    # _body_too_large: content-length gate for the 413 middleware
+    assert _body_too_large(str(50 * 1024 * 1024 + 1))
+    assert not _body_too_large(str(1024))
+    assert not _body_too_large(None)
+    assert not _body_too_large("chunked")
 
 
 if __name__ == "__main__":

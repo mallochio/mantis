@@ -63,8 +63,17 @@ CHEAP = {
 }
 
 # Shared connection pool: reuse TCP/TLS to upstream providers instead of
-# handshaking per request (sync Client is thread-safe).
-_client = httpx.Client(timeout=None)
+# handshaking per request (sync Client is thread-safe). A total timeout bounds
+# stalled upstreams so a hung provider cannot pin the router forever.
+TIMEOUT_S = float(os.environ.get("ROUTELLM_TIMEOUT_S", "600"))
+_client = httpx.Client(timeout=httpx.Timeout(TIMEOUT_S, connect=10.0))
+
+# Reject oversized bodies before they are buffered into memory (413).
+MAX_BODY_BYTES = int(os.environ.get("ROUTELLM_MAX_BODY_BYTES", str(50 * 1024 * 1024)))
+
+for _b in (EXPENSIVE, CHEAP):
+    # OpenRouter reports provider-billed cost in usage.cost when asked.
+    _b["usage_include"] = "openrouter.ai" in _b["base"]
 
 DATA_DIR = Path(os.environ.get("MANTIS_DATA_DIR", str(Path.home()/".local/share/mantis")))
 LOG_PATH = Path(os.environ.get("LOG_FILE", str(DATA_DIR/"router/decisions.log")))
@@ -294,7 +303,17 @@ def _build_outgoing_body(body: dict, backend: dict) -> dict:
         out_body.pop("temperature")
     if backend["effort"]:
         out_body["reasoning_effort"] = backend["effort"]
+    if backend.get("usage_include") and "usage" not in out_body:
+        out_body["usage"] = {"include": True}
     return out_body
+
+
+def _extract_cost(data: dict) -> float | None:
+    try:
+        cost = (data.get("usage") or {}).get("cost")
+        return float(cost) if isinstance(cost, (int, float)) else None
+    except Exception:
+        return None
 
 
 def _normalize_messages_for_backend(messages):
@@ -324,6 +343,8 @@ def _log(
     ttfb_ms: int | None,
     supra_complexity: int | None = None,
     supra_ms: int | None = None,
+    cost_usd: float | None = None,
+    usage: dict | None = None,
 ):
     row = {
         "ts": time.time(),
@@ -337,6 +358,10 @@ def _log(
         "ttfb_ms": ttfb_ms,
         "prompt": prompt[:200],
     }
+    if cost_usd is not None:
+        row["cost_usd"] = cost_usd
+    if usage:
+        row["usage"] = usage
     with LOG_PATH.open("a") as f:
         f.write(json.dumps(row) + "\n")
     if TRAINING_LOG_ENABLED:
@@ -365,6 +390,21 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="RouteLLM coding-router", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def _body_limit(request: Request, call_next):
+    length = request.headers.get("content-length")
+    if _body_too_large(length):
+        return JSONResponse(
+            {"error": {"message": "request body too large", "type": "request_too_large"}},
+            status_code=413,
+        )
+    return await call_next(request)
+
+
+def _body_too_large(content_length: str | None) -> bool:
+    return bool(content_length and content_length.isdigit() and int(content_length) > MAX_BODY_BYTES)
 
 
 @app.get("/healthz")
@@ -407,6 +447,8 @@ async def chat_completions(request: Request, authorization: str | None = Header(
     }
     if supra_complexity is not None:
         route_hdr["x-route-supra-complexity"] = str(supra_complexity)
+    if supra_ms is not None:
+        route_hdr["x-route-supra-ms"] = str(supra_ms)
 
     if want_stream:
         def gen():
@@ -414,6 +456,16 @@ async def chat_completions(request: Request, authorization: str | None = Header(
             ttfb = None
             saw_finish_reason = False
             saw_done = False
+            usage_seen: dict = {}
+
+            def track(payload: dict) -> None:
+                nonlocal saw_finish_reason
+                ch = payload.get("choices")
+                if isinstance(ch, list) and ch and ch[0].get("finish_reason") is not None:
+                    saw_finish_reason = True
+                u = payload.get("usage")
+                if isinstance(u, dict):
+                    usage_seen.update(u)
             with _client.stream("POST", url, json=out_body, headers=headers) as resp:
                 if resp.status_code != 200:
                     # Refusal/content-filter surfaced as an HTTP error: retry the other model.
@@ -436,16 +488,14 @@ async def chat_completions(request: Request, authorization: str | None = Header(
                                             saw_done = True
                                         elif sline.startswith("data: "):
                                             try:
-                                                payload = json.loads(sline[6:])
-                                                ch = payload.get("choices")
-                                                if isinstance(ch, list) and ch and ch[0].get("finish_reason") is not None:
-                                                    saw_finish_reason = True
+                                                track(json.loads(sline[6:]))
                                             except Exception:
                                                 pass
                                         yield (line + "\n").encode()
                                     else:
                                         yield b"\n"
-                                _log(flip, score, fb["model"], prompt, ttfb, supra_complexity, supra_ms)
+                                _log(flip, score, fb["model"], prompt, ttfb, supra_complexity, supra_ms,
+                                     cost_usd=_extract_cost({"usage": usage_seen}), usage=usage_seen or None)
                                 return
                     yield b'data: ' + json.dumps({"error": {"status": resp.status_code, "message": err.decode(errors="replace")[:500]}}).encode() + b'\n\ndata: [DONE]\n\n'
                     return
@@ -458,10 +508,7 @@ async def chat_completions(request: Request, authorization: str | None = Header(
                             saw_done = True
                         elif sline.startswith("data: "):
                             try:
-                                payload = json.loads(sline[6:])
-                                choices = payload.get("choices")
-                                if isinstance(choices, list) and choices and choices[0].get("finish_reason") is not None:
-                                    saw_finish_reason = True
+                                track(json.loads(sline[6:]))
                             except Exception:
                                 pass
                         yield (line + "\n").encode()
@@ -478,23 +525,32 @@ async def chat_completions(request: Request, authorization: str | None = Header(
                     yield f"data: {json.dumps(finish_chunk)}\n\n".encode()
                 if not saw_done:
                     yield b"data: [DONE]\n\n"
-            _log(decision, score, backend["model"], prompt, ttfb, supra_complexity, supra_ms)
+            _log(decision, score, backend["model"], prompt, ttfb, supra_complexity, supra_ms,
+                 cost_usd=_extract_cost({"usage": usage_seen}), usage=usage_seen or None)
 
         return StreamingResponse(gen(), media_type="text/event-stream", headers=route_hdr)
 
     t0 = time.time()
     resp = _do_post(backend, out_body)
     ttfb = int((time.time() - t0) * 1000)
-    if _is_refusal(resp.status_code, _safe_json(resp.content)):
+    data = _safe_json(resp.content)
+    if _is_refusal(resp.status_code, data):
         flip = "cheap" if decision == "expensive" else "expensive"
         fb = _backend_for(flip)
         t0 = time.time()
         resp = _do_post(fb, _build_outgoing_body(body, fb))
         ttfb = int((time.time() - t0) * 1000)
+        data = _safe_json(resp.content)
         decision = flip
         route_hdr["x-route-fallback"] = "true"
         route_hdr["x-route-model"] = fb["model"]
-    _log(decision, score, route_hdr["x-route-model"], prompt, ttfb, supra_complexity, supra_ms)
+    cost = _extract_cost(data)
+    route_hdr["x-route-ttfb-ms"] = str(ttfb)
+    if cost is not None:
+        route_hdr["x-route-cost-usd"] = f"{cost:.6f}"
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else None
+    _log(decision, score, route_hdr["x-route-model"], prompt, ttfb, supra_complexity, supra_ms,
+         cost_usd=cost, usage=usage)
     return Response(content=resp.content, status_code=resp.status_code,
                     media_type="application/json", headers=route_hdr)
 
