@@ -6,11 +6,11 @@
 scoring workers:  93%|█████████▎| 42/45 [22:05<01:23, 27.74s/it]scoring workers:  96%|█████████▌| 43/45 [22:22<00:48, 24.49s/it]scoring workers:  98%|█████████▊| 44/45 [22:37<00:21, 21.58s/it]scoring workers: 100%|██████████| 45/45 [22:58<00:00, 21.37s/it]scoring workers: 100%|██████████| 45/45 [22:58<00:00, 30.63s/it]
 [retrain] loading TRINITY backbone Qwen/Qwen3-0.6B on cpu...
 Traceback (most recent call last):
-  File "/home/ubuntu/fugu-local/scripts/retrain_router_pool.py", line 715, in <module>
+  File "/home/ubuntu/mantis/scripts/retrain_router_pool.py", line 715, in <module>
     main()
-  File "/home/ubuntu/fugu-local/scripts/retrain_router_pool.py", line 695, in main
+  File "/home/ubuntu/mantis/scripts/retrain_router_pool.py", line 695, in main
     router = FuguRouter(args.fugu_model, args.fugu_vector, device=device, seed=args.seed)
-  File "/home/ubuntu/fugu-local/OpenFugu/openfugu/mini.py", line 115, in __init__
+  File "/home/ubuntu/mantis/OpenFugu/openfugu/mini.py", line 115, in __init__
     vec = np.load(vector_path).astype(np.float64)
   File "/home/ubuntu/.local/lib/python3.10/site-packages/numpy/lib/_npyio_impl.py", line 451, in load
     fid = stack.enter_context(open(os.fspath(file), "rb"))
@@ -79,5 +79,5 @@ FileNotFoundError: [Errno 2] No such file or directory: '/app/artifacts/model_it
   "output": "outputs/pilot_terminal_cost_50",
   "vector": "outputs/pilot_terminal_cost_50/model_iter_60.npy",
   "head": "outputs/pilot_terminal_cost_50/router_head.npy",
-  "cost_table": "/home/ubuntu/fugu-local/configs/worker-costs.json"
+  "cost_table": "/home/ubuntu/mantis/configs/worker-costs.json"
 }
