@@ -156,7 +156,7 @@ class ChatRequest(BaseModel):
 
 
 _MAX_REQUESTS = int(os.environ.get("MANTIS_MAX_CONCURRENT_REQUESTS", "32"))
-_MAX_BODY_BYTES = int(os.environ.get("MANTIS_MAX_BODY_BYTES", str(5 * 1024 * 1024)))
+_MAX_BODY_BYTES = int(os.environ.get("MANTIS_MAX_BODY_BYTES", str(50 * 1024 * 1024)))
 _KEEPALIVE_SECONDS = float(os.environ.get("MANTIS_SSE_KEEPALIVE_SECONDS", "10"))
 _capacity = threading.BoundedSemaphore(_MAX_REQUESTS)
 
