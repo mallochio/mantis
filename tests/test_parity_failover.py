@@ -1,5 +1,6 @@
 """Failover tests for openfugu-patch/serve.py: transient provider errors fail
-over to the next pool worker with an identical request body."""
+over to the next pool worker, switching model/endpoint per spec while
+messages, tools, and controls stay identical across attempts."""
 
 from __future__ import annotations
 
@@ -62,7 +63,7 @@ def _messages() -> list[dict]:
     return [{"role": "user", "content": "hi"}]
 
 
-def test_transient_error_fails_over_with_identical_body(pool_env, monkeypatch):
+def test_transient_error_fails_over_to_next_pool_worker(pool_env, monkeypatch):
     usage = {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8}
     ok = {"choices": [{"message": {"content": "ok"}}], "usage": usage}
     client = _Client([_Response(500), _Response(200, ok)])
@@ -81,10 +82,10 @@ def test_transient_error_fails_over_with_identical_body(pool_env, monkeypatch):
     ]
     assert client.posts[0]["headers"]["Authorization"] == "Bearer or-key"
     assert client.posts[1]["headers"]["Authorization"] == "Bearer oc-key"
-    # The failover attempt sends the byte-identical body, assigned model included.
-    assert client.posts[0]["json"] == client.posts[1]["json"]
-    assert client.posts[1]["json"]["model"] == "gpt-alpha"
-    assert client.posts[1]["json"]["messages"] == _messages()
+    # Each attempt targets its own spec's model; messages are identical.
+    assert client.posts[0]["json"]["model"] == "gpt-alpha"
+    assert client.posts[1]["json"]["model"] == "deepseek-beta"
+    assert client.posts[0]["json"]["messages"] == client.posts[1]["json"]["messages"] == _messages()
     # Usage is recorded once, from the successful attempt only.
     assert run.usage["prompt_tokens"] == 3
     assert run.usage["completion_tokens"] == 5
@@ -161,7 +162,7 @@ def test_failover_target_without_key_is_skipped(pool_env, monkeypatch):
         serve._provider_response("openrouter/gpt-alpha", _messages(), 10, 0.7)
     message = str(excinfo.value)
     assert "openrouter/gpt-alpha: HTTP 502" in message
-    assert "opencode-go/deepseek-beta: OPENCODE_API_KEY is required" in message
+    assert "OPENCODE_API_KEY is required for opencode-go/deepseek-beta" in message
     assert len(client.posts) == 1
 
 

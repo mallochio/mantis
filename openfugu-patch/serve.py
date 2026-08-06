@@ -171,35 +171,32 @@ def _provider_response(
     temperature: float,
     tools: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    url, headers, body = _build_request(spec, messages, max_tokens, temperature)
-    if tools:
-        body["tools"] = tools
     run = getattr(_history_context, "active_run", None)
     tool_choice = getattr(run, "active_tool_choice", None)
-    if tool_choice is not None:
-        body["tool_choice"] = tool_choice
     response_format = getattr(run, "active_response_format", None)
-    if response_format is not None:
-        body["response_format"] = response_format
     controls = getattr(run, "active_controls", None) or {}
-    if "reasoning" in controls:
-        body.pop("reasoning_effort", None)
-    body.update(controls)
     failures: list[str] = []
     for index, attempt in enumerate(_failover_attempts(spec)):
         if index:
             time.sleep(_FAILOVER_DELAY)
-        target_url, target_headers = url, headers
-        if attempt != spec:  # failover: identical body, next pool provider
-            base_url, key_env = PROVIDERS[_parse_model_spec(attempt)[0]]
-            key = os.environ.get(key_env)
-            if not key:
-                failures.append(f"{attempt}: {key_env} is required")
-                continue
-            target_url = f"{base_url}/chat/completions"
-            target_headers = {**headers, "Authorization": f"Bearer {key}"}
         try:
-            response = _provider_client.post(target_url, headers=target_headers, json=body)
+            # Failover switches model/effort/endpoint per spec; messages, tools,
+            # and controls stay identical across attempts.
+            url, headers, body = _build_request(attempt, messages, max_tokens, temperature)
+        except RuntimeError as error:  # provider key missing for this attempt
+            failures.append(str(error))
+            continue
+        if tools:
+            body["tools"] = tools
+        if tool_choice is not None:
+            body["tool_choice"] = tool_choice
+        if response_format is not None:
+            body["response_format"] = response_format
+        if "reasoning" in controls:
+            body.pop("reasoning_effort", None)
+        body.update(controls)
+        try:
+            response = _provider_client.post(url, headers=headers, json=body)
             response.raise_for_status()
             data = response.json()
             break
