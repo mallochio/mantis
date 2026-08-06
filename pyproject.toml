@@ -11,7 +11,6 @@ dependencies = [
     "numpy>=1.24",
     "torch>=2.4",
     "transformers>=4.52,<5",
-    "litellm>=1.0",
     "requests>=2.25",
     "pyyaml>=6",
     "tqdm>=4.66",
@@ -21,11 +20,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-serve = [
-    "fastapi>=0.100",
-    "uvicorn>=0.30",
-    "httpx>=0.27",
-]
 train = [
     "trl>=0.19,<0.20",
     "datasets>=3.6",
@@ -59,7 +53,6 @@ target-version = "py310"
 line-length = 100
 exclude = [
     "OpenFugu",
-    "llm-router",
     "__pycache__",
     ".git",
     "*.egg-info",
@@ -114,9 +107,10 @@ warn_unused_ignores = true
 warn_unused_configs = true
 disallow_untyped_defs = false
 ignore_missing_imports = true
+follow_imports = "skip"
+no_site_packages = true
 exclude = [
     "OpenFugu",
-    "llm-router",
 ]
 
 [tool.pytest.ini_options]
@@ -129,7 +123,6 @@ source = ["scripts", "openfugu-patch"]
 omit = [
     "*/tests/*",
     "OpenFugu/*",
-    "llm-router/*",
     "scripts/make_vec.py",
     "scripts/retrain_conductor.py",
     "scripts/sky_launch_retrain_router.sh",

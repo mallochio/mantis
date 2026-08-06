@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# Run the mantis orchestrator natively on the host (MPS/CUDA/CPU).
-# litellm and llm-router should already be running in Docker on their
-# published ports (3001 and 5500).
+# Run the OpenAI-compatible Mantis orchestrator natively (MPS/CUDA/CPU).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -75,9 +73,6 @@ if [[ "${MANTIS_LEARNING:-0}" =~ ^(1|true|yes|on)$ ]]; then
 fi
 HEAD_FILE="${MANTIS_HEAD:-}"
 [[ -f "$HEAD_FILE" ]] || export MANTIS_HEAD="$REPO_ROOT/artifacts/router_head.npy"
-BASE_URL="${MANTIS_BASE_URL:-}"
-[[ -n "$BASE_URL" ]] || export MANTIS_BASE_URL="http://127.0.0.1:3001/v1"
-
 HOST_VAL="${MANTIS_HOST:-0.0.0.0}"
 PORT_VAL="${MANTIS_PORT:-8088}"
 

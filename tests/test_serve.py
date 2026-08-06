@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import http.client
 import json
 import os
 import sys
@@ -32,17 +31,21 @@ def test_is_reasoning_model():
     assert not serve._is_reasoning_model("glm-5.2")
 
 
-def test_build_litellm_kwargs_reasoning():
-    kw = serve._build_litellm_kwargs("claude-opus-5", [], 1024, 0.2)
-    assert kw["model"] == "claude-opus-5"
-    assert kw["max_tokens"] == 1024
-    assert kw["custom_llm_provider"] == "openai"
-    assert "temperature" not in kw
+def test_build_request_routes_providers(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    monkeypatch.setenv("OPENCODE_API_KEY", "oc-key")
+    url, headers, body = serve._build_request("openrouter/openai/gpt-5.6-sol|medium", [], 1024, 0.2)
+    assert url == "https://openrouter.ai/api/v1/chat/completions"
+    assert headers["Authorization"] == "Bearer or-key"
+    assert body["model"] == "openai/gpt-5.6-sol"
+    assert body["reasoning_effort"] == "medium"
+    assert "temperature" not in body
 
-
-def test_build_litellm_kwargs_non_reasoning():
-    kw = serve._build_litellm_kwargs("deepseek-v4-flash", [], 1024, 0.2)
-    assert kw["temperature"] == 0.2
+    url, headers, body = serve._build_request("opencode-go/deepseek-v4-flash", [], 1024, 0.2)
+    assert url == "https://opencode.ai/zen/go/v1/chat/completions"
+    assert headers["Authorization"] == "Bearer oc-key"
+    assert body["model"] == "deepseek-v4-flash"
+    assert body["temperature"] == 0.2
 
 
 def test_resolve_conductor_model_env(monkeypatch):
@@ -61,56 +64,77 @@ def test_resolve_conductor_model_default(monkeypatch):
     assert serve._resolve_conductor_model(SimpleNamespace()) == "openai/gpt-4o-mini"
 
 
-def test_chat_response():
-    result = SimpleNamespace(final="hello", turns=[1, 2, 3])
-    resp = serve._chat_response(result, "fugu")
-    assert resp["model"] == "fugu"
-    assert resp["choices"][0]["message"]["content"] == "hello"
-    assert resp["usage"]["fugu_turns"] == 3
-    assert resp["usage"]["fugu_trace"] == "steps:3:conductor"
-    assert resp["id"].startswith("chatcmpl-")
-
-
-def test_build_fugu_trace_trinity():
-    turns = [
-        SimpleNamespace(role_name="Worker", agent_id=4),
-        SimpleNamespace(role_name="Thinker", agent_id=1),
-        SimpleNamespace(role_name="Verifier", agent_id=1),
-    ]
-    result = SimpleNamespace(final="ok", turns=turns, terminated_by="verifier_accept")
-    assert serve._build_fugu_trace(result) == "Worker(4)→Thinker(1)→Verifier(1):verifier_accept"
-
-
-def test_build_fugu_trace_empty():
-    result = SimpleNamespace(final="ok", turns=[])
-    assert serve._build_fugu_trace(result) == "steps:0:conductor"
-
-
-# ---------------------------------------------------------------------------
-# LiteLLM worker wrappers
-# ---------------------------------------------------------------------------
-def _fake_litellm_module(content: str = "ok") -> Any:
-    def _completion(**kw):
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
-
-    mod = SimpleNamespace(completion=_completion)
-    return mod
-
-
-def test_openrouter_trinity_worker_call(monkeypatch):
-    monkeypatch.setitem(sys.modules, "litellm", _fake_litellm_module("trinity"))
-    worker = serve.OpenRouterTrinityWorker(
-        slot_models=["claude-sonnet-5"], api_key="k", api_base="http://x"
+def test_direct_workers(monkeypatch):
+    monkeypatch.setattr(serve, "_direct_completion", lambda *args: args[0])
+    trinity = serve.DirectTrinityWorker(
+        ["openrouter/anthropic/claude-sonnet-5|medium", "opencode-go/deepseek-v4-flash"]
     )
-    result = worker("Worker", [{"role": "user", "content": "hi"}], 0)
-    assert result == "trinity"
+    assert (
+        trinity("Worker", [{"role": "user", "content": "hi"}], 1) == "opencode-go/deepseek-v4-flash"
+    )
+
+    conductor = serve.DirectConductorWorker(["openrouter/openai/gpt-5.6-luna|max"])
+    assert (
+        conductor._call("openrouter/openai/gpt-5.6-luna|max", [])
+        == "openrouter/openai/gpt-5.6-luna|max"
+    )
 
 
-def test_openrouter_conductor_worker_call(monkeypatch):
-    monkeypatch.setitem(sys.modules, "litellm", _fake_litellm_module("conductor"))
-    worker = serve.OpenRouterConductorWorker(slot_models=["gpt-5.6-luna"], api_key="k")
-    result = worker._call("gpt-5.6-luna", [{"role": "user", "content": "hi"}])
-    assert result == "conductor"
+def test_direct_provider_completions(monkeypatch):
+    class Response:
+        def __init__(self, body):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return json.dumps(self.body).encode()
+
+    responses = iter(
+        [
+            Response({"choices": [{"message": {"content": "answer"}}]}),
+            Response(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call-1",
+                                        "function": {
+                                            "name": "read",
+                                            "arguments": '{"path":"README.md"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            ),
+        ]
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "provider-key")
+    monkeypatch.setattr(serve.urllib.request, "urlopen", lambda *_a, **_k: next(responses))
+
+    assert (
+        serve._direct_completion(
+            "openrouter/model", [{"role": "user", "content": "hi"}], 10, 0.7, 1
+        )
+        == "answer"
+    )
+    text, calls = serve._model_completion(
+        "openrouter/model",
+        [{"role": "user", "content": "read"}],
+        [{"type": "function", "function": {"name": "read"}}],
+    )
+    assert text == ""
+    assert calls == [{"id": "call-1", "name": "read", "arguments": {"path": "README.md"}}]
 
 
 def test_split_messages():
@@ -346,27 +370,6 @@ def test_history_worker_conduct():
         serve._history_context.calls = []
 
 
-def test_chat_response_includes_prompt_and_model_name():
-    from types import SimpleNamespace
-
-    turn = SimpleNamespace(
-        t=1,
-        agent_id=2,
-        role_name="Thinker",
-        reply="ok",
-        prompt="solve it",
-        model_name="openai/gpt-4o-mini",
-    )
-    res = SimpleNamespace(final="final", turns=[turn], terminated_by="verifier_accept")
-    body = serve._chat_response(res, "mantis")
-    step = body["mantis_steps"][0]
-    assert step["prompt"] == "solve it"
-    assert step["model_name"] == "openai/gpt-4o-mini"
-
-
-# ---------------------------------------------------------------------------
-# Local pool worker with mocked transformers
-# ---------------------------------------------------------------------------
 class _FakeBatch:
     def __init__(self, input_ids: torch.Tensor):
         self._data = {"input_ids": input_ids}
@@ -550,7 +553,7 @@ def test_handler_warm_trinity_and_conductor():
         assert resp1.status == 200
         assert body1["status"] == "ready"
         assert body1["mode"] == "trinity"
-        assert body1["native_tool_runs"] is True
+        assert body1["tool_calls"] is True
 
         # POST /warm with mode=conductor
         payload = json.dumps({"mode": "conductor"}).encode()
@@ -564,7 +567,7 @@ def test_handler_warm_trinity_and_conductor():
         assert resp2.status == 200
         assert body2["status"] == "ready"
         assert body2["mode"] == "conductor"
-        assert body2["native_tool_runs"] is True
+        assert body2["tool_calls"] is True
 
         assert called_modes == ["trinity", "conductor"]
     finally:
@@ -641,54 +644,6 @@ def test_handler_post_too_large():
         srv.shutdown()
 
 
-def test_handler_post_trinity():
-    old = serve.get_coordinator
-    try:
-        serve.get_coordinator = _fake_get_coordinator
-        srv, port = _start_server(serve.Handler)
-        time.sleep(0.1)
-        payload = json.dumps(
-            {"model": "trinity", "messages": [{"role": "user", "content": "2+2"}]}
-        ).encode()
-        req = Request(
-            f"http://127.0.0.1:{port}/v1/chat/completions",
-            data=payload,
-            headers={"Content-Type": "application/json", "Authorization": "Bearer test-key"},
-        )
-        resp = urlopen(req)
-        body = json.loads(resp.read().decode())
-        assert body["choices"][0]["message"]["content"] == "42"
-        assert body["usage"]["fugu_turns"] == 3
-        assert body["usage"]["fugu_trace"] == "Worker(4)→Thinker(1)→Verifier(1):verifier_accept"
-    finally:
-        serve.get_coordinator = old
-        srv.shutdown()
-
-
-def test_handler_post_conductor():
-    old = serve.get_coordinator
-    try:
-        serve.get_coordinator = _fake_get_coordinator
-        srv, port = _start_server(serve.Handler)
-        time.sleep(0.1)
-        payload = json.dumps(
-            {"model": "conductor", "messages": [{"role": "user", "content": "hi"}]}
-        ).encode()
-        req = Request(
-            f"http://127.0.0.1:{port}/v1/chat/completions",
-            data=payload,
-            headers={"Content-Type": "application/json", "Authorization": "Bearer test-key"},
-        )
-        resp = urlopen(req)
-        body = json.loads(resp.read().decode())
-        assert body["choices"][0]["message"]["content"] == "42"
-        assert body["usage"]["fugu_turns"] == 5
-        assert body["usage"]["fugu_trace"] == "steps:5:conductor"
-    finally:
-        serve.get_coordinator = old
-        srv.shutdown()
-
-
 def test_handler_post_bad_path():
     srv, port = _start_server(serve.Handler)
     try:
@@ -761,151 +716,14 @@ def test_handler_post_invalid_json():
         srv.shutdown()
 
 
-def test_handler_post_coordinator_error():
-    def _raising_coordinator(mode: str):
-        class BadCoord:
-            def run(self, query, verbose=False):
-                raise ValueError("boom")
-
-        return BadCoord()
-
-    old = serve.get_coordinator
-    try:
-        serve.get_coordinator = _raising_coordinator
-        srv, port = _start_server(serve.Handler)
-        time.sleep(0.1)
-        payload = json.dumps(
-            {"model": "trinity", "messages": [{"role": "user", "content": "hi"}]}
-        ).encode()
-        req = Request(
-            f"http://127.0.0.1:{port}/v1/chat/completions",
-            data=payload,
-            headers={"Content-Type": "application/json", "Authorization": "Bearer test-key"},
-        )
-        with pytest.raises(HTTPError):
-            urlopen(req)
-    finally:
-        serve.get_coordinator = old
-        srv.shutdown()
-
-
-def test_handler_post_stream():
-    class FakeWorker:
-        slot_models = ["gpt-5.6-luna", "gpt-5.6-sol", "deepseek-v4"]
-        names = slot_models
-
-        def __call__(self, role, messages, agent_id):
-            return "ok"
-
-    class StreamCoord:
-        def run(self, query, verbose=False):
-            worker = serve.HistoryWorker(FakeWorker())
-            r1 = worker("Worker", [{"role": "user", "content": query}], 4)
-            r2 = worker("Thinker", [{"role": "user", "content": query}], 1)
-            r3 = worker("Verifier", [{"role": "user", "content": query}], 1)
-            return SimpleNamespace(
-                final="final answer",
-                turns=[
-                    SimpleNamespace(t=1, agent_id=4, role_name="Worker", reply=r1),
-                    SimpleNamespace(t=2, agent_id=1, role_name="Thinker", reply=r2),
-                    SimpleNamespace(t=3, agent_id=1, role_name="Verifier", reply=r3),
-                ],
-                terminated_by="verifier_accept",
-            )
-
-    old = serve.get_coordinator
-    try:
-        serve.get_coordinator = lambda _mode: StreamCoord()
-        srv, port = _start_server(serve.Handler)
-        time.sleep(0.1)
-        payload = json.dumps(
-            {"model": "trinity", "messages": [{"role": "user", "content": "hi"}], "stream": True}
-        ).encode()
-        req = Request(
-            f"http://127.0.0.1:{port}/v1/chat/completions",
-            data=payload,
-            headers={"Content-Type": "application/json", "Authorization": "Bearer test-key"},
-        )
-        resp = urlopen(req)
-        lines = [line for line in resp.read().decode().split("\n") if line.strip()]
-        events = [json.loads(line) for line in lines]
-        starts = [e for e in events if e.get("type") == "step-start"]
-        ends = [e for e in events if e.get("type") == "step-end"]
-        results = [e for e in events if e.get("type") == "result"]
-        assert len(starts) == 3
-        assert len(ends) == 3
-        assert len(results) == 1
-        assert results[0]["text"] == "final answer"
-        assert results[0]["mantis_steps"][0]["model_name"] == "gpt-5.6-sol"
-        assert results[0]["mantis_steps"][0]["prompt"] == "hi"
-    finally:
-        serve.get_coordinator = old
-        srv.shutdown()
-
-
-def test_handler_post_chunked():
-    """Pi/fetch can send chunked POST bodies; the handler must consume them."""
-
-    class SimpleCoord:
-        def run(self, query, verbose=False):
-            return SimpleNamespace(
-                final="chunked ok",
-                turns=[
-                    SimpleNamespace(
-                        t=0,
-                        agent_id=2,
-                        role_name="Worker",
-                        reply="ok",
-                        prompt=query,
-                        model_name="gpt-5.6-luna",
-                    )
-                ],
-                terminated_by="verifier_accept",
-            )
-
-    old = serve.get_coordinator
-    try:
-        serve.get_coordinator = lambda _mode: SimpleCoord()
-        srv, port = _start_server(serve.Handler)
-        time.sleep(0.1)
-        payload = json.dumps(
-            {"model": "trinity", "messages": [{"role": "user", "content": "hi"}]}
-        ).encode()
-        chunks = [payload[i : i + 10] for i in range(0, len(payload), 10)]
-        conn = http.client.HTTPConnection("127.0.0.1", port)
-        conn.putrequest("POST", "/v1/chat/completions")
-        conn.putheader("Content-Type", "application/json")
-        conn.putheader("Authorization", "Bearer test-key")
-        conn.putheader("Transfer-Encoding", "chunked")
-        conn.endheaders()
-        for chunk in chunks:
-            conn.send(f"{len(chunk):X}\r\n".encode() + chunk + b"\r\n")
-        conn.send(b"0\r\n\r\n")
-        resp = conn.getresponse()
-        body = resp.read().decode()
-        assert resp.status == 200
-        data = json.loads(body)
-        assert data["choices"][0]["message"]["content"] == "chunked ok"
-        assert data["mantis_steps"][0]["model_name"] == "gpt-5.6-luna"
-    finally:
-        serve.get_coordinator = old
-        srv.shutdown()
-
-
-# ---------------------------------------------------------------------------
-# Worker wrappers
-# ---------------------------------------------------------------------------
-def test_openrouter_conductor_worker_with_api_base(monkeypatch):
-    captured: dict[str, Any] = {}
-
-    def _completion(**kw):
-        captured.update(kw)
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
-
-    monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=_completion))
-    worker = serve.OpenRouterConductorWorker(slot_models=["gpt-5.6-luna"], api_base="http://x/")
-    worker._call("gpt-5.6-luna", [{"role": "user", "content": "hi"}])
-    assert captured["api_base"] == "http://x/"
+def test_direct_conductor_worker(monkeypatch):
+    captured: list[Any] = []
+    monkeypatch.setattr(serve, "_direct_completion", lambda *args: captured.extend(args) or "ok")
+    worker = serve.DirectConductorWorker(["openrouter/openai/gpt-5.6-luna"])
+    assert (
+        worker._call("openrouter/openai/gpt-5.6-luna", [{"role": "user", "content": "hi"}]) == "ok"
+    )
+    assert captured[0] == "openrouter/openai/gpt-5.6-luna"
 
 
 def test_run_conductor_workflow_empty():
@@ -1046,8 +864,8 @@ def test_worker_from_args(monkeypatch):
             self.max_tokens = max_tokens
 
     monkeypatch.setattr(serve, "LocalPoolWorker", FakeLocal)
-    monkeypatch.setattr(serve, "OpenRouterTrinityWorker", FakeTrinity)
-    monkeypatch.setattr(serve, "OpenRouterConductorWorker", FakeConductor)
+    monkeypatch.setattr(serve, "DirectTrinityWorker", FakeTrinity)
+    monkeypatch.setattr(serve, "DirectConductorWorker", FakeConductor)
 
     args = SimpleNamespace(local_models="/a@cpu,/b", slot_models="x,y")
     local = serve._worker_from_args(args, "trinity")
@@ -1498,99 +1316,23 @@ def test_conductor_complete_turn_numbering():
 
 
 def test_worker_timeout_passthrough(monkeypatch):
-    captured_kw: dict[str, Any] = {}
-
-    def _completion(**kw):
-        captured_kw.update(kw)
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
-
-    monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=_completion))
-    monkeypatch.setenv("MANTIS_WORKER_TIMEOUT", "120")
-
-    worker_trinity = serve.OpenRouterTrinityWorker(slot_models=["gpt-5.6-luna"], timeout=120)
-    res_trinity = worker_trinity("Worker", [{"role": "user", "content": "test"}], 0)
-    assert res_trinity == "ok"
-    assert captured_kw["timeout"] == 120.0
-
-    captured_kw.clear()
-    worker_conductor = serve.OpenRouterConductorWorker(slot_models=["gpt-5.6-luna"], timeout=180)
-    res_conductor = worker_conductor._call("gpt-5.6-luna", [{"role": "user", "content": "test"}])
-    assert res_conductor == "ok"
-    assert captured_kw["timeout"] == 180.0
-
-
-def test_disconnect_prevents_subsequent_steps(monkeypatch):
-    worker_calls = 0
-
-    class DisconnectingWorker:
-        slot_models = ["model-0"]
-        names = ["model-0"]
-
-        def __call__(self, role, messages, agent_id):
-            nonlocal worker_calls
-            worker_calls += 1
-            if worker_calls == 1:
-                # Simulate client disconnect after step 0
-                serve._history_context.aborted = True
-            return f"reply-{worker_calls}"
-
-    class MultiStepCoord:
-        def run(self, query, verbose=False):
-            worker = serve.HistoryWorker(DisconnectingWorker())
-            worker("Worker", [{"role": "user", "content": query}], 0)
-            # This second worker call should raise ClientDisconnectedError
-            r2 = worker("Thinker", [{"role": "user", "content": query}], 0)
-            return SimpleNamespace(final=r2, turns=[])
-
-    old = serve.get_coordinator
-    try:
-        serve.get_coordinator = lambda _mode: MultiStepCoord()
-        srv, port = _start_server(serve.Handler)
-        time.sleep(0.1)
-
-        payload = json.dumps(
-            {"model": "trinity", "messages": [{"role": "user", "content": "hi"}], "stream": True}
-        ).encode()
-        req = Request(
-            f"http://127.0.0.1:{port}/v1/chat/completions",
-            data=payload,
-            headers={"Content-Type": "application/json", "Authorization": "Bearer test-key"},
-        )
-        resp = urlopen(req)
-        # Read the first event
-        resp.readline()
-        resp.close()
-
-        time.sleep(0.2)
-        # Ensure only 1 worker call occurred before aborting
-        assert worker_calls == 1
-        assert getattr(serve._history_context, "write_line", None) is None
-        assert getattr(serve._history_context, "is_client_connected", None) is None
-        assert getattr(serve._history_context, "aborted", False) is False
-    finally:
-        serve.get_coordinator = old
-        srv.shutdown()
-
-
-# ---------------------------------------------------------------------------
-# Resumable native-tool runs
-# ---------------------------------------------------------------------------
+    captured: list[Any] = []
+    monkeypatch.setattr(serve, "_direct_completion", lambda *args: captured.extend(args) or "ok")
+    worker = serve.DirectTrinityWorker(["opencode-go/deepseek-v4-flash"], timeout=120)
+    assert worker("Worker", [{"role": "user", "content": "test"}], 0) == "ok"
+    assert captured[-1] == 120
 
 
 def _run_messages(text: str = "do the task") -> list[dict[str, str]]:
     return [{"role": "system", "content": "system"}, {"role": "user", "content": text}]
 
 
-def test_litellm_upstream_config_is_separate_from_ingress(monkeypatch):
+def test_provider_config_is_separate_from_ingress(monkeypatch):
     monkeypatch.setenv("MANTIS_API_KEY", "ingress")
-    monkeypatch.setenv("LITELLM_KEY", "proxy")
-    monkeypatch.setenv("MANTIS_BASE_URL", "http://proxy/v1")
-    assert serve._litellm_api_key() == "proxy"
-    assert serve._litellm_base_url() == "http://proxy/v1"
+    monkeypatch.setenv("OPENROUTER_API_KEY", "provider")
+    _, headers, _ = serve._build_request("openrouter/openai/gpt-5.6-sol|medium", [], 10, 0.7)
+    assert headers["Authorization"] == "Bearer provider"
     assert serve._is_reasoning_model("openai/gpt-5.6-sol")
-    monkeypatch.delenv("LITELLM_KEY")
-    monkeypatch.delenv("MANTIS_LITELLM_API_KEY", raising=False)
-    assert serve._litellm_api_key() is None
 
 
 def test_configured_slot_models(monkeypatch):
@@ -1728,44 +1470,6 @@ def test_create_run_validates_messages_and_slots():
         serve.create_run("trinity", {"messages": _run_messages(), "slot_models": "bad"})
 
 
-def test_run_http_lifecycle_and_invalid_json(monkeypatch):
-    monkeypatch.setattr(serve, "_args", None)
-    monkeypatch.setenv("MANTIS_WORKER_MODELS", "worker")
-    srv, port = _start_server(serve.Handler)
-    try:
-        time.sleep(0.05)
-        headers = {"Authorization": "Bearer test-key", "Content-Type": "application/json"}
-        conn = http.client.HTTPConnection("127.0.0.1", port)
-        conn.request("POST", "/v1/runs", body="[]", headers=headers)
-        assert conn.getresponse().status == 400
-        conn.close()
-
-        conn = http.client.HTTPConnection("127.0.0.1", port)
-        conn.request(
-            "POST",
-            "/v1/runs",
-            body=json.dumps({"model": "trinity", "messages": _run_messages()}),
-            headers=headers,
-        )
-        response = conn.getresponse()
-        assert response.status == 200
-        run_id = json.loads(response.read())["run_id"]
-        conn.close()
-
-        conn = http.client.HTTPConnection("127.0.0.1", port)
-        conn.request("POST", f"/v1/runs/{run_id}/continue", body="[]", headers=headers)
-        assert conn.getresponse().status == 400
-        conn.close()
-
-        conn = http.client.HTTPConnection("127.0.0.1", port)
-        conn.request("DELETE", f"/v1/runs/{run_id}", headers=headers)
-        response = conn.getresponse()
-        assert response.status == 200 and json.loads(response.read())["deleted"] is True
-        conn.close()
-    finally:
-        srv.shutdown()
-
-
 def test_bounded_request_body_helpers():
     handler = object.__new__(serve.Handler)
     handler.headers = {"Content-Length": "4"}
@@ -1786,42 +1490,6 @@ def test_bounded_request_body_helpers():
     handler.rfile = __import__("io").BytesIO(b"2\r\nabXX0\r\n\r\n")
     with pytest.raises(ValueError, match="terminator"):
         handler._read_request_body()
-
-
-def test_convert_tools_and_model_completion(monkeypatch):
-    converted = serve._convert_tools(
-        [
-            None,
-            {},
-            {"name": "mantis_step", "parameters": {}},
-            {"name": "read", "description": "read files", "parameters": {"type": "object"}},
-            {"name": "bash"},
-            {"name": "bad", "parameters": "invalid"},
-        ]
-    )
-    assert [tool["function"]["name"] for tool in converted] == ["read", "bash"]
-    assert converted[1]["function"]["parameters"]["type"] == "object"
-    assert serve._convert_tools("bad") == []
-
-    tool_calls = [
-        SimpleNamespace(id="same", function=SimpleNamespace(name="read", arguments='{"path":"a"}')),
-        SimpleNamespace(id="same", function=SimpleNamespace(name="bash", arguments="not-json")),
-        SimpleNamespace(id=None, function=SimpleNamespace(name="edit", arguments="[]")),
-    ]
-    completion = MagicMock(
-        return_value=SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=tool_calls))]
-        )
-    )
-    monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(completion=completion))
-    monkeypatch.setenv("LITELLM_KEY", "proxy")
-    text, calls = serve._model_completion("openai/gpt-5.6-sol", [], converted)
-    assert text == ""
-    assert len({call["id"] for call in calls}) == 3
-    assert calls[1]["arguments"] == {} and calls[2]["arguments"] == {}
-    kwargs = completion.call_args.kwargs
-    assert kwargs["api_key"] == "proxy" and kwargs["tools"] == converted
-    assert "temperature" not in kwargs
 
 
 def test_run_registry_sweep_and_capacity(monkeypatch):
@@ -1994,3 +1662,141 @@ def test_learning_record_skips_ambiguous_runs(monkeypatch):
     run.turns = [{"role": "Worker", "agent_id": 0, "reply": "answer"}]
     record = serve._learning_record(run, {"type": "final", "terminated_by": "max_turns"})
     assert not record["trainable"] and not record["test_seen"]
+
+
+class _ProtocolRun:
+    def __init__(self, run_id="a" * 32, kind="trinity"):
+        self.run_id = run_id
+        self.kind = kind
+        self.terminated_by = "verifier_accept"
+        self.turns = [{"turn": 0, "role": "Worker", "agent_id": 1, "model_name": "worker"}]
+
+
+def _post_json(port, payload):
+    request = Request(
+        f"http://127.0.0.1:{port}/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "Authorization": "Bearer test-key"},
+    )
+    response = urlopen(request)
+    return response, response.read().decode()
+
+
+def test_openai_chat_completion_contract(monkeypatch):
+    run = _ProtocolRun()
+    monkeypatch.setattr(serve, "create_run", lambda mode, body: run)
+    monkeypatch.setattr(
+        serve, "_advance_to_boundary", lambda run_id, results=None: {"type": "final", "text": "42"}
+    )
+    monkeypatch.setattr(serve, "delete_run", lambda run_id: True)
+    server, port = _start_server(serve.Handler)
+    try:
+        response, raw = _post_json(
+            port, {"model": "mantis", "messages": [{"role": "user", "content": "2+2"}]}
+        )
+        body = json.loads(raw)
+        assert response.headers["Content-Type"] == "application/json"
+        assert body["object"] == "chat.completion"
+        assert body["choices"][0] == {
+            "index": 0,
+            "message": {"role": "assistant", "content": "42"},
+            "finish_reason": "stop",
+        }
+        assert body["usage"]["total_tokens"] > 0
+    finally:
+        server.shutdown()
+
+
+def test_openai_tool_call_round_trip(monkeypatch):
+    run = _ProtocolRun()
+    tool_event = {
+        "type": "tool_calls",
+        "tool_calls": [{"id": "internal", "name": "read", "arguments": {"path": "a.py"}}],
+    }
+    captured = []
+    monkeypatch.setattr(serve, "create_run", lambda mode, body: run)
+    monkeypatch.setattr(serve, "get_run", lambda run_id: run)
+    monkeypatch.setattr(serve, "delete_run", lambda run_id: True)
+    monkeypatch.setattr(
+        serve,
+        "_advance_to_boundary",
+        lambda run_id, results=None: (
+            captured.append(results)
+            or (tool_event if results is None else {"type": "final", "text": "done"})
+        ),
+    )
+    server, port = _start_server(serve.Handler)
+    try:
+        tools = [
+            {"type": "function", "function": {"name": "read", "parameters": {"type": "object"}}}
+        ]
+        _, raw = _post_json(
+            port,
+            {
+                "model": "mantis",
+                "messages": [{"role": "user", "content": "inspect"}],
+                "tools": tools,
+            },
+        )
+        first = json.loads(raw)
+        choice = first["choices"][0]
+        assert choice["finish_reason"] == "tool_calls"
+        call = choice["message"]["tool_calls"][0]
+        assert call["function"] == {"name": "read", "arguments": '{"path": "a.py"}'}
+        messages = [
+            {"role": "user", "content": "inspect"},
+            choice["message"],
+            {"role": "tool", "tool_call_id": call["id"], "content": "contents"},
+        ]
+        _, raw = _post_json(port, {"model": "mantis", "messages": messages, "tools": tools})
+        assert json.loads(raw)["choices"][0]["message"]["content"] == "done"
+        assert captured[-1] == [
+            {"tool_call_id": "internal", "content": "contents", "is_error": False}
+        ]
+    finally:
+        server.shutdown()
+
+
+def test_openai_sse_contract(monkeypatch):
+    run = _ProtocolRun()
+    monkeypatch.setattr(serve, "create_run", lambda mode, body: run)
+    monkeypatch.setattr(
+        serve,
+        "_advance_to_boundary",
+        lambda run_id, results=None: {"type": "final", "text": "hello"},
+    )
+    monkeypatch.setattr(serve, "delete_run", lambda run_id: True)
+    server, port = _start_server(serve.Handler)
+    try:
+        response, raw = _post_json(
+            port,
+            {"model": "mantis", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+        )
+        assert response.headers["Content-Type"] == "text/event-stream"
+        lines = [line for line in raw.splitlines() if line.startswith("data: ")]
+        assert json.loads(lines[0][6:])["object"] == "chat.completion.chunk"
+        assert json.loads(lines[1][6:])["choices"][0]["finish_reason"] == "stop"
+        assert lines[-1] == "data: [DONE]"
+    finally:
+        server.shutdown()
+
+
+def test_standard_tool_validation_and_model_ids():
+    tools = serve._convert_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "description": "read",
+                    "parameters": {"type": "object"},
+                },
+            },
+            {"name": "legacy"},
+        ]
+    )
+    assert [tool["function"]["name"] for tool in tools] == ["read"]
+    assert serve._mode_for_model("mantis") == "trinity"
+    assert serve._mode_for_model("mantis-ultra") == "conductor"
+    with pytest.raises(ValueError):
+        serve._mode_for_model("unknown")

@@ -1,44 +1,6 @@
+name: mantis
+
 services:
-  litellm:
-    image: ghcr.io/berriai/litellm:main-stable
-    container_name: mantis-litellm
-    ports: ["3001:4000"]
-    volumes:
-      - ./configs/litellm.yaml:/app/config.yaml:ro
-    command: ["--config", "/app/config.yaml", "--port", "4000"]
-    environment:
-      LITELLM_KEY: ${LITELLM_KEY}
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness')"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-    networks: [mantis]
-
-  router:
-    build:
-      context: .
-      dockerfile: docker/router/Dockerfile
-    container_name: mantis-router
-    ports: ["5500:5500"]
-    environment:
-      LITELLM_BASE: http://litellm:4000/v1
-      LITELLM_KEY: ${LITELLM_KEY}
-      ROUTELLM_KEY: ${LITELLM_KEY}
-      # llm-router's mf scorer still needs an OpenAI key for text-embedding-3-small.
-      # The backend LLM calls go through the LiteLLM proxy / OpenRouter.
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
-      EXPENSIVE_MODEL: ${EXPENSIVE_MODEL:-gpt-5.6-sol-medium}
-      CHEAP_MODEL: ${CHEAP_MODEL:-gpt-5.6-luna-max}
-      EXPENSIVE_REASONING_EFFORT: ""
-      CHEAP_REASONING_EFFORT: ""
-      ROUTELLM_USE_SUPRA: "1"
-    depends_on:
-      litellm:
-        condition: service_healthy
-    networks: [mantis]
-
   openfugu:
     build:
       context: .
@@ -46,16 +8,16 @@ services:
     container_name: mantis-orchestrator
     ports: ["8088:8088"]
     environment:
-      MANTIS_BASE_URL: http://litellm:4000/v1
-      MANTIS_API_KEY: ${MANTIS_API_KEY:-${LITELLM_KEY}}
-      MANTIS_LITELLM_API_KEY: ${MANTIS_LITELLM_API_KEY:-${LITELLM_KEY}}
+      MANTIS_API_KEY: ${MANTIS_API_KEY:-sk-mantis-local}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENCODE_API_KEY: ${OPENCODE_API_KEY}
       MANTIS_MODEL: ${MANTIS_MODEL:-Qwen/Qwen3-0.6B}
       MANTIS_VECTOR: ${MANTIS_VECTOR:-/app/artifacts/model_iter_60.npy}
       MANTIS_HEAD: ${MANTIS_HEAD:-}
-      MANTIS_WORKER_MODEL: ${MANTIS_WORKER_MODEL:-claude-sonnet-5-medium}
-      MANTIS_WORKER_MODELS: ${MANTIS_WORKER_MODELS:-gemini-3.6-flash-high,gpt-5.6-luna-max,gpt-5.6-sol-medium,deepseek-v4-flash-0731-xhigh,claude-opus-5-medium,claude-sonnet-5-medium,gemini-3.1-pro-preview-high}
+      MANTIS_WORKER_MODEL: ${MANTIS_WORKER_MODEL:-openrouter/anthropic/claude-sonnet-5|medium}
+      MANTIS_WORKER_MODELS: ${MANTIS_WORKER_MODELS:-openrouter/google/gemini-3.6-flash|high,openrouter/openai/gpt-5.6-luna|max,openrouter/openai/gpt-5.6-sol|medium,opencode-go/deepseek-v4-flash,openrouter/anthropic/claude-opus-5|medium,openrouter/anthropic/claude-sonnet-5|medium,openrouter/google/gemini-3.1-pro-preview|high}
       MANTIS_LOCAL_MODELS: ${MANTIS_LOCAL_MODELS:-}
-      MANTIS_CONDUCTOR_MODEL: ${MANTIS_CONDUCTOR_MODEL:-gpt-5.6-luna-max}
+      MANTIS_CONDUCTOR_MODEL: ${MANTIS_CONDUCTOR_MODEL:-openrouter/openai/gpt-5.6-luna|max}
       MANTIS_LOCAL_CONDUCTOR: ${MANTIS_LOCAL_CONDUCTOR:-}
       MANTIS_CONDUCTOR_DEVICE: ${MANTIS_CONDUCTOR_DEVICE:-cpu}
       MANTIS_CONDUCTOR_DTYPE: ${MANTIS_CONDUCTOR_DTYPE:-float32}
@@ -63,7 +25,7 @@ services:
       MANTIS_MAX_TURNS: ${MANTIS_MAX_TURNS:-5}
       HF_HOME: /root/.cache/huggingface
       HF_TOKEN: ${HF_TOKEN:-}
-      CUDA_VISIBLE_DEVICES: ""   # CPU on Mac
+      CUDA_VISIBLE_DEVICES: ""
       TOKENIZERS_PARALLELISM: "false"
       MANTIS_LEARNING: ${MANTIS_LEARNING:-0}
       MANTIS_LEARNING_DIR: /app/learning
@@ -78,9 +40,6 @@ services:
       options:
         max-size: 10m
         max-file: "3"
-    depends_on:
-      litellm:
-        condition: service_healthy
     networks: [mantis]
 
 networks:
@@ -89,3 +48,5 @@ networks:
 
 volumes:
   hf-cache:
+    external: true
+    name: mantis_hf-cache

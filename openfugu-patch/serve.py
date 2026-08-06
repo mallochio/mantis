@@ -15,7 +15,6 @@ stdlib http.server only — no FastAPI/uvicorn.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import hashlib
 import json
 import os
@@ -25,7 +24,9 @@ import socket
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -54,21 +55,31 @@ from mini import (
     Coordinator,
     FuguRouter,
 )
-from mini import LiteLLMWorker as _TrinityLiteLLMWorker
 from ultra import ConductorExecutor, conductor_prompt, parse_workflow, visible_indices
-from ultra import LiteLLMWorker as _ConductorLiteLLMWorker
 
 ROUTER: FuguRouter | None = None
 _router_lock = threading.Lock()
 MODEL_NAME = os.environ.get("MANTIS_MODEL_NAME", "mantis")
+MODEL_MODES = {
+    MODEL_NAME: "trinity",
+    "mantis-trinity": "trinity",
+    "trinity": "trinity",
+    "fugu": "trinity",
+    "mantis-ultra": "conductor",
+    "conductor": "conductor",
+    "ultra": "conductor",
+}
 MAX_TURNS = 5
 # Reject bodies larger than this many bytes.
 MAX_BODY_BYTES = int(os.environ.get("MANTIS_MAX_BODY_BYTES", str(5 * 1024 * 1024)))
 WORKER_TIMEOUT = float(os.environ.get("MANTIS_WORKER_TIMEOUT", "240"))
 
-# Aliases that carry a LiteLLM reasoning_effort parameter. OpenRouter/LiteLLM
-# reject temperature != 1 for these models.
-REASONING_ALIASES = ("claude-", "gpt-5.6-", "expensive", "cheap")
+# These providers reject temperature != 1 when reasoning is enabled.
+REASONING_MODELS = ("claude-", "gpt-5.6-")
+PROVIDERS = {
+    "openrouter": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
+    "opencode-go": ("https://opencode.ai/zen/go/v1", "OPENCODE_API_KEY"),
+}
 
 _args: argparse.Namespace | None = None
 _coordinators: dict[str, object] = {}
@@ -94,43 +105,57 @@ def _check_client_connected() -> None:
         raise ClientDisconnectedError("Client disconnected")
 
 
+def _parse_model_spec(spec: str) -> tuple[str, str, str | None]:
+    """Parse provider/model[|reasoning_effort]."""
+    provider, sep, rest = spec.partition("/")
+    if not sep or provider not in PROVIDERS:
+        raise ValueError(f"model must start with {' or '.join(PROVIDERS)}: {spec}")
+    model, marker, effort = rest.partition("|")
+    return provider, model, effort if marker and effort != "none" else None
+
+
 def _is_reasoning_model(model: str) -> bool:
     name = model.rsplit("/", 1)[-1]
-    return any(name.startswith(p) for p in REASONING_ALIASES)
+    return any(name.startswith(p) for p in REASONING_MODELS)
 
 
-def _litellm_api_key() -> str | None:
-    """Return the upstream proxy key, independent from Mantis ingress auth."""
-    return os.environ.get("MANTIS_LITELLM_API_KEY") or os.environ.get("LITELLM_KEY")
+def _build_request(
+    spec: str, messages: list[dict[str, str]], max_tokens: int, temperature: float
+) -> tuple[str, dict[str, str], dict[str, Any]]:
+    provider, model, effort = _parse_model_spec(spec)
+    base_url, key_env = PROVIDERS[provider]
+    key = os.environ.get(key_env)
+    if not key:
+        raise RuntimeError(f"{key_env} is required for {spec}")
+    body: dict[str, Any] = {"model": model, "messages": messages, "max_tokens": max_tokens}
+    if effort:
+        body["reasoning_effort"] = effort
+    if not effort and not _is_reasoning_model(model):
+        body["temperature"] = temperature
+    return (
+        f"{base_url}/chat/completions",
+        {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "User-Agent": "OpenAI/Python",
+        },
+        body,
+    )
 
 
-def _litellm_base_url() -> str:
-    return os.environ.get("MANTIS_BASE_URL", "http://127.0.0.1:3001/v1")
-
-
-def _build_litellm_kwargs(
-    model: str,
-    messages: list[dict[str, str]],
-    max_tokens: int,
-    temperature: float,
-    timeout: float | None = None,
-) -> dict[str, Any]:
-    """Construct kwargs for a LiteLLM completion routed through the OpenRouter proxy."""
-    if timeout is None:
-        timeout = WORKER_TIMEOUT
-    kw: dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "custom_llm_provider": "openai",
-        "timeout": timeout,
-    }
-    # LiteLLM's openai provider rejects temperature != 1 when reasoning_effort
-    # is enabled (claude-*, gpt-5.6-*). Drop it for those models while keeping
-    # it for the low-cost non-reasoning workers (deepseek/glm/opencode).
-    if not _is_reasoning_model(model):
-        kw["temperature"] = temperature
-    return kw
+def _direct_completion(
+    spec: str, messages: list[dict[str, str]], max_tokens: int, temperature: float, timeout: float
+) -> str:
+    url, headers, body = _build_request(spec, messages, max_tokens, temperature)
+    request = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)  # noqa: S310
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+            data = json.load(response)
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(
+            f"{spec} returned HTTP {error.code}: {error.read().decode(errors='replace')[:500]}"
+        ) from error
+    return str(data["choices"][0]["message"].get("content") or "")
 
 
 class RejectAwareRouter:
@@ -382,72 +407,31 @@ class HistoryWorker:
         return getattr(self._worker, name)
 
 
-class OpenRouterTrinityWorker(_TrinityLiteLLMWorker):
-    """TRINITY worker that dispatches each turn through the LiteLLM/OpenRouter proxy."""
-
+class DirectTrinityWorker:
     def __init__(
         self,
-        slot_models: list[str] | None = None,
+        slot_models: list[str],
         max_tokens: int = 4096,
         temperature: float = 0.7,
-        api_key: str | None = None,
-        api_base: str | None = None,
         timeout: float | None = None,
     ) -> None:
-        super().__init__(
-            slot_models=slot_models,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            api_key=api_key,
-            api_base=api_base,
-        )
+        self.slot_models = slot_models
+        self.max_tokens = max_tokens
+        self.temperature = temperature
         self.timeout = timeout if timeout is not None else WORKER_TIMEOUT
 
     def __call__(self, role_name: str, messages: list, agent_id: int) -> str:
-        import litellm
-
         model = self.slot_models[agent_id % len(self.slot_models)]
         msgs = [{"role": m["role"], "content": m["content"]} for m in messages]
-        kw = _build_litellm_kwargs(
-            model, msgs, self.max_tokens, self.temperature, timeout=self.timeout
-        )
-        if self.api_key:
-            kw["api_key"] = self.api_key
-        if self.api_base:
-            kw["api_base"] = self.api_base
-        return str(litellm.completion(**kw).choices[0].message.content or "")
+        return _direct_completion(model, msgs, self.max_tokens, self.temperature, self.timeout)
 
 
-class OpenRouterConductorWorker(_ConductorLiteLLMWorker):
-    """Conductor worker that dispatches plan and step calls through LiteLLM/OpenRouter."""
-
-    def __init__(
-        self,
-        slot_models: list[str] | None = None,
-        max_tokens: int = 4096,
-        temperature: float = 0.7,
-        api_key: str | None = None,
-        api_base: str | None = None,
-        timeout: float | None = None,
-    ) -> None:
-        super().__init__(
-            slot_models=slot_models,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            api_key=api_key,
-            api_base=api_base,
-        )
-        self.timeout = timeout if timeout is not None else WORKER_TIMEOUT
-
+class DirectConductorWorker(DirectTrinityWorker):
     def _call(self, model: str, messages: list) -> str:
-        kw = _build_litellm_kwargs(
-            model, messages, self.max_tokens, self.temperature, timeout=self.timeout
-        )
-        if self.api_key:
-            kw["api_key"] = self.api_key
-        if self.api_base:
-            kw["api_base"] = self.api_base
-        return str(self.litellm.completion(**kw).choices[0].message.content or "")
+        return _direct_completion(model, messages, self.max_tokens, self.temperature, self.timeout)
+
+    def conduct(self, model: str, messages: list) -> str:
+        return self._call(model, messages)
 
 
 class LocalPoolWorker:
@@ -495,60 +479,6 @@ class LocalPoolWorker:
                 pad_token_id=tk.pad_token_id,
             )
         return str(tk.decode(out[0, ids["input_ids"].shape[1] :], skip_special_tokens=True))
-
-
-def _build_fugu_trace(result: Any) -> str:
-    """Render a compact orchestration trace from a coordinator result."""
-    turns = getattr(result, "turns", [])
-    if not turns:
-        return "steps:0:conductor"
-    if hasattr(turns[0], "role_name"):
-        parts = [f"{t.role_name}({t.agent_id})" for t in turns]
-        tb = getattr(result, "terminated_by", "")
-        return "→".join(parts) + (f":{tb}" if tb else "")
-    return f"steps:{len(turns)}:conductor"
-
-
-def _chat_response(result: Any, model: str) -> dict:
-    text = getattr(result, "final", "")
-    turns = getattr(result, "turns", [])
-    trace = _build_fugu_trace(result)
-    step_details = [
-        {
-            "turn": getattr(turn, "t", getattr(turn, "step", getattr(turn, "idx", 0))),
-            "agent_id": getattr(turn, "agent_id", 0),
-            "role": getattr(turn, "role", getattr(turn, "role_name", "Worker")),
-            "reply": getattr(turn, "reply", getattr(turn, "text", "")),
-            "prompt": getattr(turn, "prompt", ""),
-            "model_name": getattr(turn, "model_name", ""),
-        }
-        for turn in turns
-    ]
-    return {
-        "id": "chatcmpl-" + uuid.uuid4().hex[:24],
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": text,
-                    "mantis_steps": step_details,
-                },
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {
-            "mantis_turns": len(turns),
-            "mantis_trace": trace,
-            "mantis_steps": step_details,
-            "fugu_turns": len(turns),
-            "fugu_trace": trace,
-        },
-        "mantis_steps": step_details,
-    }
 
 
 def _resolve_conductor_model(worker) -> str:
@@ -755,7 +685,7 @@ class EnvLocalConductor:
         if self.device == "auto" and _torch.cuda.device_count() > 1:
             pass  # leave device_map behavior to from_pretrained
         else:
-            self.model = self.model.to(self.device)  # type: ignore[arg-type]
+            self.model = self.model.to(self.device)
         self.model.eval()
         print("[serve] Conductor ready", flush=True)
 
@@ -855,6 +785,143 @@ def _json_object(raw: bytes) -> dict[str, Any]:
     return value
 
 
+def _message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict) and part.get("type") in ("text", "input_text")
+        )
+    return "" if content is None else str(content)
+
+
+def _mode_for_model(model: Any) -> str:
+    if not isinstance(model, str) or model not in MODEL_MODES:
+        raise ValueError(f"unknown model: {model}")
+    return MODEL_MODES[model]
+
+
+def _public_tool_id(run_id: str, internal_id: str) -> str:
+    return f"call_mantis_{run_id}_{internal_id}"
+
+
+def _parse_public_tool_id(tool_id: Any) -> tuple[str, str] | None:
+    if not isinstance(tool_id, str) or not tool_id.startswith("call_mantis_"):
+        return None
+    rest = tool_id[len("call_mantis_") :]
+    run_id, sep, internal_id = rest.partition("_")
+    if not sep or len(run_id) != 32 or any(c not in "0123456789abcdef" for c in run_id.lower()):
+        return None
+    return run_id, internal_id
+
+
+def _continuation(messages: Any) -> tuple[str, list[dict[str, Any]]] | None:
+    """Extract a Mantis continuation from trailing standard OpenAI tool messages."""
+    if not isinstance(messages, list):
+        return None
+    trailing: list[dict[str, Any]] = []
+    i = len(messages) - 1
+    while i >= 0 and isinstance(messages[i], dict) and messages[i].get("role") == "tool":
+        trailing.append(messages[i])
+        i -= 1
+    if not trailing or i < 0:
+        return None
+    assistant = messages[i]
+    if not isinstance(assistant, dict) or assistant.get("role") != "assistant":
+        return None
+    advertised = {
+        call.get("id") for call in assistant.get("tool_calls", []) if isinstance(call, dict)
+    }
+    results: list[dict[str, Any]] = []
+    run_id: str | None = None
+    for message in reversed(trailing):
+        public_id = message.get("tool_call_id")
+        parsed = _parse_public_tool_id(public_id)
+        if parsed is None or public_id not in advertised:
+            raise ValueError("tool result does not belong to a Mantis tool call")
+        current_run, internal_id = parsed
+        if run_id is not None and current_run != run_id:
+            raise ValueError("tool results span multiple Mantis runs")
+        run_id = current_run
+        results.append(
+            {
+                "tool_call_id": internal_id,
+                "content": _message_text(message.get("content"))[:RUN_MAX_MSG_BYTES],
+                "is_error": False,
+            }
+        )
+    return (cast(str, run_id), results)
+
+
+def _advance_to_boundary(run_id: str, tool_results: Any = None) -> dict[str, Any]:
+    event = advance_run(run_id, tool_results)
+    for _ in range(128):
+        if event.get("type") != "step_complete":
+            return event
+        event = advance_run(run_id, None)
+    return {"type": "error", "error": "orchestration exceeded 128 internal steps"}
+
+
+def _run_trace(run: Any) -> dict[str, Any]:
+    steps = list(getattr(run, "turns", getattr(run, "steps", [])))
+    return {
+        "mode": run.kind,
+        "terminated_by": run.terminated_by,
+        "steps": [
+            {
+                key: step.get(key)
+                for key in ("turn", "role", "agent_id", "model_name")
+                if step.get(key) is not None
+            }
+            for step in steps
+        ],
+    }
+
+
+def _completion_response(
+    model: str, messages: list[dict[str, Any]], run: Any, event: dict[str, Any]
+) -> dict[str, Any]:
+    completion_id = "chatcmpl-" + uuid.uuid4().hex[:24]
+    message: dict[str, Any] = {"role": "assistant", "content": None}
+    if event.get("type") == "tool_calls":
+        message["tool_calls"] = [
+            _openai_tool_call(
+                str(call.get("name", "")),
+                _public_tool_id(run.run_id, str(call.get("id", ""))),
+                call.get("arguments") if isinstance(call.get("arguments"), dict) else {},
+            )
+            for call in event.get("tool_calls", [])
+        ]
+        finish_reason = "tool_calls"
+        completion_text = "".join(call["function"]["arguments"] for call in message["tool_calls"])
+    else:
+        message["content"] = str(event.get("text", ""))
+        finish_reason = "stop"
+        completion_text = message["content"]
+    prompt_chars = sum(
+        len(_message_text(message.get("content")))
+        for message in messages
+        if isinstance(message, dict)
+    )
+    prompt_tokens = max(1, (prompt_chars + 3) // 4)
+    completion_tokens = max(1, (len(completion_text) + 3) // 4)
+    return {
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+        "mantis": _run_trace(run),
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -912,14 +979,14 @@ class Handler(BaseHTTPRequestHandler):
         return bytes(body)
 
     def _auth_token(self) -> str | None:
-        return os.environ.get("MANTIS_API_KEY") or os.environ.get("LITELLM_KEY")
+        return os.environ.get("MANTIS_API_KEY")
 
     def _check_auth(self) -> bool:
         expected = self._auth_token()
         if not expected:
             self._send(
                 500,
-                {"error": "MANTIS_API_KEY or LITELLM_KEY is not configured"},
+                {"error": "MANTIS_API_KEY is not configured"},
             )
             return False
         auth = self.headers.get("Authorization", "")
@@ -946,71 +1013,6 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
-    def _write_ndjson_line(self, obj: Any) -> None:
-        try:
-            self.wfile.write((json.dumps(obj) + "\n").encode())
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, OSError) as err:
-            self._disconnected = True
-            _history_context.aborted = True
-            raise ClientDisconnectedError("Client disconnected") from err
-
-    def _run_stream(self, coordinator_mode: str, query: str, model: str) -> None:
-        self.send_response(200)
-        self.send_header("Content-Type", "application/x-ndjson")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.end_headers()
-
-        _history_context.write_line = self._write_ndjson_line
-        _history_context.is_client_connected = self.is_connected
-        _history_context.aborted = False
-        _history_context.calls = []
-        _history_context.force_worker = False
-        _history_context.revision_feedback = None
-        try:
-            coord = get_coordinator(coordinator_mode)
-            res = coord.run(query, verbose=False)
-        except ClientDisconnectedError:
-            print("[serve] client disconnected during stream, aborting orchestration", flush=True)
-            return
-        except Exception as e:  # noqa: BLE001
-            with contextlib.suppress(
-                BrokenPipeError, ConnectionResetError, OSError, ClientDisconnectedError
-            ):
-                self._write_ndjson_line({"type": "error", "error": str(e)})
-            return
-        finally:
-            _history_context.write_line = None
-            _history_context.is_client_connected = None
-            _history_context.aborted = False
-            _history_context.history = []
-            _history_context.force_worker = False
-            _history_context.revision_feedback = None
-            calls = getattr(_history_context, "calls", [])
-            _history_context.calls = []
-
-        for turn, call in zip(getattr(res, "turns", []), calls, strict=False):
-            turn.prompt = call.get("prompt", "")
-            turn.model_name = call.get("model_name", "")
-        body = _chat_response(res, model)
-        try:
-            self._write_ndjson_line(
-                {
-                    "type": "result",
-                    "text": body["choices"][0]["message"]["content"],
-                    "trace": body["usage"]["mantis_trace"],
-                    "coordinator": coordinator_mode,
-                    "mantis_steps": body.get("mantis_steps", []),
-                    **body,
-                }
-            )
-        except ClientDisconnectedError:
-            print("[serve] client disconnected before writing final result", flush=True)
-
-    def _handle_stream(self, coordinator_mode: str, query: str, model: str) -> None:
-        self._run_stream(coordinator_mode, query, model)
-
     def _handle_warm(
         self, parsed: urllib.parse.ParseResult, mode_from_body: str | None = None
     ) -> None:
@@ -1028,7 +1030,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "status": "ready",
                     "mode": mode,
-                    "native_tool_runs": NATIVE_TOOL_RUNS,
+                    "tool_calls": True,
                 },
             )
         except Exception as e:  # noqa: BLE001
@@ -1045,13 +1047,52 @@ class Handler(BaseHTTPRequestHandler):
                 200,
                 {
                     "object": "list",
-                    "data": [{"id": MODEL_NAME, "object": "model", "owned_by": "mantis"}],
+                    "data": [
+                        {"id": model, "object": "model", "owned_by": "mantis"}
+                        for model in (MODEL_NAME, "mantis-trinity", "mantis-ultra")
+                    ],
                 },
             )
         elif parsed.path in ("/health", "/"):
             self._send(200, {"status": "ok", "model": MODEL_NAME})
         else:
             self._send(404, {"error": "not found"})
+
+    def _send_sse(self, body: dict[str, Any]) -> None:
+        choice = body["choices"][0]
+        message = choice["message"]
+        delta: dict[str, Any] = {"role": "assistant"}
+        if message.get("tool_calls"):
+            delta["tool_calls"] = [
+                {**call, "index": index} for index, call in enumerate(message["tool_calls"])
+            ]
+        else:
+            delta["content"] = message.get("content") or ""
+        chunk = {
+            "id": body["id"],
+            "object": "chat.completion.chunk",
+            "created": body["created"],
+            "model": body["model"],
+            "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+        }
+        finish = {
+            "id": body["id"],
+            "object": "chat.completion.chunk",
+            "created": body["created"],
+            "model": body["model"],
+            "choices": [{"index": 0, "delta": {}, "finish_reason": choice["finish_reason"]}],
+        }
+        payload = (
+            f"data: {json.dumps(chunk)}\n\ndata: {json.dumps(finish)}\n\ndata: [DONE]\n\n".encode()
+        )
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(payload)
 
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
@@ -1060,157 +1101,62 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 raw = self._read_request_body()
                 if raw:
-                    req = json.loads(raw)
-                    if isinstance(req, dict):
-                        mode = req.get("mode")
-            except RequestBodyTooLargeError:
-                self._send(413, {"error": "request body exceeds limit"})
-                return
-            except (json.JSONDecodeError, ValueError, KeyError, RuntimeError, TypeError):
+                    mode = _json_object(raw).get("mode")
+            except (json.JSONDecodeError, ValueError, TypeError):
                 pass
             self._handle_warm(parsed, mode_from_body=mode)
             return
-
-        if parsed.path == "/v1/runs":
-            self._handle_create_run()
-            return
-        if parsed.path.startswith("/v1/runs/"):
-            rest = parsed.path[len("/v1/runs/") :]
-            run_id, action = (rest.split("/", 1) + [""])[:2]
-            if run_id and action == "continue":
-                self._handle_continue_run(run_id)
-            elif run_id and not action:
-                self._handle_fetch_run(run_id)  # advance without tool results
-            else:
-                self._send(404, {"error": "not found"})
-            return
-
         if parsed.path.rstrip("/") != "/v1/chat/completions":
-            self._send(404, {"error": "not found"})
+            self._send(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
             return
         if not self._check_auth():
             return
+        run_id: str | None = None
         try:
-            raw = self._read_request_body()
-            req = _json_object(raw)
-            messages = req.get("messages", [])
-            if not messages:
-                self._send(400, {"error": "messages required"})
-                return
-
-            requested = (req.get("model") or "trinity").lower()
-            coordinator_mode = "conductor" if requested in ("conductor", "ultra") else "trinity"
-            model_name = req.get("model", MODEL_NAME)
-
-            # the user query = last user message; history = everything before it
-            query, history = _split_messages(messages)
-            print(
-                f"[serve] route request model={requested} -> coordinator={coordinator_mode}",
-                flush=True,
-            )
+            req = _json_object(self._read_request_body())
+            messages = req.get("messages")
+            if not isinstance(messages, list) or not messages:
+                raise ValueError("messages must be a non-empty list")  # noqa: TRY301
+            model = req.get("model") or MODEL_NAME
+            mode = _mode_for_model(model)
+            continuation = _continuation(messages)
+            if continuation is None:
+                run = create_run(mode, req)
+                run_id = run.run_id
+                event = _advance_to_boundary(run_id)
+            else:
+                run_id, tool_results = continuation
+                run = get_run(run_id)
+                if run.kind != mode:
+                    raise ValueError("model does not match the active Mantis run")  # noqa: TRY301
+                event = _advance_to_boundary(run_id, tool_results)
+            if event.get("type") == "error":
+                raise RuntimeError(str(event.get("error", "orchestration failed")))  # noqa: TRY301
+            body = _completion_response(str(model), messages, run, event)
+            if event.get("type") == "final":
+                delete_run(run_id)
             if req.get("stream"):
-                _history_context.history = history
-                _history_context.calls = []
-                return self._handle_stream(coordinator_mode, query, model_name)
-
-            _history_context.history = history
-            _history_context.calls = []
-            _history_context.force_worker = False
-            _history_context.revision_feedback = None
-            _history_context.is_client_connected = self.is_connected
-            _history_context.aborted = False
-            try:
-                coord = get_coordinator(coordinator_mode)
-                res = coord.run(query, verbose=False)
-            except ClientDisconnectedError:
-                print(
-                    "[serve] client disconnected during request, aborting orchestration",
-                    flush=True,
-                )
-                return
-            finally:
-                _history_context.history = []
-                _history_context.is_client_connected = None
-                _history_context.aborted = False
-                _history_context.force_worker = False
-                _history_context.revision_feedback = None
-                calls = getattr(_history_context, "calls", [])
-                _history_context.calls = []
-            for turn, call in zip(getattr(res, "turns", []), calls, strict=False):
-                turn.prompt = call.get("prompt", "")
-                turn.model_name = call.get("model_name", "")
-            self._send(200, _chat_response(res, model_name))
+                self._send_sse(body)
+            else:
+                self._send(200, body)
         except RequestBodyTooLargeError:
-            self._send(413, {"error": "request body exceeds limit"})
-        except (json.JSONDecodeError, ValueError, KeyError, RuntimeError, TypeError) as e:
-            self._send(500, {"error": str(e)})
-
-    def _handle_create_run(self) -> None:
-        if not self._check_auth():
-            return
-        try:
-            raw = self._read_request_body()
-            req = _json_object(raw)
-            model = req.get("model") or "trinity"
-            if not isinstance(model, str):
-                raise TypeError("model must be a string")  # noqa: TRY301
-            mode = model.lower()
-            mode = "conductor" if mode in ("conductor", "ultra") else "trinity"
-            if not req.get("messages"):
-                self._send(400, {"error": "messages required"})
-                return
-            run = create_run(mode, req)
-            print(f"[serve] created {mode} run {run.run_id}", flush=True)
-            self._send(200, {"run_id": run.run_id, "mode": mode})
-        except RequestBodyTooLargeError:
-            self._send(413, {"error": "request body exceeds limit"})
-        except (json.JSONDecodeError, ValueError, KeyError, RuntimeError, TypeError) as e:
-            self._send(400, {"error": str(e)})
-
-    def _handle_continue_run(self, run_id: str) -> None:
-        if not self._check_auth():
-            return
-        try:
-            raw = self._read_request_body()
-            tool_results = None
-            request_id = None
-            if raw:
-                req = _json_object(raw)
-                tool_results = req.get("tool_results")
-                request_id = req.get("request_id")
-            event = advance_run(run_id, tool_results, request_id)
-            self._send(200, event)
-        except KeyError as e:
-            self._send(404, {"error": str(e)})
-        except RequestBodyTooLargeError:
-            self._send(413, {"error": "request body exceeds limit"})
-        except (json.JSONDecodeError, ValueError, RuntimeError, TypeError) as e:
-            self._send(400, {"error": str(e)})
-
-    def _handle_fetch_run(self, run_id: str) -> None:
-        if not self._check_auth():
-            return
-        try:
-            event = advance_run(run_id, None)
-            self._send(200, event)
-        except KeyError as e:
-            self._send(404, {"error": str(e)})
-        except (json.JSONDecodeError, ValueError, RuntimeError, TypeError) as e:
-            self._send(400, {"error": str(e)})
-
-    def do_DELETE(self) -> None:
-        parsed = urllib.parse.urlparse(self.path)
-        if not parsed.path.startswith("/v1/runs/"):
-            self._send(404, {"error": "not found"})
-            return
-        if not self._check_auth():
-            return
-        run_id = parsed.path[len("/v1/runs/") :].rstrip("/")
-        if not run_id or "/" in run_id:
-            self._send(404, {"error": "not found"})
-            return
-        deleted = delete_run(run_id)
-        self._send(200, {"deleted": deleted})
+            self._send(
+                413,
+                {
+                    "error": {
+                        "message": "request body exceeds limit",
+                        "type": "invalid_request_error",
+                    }
+                },
+            )
+        except KeyError as error:
+            self._send(400, {"error": {"message": str(error), "type": "invalid_request_error"}})
+        except (json.JSONDecodeError, ValueError, TypeError) as error:
+            self._send(400, {"error": {"message": str(error), "type": "invalid_request_error"}})
+        except RuntimeError as error:
+            if run_id:
+                delete_run(run_id)
+            self._send(502, {"error": {"message": str(error), "type": "upstream_error"}})
 
     def log_message(self, *a) -> None:  # quiet
         pass
@@ -1244,7 +1190,7 @@ def _parse_args() -> argparse.Namespace:
         "--slot-models",
         metavar="CSV",
         default=default_workers,
-        help="litellm worker ids (CSV); also MANTIS_WORKER_MODELS",
+        help="provider/model[|reasoning_effort] worker specs (CSV); also MANTIS_WORKER_MODELS",
     )
     ap.add_argument(
         "--local-models",
@@ -1329,18 +1275,14 @@ def _worker_from_args(args: argparse.Namespace, mode: str) -> Any:
 
     # 4096 tokens to leave room for high reasoning effort (max/xhigh) while still
     # capping cost on long code outputs.
-    slot_models = args.slot_models.split(",") if args.slot_models else None
-    base_url = _litellm_base_url()
-    api_key = _litellm_api_key()
+    slot_models = args.slot_models.split(",") if args.slot_models else []
+    if not slot_models:
+        raise ValueError("MANTIS_WORKER_MODELS is required")
     if mode == "conductor":
-        worker = OpenRouterConductorWorker(slot_models=slot_models, max_tokens=4096)
-    elif mode == "trinity":
-        worker = OpenRouterTrinityWorker(slot_models=slot_models, max_tokens=4096)
-    else:
-        raise ValueError(f"unknown coordinator mode: {mode}")
-    worker.api_key = api_key
-    worker.api_base = base_url
-    return worker
+        return DirectConductorWorker(slot_models=slot_models, max_tokens=4096)
+    if mode == "trinity":
+        return DirectTrinityWorker(slot_models=slot_models, max_tokens=4096)
+    raise ValueError(f"unknown coordinator mode: {mode}")
 
 
 def load_coordinator(mode: str):
@@ -1371,10 +1313,10 @@ def get_coordinator(mode: str):
 
 def main() -> None:
     args = _parse_args()
-    token = os.environ.get("MANTIS_API_KEY") or os.environ.get("LITELLM_KEY")
+    token = os.environ.get("MANTIS_API_KEY")
     if not token:
         print(
-            "[serve] FATAL: set MANTIS_API_KEY or LITELLM_KEY before starting the server",
+            "[serve] FATAL: set MANTIS_API_KEY before starting the server",
             flush=True,
         )
         raise SystemExit(1)
@@ -1389,11 +1331,9 @@ def main() -> None:
 # ---------------------------------------------------------------------------
 # Resumable native-tool runs
 # ---------------------------------------------------------------------------
-# Pi forwards its active tool schemas; the backend selects a role/model and
-# drives a tool loop, and Pi executes each tool natively and returns results.
-# Each HTTP call advances the run by exactly one model invocation; events tell
-# Pi whether to execute tools, acknowledge a completed role step, or return a
-# final answer. State lives only in the bounded in-memory registry below.
+# Stateful orchestration runs back standard Chat Completions tool calls.
+# Internal steps stay server-side; the calling harness executes only its own tools.
+# State lives in this bounded, expiring in-memory registry.
 RUN_TTL = float(os.environ.get("MANTIS_RUN_TTL", "600"))
 MAX_TOOL_ROUNDS = int(os.environ.get("MANTIS_MAX_TOOL_ROUNDS_PER_STEP", "8"))
 MAX_RUNS = int(os.environ.get("MANTIS_MAX_CONCURRENT_RUNS", "32"))
@@ -1402,7 +1342,6 @@ RUN_MAX_MSG_BYTES = 400_000
 _runs: dict[str, NativeRun] = {}
 _runs_lock = threading.Lock()
 _runs_sweeper_started = False
-NATIVE_TOOL_RUNS = True
 
 
 def _sweep_runs() -> None:
@@ -1448,27 +1387,17 @@ def _register_run(run: NativeRun) -> str:
 
 
 def _convert_tools(tools: Any) -> list[dict[str, Any]]:
-    """Convert Pi active-tool definitions to OpenAI function-tool format."""
-    out: list[dict[str, Any]] = []
+    """Validate and copy standard OpenAI function tools."""
     if not isinstance(tools, list):
-        return out
-    for t in tools:
-        if not isinstance(t, dict):
+        return []
+    out: list[dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
             continue
-        name = t.get("name")
-        if not name or name == "mantis_step":
+        function = tool.get("function")
+        if not isinstance(function, dict) or not function.get("name"):
             continue
-        fn: dict[str, Any] = {"name": name}
-        if t.get("description"):
-            fn["description"] = t["description"]
-        params = t.get("parameters")
-        if isinstance(params, dict):
-            fn["parameters"] = params
-        elif not params:
-            fn["parameters"] = {"type": "object", "properties": {}}
-        else:
-            continue  # non-dict parameters: cannot serialize a stable schema
-        out.append({"type": "function", "function": fn})
+        out.append({"type": "function", "function": dict(function)})
     return out
 
 
@@ -1477,39 +1406,40 @@ def _model_completion(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Call LiteLLM/OpenRouter; return (text, tool_calls)."""
-    import litellm
-
-    kw = _build_litellm_kwargs(model, messages, 4096, 0.7)
-    api_key = _litellm_api_key()
-    if not api_key:
-        raise RuntimeError("set LITELLM_KEY or MANTIS_LITELLM_API_KEY for worker calls")
-    kw["api_key"] = api_key
-    kw["api_base"] = _litellm_base_url()
+    """Call the selected provider directly; return (text, tool_calls)."""
+    url, headers, body = _build_request(model, messages, 4096, 0.7)
     if tools:
-        kw["tools"] = tools
-    resp = litellm.completion(**kw)
-    msg = resp.choices[0].message
-    text = str(getattr(msg, "content", None) or "")
-    tcs = getattr(msg, "tool_calls", None) or []
+        body["tools"] = tools
+    request = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)  # noqa: S310
+    try:
+        with urllib.request.urlopen(request, timeout=WORKER_TIMEOUT) as response:  # noqa: S310
+            data = json.load(response)
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(
+            f"{model} returned HTTP {error.code}: {error.read().decode(errors='replace')[:500]}"
+        ) from error
+    msg = data["choices"][0]["message"]
+    text = str(msg.get("content") or "")
+    tcs = msg.get("tool_calls") or []
     calls: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     for tc in tcs:
-        fn = tc.function
+        fn = tc.get("function", {})
+        raw_arguments = fn.get("arguments")
         try:
-            args = json.loads(fn.arguments) if fn.arguments else {}
+            args = json.loads(raw_arguments) if raw_arguments else {}
         except (json.JSONDecodeError, ValueError, TypeError):
             args = {}
         if not isinstance(args, dict):
             args = {}
-        call_id = str(tc.id or f"tc_{uuid.uuid4().hex}")
+        call_id = str(tc.get("id") or f"tc_{uuid.uuid4().hex}")
         if call_id in seen_ids:
             call_id = f"tc_{uuid.uuid4().hex}"
         seen_ids.add(call_id)
         calls.append(
             {
                 "id": call_id,
-                "name": str(fn.name),
+                "name": str(fn.get("name")),
                 "arguments": args,
             }
         )
@@ -1722,7 +1652,7 @@ class TrinityRun(NativeRun):
 
     Replicates Coordinator semantics (role sampling, Thinker suggestion,
     Verifier accept/reject, cold-verifier -> Worker, empty-response recovery,
-    multi-turn history) but lets each role's model call Pi tools before its text
+    multi-turn history) but lets each role's model call client-provided tools before its text
     reply finalizes."""
 
     def __init__(

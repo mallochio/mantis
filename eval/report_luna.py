@@ -257,7 +257,7 @@ def main() -> None:
         )
 
     lines.append(f"- Decision branch: {decision}")
-    lines.append(f"- Recommended `MANTIS_AUTO_THRESHOLD`: {threshold}")
+    lines.append(f"- Recommended Conductor routing threshold: {threshold}")
     lines.append(f"- Reasoning: {reason}")
     if failure_rate > 0.10:
         lines.append(

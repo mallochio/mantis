@@ -412,7 +412,7 @@ def _acceptance_generation(
     model = AutoModelForCausalLM.from_pretrained(
         str(checkpoint_dir), torch_dtype=dtype, trust_remote_code=True
     )
-    model = model.to(torch.device(device))  # type: ignore[arg-type]
+    model = model.to(torch.device(device))
     model.eval()
 
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
@@ -555,7 +555,7 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(
         args.base, torch_dtype=dtype, trust_remote_code=True
     )
-    model = model.to(torch.device(device))  # type: ignore[arg-type]
+    model = model.to(torch.device(device))
     model.config.use_cache = False
 
     # TRL 0.19 + bfloat16 gradient checkpointing can corrupt generation while the
