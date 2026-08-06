@@ -28,10 +28,13 @@ def _run():
     )
 
 
-def test_auth_health_and_validation(client):
+def test_auth_health_and_validation(client, monkeypatch):
     assert client.get("/health").status_code == 200
     assert client.get("/v1/models").status_code == 401
     assert client.get("/v1/models", headers=_headers()).status_code == 200
+    monkeypatch.delenv("MANTIS_API_KEY")
+    assert client.get("/v1/models", headers=_headers()).status_code == 503
+    monkeypatch.setenv("MANTIS_API_KEY", "test-key")
     bad = client.post(
         "/v1/chat/completions",
         headers=_headers(),
@@ -48,6 +51,29 @@ def test_auth_health_and_validation(client):
         },
     )
     assert no_tools.status_code == 422
+    invalid_role_fields = [
+        {"role": "tool", "content": "x"},
+        {"role": "user", "content": "x", "tool_calls": []},
+    ]
+    for message in invalid_role_fields:
+        response = client.post(
+            "/v1/chat/completions",
+            headers=_headers(),
+            json={"model": "mantis", "messages": [message]},
+        )
+        assert response.status_code == 422
+    assert (
+        client.post(
+            "/v1/chat/completions",
+            headers=_headers(),
+            json={
+                "model": "mantis",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream_options": {"include_usage": True},
+            },
+        ).status_code
+        == 422
+    )
 
 
 def test_completion_uses_aggregate_usage_and_hides_trace(client, monkeypatch):
@@ -118,6 +144,46 @@ def test_buffered_stream_includes_usage(client, monkeypatch):
     assert response.headers["x-mantis-streaming"] == "buffered"
     assert '"choices": []' in response.text
     assert response.text.endswith("data: [DONE]\n\n")
+
+
+def test_api_maps_run_errors(client, monkeypatch):
+    request = api.ChatRequest(model="mantis", messages=[api.Message(role="user", content="hi")])
+    cases = ((KeyError("expired"), 409), (ValueError("bad"), 400), (RuntimeError("upstream"), 502))
+    for error, status in cases:
+        monkeypatch.setattr(api, "_advance", lambda *_a, error=error: (_ for _ in ()).throw(error))
+        response = client.post(
+            "/v1/chat/completions",
+            headers=_headers(),
+            json=request.model_dump(),
+        )
+        assert response.status_code == status
+
+
+def test_usage_accumulator():
+    run = serve.NativeRun("usage")
+    run.add_usage(None)
+    run.add_usage(
+        {
+            "prompt_tokens": 2,
+            "completion_tokens": 3,
+            "total_tokens": 5,
+            "completion_tokens_details": {"reasoning_tokens": 2},
+        }
+    )
+    run.add_usage(
+        {
+            "prompt_tokens": 4,
+            "completion_tokens": 5,
+            "total_tokens": 9,
+            "completion_tokens_details": {"reasoning_tokens": 3},
+        }
+    )
+    assert run.usage == {
+        "prompt_tokens": 6,
+        "completion_tokens": 8,
+        "total_tokens": 14,
+        "completion_tokens_details": {"reasoning_tokens": 5},
+    }
 
 
 def test_capacity_returns_429(client, monkeypatch):

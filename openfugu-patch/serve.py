@@ -19,14 +19,11 @@ import hashlib
 import json
 import os
 import re
-import select
 import socket
 import sys
 import threading
 import time
-import urllib.parse
 import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -69,8 +66,6 @@ MODEL_MODES = {
     "ultra": "conductor",
 }
 MAX_TURNS = 5
-# Reject bodies larger than this many bytes.
-MAX_BODY_BYTES = int(os.environ.get("MANTIS_MAX_BODY_BYTES", str(5 * 1024 * 1024)))
 WORKER_TIMEOUT = float(os.environ.get("MANTIS_WORKER_TIMEOUT", "240"))
 
 # These providers reject temperature != 1 when reasoning is enabled.
@@ -89,10 +84,6 @@ _provider_client = httpx.Client(timeout=WORKER_TIMEOUT)
 
 class ClientDisconnectedError(Exception):
     """Raised when client disconnects during streaming or step execution."""
-
-
-class RequestBodyTooLargeError(Exception):
-    """Raised before an oversized request body is allocated."""
 
 
 def _check_client_connected() -> None:
@@ -946,245 +937,6 @@ def _completion_response(
     }
 
 
-class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def _send(self, code: int, body: dict) -> None:
-        self.close_connection = True
-        data = json.dumps(body).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(data)
-
-    def _read_request_body(self, max_bytes: int | None = None) -> bytes:
-        """Read a bounded POST body, supporting Content-Length and chunked encoding."""
-        max_bytes = MAX_BODY_BYTES if max_bytes is None else max_bytes
-        te = self.headers.get("Transfer-Encoding", "")
-        if te.lower() == "chunked":
-            return self._read_chunked_body(max_bytes)
-        n = int(self.headers.get("Content-Length", 0))
-        if n > max_bytes:
-            raise RequestBodyTooLargeError
-        return self.rfile.read(n) if n > 0 else b""
-
-    def _read_chunked_body(self, max_bytes: int | None = None) -> bytes:
-        """Decode a bounded chunked transfer-coded request body."""
-        max_bytes = MAX_BODY_BYTES if max_bytes is None else max_bytes
-        body = bytearray()
-        while True:
-            line = self.rfile.readline()
-            if not line:
-                break
-            size_str = line.split(b";", 1)[0].strip()
-            try:
-                chunk_size = int(size_str, 16)
-            except ValueError:
-                break
-            if chunk_size < 0:
-                raise ValueError("invalid negative chunk size")
-            if chunk_size == 0:
-                # consume optional trailers until final CRLF
-                while True:
-                    line = self.rfile.readline()
-                    if not line or line == b"\r\n":
-                        break
-                break
-            if len(body) + chunk_size > max_bytes:
-                raise RequestBodyTooLargeError
-            chunk = self.rfile.read(chunk_size)
-            if len(chunk) != chunk_size:
-                raise ValueError("truncated chunk data")
-            body.extend(chunk)
-            if self.rfile.read(2) != b"\r\n":
-                raise ValueError("invalid chunk terminator")
-        return bytes(body)
-
-    def _auth_token(self) -> str | None:
-        return os.environ.get("MANTIS_API_KEY")
-
-    def _check_auth(self) -> bool:
-        expected = self._auth_token()
-        if not expected:
-            self._send(
-                500,
-                {"error": "MANTIS_API_KEY is not configured"},
-            )
-            return False
-        auth = self.headers.get("Authorization", "")
-        if not auth.startswith("Bearer ") or auth[7:] != expected:
-            self._send(401, {"error": "unauthorized"})
-            return False
-        return True
-
-    def is_connected(self) -> bool:
-        if getattr(self, "_disconnected", False):
-            return False
-        try:
-            sock = getattr(self, "connection", None)
-            if sock is None:
-                return True
-            r, _, _ = select.select([sock], [], [], 0)
-            if r:
-                buf = sock.recv(1, socket.MSG_PEEK)
-                if not buf:
-                    self._disconnected = True
-                    return False
-        except Exception:  # noqa: BLE001
-            self._disconnected = True
-            return False
-        return True
-
-    def _handle_warm(
-        self, parsed: urllib.parse.ParseResult, mode_from_body: str | None = None
-    ) -> None:
-        if not self._check_auth():
-            return
-        qs = urllib.parse.parse_qs(parsed.query)
-        mode = mode_from_body or (qs.get("mode", ["trinity"])[0] if qs.get("mode") else "trinity")
-        if mode not in ("trinity", "conductor"):
-            self._send(400, {"error": f"unknown mode: {mode}"})
-            return
-        try:
-            get_coordinator(mode)
-            self._send(
-                200,
-                {
-                    "status": "ready",
-                    "mode": mode,
-                    "tool_calls": True,
-                },
-            )
-        except Exception as e:  # noqa: BLE001
-            self._send(500, {"error": str(e)})
-
-    def do_GET(self) -> None:
-        parsed = urllib.parse.urlparse(self.path)
-        if parsed.path in ("/warm", "/v1/warm"):
-            self._handle_warm(parsed)
-        elif parsed.path == "/v1/models":
-            if not self._check_auth():
-                return
-            self._send(
-                200,
-                {
-                    "object": "list",
-                    "data": [
-                        {"id": model, "object": "model", "owned_by": "mantis"}
-                        for model in (MODEL_NAME, "mantis-trinity", "mantis-ultra")
-                    ],
-                },
-            )
-        elif parsed.path in ("/health", "/"):
-            self._send(200, {"status": "ok", "model": MODEL_NAME})
-        else:
-            self._send(404, {"error": "not found"})
-
-    def _send_sse(self, body: dict[str, Any]) -> None:
-        choice = body["choices"][0]
-        message = choice["message"]
-        delta: dict[str, Any] = {"role": "assistant"}
-        if message.get("tool_calls"):
-            delta["tool_calls"] = [
-                {**call, "index": index} for index, call in enumerate(message["tool_calls"])
-            ]
-        else:
-            delta["content"] = message.get("content") or ""
-        chunk = {
-            "id": body["id"],
-            "object": "chat.completion.chunk",
-            "created": body["created"],
-            "model": body["model"],
-            "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
-        }
-        finish = {
-            "id": body["id"],
-            "object": "chat.completion.chunk",
-            "created": body["created"],
-            "model": body["model"],
-            "choices": [{"index": 0, "delta": {}, "finish_reason": choice["finish_reason"]}],
-        }
-        payload = (
-            f"data: {json.dumps(chunk)}\n\ndata: {json.dumps(finish)}\n\ndata: [DONE]\n\n".encode()
-        )
-        self.close_connection = True
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def do_POST(self) -> None:
-        parsed = urllib.parse.urlparse(self.path)
-        if parsed.path in ("/warm", "/v1/warm"):
-            mode = None
-            try:
-                raw = self._read_request_body()
-                if raw:
-                    mode = _json_object(raw).get("mode")
-            except (json.JSONDecodeError, ValueError, TypeError):
-                pass
-            self._handle_warm(parsed, mode_from_body=mode)
-            return
-        if parsed.path.rstrip("/") != "/v1/chat/completions":
-            self._send(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
-            return
-        if not self._check_auth():
-            return
-        run_id: str | None = None
-        try:
-            req = _json_object(self._read_request_body())
-            messages = req.get("messages")
-            if not isinstance(messages, list) or not messages:
-                raise ValueError("messages must be a non-empty list")  # noqa: TRY301
-            model = req.get("model") or MODEL_NAME
-            mode = _mode_for_model(model)
-            continuation = _continuation(messages)
-            if continuation is None:
-                run = create_run(mode, req)
-                run_id = run.run_id
-                event = _advance_to_boundary(run_id)
-            else:
-                run_id, tool_results = continuation
-                run = get_run(run_id)
-                if run.kind != mode:
-                    raise ValueError("model does not match the active Mantis run")  # noqa: TRY301
-                event = _advance_to_boundary(run_id, tool_results)
-            if event.get("type") == "error":
-                raise RuntimeError(str(event.get("error", "orchestration failed")))  # noqa: TRY301
-            body = _completion_response(str(model), messages, run, event)
-            if event.get("type") == "final":
-                delete_run(run_id)
-            if req.get("stream"):
-                self._send_sse(body)
-            else:
-                self._send(200, body)
-        except RequestBodyTooLargeError:
-            self._send(
-                413,
-                {
-                    "error": {
-                        "message": "request body exceeds limit",
-                        "type": "invalid_request_error",
-                    }
-                },
-            )
-        except KeyError as error:
-            self._send(400, {"error": {"message": str(error), "type": "invalid_request_error"}})
-        except (json.JSONDecodeError, ValueError, TypeError) as error:
-            self._send(400, {"error": {"message": str(error), "type": "invalid_request_error"}})
-        except RuntimeError as error:
-            if run_id:
-                delete_run(run_id)
-            self._send(502, {"error": {"message": str(error), "type": "upstream_error"}})
-
-    def log_message(self, *a) -> None:  # quiet
-        pass
-
 
 def _parse_args() -> argparse.Namespace:
     global _args
@@ -1334,22 +1086,6 @@ def get_coordinator(mode: str):
                 _coordinators[mode] = load_coordinator(mode)
     return _coordinators[mode]
 
-
-def main() -> None:
-    args = _parse_args()
-    token = os.environ.get("MANTIS_API_KEY")
-    if not token:
-        print(
-            "[serve] FATAL: set MANTIS_API_KEY before starting the server",
-            flush=True,
-        )
-        raise SystemExit(1)
-    srv = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(
-        f"[serve] Mantis listening on {args.host}:{args.port} — POST /v1/chat/completions",
-        flush=True,
-    )
-    srv.serve_forever()
 
 
 # ---------------------------------------------------------------------------
@@ -2247,7 +1983,3 @@ def delete_run(run_id: str) -> bool:
         _write_learning_record(run, {"type": "error", "terminated_by": "deleted"})
         run.close()
     return run is not None
-
-
-if __name__ == "__main__":
-    main()
