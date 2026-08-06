@@ -1206,17 +1206,18 @@ def test_run_registry_sweep_and_capacity(monkeypatch):
     first = serve.NativeRun("first")
     second = serve.NativeRun("second")
     serve._register_run(first)
-    serve._register_run(second)
-    assert first.cancelled and serve.get_run("second") is second
-    second.last_active = 0
-    second.in_flight = 1
+    with pytest.raises(serve.RunCapacityError):
+        serve._register_run(second)
+    assert not first.cancelled and serve.get_run("first") is first
+    first.last_active = 0
+    first.in_flight = 1
     serve._sweep_runs()
-    assert serve.get_run("second") is second and not second.cancelled
-    second.in_flight = 0
+    assert serve.get_run("first") is first and not first.cancelled
+    first.in_flight = 0
     serve._sweep_runs()
-    assert second.cancelled
+    assert first.cancelled
     with pytest.raises(KeyError):
-        serve.get_run("second")
+        serve.get_run("first")
     assert not serve.delete_run("missing")
 
 

@@ -132,6 +132,8 @@ def _complete(request: ChatRequest) -> dict[str, Any]:
     run_id: str | None = None
     try:
         run, run_id, event = _advance(request, body)
+    except serve.RunCapacityError as error:
+        raise HTTPException(429, str(error)) from error
     except KeyError as error:
         raise HTTPException(409, str(error)) from error
     except (TypeError, ValueError) as error:
@@ -172,7 +174,9 @@ def _sse(body: dict[str, Any], include_usage: bool) -> Iterator[bytes]:
 @app.exception_handler(HTTPException)
 def http_error(_request: Any, error: HTTPException) -> JSONResponse:
     error_type = "authentication_error" if error.status_code == 401 else "invalid_request_error"
-    if error.status_code >= 500:
+    if error.status_code == 429:
+        error_type = "rate_limit_error"
+    elif error.status_code >= 500:
         error_type = "upstream_error"
     return _error(error.status_code, str(error.detail), error_type)
 

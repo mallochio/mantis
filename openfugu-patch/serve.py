@@ -86,6 +86,10 @@ class ClientDisconnectedError(Exception):
     """Raised when client disconnects during streaming or step execution."""
 
 
+class RunCapacityError(Exception):
+    """Raised instead of evicting a live tool run."""
+
+
 def _check_client_connected() -> None:
     """Check if current request client connection is broken or aborted."""
     if getattr(_history_context, "aborted", False):
@@ -1135,13 +1139,10 @@ def _register_run(run: NativeRun) -> str:
         _ensure_runs_sweeper()
         if run.run_id in _runs:
             raise ValueError("run id already exists")
-        while len(_runs) >= MAX_RUNS:
+        if len(_runs) >= MAX_RUNS:
             _sweep_runs()
-            if len(_runs) >= MAX_RUNS:  # still full: drop oldest
-                oldest = min(_runs, key=lambda rid: _runs[rid].created)
-                dropped = _runs.pop(oldest, None)
-                if dropped is not None:
-                    dropped.close()
+        if len(_runs) >= MAX_RUNS:
+            raise RunCapacityError("Mantis tool-run capacity is full")
         _runs[run.run_id] = run
     return cast(str, run.run_id)
 

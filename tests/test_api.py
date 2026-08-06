@@ -148,7 +148,12 @@ def test_buffered_stream_includes_usage(client, monkeypatch):
 
 def test_api_maps_run_errors(client, monkeypatch):
     request = api.ChatRequest(model="mantis", messages=[api.Message(role="user", content="hi")])
-    cases = ((KeyError("expired"), 409), (ValueError("bad"), 400), (RuntimeError("upstream"), 502))
+    cases = (
+        (serve.RunCapacityError("full"), 429),
+        (KeyError("expired"), 409),
+        (ValueError("bad"), 400),
+        (RuntimeError("upstream"), 502),
+    )
     for error, status in cases:
         monkeypatch.setattr(api, "_advance", lambda *_a, error=error: (_ for _ in ()).throw(error))
         response = client.post(
