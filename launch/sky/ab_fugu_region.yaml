@@ -1,0 +1,40 @@
+name: ab-fugu-ultra-us
+
+# Completes the fugu-ultra leg of eval/ab_compare.py from an allowed region.
+# sakana/fugu-ultra provider-blocks the dev machine's region; the mantis leg
+# runs locally. Network-only job (no GPU): 16 calls with mandatory reasoning,
+# latency-dominated (30-90 min).
+#
+# Launch from the repo root:
+#   uv run sky launch -y --down launch/sky/ab_fugu_region.yaml \
+#     --env OPENROUTER_API_KEY="$OPENROUTER_API_KEY"
+#
+# No workdir and no `sky jobs`: local file_mounts rsync straight to the VM, so
+# no object-storage bucket is created. `--down` tears the cluster down when
+# the run finishes. Results are printed between RESULTS_BEGIN/END markers in
+# the launch log; extract and merge them into eval/results-ab.jsonl.
+
+resources:
+  cloud: gcp
+  region: us-central1
+  cpus: 2
+  memory: 4+
+  use_spot: true
+
+file_mounts:
+  /tmp/ab/ab_compare.py: eval/ab_compare.py
+  /tmp/ab/fixtures.jsonl: eval/fixtures.jsonl
+  /tmp/ab/score.py: eval/score.py
+
+setup: |
+  pip install requests
+
+run: |
+  set -e
+  cd /tmp/ab
+  python ab_compare.py --targets openrouter-fugu \
+    --fixtures /tmp/ab/fixtures.jsonl \
+    --output /tmp/results-fugu.jsonl --timeout 900
+  echo "=== RESULTS_BEGIN ==="
+  cat /tmp/results-fugu.jsonl
+  echo "=== RESULTS_END ==="
