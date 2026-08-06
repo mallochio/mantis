@@ -5,7 +5,7 @@ Fixtures: 16 tasks x 2 targets. Scoring: keyword hit rate on `expect` terms (eva
 | target | success | score | cost $ | score/$ | latency s (med/p95) | completion tokens (med) |
 |---|---|---|---|---|---|---|
 | mantis | 16/16 | 0.92 | 0.3672 | 2.5 | 61.8/300.5 | 5183 |
-| openrouter-fugu | 0/16 | 0.00 | 0.0000 | nan | 0.0/0.0 | 0 |
+| openrouter-fugu | 16/16 | 0.87 | 1.8603 | 0.5 | 37.1/215.3 | 2141 |
 
 ## Per tier (mean score / total cost $)
 
@@ -14,26 +14,28 @@ Fixtures: 16 tasks x 2 targets. Scoring: keyword hit rate on `expect` terms (eva
 | target | score | cost $ | latency med s |
 |---|---|---|---|
 | mantis | 0.79 | 0.0842 | 34.7 |
+| openrouter-fugu | 0.82 | 0.2052 | 13.1 |
 
 ### hard
 
 | target | score | cost $ | latency med s |
 |---|---|---|---|
 | mantis | 0.96 | 0.1525 | 65.6 |
+| openrouter-fugu | 0.71 | 0.9687 | 77.6 |
 
 ### medium
 
 | target | score | cost $ | latency med s |
 |---|---|---|---|
 | mantis | 0.95 | 0.0293 | 63.3 |
+| openrouter-fugu | 0.95 | 0.5375 | 45.5 |
 
 ### simple
 
 | target | score | cost $ | latency med s |
 |---|---|---|---|
 | mantis | 1.00 | 0.1011 | 72.9 |
-
-
+| openrouter-fugu | 1.00 | 0.1488 | 10.6 |
 ## Notes
 
 - **Region workaround:** sakana/fugu-ultra provider-blocks the dev machine's
