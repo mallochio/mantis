@@ -7,6 +7,7 @@ import json
 import os
 import queue
 import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
@@ -348,12 +349,36 @@ def ready(response: Response) -> dict[str, Any]:
     return {"status": "ready", "model": serve.MODEL_NAME}
 
 
+_MODEL_CREATED = int(time.time())
+_SUPPORTED_PARAMETERS = [
+    "tools",
+    "tool_choice",
+    "response_format",
+    "reasoning",
+    "reasoning_effort",
+    "max_tokens",
+    "max_completion_tokens",
+    "stream",
+    "stream_options",
+    "web_search_options",
+]
+
+
 @app.get("/v1/models", dependencies=[Depends(_authorize)])
 def models() -> dict[str, Any]:
+    descriptor = {
+        "object": "model",
+        "owned_by": "mantis",
+        "created": _MODEL_CREATED,
+        "context_length": int(os.environ.get("MANTIS_CONTEXT_LENGTH", "262144")),
+        "max_completion_tokens": int(os.environ.get("MANTIS_MAX_COMPLETION_TOKENS", "32768")),
+        "supported_parameters": _SUPPORTED_PARAMETERS,
+        "pricing": {"prompt": "0", "completion": "0"},
+    }
     return {
         "object": "list",
         "data": [
-            {"id": model, "object": "model", "owned_by": "mantis"}
+            {"id": model, **descriptor}
             for model in (serve.MODEL_NAME, "mantis-trinity", "mantis-ultra")
         ],
     }
