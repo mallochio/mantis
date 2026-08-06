@@ -62,6 +62,10 @@ CHEAP = {
     "max_tokens": int(os.environ.get("CHEAP_MAX_TOKENS", str(ROUTELLM_MAX_TOKENS))),
 }
 
+# Shared connection pool: reuse TCP/TLS to upstream providers instead of
+# handshaking per request (sync Client is thread-safe).
+_client = httpx.Client(timeout=None)
+
 DATA_DIR = Path(os.environ.get("MANTIS_DATA_DIR", str(Path.home()/".local/share/mantis")))
 LOG_PATH = Path(os.environ.get("LOG_FILE", str(DATA_DIR/"router/decisions.log")))
 TRAINING_LOG_ENABLED = os.environ.get("ROUTELLM_TRAINING_LOG", "0").lower() in {"1", "true", "yes", "on"}
@@ -273,8 +277,7 @@ def _is_refusal(status: int, data: dict) -> bool:
 def _do_post(backend: dict, out_body: dict):
     url = backend["base"].rstrip("/") + "/chat/completions"
     headers = {"Authorization": f"Bearer {backend['key']}", "Content-Type": "application/json"}
-    with httpx.Client(timeout=None) as c:
-        return c.post(url, json=out_body, headers=headers)
+    return _client.post(url, json=out_body, headers=headers)
 
 
 def _build_outgoing_body(body: dict, backend: dict) -> dict:
@@ -358,6 +361,7 @@ async def lifespan(app: FastAPI):
         global _READY
         _READY = True
     yield
+    _client.close()
 
 
 app = FastAPI(title="RouteLLM coding-router", lifespan=lifespan)
@@ -405,80 +409,75 @@ async def chat_completions(request: Request, authorization: str | None = Header(
         route_hdr["x-route-supra-complexity"] = str(supra_complexity)
 
     if want_stream:
-        client = httpx.Client(timeout=None)
-
         def gen():
             t0 = time.time()
             ttfb = None
             saw_finish_reason = False
             saw_done = False
-            try:
-                with client.stream("POST", url, json=out_body, headers=headers) as resp:
-                    if resp.status_code != 200:
-                        # Refusal/content-filter surfaced as an HTTP error: retry the other model.
-                        err = resp.read()
-                        if _is_refusal(resp.status_code, _safe_json(err)):
-                            flip = "cheap" if decision == "expensive" else "expensive"
-                            fb = _backend_for(flip)
-                            fb_url = fb["base"].rstrip("/") + "/chat/completions"
-                            fb_headers = {"Authorization": f"Bearer {fb['key']}", "Content-Type": "application/json"}
-                            with client.stream("POST", fb_url, json=_build_outgoing_body(body, fb), headers=fb_headers) as resp:
-                                if resp.status_code == 200:
-                                    # route_hdr was already sealed by StreamingResponse;
-                                    # the fallback is only visible in decisions.log.
-                                    for line in resp.iter_lines():
-                                        if ttfb is None:
-                                            ttfb = int((time.time() - t0) * 1000)
-                                        if line:
-                                            sline = line.strip()
-                                            if sline == "data: [DONE]":
-                                                saw_done = True
-                                            elif sline.startswith("data: "):
-                                                try:
-                                                    payload = json.loads(sline[6:])
-                                                    ch = payload.get("choices")
-                                                    if isinstance(ch, list) and ch and ch[0].get("finish_reason") is not None:
-                                                        saw_finish_reason = True
-                                                except Exception:
-                                                    pass
-                                            yield (line + "\n").encode()
-                                        else:
-                                            yield b"\n"
-                                    _log(flip, score, fb["model"], prompt, ttfb, supra_complexity, supra_ms)
-                                    return
-                        yield b'data: ' + json.dumps({"error": {"status": resp.status_code, "message": err.decode(errors="replace")[:500]}}).encode() + b'\n\ndata: [DONE]\n\n'
-                        return
-                    for line in resp.iter_lines():
-                        if ttfb is None:
-                            ttfb = int((time.time() - t0) * 1000)
-                        if line:
-                            sline = line.strip()
-                            if sline == "data: [DONE]":
-                                saw_done = True
-                            elif sline.startswith("data: "):
-                                try:
-                                    payload = json.loads(sline[6:])
-                                    choices = payload.get("choices")
-                                    if isinstance(choices, list) and choices and choices[0].get("finish_reason") is not None:
-                                        saw_finish_reason = True
-                                except Exception:
-                                    pass
-                            yield (line + "\n").encode()
-                        else:
-                            yield b"\n"
-                    if not saw_finish_reason:
-                        finish_chunk = {
-                            "id": "gen-finish",
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": backend["model"],
-                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                        }
-                        yield f"data: {json.dumps(finish_chunk)}\n\n".encode()
-                    if not saw_done:
-                        yield b"data: [DONE]\n\n"
-            finally:
-                client.close()
+            with _client.stream("POST", url, json=out_body, headers=headers) as resp:
+                if resp.status_code != 200:
+                    # Refusal/content-filter surfaced as an HTTP error: retry the other model.
+                    err = resp.read()
+                    if _is_refusal(resp.status_code, _safe_json(err)):
+                        flip = "cheap" if decision == "expensive" else "expensive"
+                        fb = _backend_for(flip)
+                        fb_url = fb["base"].rstrip("/") + "/chat/completions"
+                        fb_headers = {"Authorization": f"Bearer {fb['key']}", "Content-Type": "application/json"}
+                        with _client.stream("POST", fb_url, json=_build_outgoing_body(body, fb), headers=fb_headers) as resp:
+                            if resp.status_code == 200:
+                                # route_hdr was already sealed by StreamingResponse;
+                                # the fallback is only visible in decisions.log.
+                                for line in resp.iter_lines():
+                                    if ttfb is None:
+                                        ttfb = int((time.time() - t0) * 1000)
+                                    if line:
+                                        sline = line.strip()
+                                        if sline == "data: [DONE]":
+                                            saw_done = True
+                                        elif sline.startswith("data: "):
+                                            try:
+                                                payload = json.loads(sline[6:])
+                                                ch = payload.get("choices")
+                                                if isinstance(ch, list) and ch and ch[0].get("finish_reason") is not None:
+                                                    saw_finish_reason = True
+                                            except Exception:
+                                                pass
+                                        yield (line + "\n").encode()
+                                    else:
+                                        yield b"\n"
+                                _log(flip, score, fb["model"], prompt, ttfb, supra_complexity, supra_ms)
+                                return
+                    yield b'data: ' + json.dumps({"error": {"status": resp.status_code, "message": err.decode(errors="replace")[:500]}}).encode() + b'\n\ndata: [DONE]\n\n'
+                    return
+                for line in resp.iter_lines():
+                    if ttfb is None:
+                        ttfb = int((time.time() - t0) * 1000)
+                    if line:
+                        sline = line.strip()
+                        if sline == "data: [DONE]":
+                            saw_done = True
+                        elif sline.startswith("data: "):
+                            try:
+                                payload = json.loads(sline[6:])
+                                choices = payload.get("choices")
+                                if isinstance(choices, list) and choices and choices[0].get("finish_reason") is not None:
+                                    saw_finish_reason = True
+                            except Exception:
+                                pass
+                        yield (line + "\n").encode()
+                    else:
+                        yield b"\n"
+                if not saw_finish_reason:
+                    finish_chunk = {
+                        "id": "gen-finish",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": backend["model"],
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    }
+                    yield f"data: {json.dumps(finish_chunk)}\n\n".encode()
+                if not saw_done:
+                    yield b"data: [DONE]\n\n"
             _log(decision, score, backend["model"], prompt, ttfb, supra_complexity, supra_ms)
 
         return StreamingResponse(gen(), media_type="text/event-stream", headers=route_hdr)
