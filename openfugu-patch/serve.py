@@ -24,15 +24,14 @@ import socket
 import sys
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import httpx
 import numpy as np
 import torch
 
@@ -85,6 +84,7 @@ _args: argparse.Namespace | None = None
 _coordinators: dict[str, object] = {}
 _coordinator_lock = threading.Lock()
 _history_context = threading.local()
+_provider_client = httpx.Client(timeout=WORKER_TIMEOUT)
 
 
 class ClientDisconnectedError(Exception):
@@ -143,18 +143,40 @@ def _build_request(
     )
 
 
+def _provider_response(
+    spec: str,
+    messages: list[dict[str, Any]],
+    max_tokens: int,
+    temperature: float,
+    tools: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    url, headers, body = _build_request(spec, messages, max_tokens, temperature)
+    if tools:
+        body["tools"] = tools
+    run = getattr(_history_context, "active_run", None)
+    tool_choice = getattr(run, "tool_choice", None)
+    if tool_choice is not None:
+        body["tool_choice"] = tool_choice
+    try:
+        response = _provider_client.post(url, headers=headers, json=body)
+        response.raise_for_status()
+        data = response.json()
+    except httpx.HTTPStatusError as error:
+        raise RuntimeError(
+            f"{spec} returned HTTP {error.response.status_code}: {error.response.text[:500]}"
+        ) from error
+    if not isinstance(data, dict):
+        raise TypeError(f"{spec} returned a non-object response")
+    if run is not None:
+        run.add_usage(data.get("usage"))
+    return data
+
+
 def _direct_completion(
     spec: str, messages: list[dict[str, str]], max_tokens: int, temperature: float, timeout: float
 ) -> str:
-    url, headers, body = _build_request(spec, messages, max_tokens, temperature)
-    request = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)  # noqa: S310
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
-            data = json.load(response)
-    except urllib.error.HTTPError as error:
-        raise RuntimeError(
-            f"{spec} returned HTTP {error.code}: {error.read().decode(errors='replace')[:500]}"
-        ) from error
+    del timeout  # the shared client uses MANTIS_WORKER_TIMEOUT
+    data = _provider_response(spec, messages, max_tokens, temperature)
     return str(data["choices"][0]["message"].get("content") or "")
 
 
@@ -900,25 +922,27 @@ def _completion_response(
         message["content"] = str(event.get("text", ""))
         finish_reason = "stop"
         completion_text = message["content"]
-    prompt_chars = sum(
-        len(_message_text(message.get("content")))
-        for message in messages
-        if isinstance(message, dict)
-    )
-    prompt_tokens = max(1, (prompt_chars + 3) // 4)
-    completion_tokens = max(1, (len(completion_text) + 3) // 4)
+    usage = dict(getattr(run, "usage", {}))
+    if not usage.get("total_tokens"):
+        prompt_chars = sum(
+            len(_message_text(message.get("content")))
+            for message in messages
+            if isinstance(message, dict)
+        )
+        prompt_tokens = max(1, (prompt_chars + 3) // 4)
+        completion_tokens = max(1, (len(completion_text) + 3) // 4)
+        usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
     return {
         "id": completion_id,
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
         "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        },
-        "mantis": _run_trace(run),
+        "usage": usage,
     }
 
 
@@ -1407,17 +1431,7 @@ def _model_completion(
     tools: list[dict[str, Any]] | None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Call the selected provider directly; return (text, tool_calls)."""
-    url, headers, body = _build_request(model, messages, 4096, 0.7)
-    if tools:
-        body["tools"] = tools
-    request = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)  # noqa: S310
-    try:
-        with urllib.request.urlopen(request, timeout=WORKER_TIMEOUT) as response:  # noqa: S310
-            data = json.load(response)
-    except urllib.error.HTTPError as error:
-        raise RuntimeError(
-            f"{model} returned HTTP {error.code}: {error.read().decode(errors='replace')[:500]}"
-        ) from error
+    data = _provider_response(model, messages, 4096, 0.7, tools)
     msg = data["choices"][0]["message"]
     text = str(msg.get("content") or "")
     tcs = msg.get("tool_calls") or []
@@ -1598,6 +1612,26 @@ class NativeRun:
         self.tool_observations: list[dict[str, Any]] = []
         self.learning_logged = False
         self.in_flight = 0
+        self.tool_choice: Any = None
+        self.usage: dict[str, Any] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+
+    def add_usage(self, usage: Any) -> None:
+        if not isinstance(usage, dict):
+            return
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = usage.get(key)
+            if isinstance(value, int) and value >= 0:
+                self.usage[key] += value
+        details = usage.get("completion_tokens_details")
+        if isinstance(details, dict):
+            target = self.usage.setdefault("completion_tokens_details", {})
+            for key, value in details.items():
+                if isinstance(value, int) and value >= 0:
+                    target[key] = target.get(key, 0) + value
 
     def touch(self) -> None:
         self.last_active = time.time()
@@ -2174,6 +2208,7 @@ def create_run(mode: str, body: dict[str, Any]) -> NativeRun:
         run = ConductorRun(run_id, messages, tools, slot_models=slot_models)
     else:
         run = TrinityRun(run_id, messages, tools, slot_models=slot_models)
+    run.tool_choice = body.get("tool_choice")
     _register_run(run)
     return run
 
@@ -2193,11 +2228,13 @@ def advance_run(run_id: str, tool_results: Any, request_id: Any = None) -> dict[
             raise KeyError(f"unknown or expired run: {run_id}")
         run.in_flight += 1
     try:
+        _history_context.active_run = run
         event = run.advance_idempotent(tool_results, request_id)
         if event.get("type") in ("final", "error"):
             _write_learning_record(run, event)
         return event
     finally:
+        _history_context.active_run = None
         with _runs_lock:
             run.in_flight -= 1
             run.touch()

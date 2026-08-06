@@ -57,7 +57,8 @@ print(response.choices[0].message.content)
 ```
 
 `stream=True` returns standard `text/event-stream` Chat Completions chunks and
-ends with `data: [DONE]`.
+ends with `data: [DONE]`. Streaming is currently buffered until orchestration
+finishes; responses include `X-Mantis-Streaming: buffered`.
 
 ## Agent tools
 
@@ -106,7 +107,8 @@ Mantis only chooses and orchestrates models.
 | `MANTIS_MAX_TURNS` | TRINITY turn cap | `5` |
 | `MANTIS_WORKER_TIMEOUT` | Downstream timeout in seconds | `240` |
 | `MANTIS_RUN_TTL` | Idle tool-run lifetime in seconds | `600` |
-| `MANTIS_MAX_CONCURRENT_RUNS` | Bounded in-memory run count | `32` |
+| `MANTIS_MAX_CONCURRENT_RUNS` | Bounded in-memory tool-run count | `32` |
+| `MANTIS_MAX_CONCURRENT_REQUESTS` | Concurrent HTTP request limit; excess receives `429` | `32` |
 
 Supported hosted model prefixes are currently `openrouter/` and `opencode-go/`.
 Reasoning effort is appended with `|`, for example

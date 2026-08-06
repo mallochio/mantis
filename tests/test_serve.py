@@ -84,15 +84,14 @@ def test_direct_provider_completions(monkeypatch):
     class Response:
         def __init__(self, body):
             self.body = body
+            self.status_code = 200
+            self.text = json.dumps(body)
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
+        def raise_for_status(self):
             return None
 
-        def read(self):
-            return json.dumps(self.body).encode()
+        def json(self):
+            return self.body
 
     responses = iter(
         [
@@ -119,8 +118,9 @@ def test_direct_provider_completions(monkeypatch):
             ),
         ]
     )
+    client = SimpleNamespace(post=lambda *_a, **_k: next(responses))
     monkeypatch.setenv("OPENROUTER_API_KEY", "provider-key")
-    monkeypatch.setattr(serve.urllib.request, "urlopen", lambda *_a, **_k: next(responses))
+    monkeypatch.setattr(serve, "_provider_client", client)
 
     assert (
         serve._direct_completion(

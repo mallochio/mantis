@@ -4,7 +4,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VENV="$REPO_ROOT/.venv-mantis"
-SERVE="$REPO_ROOT/openfugu-patch/serve.py"
+SERVE="$REPO_ROOT/openfugu-patch/api.py"
 
 if [[ ! -f "$SERVE" ]]; then
     echo "ERROR: $SERVE not found" >&2
@@ -88,7 +88,7 @@ if [[ "${MANTIS_LEARNING:-0}" =~ ^(1|true|yes|on)$ ]]; then
     python3 "$REPO_ROOT/scripts/learn_router.py" --watch --promote &
     LEARN_PID=$!
     trap 'kill "$LEARN_PID" 2>/dev/null || true' EXIT INT TERM
-    python3 "$SERVE" --host "$MANTIS_HOST" --port "$MANTIS_PORT"
+    python3 -m uvicorn api:app --app-dir "$(dirname "$SERVE")" --host "$MANTIS_HOST" --port "$MANTIS_PORT"
 else
-    exec python3 "$SERVE" --host "$MANTIS_HOST" --port "$MANTIS_PORT"
+    exec python3 -m uvicorn api:app --app-dir "$(dirname "$SERVE")" --host "$MANTIS_HOST" --port "$MANTIS_PORT"
 fi

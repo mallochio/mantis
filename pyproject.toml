@@ -17,6 +17,9 @@ dependencies = [
     "safetensors>=0.4",
     "huggingface_hub>=0.23",
     "accelerate>=0.30",
+    "fastapi>=0.115,<1",
+    "httpx>=0.27,<1",
+    "uvicorn>=0.30,<1",
 ]
 
 [project.optional-dependencies]
@@ -94,6 +97,7 @@ ignore = [
 "scripts/retrain_conductor.py" = ["E402", "I001"]
 "scripts/update_pool.py" = ["S310"]
 "tests/test_serve.py" = ["E501", "S310"]
+"openfugu-patch/api.py" = ["E501"]
 "tests/test_retrain_router_pool.py" = ["E501"]
 "tests/test_retrain_conductor.py" = ["S105"]
 
