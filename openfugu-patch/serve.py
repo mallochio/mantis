@@ -1127,7 +1127,7 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.environ.get("MANTIS_MAX_TURNS", "5")),
     )
-    _args = ap.parse_args()
+    _args, _ = ap.parse_known_args()  # ignore uvicorn's own argv (api:app --app-dir ...)
     return _args
 
 
@@ -1839,7 +1839,15 @@ class TrinityRun(NativeRun):
                 return {"type": "error", "error": str(e)}
 
     def _final(self) -> dict[str, Any]:
-        text = self.final_text or (self.turns[-1]["reply"] if self.turns else "")
+        text = self.final_text
+        if not text:
+            # Reasoning workers can return content:null when effort eats the
+            # budget; fall back to the last non-empty reply so the client
+            # never receives an empty final answer.
+            for step in reversed(self.turns):
+                if step.get("reply", "").strip():
+                    text = step["reply"]
+                    break
         return {
             "type": "final",
             "text": text,
@@ -2090,24 +2098,12 @@ class ConductorRun(NativeRun):
                 mids, subs, access = self._workflow
                 if self._next_node >= len(subs):
                     self.finished = True
-                    self.final_text = self._outputs[-1] if self._outputs else ""
                     self.terminated_by = "conductor_done"
-                    return {
-                        "type": "final",
-                        "text": self.final_text,
-                        "terminated_by": "conductor_done",
-                        "steps": self.steps,
-                    }
+                    return self._final_conductor("conductor_done")
                 if self._next_node >= self.max_steps:
                     self.finished = True
-                    self.final_text = self._outputs[-1] if self._outputs else ""
                     self.terminated_by = "max_steps"
-                    return {
-                        "type": "final",
-                        "text": self.final_text,
-                        "terminated_by": "max_steps",
-                        "steps": self.steps,
-                    }
+                    return self._final_conductor("max_steps")
                 node_index = self._next_node
                 self._next_node += 1
                 mid = int(mids[node_index]) % len(self.slot_models)
@@ -2123,6 +2119,20 @@ class ConductorRun(NativeRun):
 
     def close(self) -> None:
         self.cancelled = True
+
+    def _final_conductor(self, terminated_by: str) -> dict[str, Any]:
+        text = ""
+        for out in reversed(self._outputs):
+            if str(out or "").strip():
+                text = str(out)
+                break
+        self.final_text = text
+        return {
+            "type": "final",
+            "text": text,
+            "terminated_by": terminated_by,
+            "steps": self.steps,
+        }
 
 
 def create_run(mode: str, body: dict[str, Any]) -> NativeRun:
