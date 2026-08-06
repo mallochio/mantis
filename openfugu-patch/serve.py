@@ -139,6 +139,31 @@ def _build_request(
     )
 
 
+# Provider failures worth retrying on the next pool worker.
+_TRANSIENT_STATUSES = {408, 429, 500, 502, 503, 504}
+_FAILOVER_DELAY = 0.5  # short, constant pause between attempts
+
+
+def _failover_attempts(spec: str) -> list[str]:
+    """Attempt order on transient failures: the assigned spec, then the rest of
+    the configured pool in declared order, each at most once. Falls back to
+    [spec] when no provider pool is configured (tests, local workers)."""
+    try:
+        pool = _configured_slot_models()
+    except (TypeError, ValueError):
+        return [spec]
+    attempts = [spec]
+    for candidate in pool:
+        if candidate in attempts:
+            continue
+        try:
+            _parse_model_spec(candidate)
+        except ValueError:
+            continue  # bare labels are not routable failover targets
+        attempts.append(candidate)
+    return attempts
+
+
 def _provider_response(
     spec: str,
     messages: list[dict[str, Any]],
@@ -160,14 +185,35 @@ def _provider_response(
     if "reasoning" in controls:
         body.pop("reasoning_effort", None)
     body.update(controls)
-    try:
-        response = _provider_client.post(url, headers=headers, json=body)
-        response.raise_for_status()
-        data = response.json()
-    except httpx.HTTPStatusError as error:
-        raise RuntimeError(
-            f"{spec} returned HTTP {error.response.status_code}: {error.response.text[:500]}"
-        ) from error
+    failures: list[str] = []
+    for index, attempt in enumerate(_failover_attempts(spec)):
+        if index:
+            time.sleep(_FAILOVER_DELAY)
+        target_url, target_headers = url, headers
+        if attempt != spec:  # failover: identical body, next pool provider
+            base_url, key_env = PROVIDERS[_parse_model_spec(attempt)[0]]
+            key = os.environ.get(key_env)
+            if not key:
+                failures.append(f"{attempt}: {key_env} is required")
+                continue
+            target_url = f"{base_url}/chat/completions"
+            target_headers = {**headers, "Authorization": f"Bearer {key}"}
+        try:
+            response = _provider_client.post(target_url, headers=target_headers, json=body)
+            response.raise_for_status()
+            data = response.json()
+            break
+        except httpx.HTTPStatusError as error:
+            status = error.response.status_code
+            if status not in _TRANSIENT_STATUSES:
+                raise RuntimeError(
+                    f"{attempt} returned HTTP {status}: {error.response.text[:500]}"
+                ) from error
+            failures.append(f"{attempt}: HTTP {status}")
+        except (httpx.TimeoutException, httpx.ConnectError) as error:
+            failures.append(f"{attempt}: {type(error).__name__}")
+    else:
+        raise RuntimeError(f"{spec} failed on every pool worker: " + "; ".join(failures))
     if not isinstance(data, dict):
         raise TypeError(f"{spec} returned a non-object response")
     if run is not None:
