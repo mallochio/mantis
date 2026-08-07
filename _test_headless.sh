@@ -22,5 +22,5 @@ route_one "EASY (expect deepseek-v4-pro)"  "Write hello world in Python, one lin
 route_one "HARD (expect luna)"    "Implement Paxos with byzantine fault tolerance and prove liveness and safety; include the formal invariant argument and the fail-stop vs fail-beautiful distinction"
 route_one "MEDIUM (refactor)"     "Refactor this pymongo query to avoid N+1 by adding a covering compound index, and explain the query planner interaction with the ESR rule"
 rm -f "$H"
-echo "=== decision log tail ==="
-tail -5 ~/.config/llm-router/logs/decisions.log 2>/dev/null | jq -c '{decision, score, model, ttfb_ms, prompt}' 2>/dev/null || tail -5 ~/.config/llm-router/logs/decisions.log
+LOG="${MANTIS_DATA_DIR:-$HOME/.local/share/mantis}/router/decisions.log"
+tail -5 "$LOG" 2>/dev/null | jq -c '{decision, score, model, ttfb_ms, prompt}' 2>/dev/null || tail -5 "$LOG"

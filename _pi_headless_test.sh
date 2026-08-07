@@ -12,4 +12,5 @@ echo "=== pi exit: $rc ==="
 echo "=== pi output ==="
 cat "$OUT"
 echo "=== last router decision ==="
-tail -1 ~/.config/llm-router/logs/decisions.log 2>/dev/null
+LOG="${MANTIS_DATA_DIR:-$HOME/.local/share/mantis}/router/decisions.log"
+tail -1 "$LOG" 2>/dev/null

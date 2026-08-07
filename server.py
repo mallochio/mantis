@@ -146,6 +146,17 @@ def _load_router():
     # client is instantiated at import of routellm.routers.similarity_weighted.utils,
     # so the key must be in env before this import runs.
     if not os.environ.get("OPENAI_API_KEY"):
+        import subprocess
+        try:
+            k = subprocess.check_output(
+                ["security", "find-generic-password", "-s", "AI.Playground.openai.apiKey", "-w"],
+                text=True, stderr=subprocess.DEVNULL,
+            ).strip()
+            if k:
+                os.environ["OPENAI_API_KEY"] = k
+        except Exception:
+            pass
+    if not os.environ.get("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY required for mf router (embeddings)")
     from routellm.routers.routers import ROUTER_CLS
     cfg = {"checkpoint_path": "routellm/mf_gpt4_augmented"}
@@ -486,6 +497,8 @@ async def chat_completions(request: Request, authorization: str | None = Header(
                                         sline = line.strip()
                                         if sline == "data: [DONE]":
                                             saw_done = True
+                                            yield (line + "\n").encode()
+                                            break
                                         elif sline.startswith("data: "):
                                             try:
                                                 track(json.loads(sline[6:]))
@@ -506,6 +519,8 @@ async def chat_completions(request: Request, authorization: str | None = Header(
                         sline = line.strip()
                         if sline == "data: [DONE]":
                             saw_done = True
+                            yield (line + "\n").encode()
+                            break
                         elif sline.startswith("data: "):
                             try:
                                 track(json.loads(sline[6:]))
