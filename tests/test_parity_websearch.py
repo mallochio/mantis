@@ -60,6 +60,8 @@ def _chat(
         posted.append(kwargs["json"])
         return _ProviderResponse(queue.pop(0))
 
+    # These tests exercise request-body passthrough, not transport; pin buffered.
+    monkeypatch.setattr(serve, "_upstream_streaming_enabled", lambda: False)
     monkeypatch.setattr(serve, "_provider_client", SimpleNamespace(post=post))
     payload: dict[str, Any] = {
         "model": "mantis",

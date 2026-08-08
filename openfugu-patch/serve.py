@@ -123,6 +123,44 @@ def _is_reasoning_model(model: str) -> bool:
     return any(name.startswith(p) for p in REASONING_MODELS)
 
 
+def _cache_breakpoints_enabled() -> bool:
+    value = os.environ.get("MANTIS_CACHE_BREAKPOINTS", "1").lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _with_cache_breakpoints(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Mark the stable prefix for prompt caching (OpenRouter + Anthropic models).
+
+    The orchestration re-sends the same system+history prefix for every internal
+    step and tool round, which is exactly the pattern provider prompt caching
+    rewards. Breakpoints go on the end of the system message and on the message
+    before the final role prompt (the end of the stable history prefix), so the
+    whole reusable prefix is cached and only the role prompt varies per step.
+    The input list is not mutated.
+    """
+    if not isinstance(messages, list) or len(messages) < 2:
+        return messages
+    out = [dict(message) for message in messages]
+
+    def _mark(message: dict[str, Any]) -> None:
+        content = message.get("content")
+        if content is None:
+            return  # tool-call messages carry no text; nothing to cache-mark
+        if isinstance(content, list):
+            blocks = list(content)
+        else:
+            blocks = [{"type": "text", "text": str(content)}]
+        if blocks and isinstance(blocks[-1], dict) and "cache_control" not in blocks[-1]:
+            blocks[-1] = {**blocks[-1], "cache_control": {"type": "ephemeral"}}
+            message["content"] = blocks
+
+    if out and out[0].get("role") == "system":
+        _mark(out[0])
+    if len(out) >= 3:
+        _mark(out[-2])
+    return out
+
+
 def _build_request(
     spec: str, messages: list[dict[str, str]], max_tokens: int, temperature: float
 ) -> tuple[str, dict[str, str], dict[str, Any]]:
@@ -132,6 +170,8 @@ def _build_request(
     if not key:
         raise RuntimeError(f"{key_env} is required for {spec}")
     body: dict[str, Any] = {"model": model, "messages": messages, "max_tokens": max_tokens}
+    if _cache_breakpoints_enabled() and model.startswith("anthropic/claude-"):
+        body["messages"] = _with_cache_breakpoints(messages)
     if effort:
         body["reasoning_effort"] = effort
     if not effort and not _is_reasoning_model(model):
@@ -149,7 +189,96 @@ def _build_request(
 
 # Provider failures worth retrying on the next pool worker.
 _TRANSIENT_STATUSES = {408, 429, 500, 502, 503, 504}
+_TRANSIENT_EXCEPTIONS = (httpx.TimeoutException, httpx.ConnectError, httpx.StreamError)
 _FAILOVER_DELAY = 0.5  # short, constant pause between attempts
+
+
+def _upstream_streaming_enabled() -> bool:
+    """Stream upstream provider responses (SSE) so long generations survive
+    pass-through proxies; disable with MANTIS_UPSTREAM_STREAM=0."""
+    return os.environ.get("MANTIS_UPSTREAM_STREAM", "1").lower() not in {"0", "false", "no", "off"}
+
+
+def _parse_sse_line(line: str) -> dict[str, Any] | None:
+    """Parse one SSE `data:` line; None for comments/junk/keep-alives, {} for [DONE]."""
+    stripped = line.strip()
+    if not stripped.startswith("data:"):
+        return None
+    payload = stripped[len("data:"):].strip()
+    if payload == "[DONE]":
+        return {}
+    try:
+        value = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _assemble_streamed_completion(chunks: Any) -> dict[str, Any]:
+    """Reassemble OpenAI-style SSE chunks into one completion object."""
+    message: dict[str, Any] = {"role": "assistant", "content": None}
+    tool_calls: list[dict[str, Any]] = []
+    usage: dict[str, Any] | None = None
+    for chunk in chunks:
+        if not chunk:
+            continue
+        if chunk.get("error"):
+            error = chunk["error"]
+            detail = error.get("message") if isinstance(error, dict) else error
+            raise RuntimeError(f"provider stream error: {detail}")
+        usage = chunk.get("usage") or usage
+        for choice in chunk.get("choices") or []:
+            delta = choice.get("delta") or {}
+            if not isinstance(delta, dict):
+                continue
+            if delta.get("role"):
+                message["role"] = delta["role"]
+            if delta.get("content"):
+                message["content"] = (message.get("content") or "") + delta["content"]
+            for key in ("reasoning", "reasoning_details", "annotations", "citations"):
+                part = delta.get(key)
+                if isinstance(part, str):
+                    message[key] = (message.get(key) or "") + part
+                elif part is not None:
+                    message[key] = part
+            for call in delta.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                index = call.get("index")
+                if not isinstance(index, int):
+                    index = len(tool_calls)
+                while len(tool_calls) <= index:
+                    tool_calls.append(
+                        {"id": None, "type": "function", "function": {"name": "", "arguments": ""}}
+                    )
+                slot = tool_calls[index]
+                if call.get("id"):
+                    slot["id"] = call["id"]
+                if call.get("type"):
+                    slot["type"] = call["type"]
+                function = call.get("function")
+                if isinstance(function, dict):
+                    if function.get("name"):
+                        slot["function"]["name"] += function["name"]
+                    if function.get("arguments"):
+                        slot["function"]["arguments"] += function["arguments"]
+    named = [call for call in tool_calls if call.get("id") or call["function"]["name"]]
+    if named:
+        message["tool_calls"] = named
+    return {"choices": [{"message": message}], "usage": usage}
+
+
+def _stream_completion(
+    client: Any, url: str, headers: dict[str, str], body: dict[str, Any]
+) -> dict:
+    """POST with SSE streaming; returns the reassembled completion object."""
+    stream_body = dict(body)
+    stream_body["stream"] = True
+    stream_body["stream_options"] = {"include_usage": True}
+    with client.stream("POST", url, headers=headers, json=stream_body) as response:
+        response.raise_for_status()
+        chunks = (_parse_sse_line(line) for line in response.iter_lines())
+        return _assemble_streamed_completion(chunks)
 
 
 def _failover_attempts(spec: str) -> list[str]:
@@ -204,9 +333,12 @@ def _provider_response(
             body.pop("reasoning_effort", None)
         body.update(controls)
         try:
-            response = _provider_client.post(url, headers=headers, json=body)
-            response.raise_for_status()
-            data = response.json()
+            if _upstream_streaming_enabled():
+                data = _stream_completion(_provider_client, url, headers, body)
+            else:
+                response = _provider_client.post(url, headers=headers, json=body)
+                response.raise_for_status()
+                data = response.json()
             break
         except httpx.HTTPStatusError as error:
             status = error.response.status_code
@@ -223,7 +355,7 @@ def _provider_response(
                     status="failed",
                     attempt=index + 1,
                 )
-        except (httpx.TimeoutException, httpx.ConnectError) as error:
+        except _TRANSIENT_EXCEPTIONS as error:
             failures.append(f"{attempt}: {type(error).__name__}")
             run_record = getattr(_history_context, "active_run", None)
             if run_record is not None:
@@ -259,33 +391,47 @@ def _direct_completion(
 
 _PRICES_URL = "https://openrouter.ai/api/v1/models"
 _price_cache: dict[str, tuple[float, float]] | None = None
+_cache_read_price_cache: dict[str, float] | None = None
 
 
-def _price_entry(entry: Any) -> tuple[str, tuple[float, float]] | None:
-    """(model id, (prompt, completion) price) pair, or None for a malformed entry."""
+def _price_entry(entry: Any) -> tuple[str, tuple[float, float], float | None] | None:
+    """(model id, (prompt, completion) price, cache-read price) or None."""
     try:
         pricing = entry["pricing"]
-        return str(entry["id"]), (float(pricing["prompt"]), float(pricing["completion"]))
+        cache_read = pricing.get("input_cache_read")
+        cache_price = None if cache_read in (None, "") else float(cache_read)
+        return (
+            str(entry["id"]),
+            (float(pricing["prompt"]), float(pricing["completion"])),
+            cache_price,
+        )
     except (AttributeError, KeyError, TypeError, ValueError):
         return None
 
 
 def _fetch_prices() -> dict[str, tuple[float, float]]:
-    """Fetch model id -> (prompt, completion) per-token USD prices; empty on any failure."""
+    """Fetch (prompt, completion) USD prices and cache-read prices; empty on failure."""
+    global _cache_read_price_cache
     try:
         response = httpx.get(_PRICES_URL, timeout=5.0)
         response.raise_for_status()
         payload = response.json()
     except (httpx.HTTPError, ValueError):
+        _cache_read_price_cache = {}
         return {}
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, list):
+        _cache_read_price_cache = {}
         return {}
     prices: dict[str, tuple[float, float]] = {}
+    cache_read: dict[str, float] = {}
     for entry in data:
         pair = _price_entry(entry)
         if pair is not None:
             prices[pair[0]] = pair[1]
+            if pair[2] is not None:
+                cache_read[pair[0]] = pair[2]
+    _cache_read_price_cache = cache_read
     return prices
 
 
@@ -297,6 +443,28 @@ def _price_map() -> dict[str, tuple[float, float]]:
     return _price_cache
 
 
+def _cache_read_prices() -> dict[str, float]:
+    """Per-model cache-read USD prices, populated by the same fetch as the map."""
+    global _cache_read_price_cache
+    if _cache_read_price_cache is None:
+        _price_map()  # the shared lazy fetch fills both caches
+    return _cache_read_price_cache or {}
+
+
+def _model_cost(
+    model: str, tokens: dict[str, int], prices: dict[str, tuple[float, float]]
+) -> float | None:
+    """USD cost for one model's tokens, cache-aware; None when unpriced."""
+    price = prices.get(model)
+    if price is None:
+        return None
+    prompt = int(tokens.get("prompt_tokens", 0))
+    completion = int(tokens.get("completion_tokens", 0))
+    cached = min(int(tokens.get("cached_tokens", 0)), prompt)
+    cache_price = _cache_read_prices().get(model, price[0])
+    return (prompt - cached) * price[0] + cached * cache_price + completion * price[1]
+
+
 def _usage_cost(usage_models: dict[str, dict[str, int]]) -> float | None:
     """Total USD cost, or None when any consumed model has no known price."""
     if not usage_models:
@@ -304,10 +472,10 @@ def _usage_cost(usage_models: dict[str, dict[str, int]]) -> float | None:
     prices = _price_map()
     cost = 0.0
     for model, tokens in usage_models.items():
-        price = prices.get(model)
-        if price is None:
+        model_cost = _model_cost(model, tokens, prices)
+        if model_cost is None:
             return None
-        cost += tokens["prompt_tokens"] * price[0] + tokens["completion_tokens"] * price[1]
+        cost += model_cost
     return round(cost, 6)
 
 
@@ -341,27 +509,28 @@ def _cost_breakdown(usage_models: dict[str, dict[str, int]]) -> dict[str, Any]:
     total = 0.0
     known = True
     for model, tokens in usage_models.items():
-        price = prices.get(model)
-        if price is None:
+        model_cost = _model_cost(model, tokens, prices)
+        if model_cost is None:
             known = False
             models.append(
                 {
                     "model": model,
                     "prompt_tokens": tokens["prompt_tokens"],
                     "completion_tokens": tokens["completion_tokens"],
+                    "cached_tokens": tokens.get("cached_tokens", 0),
                     "cost": None,
                     "source": "unknown",
                 }
             )
             continue
-        cost = tokens["prompt_tokens"] * price[0] + tokens["completion_tokens"] * price[1]
-        total += cost
+        total += model_cost
         models.append(
             {
                 "model": model,
                 "prompt_tokens": tokens["prompt_tokens"],
                 "completion_tokens": tokens["completion_tokens"],
-                "cost": round(cost, 6),
+                "cached_tokens": tokens.get("cached_tokens", 0),
+                "cost": round(model_cost, 6),
                 "source": "price_table",
             }
         )
@@ -1810,6 +1979,14 @@ class NativeRun:
                 value = usage.get(key)
                 if isinstance(value, int) and value >= 0:
                     model_usage[key] += value
+        prompt_details = usage.get("prompt_tokens_details")
+        if model and isinstance(prompt_details, dict):
+            cached = prompt_details.get("cached_tokens")
+            if isinstance(cached, int) and cached > 0:
+                model_usage = self.usage_models.setdefault(
+                    model, {"prompt_tokens": 0, "completion_tokens": 0}
+                )
+                model_usage["cached_tokens"] = model_usage.get("cached_tokens", 0) + cached
 
     def validate_output(self, text: str) -> None:
         if not self.response_format:

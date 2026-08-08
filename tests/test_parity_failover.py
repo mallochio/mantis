@@ -5,6 +5,7 @@ messages, tools, and controls stay identical across attempts."""
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import httpx
 import pytest
@@ -33,6 +34,43 @@ class _Response:
         return self.body
 
 
+class _StreamResponse:
+    """Context-manager stand-in for httpx's stream() response."""
+
+    def __init__(self, response: _Response) -> None:
+        self._response = response
+
+    def __enter__(self) -> _StreamResponse:
+        return self
+
+    def __exit__(self, *_args) -> None:
+        return None
+
+    def raise_for_status(self) -> None:
+        self._response.raise_for_status()
+
+    def iter_lines(self):
+        body = self._response.body
+        message = (body.get("choices") or [{}])[0].get("message", {})
+        delta: dict[str, Any] = {"role": "assistant"}
+        if message.get("content"):
+            delta["content"] = message["content"]
+        if message.get("tool_calls"):
+            delta["tool_calls"] = [
+                {
+                    "index": i,
+                    "id": call.get("id"),
+                    "type": "function",
+                    "function": call.get("function", {}),
+                }
+                for i, call in enumerate(message["tool_calls"])
+            ]
+        yield "data: " + json.dumps({"choices": [{"delta": delta}]})
+        if body.get("usage"):
+            yield "data: " + json.dumps({"usage": body["usage"]})
+        yield "data: [DONE]"
+
+
 class _Client:
     """Queue-backed replacement for serve._provider_client that records calls."""
 
@@ -40,12 +78,18 @@ class _Client:
         self._items = list(items)
         self.posts: list[dict] = []
 
-    def post(self, url, headers=None, json=None):
+    def _record(self, url, headers, json) -> object:
         self.posts.append({"url": url, "headers": dict(headers or {}), "json": json})
         item = self._items.pop(0)
         if isinstance(item, Exception):
             raise item
         return item
+
+    def post(self, url, headers=None, json=None):
+        return self._record(url, headers, json)
+
+    def stream(self, _method, url, headers=None, json=None):
+        return _StreamResponse(self._record(url, headers, json))
 
 
 @pytest.fixture

@@ -132,8 +132,16 @@ reasoning engine or search crawler.
 | `MANTIS_MAX_CONCURRENT_REQUESTS` | Concurrent HTTP request limit; excess receives `429` | `32` |
 | `MANTIS_SSE_KEEPALIVE_SECONDS` | SSE keep-alive interval during orchestration | `10` |
 | `MANTIS_MAX_BODY_BYTES` | Maximum request body size | `52428800` |
+| `MANTIS_UPSTREAM_STREAM` | Stream provider responses upstream (SSE) instead of buffering | `1` |
+| `MANTIS_CACHE_BREAKPOINTS` | Add prompt-cache breakpoints to Claude-family requests | `1` |
 
 Supported hosted model prefixes are currently `openrouter/` and `opencode-go/`.
+Provider base URLs are overridable with `OPENROUTER_BASE_URL` and
+`OPENCODE_GO_ENDPOINT_URL`, so the whole pool can be pointed at a pass-through
+proxy (e.g. a Cloudflare Worker gateway) by setting the matching API key to the
+gateway secret. Upstream streaming keeps long generations alive through such
+proxies. Cached prompt tokens are accounted per model in the `mantis` details
+and billed at the model's cache-read price when known.
 Reasoning effort is appended with `|`, for example
 `openrouter/openai/gpt-5.6-luna|max`.
 

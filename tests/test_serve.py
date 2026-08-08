@@ -116,6 +116,7 @@ def test_direct_provider_completions(monkeypatch):
     )
     client = SimpleNamespace(post=lambda *_a, **_k: next(responses))
     monkeypatch.setenv("OPENROUTER_API_KEY", "provider-key")
+    monkeypatch.setattr(serve, "_upstream_streaming_enabled", lambda: False)
     monkeypatch.setattr(serve, "_provider_client", client)
 
     assert (
@@ -159,6 +160,7 @@ def test_provider_metadata_is_captured_for_public_response(monkeypatch):
     run.capture_metadata = True
     serve._history_context.active_run = run
     monkeypatch.setenv("OPENROUTER_API_KEY", "provider-key")
+    monkeypatch.setattr(serve, "_upstream_streaming_enabled", lambda: False)
     monkeypatch.setattr(serve, "_provider_client", SimpleNamespace(post=lambda *_a, **_k: Response()))
     try:
         serve._provider_response("openrouter/model", [], 10, 0.7)

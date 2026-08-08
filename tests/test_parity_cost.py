@@ -86,6 +86,7 @@ def test_provider_response_records_bare_model_id(monkeypatch):
     run = serve.NativeRun("provider")
     serve._history_context.active_run = run
     monkeypatch.setenv("OPENROUTER_API_KEY", "provider-key")
+    monkeypatch.setattr(serve, "_upstream_streaming_enabled", lambda: False)
     monkeypatch.setattr(
         serve, "_provider_client", SimpleNamespace(post=lambda *_a, **_k: Response())
     )

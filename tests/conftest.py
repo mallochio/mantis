@@ -30,10 +30,18 @@ def _block_external_provider_calls(monkeypatch: pytest.MonkeyPatch):
             "See tests/conftest.py."
         )
 
+    def blocked_stream(*_args, **_kwargs):
+        raise httpx.NetworkError(
+            "Real provider calls are blocked in tests. "
+            "Monkeypatch serve._provider_client or serve._model_completion. "
+            "See tests/conftest.py."
+        )
+
     def blocked_get(url, *_args, **_kwargs):
         request = httpx.Request("GET", url)
         raise httpx.ConnectError("Network access is blocked in tests.", request=request)
 
     monkeypatch.setattr(serve._provider_client, "post", blocked_post)
+    monkeypatch.setattr(serve._provider_client, "stream", blocked_stream)
     monkeypatch.setattr(serve.httpx, "get", blocked_get)
     yield
