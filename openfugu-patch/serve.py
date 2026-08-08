@@ -74,8 +74,14 @@ WORKER_TIMEOUT = float(os.environ.get("MANTIS_WORKER_TIMEOUT", "240"))
 # These providers reject temperature != 1 when reasoning is enabled.
 REASONING_MODELS = ("claude-", "gpt-5.6-")
 PROVIDERS = {
-    "openrouter": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
-    "opencode-go": ("https://opencode.ai/zen/go/v1", "OPENCODE_API_KEY"),
+    "openrouter": (
+        os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+        "OPENROUTER_API_KEY",
+    ),
+    "opencode-go": (
+        os.environ.get("OPENCODE_GO_ENDPOINT_URL", "https://opencode.ai/zen/go/v1"),
+        "OPENCODE_API_KEY",
+    ),
 }
 
 _args: argparse.Namespace | None = None

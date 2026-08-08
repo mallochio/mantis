@@ -22,7 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class FunctionDefinition(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     name: str = Field(min_length=1)
     description: str | None = None
@@ -31,41 +31,41 @@ class FunctionDefinition(BaseModel):
 
 
 class FunctionTool(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal["function"]
     function: FunctionDefinition
 
 
 class FunctionChoice(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     name: str = Field(min_length=1)
 
 
 class NamedToolChoice(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal["function"]
     function: FunctionChoice
 
 
 class TextPart(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal["text"]
     text: str
 
 
 class ImageURL(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     url: str = Field(min_length=1)
     detail: Literal["auto", "low", "high"] | None = None
 
 
 class ImagePart(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal["image_url"]
     image_url: ImageURL
@@ -89,7 +89,7 @@ class Message(BaseModel):
 
 
 class JsonSchemaDefinition(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     name: str = Field(min_length=1)
     description: str | None = None
@@ -98,20 +98,20 @@ class JsonSchemaDefinition(BaseModel):
 
 
 class JsonSchemaFormat(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal["json_schema"]
     json_schema: JsonSchemaDefinition
 
 
 class JsonObjectFormat(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal["json_object"]
 
 
 class ReasoningOptions(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
     max_tokens: int | None = Field(default=None, ge=1)
@@ -119,13 +119,13 @@ class ReasoningOptions(BaseModel):
 
 
 class StreamOptions(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     include_usage: bool = False
 
 
 class ChatRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     model: str = serve.MODEL_NAME
     messages: list[Message] = Field(min_length=1)
