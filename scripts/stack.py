@@ -164,7 +164,7 @@ def _native_run_redis(spec: dict) -> None:
     )
 
 
-def native_up(redis: bool, conductor: str | None) -> None:
+def native_up(redis: bool, conductor: str | None, memory: str = "4G") -> None:
     spec = load_spec(COMPOSE_FILE)
     svc = spec["services"]["openfugu"]
     _ensure_network_and_volumes(spec)
@@ -192,6 +192,8 @@ def native_up(redis: bool, conductor: str | None) -> None:
         svc["container_name"],
         "--network",
         "mantis",
+        "--memory",
+        memory,
     ]
     for port in svc["ports"]:
         argv += ["-p", port]
@@ -241,6 +243,9 @@ def main() -> None:
     parser.add_argument("command", choices=["up", "down", "build", "logs", "status"])
     parser.add_argument("--redis", action="store_true", help="also run the redis service")
     parser.add_argument(
+        "--memory", default="4G", help="container memory limit (native backend; default 4G)"
+    )
+    parser.add_argument(
         "--conductor", metavar="DIR", help="mount a conductor checkpoint (eval override)"
     )
     args = parser.parse_args()
@@ -262,7 +267,7 @@ def main() -> None:
         _run(docker_args(command, flags))
         return
     if args.command == "up":
-        native_up(args.redis, args.conductor)
+        native_up(args.redis, args.conductor, args.memory)
     elif args.command == "down":
         native_down()
     elif args.command == "build":

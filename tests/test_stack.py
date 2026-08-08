@@ -207,7 +207,10 @@ def test_native_up_runs_expected_argv(monkeypatch, tmp_path):
     joined = "\n".join(" ".join(c) for c in calls)
     assert "container network create mantis" in joined
     assert "container volume create mantis_hf-cache" in joined
-    assert "container run -d --name mantis-orchestrator --network mantis -p 8088:8088" in joined
+    assert (
+        "container run -d --name mantis-orchestrator --network mantis --memory 4G -p 8088:8088"
+        in joined
+    )
     assert "--mount type=volume,source=mantis_hf-cache,target=/root/.cache/huggingface" in joined
     assert "--env-file" in joined
     assert "MANTIS_REDIS_URL=redis://192.168.65.9:6379/0" in env_files[0]
