@@ -122,7 +122,7 @@ def test_stream_include_usage_appends_usage_chunk(client, monkeypatch):
     assert response.status_code == 200
     events = _events(response)
     assert events[-1]["choices"] == []
-    assert events[-1]["usage"] == run.usage
+    assert events[-1]["usage"] == {"prompt_tokens": 1, "completion_tokens": 10, "total_tokens": 11}
     assert events[-2]["choices"][0]["finish_reason"] == "stop"
     assert response.text.endswith("data: [DONE]\n\n")
 

@@ -149,12 +149,15 @@ def test_completion_response_reports_cost(monkeypatch):
     run.add_usage(
         {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12}, model="model-b"
     )
-    body = serve._completion_response("mantis", [], run, {"type": "final", "text": "answer"})
+    messages = [{"role": "user", "content": "hi"}]
+    body = serve._completion_response("mantis", messages, run, {"type": "final", "text": "answer"})
     expected = 4 * 0.001 + 6 * 0.002 + 5 * 0.003 + 7 * 0.004
     assert body["usage"]["cost"] == round(expected, 6)
-    assert body["usage"]["prompt_tokens"] == 9
-    assert body["usage"]["completion_tokens"] == 13
-    assert body["usage"]["total_tokens"] == 22
+    # Tokens are per-request (the client's context), while cost is the run's
+    # cumulative orchestration spend.
+    assert body["usage"]["prompt_tokens"] == 1
+    assert body["usage"]["completion_tokens"] == 2
+    assert body["usage"]["total_tokens"] == 3
 
 
 def test_cost_omitted_when_any_consumed_model_is_unpriced(monkeypatch):
@@ -184,6 +187,21 @@ def test_cost_omitted_when_price_fetch_fails(monkeypatch):
     body = serve._completion_response("mantis", [], run, {"type": "final", "text": "answer"})
     assert serve._price_map() == {}
     assert "cost" not in body["usage"]
+
+
+def test_completion_usage_ignores_accumulated_run_usage():
+    """A resumable run accumulates usage across internal steps and tool rounds.
+    The response must report this request's context, not the accumulated total,
+    or context-tracking clients (prime-agent harness) compact repeatedly."""
+    run = serve.NativeRun("acc")
+    for _ in range(6):
+        run.add_usage(
+            {"prompt_tokens": 42000, "completion_tokens": 1000, "total_tokens": 43000}
+        )
+    messages = [{"role": "user", "content": "hi"}]
+    body = serve._completion_response("mantis", messages, run, {"type": "final", "text": "answer"})
+    assert body["usage"] == {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+    assert run.usage["total_tokens"] == 6 * 43000  # run accounting is untouched
 
 
 def test_streaming_include_usage_chunk_carries_cost(monkeypatch):

@@ -86,7 +86,7 @@ def test_auth_health_and_validation(client, monkeypatch):
         assert response.status_code == 400
 
 
-def test_completion_uses_aggregate_usage_and_hides_trace(client, monkeypatch):
+def test_completion_reports_per_request_usage_and_hides_trace(client, monkeypatch):
     run = _run()
     monkeypatch.setattr(serve, "create_run", lambda *_a: run)
     monkeypatch.setattr(
@@ -102,7 +102,10 @@ def test_completion_uses_aggregate_usage_and_hides_trace(client, monkeypatch):
     assert response.headers["x-request-id"]
     body = response.json()
     assert body["choices"][0]["message"]["content"] == "answer"
-    assert body["usage"] == run.usage
+    # Usage describes this request's context (client messages + response), not the
+    # run's accumulated orchestration usage, so context-tracking clients (e.g. the
+    # prime-agent harness) do not see runaway growth across tool rounds.
+    assert body["usage"] == {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
     assert "mantis" not in body
 
 

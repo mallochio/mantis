@@ -1159,6 +1159,41 @@ def _run_trace(run: Any) -> dict[str, Any]:
     }
 
 
+def _request_usage(messages: list[dict[str, Any]], completion_text: str) -> dict[str, int]:
+    """Estimate per-request usage from the client's messages and this response.
+
+    OpenAI clients (including the prime-agent harness) track their own context
+    size from the response usage and compact when it approaches the window. The
+    run's accumulated usage spans every internal orchestrator call and tool
+    round, so reporting it would make the client see the context grow by the
+    full orchestration cost each round and compact repeatedly. Report only the
+    current request's context instead, using the same chars/4 estimate the
+    client itself applies to messages without usage.
+    """
+    prompt_chars = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        prompt_chars += len(_message_text(message.get("content")))
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            if not isinstance(function, dict):
+                continue
+            arguments = function.get("arguments", "")
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments)
+            prompt_chars += len(str(function.get("name", ""))) + len(arguments)
+    prompt_tokens = max(1, (prompt_chars + 3) // 4)
+    completion_tokens = max(1, (len(completion_text) + 3) // 4)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+
 def _completion_response(
     model: str,
     messages: list[dict[str, Any]],
@@ -1184,20 +1219,7 @@ def _completion_response(
         message.update(getattr(run, "response_metadata", {}))
         finish_reason = "stop"
         completion_text = message["content"]
-    usage = dict(getattr(run, "usage", {}))
-    if not usage.get("total_tokens"):
-        prompt_chars = sum(
-            len(_message_text(message.get("content")))
-            for message in messages
-            if isinstance(message, dict)
-        )
-        prompt_tokens = max(1, (prompt_chars + 3) // 4)
-        completion_tokens = max(1, (len(completion_text) + 3) // 4)
-        usage = {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        }
+    usage: dict[str, Any] = _request_usage(messages, completion_text)
     cost = _usage_cost(getattr(run, "usage_models", {}))
     if cost is not None:
         usage["cost"] = cost
