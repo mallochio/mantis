@@ -341,7 +341,7 @@ def test_invalid_structured_output_returns_502(client, monkeypatch):
     monkeypatch.setattr(
         serve, "_advance_to_boundary", lambda *_a: {"type": "final", "text": "bad"}
     )
-    monkeypatch.setattr(serve, "delete_run", lambda *_a: True)
+    monkeypatch.setattr(serve, "delete_run", lambda *_a, **_k: True)
     response = client.post(
         "/v1/chat/completions",
         headers=_headers(),

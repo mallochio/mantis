@@ -23,6 +23,11 @@ import pytest
 def _block_external_provider_calls(monkeypatch: pytest.MonkeyPatch):
     import serve
 
+    # Keep the dev shell's MANTIS_LEARNING=1 from polluting the production
+    # learning file with test runs (pool=test-worker etc.). Tests that need
+    # learning set MANTIS_LEARNING=1 themselves.
+    monkeypatch.setenv("MANTIS_LEARNING", "0")
+
     def blocked_post(*_args, **_kwargs):
         raise httpx.NetworkError(
             "Real provider calls are blocked in tests. "

@@ -281,13 +281,13 @@ def _complete(request: ChatRequest, headers: dict[str, str] | None = None) -> di
         raise HTTPException(400, str(error)) from error
     except RuntimeError as error:
         if run_id:
-            serve.delete_run(run_id)
+            serve.delete_run(run_id, error=str(error))
         raise HTTPException(502, str(error)) from error
     if event.get("type") == "final":
         try:
             run.validate_output(str(event.get("text", "")))
         except ValueError as error:
-            serve.delete_run(run_id)
+            serve.delete_run(run_id, error=str(error))
             raise HTTPException(502, str(error)) from error
     response = serve._completion_response(
         request.model, body["messages"], run, event, details=detail_level

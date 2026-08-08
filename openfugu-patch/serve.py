@@ -354,6 +354,7 @@ def _provider_response(
                     model=attempt,
                     status="failed",
                     attempt=index + 1,
+                    detail=f"HTTP {status}: {error.response.text[:300]}",
                 )
         except _TRANSIENT_EXCEPTIONS as error:
             failures.append(f"{attempt}: {type(error).__name__}")
@@ -364,6 +365,7 @@ def _provider_response(
                     model=attempt,
                     status="failed",
                     attempt=index + 1,
+                    detail=str(error)[:300],
                 )
     else:
         raise RuntimeError(f"{spec} failed on every pool worker: " + "; ".join(failures))
@@ -1643,6 +1645,15 @@ def _redis_registry_lock():
         lock.release()
 
 
+def _record_abandoned(run: NativeRun | None) -> None:
+    """Write a learning record for a run that expired before completing."""
+    if run is None or not _learning_enabled():
+        return
+    if not (getattr(run, "turns", None) or getattr(run, "steps", None)):
+        return  # never progressed; nothing to learn from
+    _write_learning_record(run, {"type": "error", "terminated_by": "abandoned"})
+
+
 def _sweep_runs() -> None:
     if RUN_STORE == "redis":
         client = _redis()
@@ -1651,6 +1662,7 @@ def _sweep_runs() -> None:
             run_id = raw_id.decode() if isinstance(raw_id, bytes) else str(raw_id)
             run = _redis_get(run_id)
             if run is None or now - run.last_active > RUN_TTL:
+                _record_abandoned(run)
                 client.delete(_redis_key(run_id))
                 client.srem(_redis_index_key(), run_id)
         return
@@ -1661,6 +1673,7 @@ def _sweep_runs() -> None:
     for rid in stale:
         run = _runs.pop(rid, None)
         if run is not None:
+            _record_abandoned(run)
             run.close()
 
 
@@ -1797,6 +1810,9 @@ def _configured_slot_models(override: Any = None) -> list[str]:
 
 
 _learning_lock = threading.Lock()
+# Tool names whose payload may contain a test command. The prime-agent harness
+# runs tests through `ipython` (code cells), not a bare `bash` tool.
+_TEST_TOOL_NAMES = ("bash", "ipython", "exec", "python", "sh", "shell")
 _TEST_COMMAND = re.compile(
     r"(?:^|[;&|]\s*|\s)(?:python\d*\s+-m\s+(?:pytest|unittest)|pytest|npm\s+(?:run\s+)?test|"
     r"pnpm\s+(?:run\s+)?test|yarn\s+test|bun\s+test|cargo\s+test|go\s+test|dotnet\s+test|"
@@ -1849,6 +1865,15 @@ def _learning_record(run: NativeRun, event: dict[str, Any]) -> dict[str, Any]:
     accepted = event.get("terminated_by") == "verifier_accept"
     trainable = bool(run.kind == "trinity" and accepted and last_test_passed and final_worker)
     task = _redact_learning_task(str(getattr(run, "query", "")))
+    steps = [
+        {
+            "role": str(turn.get("role", "")),
+            "model": turn.get("model_name"),
+            "agent_id": turn.get("agent_id"),
+        }
+        for turn in turns[:50]
+        if isinstance(turn, dict)
+    ]
     return {
         "schema_version": 1,
         "timestamp": int(time.time()),
@@ -1865,6 +1890,8 @@ def _learning_record(run: NativeRun, event: dict[str, Any]) -> dict[str, Any]:
         "tool_error_count": sum(item["is_error"] for item in run.tool_observations),
         "verifier_accepted": accepted,
         "trainable": trainable,
+        "steps": steps,
+        "error": event.get("error") if isinstance(event, dict) else None,
         "label_worker": (
             final_worker.get("agent_id") if trainable and final_worker is not None else None
         ),
@@ -1932,6 +1959,7 @@ class NativeRun:
         duration_ms: float | None = None,
         summary: str | None = None,
         attempt: int | None = None,
+        detail: str | None = None,
     ) -> None:
         entry: dict[str, Any] = {
             "type": activity_type,
@@ -1940,6 +1968,8 @@ class NativeRun:
             "status": status,
             "summary": summary or _activity_summary(activity_type, role),
         }
+        if detail is not None:
+            entry["error"] = detail
         if duration_ms is not None:
             entry["duration_ms"] = round(duration_ms, 1)
         if attempt is not None:
@@ -2034,14 +2064,17 @@ class NativeRun:
                 arguments = json.loads(function.get("arguments", "{}"))
             except (json.JSONDecodeError, TypeError, ValueError):
                 arguments = {}
-            command = arguments.get("command", "") if isinstance(arguments, dict) else ""
+            command = (
+                str(arguments.get("command") or arguments.get("code") or "")
+                if isinstance(arguments, dict)
+                else ""
+            )
             self.tool_observations.append(
                 {
                     "name": str(function.get("name", "")),
                     "is_error": bool(result.get("is_error", False)),
                     "is_test": bool(
-                        function.get("name") == "bash"
-                        and isinstance(command, str)
+                        str(function.get("name", "")).lower() in _TEST_TOOL_NAMES
                         and _TEST_COMMAND.search(command)
                     ),
                 }
@@ -2214,13 +2247,14 @@ class TrinityRun(NativeRun):
         try:
             text, calls = _model_completion(model, messages, self.tools)
             duration_ms = (time.monotonic() - started) * 1000.0
-        except Exception:
+        except Exception as error:
             self.record_activity(
                 "step",
                 role=role,
                 model=model,
                 status="failed",
                 duration_ms=(time.monotonic() - started) * 1000.0,
+                detail=str(error)[:300],
             )
             raise
         finally:
@@ -2454,13 +2488,14 @@ class ConductorRun(NativeRun):
         try:
             text, calls = _model_completion(model, messages, self.tools)
             duration_ms = (time.monotonic() - started) * 1000.0
-        except Exception:
+        except Exception as error:
             self.record_activity(
                 "step",
                 role=role,
                 model=model,
                 status="failed",
                 duration_ms=(time.monotonic() - started) * 1000.0,
+                detail=str(error)[:300],
             )
             raise
         finally:
@@ -2719,7 +2754,7 @@ def advance_run(run_id: str, tool_results: Any, request_id: Any = None) -> dict[
                 _redis_put(run)
 
 
-def delete_run(run_id: str) -> bool:
+def delete_run(run_id: str, error: str | None = None) -> bool:
     if RUN_STORE == "redis":
         with _redis_run_lock(run_id):
             run = _redis_get(run_id)
@@ -2732,6 +2767,8 @@ def delete_run(run_id: str) -> bool:
             run = _runs.pop(run_id, None)
         if run is None:
             return False
-    _write_learning_record(run, {"type": "error", "terminated_by": "deleted"})
+    _write_learning_record(
+        run, {"type": "error", "terminated_by": "deleted", "error": error}
+    )
     run.close()
     return True
