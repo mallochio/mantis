@@ -25,11 +25,23 @@ provided by the calling harness are returned as standard OpenAI `tool_calls`.
 cp .env.example .env
 # Set MANTIS_API_KEY and the provider keys used by your worker pool.
 
-docker compose up --build -d
+uv run scripts/stack.py up
 curl http://127.0.0.1:8088/health
 ```
 
-For native MPS/CUDA execution:
+`scripts/stack.py` is the stack driver. It reads `docker-compose.yml` as the
+single source of truth and picks the runtime automatically:
+
+- **native**: Apple `container` CLI on macOS 26+ (no Docker daemon)
+- **docker**: `docker compose` everywhere else
+
+Override with `MANTIS_STACK_BACKEND=auto|native|docker`. Subcommands:
+`up`, `down`, `build`, `logs`, `status`. Optional flags: `--redis`
+(also runs the redis service; the native backend injects the redis IP since
+Apple containers do not resolve service names), `--conductor DIR`
+(eval override that mounts a retrained conductor checkpoint read-only).
+
+For native MPS/CUDA execution on the host (no container):
 
 ```bash
 ./scripts/run_mantis_native.sh
@@ -147,8 +159,8 @@ Reasoning effort is appended with `|`, for example
 
 Tool runs use bounded process memory by default until completion or TTL expiry.
 For multi-replica deployment, set `MANTIS_RUN_STORE=redis`, configure
-`MANTIS_REDIS_URL`, and start the optional `redis` Compose profile:
-`docker compose --profile redis up --build`. Redis stores serialized run state
+`MANTIS_REDIS_URL`, and start the optional redis service:
+`uv run scripts/stack.py up --redis`. Redis stores serialized run state
 and locks each advance, so replicas can share tool loops. Use a trusted,
 private Redis deployment; run one replica with the memory backend.
 
