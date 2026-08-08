@@ -31,6 +31,8 @@ import httpx
 
 DEFAULT_MODEL = "google/gemini-3.5-flash-lite"
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
+# Batch API lives under /api/beta (not /api/v1).
+OPENROUTER_BATCH_BASE = "https://openrouter.ai/api/beta"
 API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY")
 
 # Prompts may be very long; the tail usually carries the current intent.
@@ -289,6 +291,28 @@ def write_batch(
             sf.write(json.dumps(item["supra"]) + "\n")
 
 
+def build_records(item, parsed, model, elapsed_ms, raw="") -> tuple[dict, dict]:
+    label = normalize_label(parsed)
+    record = {
+        "hash": item["hash"],
+        "model": model,
+        "prompt": item["prompt"],
+        "truncated_prompt": truncate_prompt(item["prompt"], DEFAULT_MAX_PROMPT_CHARS),
+        "truncated": len(item["prompt"]) > DEFAULT_MAX_PROMPT_CHARS,
+        **label,
+        "elapsed_ms": elapsed_ms,
+        "raw": raw,
+    }
+    supra_record = {
+        "input": f"Task: {truncate_prompt(item['prompt'], DEFAULT_MAX_PROMPT_CHARS)}\nAnalysis: ",
+        "target": supra_target_text(label),
+        "text": f"Task: {truncate_prompt(item['prompt'], DEFAULT_MAX_PROMPT_CHARS)}\nAnalysis: {supra_target_text(label)}",
+        "complexity": label["complexity"],
+        "route": label["route"],
+    }
+    return record, supra_record
+
+
 def process(
     item: dict[str, Any],
     model: str,
@@ -304,25 +328,7 @@ def process(
         print(f"ERROR classifying prompt: {exc}")
         return None
     elapsed_ms = int((time.time() - t0) * 1000)
-    label = normalize_label(result["parsed"])
-
-    record = {
-        "hash": item["hash"],
-        "model": model,
-        "prompt": item["prompt"],
-        "truncated_prompt": truncated,
-        "truncated": len(item["prompt"]) > max_chars,
-        **label,
-        "elapsed_ms": elapsed_ms,
-        "raw": result["raw"],
-    }
-    supra_record = {
-        "input": f"Task: {truncated}\nAnalysis: ",
-        "target": supra_target_text(label),
-        "text": f"Task: {truncated}\nAnalysis: {supra_target_text(label)}",
-        "complexity": label["complexity"],
-        "route": label["route"],
-    }
+    record, supra_record = build_records(item, result["parsed"], model, elapsed_ms, result.get("raw", ""))
     return {
         "record": record,
         "supra": supra_record,
@@ -331,6 +337,84 @@ def process(
         "completion_tokens": result.get("completion_tokens", 0),
         "elapsed_ms": elapsed_ms,
     }
+
+
+BATCH_TIMEOUT_S = 3600
+
+
+def run_batch(
+    rows: list[dict[str, Any]],
+    model: str,
+    output_path: Path,
+    supra_output_path: Path,
+    state_path: Path,
+    state: set[str],
+) -> None:
+    """Label all pending prompts via OpenRouter's inline batch API (~50% cost)."""
+    if not rows:
+        print("Nothing to label.")
+        return
+    requests = [
+        {
+            "custom_id": item["hash"],
+            "body": {
+                "messages": build_openai_messages(truncate_prompt(item["prompt"], DEFAULT_MAX_PROMPT_CHARS)),
+                "temperature": 0,
+                "max_tokens": 256,
+            },
+        }
+        for item in rows
+    ]
+    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    with httpx.Client(timeout=60) as client:
+        resp = client.post(
+            f"{OPENROUTER_BATCH_BASE}/batches",
+            headers=headers,
+            json={"endpoint": "/v1/chat/completions", "model": model, "requests": requests},
+        )
+        resp.raise_for_status()
+        batch_id = resp.json()["id"]
+        print(f"Submitted batch {batch_id} with {len(requests)} requests", flush=True)
+        deadline = time.time() + BATCH_TIMEOUT_S
+        while time.time() < deadline:
+            time.sleep(30)
+            st = client.get(f"{OPENROUTER_BATCH_BASE}/batches/{batch_id}", headers=headers).json()
+            status = st.get("status")
+            print(f"  batch {status}: {st.get('request_counts')}", flush=True)
+            if status == "completed":
+                items = {item["hash"]: item for item in rows}
+                ok = err = 0
+                batch: list[dict] = []
+                for r in st.get("results") or []:
+                    item = items.get(r.get("custom_id"))
+                    if item is None:
+                        continue
+                    if r.get("error"):
+                        err += 1
+                        print(f"ERROR batch item {r['custom_id']}: {r['error']}", flush=True)
+                        continue
+                    content = r["response"]["body"]["choices"][0]["message"]["content"]
+                    parsed = extract_first_json_object(content)
+                    if parsed is None:
+                        err += 1
+                        print(f"ERROR no JSON in {r['custom_id']}: {content[:120]!r}", flush=True)
+                        continue
+                    record, supra_record = build_records(item, parsed, model, 0, raw=content)
+                    batch.append({"record": record, "supra": supra_record})
+                    state.add(item["hash"])
+                    ok += 1
+                    if len(batch) >= 32:
+                        write_batch(output_path, supra_output_path, batch)
+                        save_state(state_path, state)
+                        batch = []
+                if batch:
+                    write_batch(output_path, supra_output_path, batch)
+                save_state(state_path, state)
+                print(f"Done. Labeled: {ok}, errors: {err}", flush=True)
+                return
+            if status in ("failed", "expired", "cancelled", "cancelling"):
+                raise RuntimeError(f"batch {batch_id} ended with status {status}")
+        raise RuntimeError(f"batch {batch_id} did not finish within {BATCH_TIMEOUT_S}s")
 
 
 def demo() -> None:
@@ -394,6 +478,11 @@ def main() -> None:
         help="Seconds to sleep before each OpenRouter request (per worker)",
     )
     parser.add_argument(
+        "--batch",
+        action="store_true",
+        help="Label via OpenRouter's inline batch API (~50% cost, async)",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=1,
@@ -437,6 +526,11 @@ def main() -> None:
     print(f"Loaded {len(rows)} new prompts from {input_path}")
     print(f"Model: {args.model}")
     print(f"Writing labels to {output_path} and Supra dataset to {supra_output_path}")
+
+    if args.batch:
+        batch_model = args.model if args.model.endswith(":batch") else f"{args.model}:batch"
+        run_batch(rows, batch_model, output_path, supra_output_path, state_path, state)
+        return
 
     stats = {"ok": 0, "errors": 0, "prompt_tokens": 0, "completion_tokens": 0}
     latencies: list[int] = []

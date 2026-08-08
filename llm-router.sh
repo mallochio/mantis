@@ -72,7 +72,8 @@ export ROUTELLM_MAX_TOKENS="${ROUTELLM_MAX_TOKENS:-131072}"
 export ROUTELLM_ROUTER="${ROUTELLM_ROUTER:-mf}"
 # 0.156 = calibrated for 30% strong-model calls via RouteLLM.
 # Canonical defaults live here; server.py mirrors them (bare-run parity).
-export ROUTELLM_THRESHOLD="${ROUTELLM_THRESHOLD:-0.156}"
+export ROUTELLM_THRESHOLD="${ROUTELLM_THRESHOLD:-0.2}"
+export ROUTELLM_RESP_CACHE_TTL_S="${ROUTELLM_RESP_CACHE_TTL_S:-120}"
 export ROUTELLM_USE_SUPRA="${ROUTELLM_USE_SUPRA:-1}"
 export ROUTELLM_KEY="${ROUTELLM_KEY:-sk-route-local}"
 export ROUTELLM_HOST="${ROUTELLM_HOST:-127.0.0.1}"

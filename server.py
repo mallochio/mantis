@@ -11,7 +11,7 @@ Config via env:
   EXPENSIVE_KEY=...
   CHEAP_BASE=https://opencode.ai/zen/go/v1
   CHEAP_KEY=...
-  ROUTELLM_THRESHOLD=0.156
+  ROUTELLM_THRESHOLD=0.2
   ROUTELLM_ROUTER=mf
   ROUTELLM_USE_SUPRA=1
   ROUTELLM_SUPRA_THRESHOLD=3
@@ -22,6 +22,7 @@ Config via env:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -39,7 +40,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 HOST = os.environ.get("ROUTELLM_HOST", "127.0.0.1")
 PORT = int(os.environ.get("ROUTELLM_PORT", "5500"))
 SERVER_KEY = os.environ.get("ROUTELLM_KEY", "sk-route-local")
-THRESHOLD = float(os.environ.get("ROUTELLM_THRESHOLD", "0.156"))
+THRESHOLD = float(os.environ.get("ROUTELLM_THRESHOLD", "0.2"))
 ROUTER_NAME = os.environ.get("ROUTELLM_ROUTER", "mf")
 SUPRA_ENABLED = os.environ.get("ROUTELLM_USE_SUPRA", "1") != "0"
 SUPRA_THRESHOLD = int(os.environ.get("ROUTELLM_SUPRA_THRESHOLD", "3"))
@@ -79,6 +80,14 @@ DATA_DIR = Path(os.environ.get("MANTIS_DATA_DIR", str(Path.home()/".local/share/
 LOG_PATH = Path(os.environ.get("LOG_FILE", str(DATA_DIR/"router/decisions.log")))
 TRAINING_LOG_ENABLED = os.environ.get("ROUTELLM_TRAINING_LOG", "0").lower() in {"1", "true", "yes", "on"}
 TRAINING_LOG_PATH = Path(os.environ.get("TRAINING_LOG_FILE", str(DATA_DIR/"router/training.jsonl")))
+OUTCOME_LOG_PATH = Path(os.environ.get("OUTCOME_LOG_FILE", str(DATA_DIR/"router/outcomes.jsonl")))
+# Same prompt re-sent within this window usually means the previous route failed.
+RETRY_WINDOW_S = float(os.environ.get("ROUTELLM_RETRY_WINDOW_S", "900"))
+# Short prompts are mostly trivial/ack traffic; MF embeddings on tiny text are
+# noisy and over-route (27% of <=120-char prompts went expensive in the
+# Aug 5-8 log, labeler called them cheap). Force cheap unless MF is very sure.
+SHORT_PROMPT_MAX_CHARS = int(os.environ.get("ROUTELLM_SHORT_PROMPT_MAX_CHARS", "120"))
+SHORT_PROMPT_FORCE_CHEAP_SCORE = float(os.environ.get("ROUTELLM_SHORT_PROMPT_SCORE", "0.25"))
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 if TRAINING_LOG_ENABLED:
     TRAINING_LOG_PATH.touch(mode=0o600, exist_ok=True)
@@ -211,7 +220,8 @@ def _parse_supra_complexity(text: str) -> int:
 def _supra_complexity(prompt: str) -> tuple[int, int]:
     model, tokenizer = _load_supra()
     fmt = f"Task: {prompt}\nAnalysis: "
-    inputs = tokenizer(fmt, return_tensors="pt")
+    inputs = tokenizer(fmt, return_tensors="pt", truncation=True,
+                       max_length=tokenizer.model_max_length)
     import torch
     t0 = time.time()
     with torch.no_grad():
@@ -230,6 +240,8 @@ def _decide_uncached(trimmed_prompt: str) -> tuple[str, float, int | None, int |
     try:
         r = _load_router()
         score = float(r.calculate_strong_win_rate(trimmed_prompt))
+        if len(trimmed_prompt) <= SHORT_PROMPT_MAX_CHARS and score < SHORT_PROMPT_FORCE_CHEAP_SCORE:
+            return "cheap", score, None, None
         supra_complexity = None
         supra_ms = None
         if score >= THRESHOLD:
@@ -368,6 +380,7 @@ def _log(
         "model": backend_model,
         "ttfb_ms": ttfb_ms,
         "prompt": prompt[:200],
+        "prompt_hash": _prompt_hash(prompt),
     }
     if cost_usd is not None:
         row["cost_usd"] = cost_usd
@@ -379,6 +392,83 @@ def _log(
         row["prompt"] = prompt
         with TRAINING_LOG_PATH.open("a") as f:
             f.write(json.dumps(row) + "\n")
+
+
+def _prompt_hash(prompt: str) -> str:
+    return hashlib.sha1(prompt.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _log_outcome(prompt_hash: str, outcome: str, **detail) -> None:
+    """Outcome feedback for retraining, joined to decisions via prompt_hash."""
+    row = {"ts": time.time(), "prompt_hash": prompt_hash, "outcome": outcome, **detail}
+    try:
+        OUTCOME_LOG_PATH.touch(mode=0o600, exist_ok=True)
+        OUTCOME_LOG_PATH.chmod(0o600)
+        with OUTCOME_LOG_PATH.open("a") as f:
+            f.write(json.dumps(row) + "\n")
+    except Exception:
+        pass
+
+
+_recent_prompts: dict[str, tuple[str, str, float]] = {}  # request_hash -> (decision, model, ts)
+
+# ---- response cache: identical resends (timeout retries) served without
+# hitting upstream. Keyed on the full request body so agent-loop iterations
+# (which append tool results) never match. ----
+RESP_CACHE_TTL_S = float(os.environ.get("ROUTELLM_RESP_CACHE_TTL_S", "120"))
+_RESP_CACHE_MAX = 512
+_resp_cache: dict[str, tuple[float, list[bytes]]] = {}  # body hash -> (ts, chunks)
+
+
+def _request_body_hash(body: dict) -> str:
+    return hashlib.sha1(
+        json.dumps(body, sort_keys=True, ensure_ascii=False, default=str).encode()
+    ).hexdigest()[:16]
+
+
+def _cache_get(req_hash: str) -> list[bytes] | None:
+    hit = _resp_cache.get(req_hash)
+    if not hit:
+        return None
+    ts, chunks = hit
+    if time.time() - ts > RESP_CACHE_TTL_S:
+        _resp_cache.pop(req_hash, None)
+        return None
+    return chunks
+
+
+def _cache_put(req_hash: str, chunks: list[bytes]) -> None:
+    if len(_resp_cache) >= _RESP_CACHE_MAX:
+        oldest = min(_resp_cache, key=lambda k: _resp_cache[k][0])
+        _resp_cache.pop(oldest, None)
+    _resp_cache[req_hash] = (time.time(), chunks)
+
+
+def _request_hash(body: dict) -> str:
+    """Hash of the tail of the conversation. Agent loops append tool results
+    between calls (hash changes); a true retry resends an identical body
+    (hash stable) — hashing just the last user message misfires on loops."""
+    msgs = body.get("messages") or []
+    return hashlib.sha1(
+        json.dumps(msgs[-6:], sort_keys=True, ensure_ascii=False, default=str).encode()
+    ).hexdigest()[:16]
+
+
+def _record_and_detect_retry(req_hash: str, decision: str, model: str, prompt_hash: str) -> None:
+    now = time.time()
+    for k, (_, _, ts) in list(_recent_prompts.items()):
+        if now - ts > RETRY_WINDOW_S:
+            del _recent_prompts[k]
+    prev = _recent_prompts.pop(req_hash, None)
+    if prev and now - prev[2] <= RETRY_WINDOW_S:
+        _log_outcome(prompt_hash, "retried", decision=prev[0], model=prev[1],
+                     request_hash=req_hash, retry_after_s=round(now - prev[2], 1))
+    _recent_prompts[req_hash] = (decision, model, now)
+
+
+def _length_truncated(data: dict) -> bool:
+    ch = data.get("choices")
+    return bool(isinstance(ch, list) and ch and ch[0].get("finish_reason") == "length")
 
 
 _READY = False
@@ -438,12 +528,21 @@ async def chat_completions(request: Request, authorization: str | None = Header(
         return JSONResponse({"error": {"message": "Invalid API key", "type": "auth_error"}}, status_code=401)
 
     body = await request.json()
+    cache_key = _request_body_hash(body)
+    cached_chunks = _cache_get(cache_key)
+    if cached_chunks is not None:
+        if bool(body.get("stream")):
+            return StreamingResponse(iter(cached_chunks), media_type="text/event-stream",
+                                     headers={"x-route-cache": "hit"})
+        return Response(content=b"".join(cached_chunks), status_code=200,
+                        media_type="application/json", headers={"x-route-cache": "hit"})
     prompt = _extract_prompt(body)
     if prompt.strip():
         decision, score, supra_complexity, supra_ms = await asyncio.to_thread(_decide, prompt)
     else:
         decision, score, supra_complexity, supra_ms = "cheap", 0.0, None, None
     backend = _backend_for(decision)
+    _record_and_detect_retry(_request_hash(body), decision, backend["model"], _prompt_hash(prompt))
 
     out_body = _build_outgoing_body(body, backend)
 
@@ -465,15 +564,19 @@ async def chat_completions(request: Request, authorization: str | None = Header(
         def gen():
             t0 = time.time()
             ttfb = None
+            cache_chunks: list[bytes] = []
             saw_finish_reason = False
             saw_done = False
+            saw_length = False
             usage_seen: dict = {}
 
             def track(payload: dict) -> None:
-                nonlocal saw_finish_reason
+                nonlocal saw_finish_reason, saw_length
                 ch = payload.get("choices")
                 if isinstance(ch, list) and ch and ch[0].get("finish_reason") is not None:
                     saw_finish_reason = True
+                    if ch[0].get("finish_reason") == "length":
+                        saw_length = True
                 u = payload.get("usage")
                 if isinstance(u, dict):
                     usage_seen.update(u)
@@ -482,6 +585,8 @@ async def chat_completions(request: Request, authorization: str | None = Header(
                     # Refusal/content-filter surfaced as an HTTP error: retry the other model.
                     err = resp.read()
                     if _is_refusal(resp.status_code, _safe_json(err)):
+                        _log_outcome(_prompt_hash(prompt), "refused", decision=decision,
+                                     model=backend["model"], status=resp.status_code)
                         flip = "cheap" if decision == "expensive" else "expensive"
                         fb = _backend_for(flip)
                         fb_url = fb["base"].rstrip("/") + "/chat/completions"
@@ -510,6 +615,8 @@ async def chat_completions(request: Request, authorization: str | None = Header(
                                 _log(flip, score, fb["model"], prompt, ttfb, supra_complexity, supra_ms,
                                      cost_usd=_extract_cost({"usage": usage_seen}), usage=usage_seen or None)
                                 return
+                    _log_outcome(_prompt_hash(prompt), "upstream_error", decision=decision,
+                                 model=backend["model"], status=resp.status_code)
                     yield b'data: ' + json.dumps({"error": {"status": resp.status_code, "message": err.decode(errors="replace")[:500]}}).encode() + b'\n\ndata: [DONE]\n\n'
                     return
                 for line in resp.iter_lines():
@@ -519,6 +626,7 @@ async def chat_completions(request: Request, authorization: str | None = Header(
                         sline = line.strip()
                         if sline == "data: [DONE]":
                             saw_done = True
+                            cache_chunks.append((line + "\n").encode())
                             yield (line + "\n").encode()
                             break
                         elif sline.startswith("data: "):
@@ -526,8 +634,10 @@ async def chat_completions(request: Request, authorization: str | None = Header(
                                 track(json.loads(sline[6:]))
                             except Exception:
                                 pass
+                        cache_chunks.append((line + "\n").encode())
                         yield (line + "\n").encode()
                     else:
+                        cache_chunks.append(b"\n")
                         yield b"\n"
                 if not saw_finish_reason:
                     finish_chunk = {
@@ -537,9 +647,16 @@ async def chat_completions(request: Request, authorization: str | None = Header(
                         "model": backend["model"],
                         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                     }
+                    cache_chunks.append(f"data: {json.dumps(finish_chunk)}\n\n".encode())
                     yield f"data: {json.dumps(finish_chunk)}\n\n".encode()
                 if not saw_done:
+                    cache_chunks.append(b"data: [DONE]\n\n")
                     yield b"data: [DONE]\n\n"
+            if saw_done and not saw_length:
+                _cache_put(cache_key, cache_chunks)
+            if saw_length:
+                _log_outcome(_prompt_hash(prompt), "truncated", decision=decision,
+                             model=backend["model"])
             _log(decision, score, backend["model"], prompt, ttfb, supra_complexity, supra_ms,
                  cost_usd=_extract_cost({"usage": usage_seen}), usage=usage_seen or None)
 
@@ -550,6 +667,8 @@ async def chat_completions(request: Request, authorization: str | None = Header(
     ttfb = int((time.time() - t0) * 1000)
     data = _safe_json(resp.content)
     if _is_refusal(resp.status_code, data):
+        _log_outcome(_prompt_hash(prompt), "refused", decision=decision,
+                     model=backend["model"], status=resp.status_code)
         flip = "cheap" if decision == "expensive" else "expensive"
         fb = _backend_for(flip)
         t0 = time.time()
@@ -559,6 +678,12 @@ async def chat_completions(request: Request, authorization: str | None = Header(
         decision = flip
         route_hdr["x-route-fallback"] = "true"
         route_hdr["x-route-model"] = fb["model"]
+    if resp.status_code != 200:
+        _log_outcome(_prompt_hash(prompt), "upstream_error", decision=decision,
+                     model=route_hdr["x-route-model"], status=resp.status_code)
+    elif _length_truncated(data):
+        _log_outcome(_prompt_hash(prompt), "truncated", decision=decision,
+                     model=route_hdr["x-route-model"])
     cost = _extract_cost(data)
     route_hdr["x-route-ttfb-ms"] = str(ttfb)
     if cost is not None:
@@ -566,6 +691,8 @@ async def chat_completions(request: Request, authorization: str | None = Header(
     usage = data.get("usage") if isinstance(data.get("usage"), dict) else None
     _log(decision, score, route_hdr["x-route-model"], prompt, ttfb, supra_complexity, supra_ms,
          cost_usd=cost, usage=usage)
+    if resp.status_code == 200 and "x-route-fallback" not in route_hdr:
+        _cache_put(cache_key, [resp.content])
     return Response(content=resp.content, status_code=resp.status_code,
                     media_type="application/json", headers=route_hdr)
 
