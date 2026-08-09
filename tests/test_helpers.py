@@ -52,3 +52,13 @@ def test_outcomes_ignore_attempt_telemetry_rows():
     result = eval_outcomes.evaluate(decisions, outcomes, [])
     assert result["cells"]["expensive"]["0.1-0.156"] == [1, 1]
     assert result["cells"]["cheap"]["0.1-0.156"] == [1, 1]
+
+
+def test_outcomes_prefer_occurrence_over_duplicate_caller_request_id():
+    decisions = [
+        {"record_type": "decision", "occurrence_id": "a", "request_id": "duplicate", "score": 0.1, "decision": "cheap"},
+        {"record_type": "decision", "occurrence_id": "b", "request_id": "duplicate", "score": 0.1, "decision": "cheap"},
+    ]
+    outcomes = [{"decision_occurrence_id": "a", "request_id": "duplicate", "outcome": "upstream_error"}]
+    result = eval_outcomes.evaluate(decisions, outcomes, [])
+    assert result["cells"]["cheap"]["0.1-0.156"] == [2, 1]

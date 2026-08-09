@@ -53,7 +53,8 @@ def evaluate(decisions: list[dict], outcomes: list[dict], labels: list[dict]) ->
     for outcome in outcomes:
         if outcome.get("outcome") not in FAILURES:
             continue
-        occurrence = outcome.get("related_request_id") or outcome.get("request_id") or outcome.get("decision_occurrence_id")
+        occurrence = (outcome.get("decision_occurrence_id") or outcome.get("occurrence_id")
+                      or outcome.get("related_request_id") or outcome.get("request_id"))
         if occurrence:
             failed_ids.add(str(occurrence))
         elif outcome.get("prompt_hash"):
@@ -78,7 +79,7 @@ def evaluate(decisions: list[dict], outcomes: list[dict], labels: list[dict]) ->
         if d not in cells:
             continue
         cells[d][band_of(score)][0] += 1
-        row_id = r.get("request_id") or r.get("occurrence_id")
+        row_id = r.get("decision_occurrence_id") or r.get("occurrence_id") or r.get("request_id")
         is_failed = (str(row_id) in failed_ids if row_id else r.get("prompt_hash") in legacy_failed_hashes)
         if is_failed:
             cells[d][band_of(score)][1] += 1

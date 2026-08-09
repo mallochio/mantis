@@ -332,16 +332,23 @@ def _fsync_replace(path: Path, lines: list[str]) -> None:
 
 
 def _migrate_journal(output_path: Path, supra_output_path: Path, journal: Path) -> None:
-    if journal.exists() or not output_path.exists() or not supra_output_path.exists():
+    if journal.exists():
         return
-    records = output_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    supra = supra_output_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    present = (output_path.exists(), supra_output_path.exists())
+    if present == (False, False):
+        return
+    if present[0] != present[1]:
+        raise RuntimeError("cannot migrate pseudo-label outputs: one legacy projection is missing")
+    records = output_path.read_text(encoding="utf-8", errors="strict").splitlines()
+    supra = supra_output_path.read_text(encoding="utf-8", errors="strict").splitlines()
+    if len(records) != len(supra):
+        raise RuntimeError("cannot migrate pseudo-label outputs: legacy line counts differ")
     entries = []
-    for record_line, supra_line in zip(records, supra, strict=False):
-        try:
+    try:
+        for record_line, supra_line in zip(records, supra, strict=True):
             entries.append(json.dumps({"record": json.loads(record_line), "supra": json.loads(supra_line)}) + "\n")
-        except json.JSONDecodeError:
-            break
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError("cannot migrate invalid legacy pseudo-label outputs") from exc
     _fsync_replace(journal, entries)
 
 

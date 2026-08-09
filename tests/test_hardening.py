@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 
 import httpx
 import pytest
@@ -157,12 +158,14 @@ async def test_downstream_cancellation_closes_upstream(client, monkeypatch):
     stream = BlockingStream()
     mock = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, stream=stream)))
     monkeypatch.setattr(server, "_client", mock)
-    task = asyncio.create_task(client.post("/v1/chat/completions", headers=AUTH, json={**BODY, "stream": True}))
+    headers = {**AUTH, "Idempotency-Key": "cancel-during-stream"}
+    task = asyncio.create_task(client.post("/v1/chat/completions", headers=headers, json={**BODY, "stream": True}))
     await stream.blocked.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     assert stream.closed
+    assert not server._inflight
     await mock.aclose()
 
 
@@ -190,8 +193,9 @@ async def test_error_attempt_uses_internal_immutable_occurrence(client, monkeypa
     response = await client.post("/v1/chat/completions", headers={**AUTH, "x-request-id": supplied}, json=BODY)
     assert response.status_code == 502
     rows = [json.loads(line) for line in log.read_text().splitlines()]
-    assert len(rows) == 2
-    assert {row["record_type"] for row in rows} == {"attempt"}
+    assert len(rows) == 3
+    assert [row["record_type"] for row in rows].count("attempt") == 2
+    assert [row["record_type"] for row in rows].count("decision") == 1
     assert len({row["occurrence_id"] for row in rows}) == 1
     assert rows[0]["occurrence_id"] != supplied
     assert all(row["request_id"] == supplied for row in rows)
@@ -220,3 +224,150 @@ def test_journal_truncates_uncommitted_tail(tmp_path):
         handle.write(b'{"record":')
     assert pseudo_label.recover_outputs(output, supra) == {"h"}
     assert journal.stat().st_size == committed
+
+
+@pytest.mark.anyio
+async def test_realistic_delta_refusal_falls_back(client, monkeypatch):
+    calls = 0
+    refusal = (b'data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+               b'data: {"choices":[{"delta":{"content":"I cannot"},"finish_reason":null}]}\n\n'
+               b'data: {"choices":[{"delta":{"content":" assist with that"},"finish_reason":"stop"}]}\n\n'
+               b'data: [DONE]\n\n')
+    success = (b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n'
+               b'data: [DONE]\n\n')
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=refusal if calls == 1 else success)
+    mock = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(server, "_client", mock)
+    response = await client.post("/v1/chat/completions", headers=AUTH, json={**BODY, "stream": True})
+    assert calls == 2
+    assert "cannot" not in response.text.lower()
+    assert "ok" in response.text
+    await mock.aclose()
+
+
+@pytest.mark.anyio
+async def test_stream_content_filter_falls_back(client, monkeypatch):
+    calls = 0
+    filtered = (b'data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+                b'data: {"choices":[{"delta":{},"finish_reason":"content_filter"}]}\n\n')
+    success = (b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+               b'data: [DONE]\n\n')
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=filtered if calls == 1 else success)
+    mock = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(server, "_client", mock)
+    response = await client.post("/v1/chat/completions", headers=AUTH, json={**BODY, "stream": True})
+    assert calls == 2
+    assert "content_filter" not in response.text
+    assert response.text.count("[DONE]") == 1
+    await mock.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("first,second", [
+    (b"\n", b"\n"), (b"\r", b"\r"), (b"\r\n", b"\r\n"),
+    (b"\r\n", b"\n"), (b"\n", b"\r\n"), (b"\r\n", b"\r"),
+    (b"\r", b"\r\n"), (b"\n", b"\r"),
+])
+async def test_sse_line_ending_matrix_preserved(client, monkeypatch, first, second):
+    finish = b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}' + first + second
+    done = b'data: [DONE]' + first + second
+    wire = finish + done
+    mock = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=wire)))
+    monkeypatch.setattr(server, "_client", mock)
+    response = await client.post("/v1/chat/completions", headers=AUTH, json={**BODY, "stream": True})
+    assert response.content == wire
+    await mock.aclose()
+
+
+class PrefetchBlockingStream(httpx.AsyncByteStream):
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.closed = False
+    async def __aiter__(self):
+        self.started.set()
+        await asyncio.Event().wait()
+        yield b""
+    async def aclose(self):
+        self.closed = True
+
+
+@pytest.mark.anyio
+async def test_keyed_cancel_during_prefetch_cleans_owner_and_allows_retry(client, monkeypatch):
+    blocked = PrefetchBlockingStream()
+    first_mock = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, stream=blocked)))
+    monkeypatch.setattr(server, "_client", first_mock)
+    headers = {**AUTH, "Idempotency-Key": "cancel-prefetch"}
+    task = asyncio.create_task(client.post("/v1/chat/completions", headers=headers, json={**BODY, "stream": True}))
+    await blocked.started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert blocked.closed
+    assert not server._inflight
+    await first_mock.aclose()
+    wire = (b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            b'data: [DONE]\n\n')
+    retry_mock = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=wire)))
+    monkeypatch.setattr(server, "_client", retry_mock)
+    retry = await client.post("/v1/chat/completions", headers=headers, json={**BODY, "stream": True})
+    assert retry.status_code == 200 and "[DONE]" in retry.text
+    assert not server._inflight
+    await retry_mock.aclose()
+
+
+@pytest.mark.anyio
+async def test_keyed_cancel_before_stream_iteration_cleans_owner_and_retries(client, monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+    def blocked_decide(prompt):
+        started.set()
+        release.wait(2)
+        return "cheap", 0.1, None, None
+    monkeypatch.setattr(server, "_decide", blocked_decide)
+    headers = {**AUTH, "Idempotency-Key": "cancel-routing"}
+    task = asyncio.create_task(client.post("/v1/chat/completions", headers=headers, json={**BODY, "stream": True}))
+    await asyncio.to_thread(started.wait, 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release.set()
+    assert not server._inflight
+    monkeypatch.setattr(server, "_decide", lambda prompt: ("cheap", 0.1, None, None))
+    wire = (b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+            b'data: [DONE]\n\n')
+    mock = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=wire)))
+    monkeypatch.setattr(server, "_client", mock)
+    retry = await client.post("/v1/chat/completions", headers=headers, json={**BODY, "stream": True})
+    assert retry.status_code == 200
+    assert not server._inflight
+    await mock.aclose()
+
+
+def test_legacy_migration_missing_projection_fails_without_changes(tmp_path):
+    output = tmp_path / "labels.jsonl"
+    supra = tmp_path / "supra.jsonl"
+    original = '{"hash":"h"}\n'
+    output.write_text(original)
+    with pytest.raises(RuntimeError, match="missing"):
+        pseudo_label.recover_outputs(output, supra)
+    assert output.read_text() == original
+    assert not supra.exists()
+    assert not pseudo_label._journal_path(output).exists()
+
+
+def test_legacy_migration_mismatched_counts_fails_without_changes(tmp_path):
+    output = tmp_path / "labels.jsonl"
+    supra = tmp_path / "supra.jsonl"
+    output.write_text('{"hash":"one"}\n{"hash":"two"}\n')
+    supra.write_text('{"target":"one"}\n')
+    before = output.read_bytes(), supra.read_bytes()
+    with pytest.raises(RuntimeError, match="line counts"):
+        pseudo_label.recover_outputs(output, supra)
+    assert (output.read_bytes(), supra.read_bytes()) == before
+    assert not pseudo_label._journal_path(output).exists()
