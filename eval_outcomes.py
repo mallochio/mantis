@@ -67,6 +67,10 @@ def evaluate(decisions: list[dict], outcomes: list[dict], labels: list[dict]) ->
     cells = {d: {b: [0, 0] for b, _, _ in BANDS} for d in ("cheap", "expensive")}
     lab_cells = {d: {r: [0, 0] for r in ("cheap", "expensive")} for d in ("cheap", "expensive")}
     for r in decisions:
+        # Attempt telemetry is operational detail, not a routed-call outcome.
+        # Rows without record_type are legacy decision rows.
+        if r.get("record_type") not in (None, "decision"):
+            continue
         score = r.get("score")
         if not isinstance(score, (int, float)):
             continue

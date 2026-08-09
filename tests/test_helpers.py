@@ -36,3 +36,19 @@ async def test_model_discovery_matches_provider_namespace(monkeypatch):
     monkeypatch.setattr(server, "_client", mock)
     assert await server._fetch_model_context_length("https://mock.invalid/v1", "key", "other/model") == 1234
     await mock.aclose()
+
+
+def test_outcomes_ignore_attempt_telemetry_rows():
+    decisions = [
+        {"record_type": "attempt", "occurrence_id": "route-1", "score": 0.1, "decision": "cheap"},
+        {"record_type": "attempt", "occurrence_id": "route-1", "score": 0.1, "decision": "expensive"},
+        {"record_type": "decision", "occurrence_id": "route-1", "score": 0.1, "decision": "expensive"},
+        {"score": 0.1, "prompt_hash": "legacy", "decision": "cheap"},
+    ]
+    outcomes = [
+        {"decision_occurrence_id": "route-1", "outcome": "upstream_error"},
+        {"prompt_hash": "legacy", "outcome": "retried"},
+    ]
+    result = eval_outcomes.evaluate(decisions, outcomes, [])
+    assert result["cells"]["expensive"]["0.1-0.156"] == [1, 1]
+    assert result["cells"]["cheap"]["0.1-0.156"] == [1, 1]
