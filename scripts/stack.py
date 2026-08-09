@@ -11,14 +11,19 @@ Override the backend with MANTIS_STACK_BACKEND=auto|native|docker.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
+import shlex
 import shutil
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import TypedDict
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 import stack_compose
@@ -33,6 +38,148 @@ ORCHESTRATOR = "mantis-orchestrator"
 REDIS_NAME = "mantis-redis"
 READY_URL = "http://127.0.0.1:8088/ready"
 START_TIMEOUT = 90
+DIRECT_OPENROUTER_URL = "https://openrouter.ai/api/v1"
+DIRECT_OPENCODE_URL = "https://opencode.ai/zen/go/v1"
+CLOUDFLARE_GATEWAY_URL = "https://unified-ai-gateway.siddsantham.workers.dev/v1"
+
+
+class EndpointValues(TypedDict):
+    openrouter: str
+    opencode: str
+
+
+class ReadinessMetadata(TypedDict):
+    status: str
+    endpoint_profile: str
+    endpoint_hosts: EndpointValues
+    endpoint_fingerprints: EndpointValues
+
+
+@dataclass(frozen=True)
+class EndpointProfile:
+    """Resolved, container-facing provider configuration."""
+
+    name: str
+    openrouter_url: str
+    opencode_url: str
+    openrouter_key: str
+    opencode_key: str
+
+    @property
+    def hosts(self) -> tuple[str, str]:
+        return (_endpoint_host(self.openrouter_url), _endpoint_host(self.opencode_url))
+
+    @property
+    def fingerprints(self) -> tuple[str, str]:
+        return (
+            _endpoint_fingerprint(self.openrouter_url),
+            _endpoint_fingerprint(self.opencode_url),
+        )
+
+    def environment(self) -> dict[str, str]:
+        return {
+            "MANTIS_ENDPOINT_PROFILE": self.name,
+            "OPENROUTER_BASE_URL": self.openrouter_url,
+            "OPENCODE_GO_ENDPOINT_URL": self.opencode_url,
+            "OPENROUTER_API_KEY": self.openrouter_key,
+            "OPENCODE_API_KEY": self.opencode_key,
+        }
+
+
+def _normalize_endpoint_url(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError as error:
+        raise SystemExit("provider endpoint override has an invalid port") from error
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+        raise SystemExit("provider endpoint overrides must be absolute HTTP(S) URLs")
+    if parsed.username is not None or parsed.password is not None:
+        raise SystemExit("provider endpoint overrides must not contain user information")
+    if parsed.query or parsed.fragment:
+        raise SystemExit("provider endpoint overrides must not contain a query or fragment")
+    hostname = parsed.hostname.lower()
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    default_port = (parsed.scheme.lower() == "http" and port == 80) or (
+        parsed.scheme.lower() == "https" and port == 443
+    )
+    netloc = f"{host}:{port}" if port is not None and not default_port else host
+    path = parsed.path.rstrip("/")
+    return urlunsplit((parsed.scheme.lower(), netloc, path, "", ""))
+
+
+def _endpoint_host(url: str) -> str:
+    return urlsplit(_normalize_endpoint_url(url)).hostname or ""
+
+
+def _endpoint_fingerprint(url: str) -> str:
+    normalized = _normalize_endpoint_url(url)
+    return hashlib.sha256(normalized.encode()).hexdigest()[:12]
+
+
+def load_dotenv_defaults(path: Path = REPO / ".env") -> None:
+    """Load shell-compatible KEY=VALUE defaults; exported values keep priority."""
+    if not path.exists():
+        return
+    for line_number, raw in enumerate(path.read_text().splitlines(), 1):
+        try:
+            tokens = shlex.split(raw, comments=True, posix=True)
+        except ValueError as error:
+            raise SystemExit(f"{path}:{line_number}: invalid quoted value") from error
+        if not tokens:
+            continue
+        if tokens[0] == "export":
+            tokens = tokens[1:]
+        if len(tokens) != 1 or "=" not in tokens[0]:
+            raise SystemExit(f"{path}:{line_number}: expected KEY=VALUE")
+        key, value = tokens[0].split("=", 1)
+        if not key or not key.replace("_", "a").isalnum() or key[0].isdigit():
+            raise SystemExit(f"{path}:{line_number}: invalid environment variable name")
+        os.environ.setdefault(key, value)
+
+
+def resolve_endpoint_profile(name: str, env: dict[str, str] | None = None) -> EndpointProfile:
+    """Resolve a profile without including credentials in diagnostics or errors."""
+    source = os.environ if env is None else env
+    if name == "direct":
+        profile = EndpointProfile(
+            name=name,
+            openrouter_url=source.get("OPENROUTER_BASE_URL", DIRECT_OPENROUTER_URL),
+            opencode_url=source.get("OPENCODE_GO_ENDPOINT_URL", DIRECT_OPENCODE_URL),
+            openrouter_key=source.get("OPENROUTER_API_KEY", ""),
+            opencode_key=source.get("OPENCODE_API_KEY", ""),
+        )
+    elif name == "cloudflare":
+        token = source.get("MANTIS_GATEWAY_API_KEY") or source.get("AI_GATEWAY_API_KEY")
+        if not token:
+            raise SystemExit(
+                "cloudflare endpoint profile requires MANTIS_GATEWAY_API_KEY or AI_GATEWAY_API_KEY"
+            )
+        gateway_url = source.get("MANTIS_GATEWAY_URL", CLOUDFLARE_GATEWAY_URL)
+        profile = EndpointProfile(
+            name=name,
+            openrouter_url=source.get("MANTIS_GATEWAY_OPENROUTER_URL", gateway_url),
+            opencode_url=source.get("MANTIS_GATEWAY_OPENCODE_URL", gateway_url),
+            openrouter_key=token,
+            opencode_key=token,
+        )
+    else:
+        raise SystemExit(f"unknown endpoint profile: {name}")
+    return EndpointProfile(
+        name=profile.name,
+        openrouter_url=_normalize_endpoint_url(profile.openrouter_url),
+        opencode_url=_normalize_endpoint_url(profile.opencode_url),
+        openrouter_key=profile.openrouter_key,
+        opencode_key=profile.opencode_key,
+    )
+
+
+def apply_endpoint_profile(profile: EndpointProfile) -> None:
+    os.environ.update(profile.environment())
+    openrouter_host, opencode_host = profile.hosts
+    print(
+        f"endpoint profile: {profile.name} (openrouter={openrouter_host}, opencode={opencode_host})"
+    )
 
 
 def detect_backend() -> str:
@@ -164,12 +311,12 @@ def _native_run_redis(spec: dict) -> None:
     )
 
 
-def native_up(redis: bool, conductor: str | None, memory: str = "4G") -> None:
+def native_up(redis: bool, conductor: str | None, memory: str = "8G") -> None:
     spec = load_spec(COMPOSE_FILE)
     svc = spec["services"]["openfugu"]
     _ensure_network_and_volumes(spec)
     if svc["container_name"] in _container_output(["container", "list"]):
-        print(f"{svc['container_name']} already running")
+        validate_running_container()
         return
     if not _image_present(IMAGE_TAG):
         native_build()
@@ -210,23 +357,73 @@ def native_up(redis: bool, conductor: str | None, memory: str = "4G") -> None:
     wait_ready()
 
 
+def _expected_readiness_metadata() -> ReadinessMetadata:
+    openrouter_url = os.environ.get("OPENROUTER_BASE_URL", DIRECT_OPENROUTER_URL)
+    opencode_url = os.environ.get("OPENCODE_GO_ENDPOINT_URL", DIRECT_OPENCODE_URL)
+    return {
+        "status": "ready",
+        "endpoint_profile": os.environ.get("MANTIS_ENDPOINT_PROFILE", "direct"),
+        "endpoint_hosts": {
+            "openrouter": _endpoint_host(openrouter_url),
+            "opencode": _endpoint_host(opencode_url),
+        },
+        "endpoint_fingerprints": {
+            "openrouter": _endpoint_fingerprint(openrouter_url),
+            "opencode": _endpoint_fingerprint(opencode_url),
+        },
+    }
+
+
+def _readiness_matches(response: httpx.Response, expected: ReadinessMetadata) -> bool:
+    if response.status_code != 200:
+        return False
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and all(body.get(key) == value for key, value in expected.items())
+
+
+def validate_running_container() -> None:
+    expected = _expected_readiness_metadata()
+    try:
+        matches = _readiness_matches(httpx.get(READY_URL, timeout=2), expected)
+    except httpx.HTTPError:
+        matches = False
+    if not matches:
+        raise SystemExit(
+            f"{ORCHESTRATOR} is already running with different or unavailable endpoint "
+            "metadata; use the restart command to replace it"
+        )
+    print(f"{ORCHESTRATOR} already running with the selected endpoint profile")
+
+
 def wait_ready(timeout: int = START_TIMEOUT) -> None:
+    expected = _expected_readiness_metadata()
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            if httpx.get(READY_URL, timeout=2).status_code == 200:
+            if _readiness_matches(httpx.get(READY_URL, timeout=2), expected):
                 print("ready")
                 return
         except httpx.HTTPError:
             pass
         time.sleep(3)
-    raise SystemExit(f"not ready within {timeout}s")
+    endpoint_hosts = expected["endpoint_hosts"]
+    hosts = ", ".join(sorted({endpoint_hosts["openrouter"], endpoint_hosts["opencode"]}))
+    raise SystemExit(
+        f"not ready within {timeout}s: expected endpoint profile "
+        f"{expected['endpoint_profile']} on {hosts}; readiness metadata did not match"
+    )
 
 
 def native_down() -> None:
+    running = _container_output(["container", "list"])
+    all_containers = _container_output(["container", "list", "--all"])
     for name in (ORCHESTRATOR, REDIS_NAME):
-        if name in _container_output(["container", "list"]):
+        if name in running:
             _run(["container", "stop", "--time", "30", name])
+        if name in all_containers:
             _run(["container", "delete", name])
 
 
@@ -240,15 +437,24 @@ def native_status() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["up", "down", "build", "logs", "status"])
+    parser.add_argument("command", choices=["up", "restart", "down", "build", "logs", "status"])
     parser.add_argument("--redis", action="store_true", help="also run the redis service")
     parser.add_argument(
-        "--memory", default="4G", help="container memory limit (native backend; default 4G)"
+        "--endpoint-profile",
+        choices=["direct", "cloudflare"],
+        default="direct",
+        help="provider endpoint and credential profile (default: direct)",
+    )
+    parser.add_argument(
+        "--memory", default="8G", help="container memory limit (native backend; default 8G)"
     )
     parser.add_argument(
         "--conductor", metavar="DIR", help="mount a conductor checkpoint (eval override)"
     )
     args = parser.parse_args()
+    if args.command in ("up", "restart"):
+        load_dotenv_defaults()
+        apply_endpoint_profile(resolve_endpoint_profile(args.endpoint_profile))
     backend = detect_backend()
     print(f"backend: {backend}")
     if backend == "docker":
@@ -257,17 +463,30 @@ def main() -> None:
             flags.append("redis")
         if args.conductor:
             flags.append("conductor")
-        command = {"up": "up", "down": "down", "build": "build", "logs": "logs", "status": "ps"}[
-            args.command
-        ]
-        if args.command == "up":
+        command = {
+            "up": "up",
+            "restart": "up",
+            "down": "down",
+            "build": "build",
+            "logs": "logs",
+            "status": "ps",
+        }[args.command]
+        if args.command in ("up", "restart"):
             flags.append("-d")
+            if args.command == "restart":
+                flags.append("--force-recreate")
         elif args.command == "logs":
             flags.append("-f")
         _run(docker_args(command, flags))
+        if args.command in ("up", "restart"):
+            wait_ready()
         return
     if args.command == "up":
         native_up(args.redis, args.conductor, args.memory)
+    elif args.command == "restart":
+        redis_was_running = REDIS_NAME in _container_output(["container", "list"])
+        native_down()
+        native_up(args.redis or redis_was_running, args.conductor, args.memory)
     elif args.command == "down":
         native_down()
     elif args.command == "build":

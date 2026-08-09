@@ -169,6 +169,43 @@ def test_stream_completion_posts_stream_flags_and_assembles(monkeypatch):
     assert posted["model"] == "m"
 
 
+def test_provider_response_uses_responses_stream_for_openai(monkeypatch):
+    raw_response = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "native response"}],
+            }
+        ],
+        "usage": {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6},
+    }
+    client = _StreamingClient([_sse({"type": "response.completed", "response": raw_response})])
+    monkeypatch.setattr(serve, "_provider_client", client)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "key")
+
+    progress = []
+    with serve.progress_events(progress.append):
+        data = serve._provider_response(
+            "openrouter/openai/gpt-5.6-sol|medium",
+            [{"role": "user", "content": "hi"}],
+            100,
+            0.7,
+        )
+
+    assert data["choices"][0]["message"]["content"] == "native response"
+    assert [event["status"] for event in progress] == ["started", "completed"]
+    assert all(event["model"] == "openrouter/openai/gpt-5.6-sol|medium" for event in progress)
+    assert data["usage"]["prompt_tokens"] == 4
+    assert client.posted[0]["stream"] is True
+    assert "stream_options" not in client.posted[0]
+    assert "input" in client.posted[0] and "messages" not in client.posted[0]
+    assert client.posted[0]["session_id"].startswith("mantis-")
+    assert len(client.posted[0]["prompt_cache_key"]) == 32
+    assert client.posted[0]["cache_control"] == {"type": "ephemeral"}
+
+
 def test_stream_completion_raises_http_status_error():
     client = _StreamingClient([_StreamResponse(429, [], text="busy")])
     with pytest.raises(httpx.HTTPStatusError):
@@ -242,7 +279,8 @@ def test_build_request_adds_breakpoints_only_for_claude_on_openrouter(monkeypatc
     )
     assert body["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
     url, headers, body = serve._build_request("openrouter/openai/gpt-5.6-luna", messages, 100, 0.7)
-    assert body["messages"][0]["content"] == "you are helpful"
+    assert url.endswith("/responses")
+    assert body["input"][0]["content"] == [{"type": "input_text", "text": "you are helpful"}]
     monkeypatch.setenv("MANTIS_CACHE_BREAKPOINTS", "0")
     url, headers, body = serve._build_request(
         "openrouter/anthropic/claude-sonnet-5", messages, 100, 0.7
@@ -394,6 +432,24 @@ def test_provider_response_uses_buffered_post_when_streaming_disabled(monkeypatc
     )
     assert data["choices"][0]["message"]["content"] == "buffered"
     assert client.posts == 1
+
+
+def test_openrouter_chat_model_gets_session_stickiness(monkeypatch):
+    # Non-OpenAI OpenRouter models use Chat Completions, not Responses, but
+    # still need session_id/prompt_cache_key so OpenRouter pins one
+    # model+provider per conversation for prompt-cache hits.
+    client = _StreamingClient(
+        [_sse({"choices": [{"delta": {"role": "assistant", "content": "hi"}}]})]
+    )
+    monkeypatch.setattr(serve, "_provider_client", client)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "key")
+    serve._provider_response(
+        "openrouter/anthropic/claude-sonnet-5", [{"role": "user", "content": "hi"}], 10, 0.7
+    )
+    posted = client.posted[0]
+    assert "messages" in posted and "input" not in posted  # Chat Completions path
+    assert posted["session_id"].startswith("mantis-")
+    assert len(posted["prompt_cache_key"]) == 32
 
 
 def test_provider_response_fails_over_between_stream_attempts(monkeypatch):

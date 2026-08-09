@@ -15,6 +15,7 @@ stdlib http.server only — no FastAPI/uvicorn.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -53,6 +54,12 @@ from mini import (
     VERIFICATION_PROMPT,
     Coordinator,
     FuguRouter,
+)
+from provider_protocols import (
+    assemble_responses_stream,
+    build_responses_body,
+    responses_to_chat,
+    uses_responses_api,
 )
 from ultra import ConductorExecutor, conductor_prompt, parse_workflow, visible_indices
 
@@ -161,30 +168,128 @@ def _with_cache_breakpoints(messages: list[dict[str, Any]]) -> list[dict[str, An
     return out
 
 
+def _normalize_upstream_tool_ids(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return a copy with compact, consistently paired tool-call IDs."""
+    aliases: dict[str, str] = {}
+
+    def alias(raw_id: str) -> str:
+        if raw_id not in aliases:
+            aliases[raw_id] = f"m{len(aliases):08x}"
+        return aliases[raw_id]
+
+    normalized: list[dict[str, Any]] = []
+    for original in messages:
+        message = dict(original)
+        calls = original.get("tool_calls")
+        if isinstance(calls, list):
+            message["tool_calls"] = [
+                {**call, "id": alias(call["id"])}
+                if isinstance(call, dict) and isinstance(call.get("id"), str) and call["id"]
+                else call
+                for call in calls
+            ]
+        result_id = original.get("tool_call_id")
+        if isinstance(result_id, str) and result_id:
+            message["tool_call_id"] = alias(result_id)
+        normalized.append(message)
+    return normalized
+
+
+def _prompt_cache_namespace(
+    messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None
+) -> str:
+    """Return a privacy-safe stable key for one conversation's cacheable root."""
+    root: list[dict[str, Any]] = []
+    for message in messages:
+        root.append(message)
+        if message.get("role") == "user":
+            break
+    payload = json.dumps({"messages": root, "tools": tools or []}, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()[:32]
+
+
+@contextmanager
+def progress_events(sink: Any):
+    """Install a request-local orchestration event sink."""
+    previous = getattr(_history_context, "event_sink", None)
+    _history_context.event_sink = sink
+    try:
+        yield
+    finally:
+        _history_context.event_sink = previous
+
+
+def _emit_progress(event: dict[str, Any]) -> None:
+    sink = getattr(_history_context, "event_sink", None)
+    if sink is not None:
+        sink(event)
+
+
+@contextmanager
+def client_connection(is_connected: Any):
+    """Install a request-local client connection check."""
+    previous = getattr(_history_context, "is_client_connected", None)
+    _history_context.is_client_connected = is_connected
+    try:
+        yield
+    finally:
+        _history_context.is_client_connected = previous
+
+
 def _build_request(
-    spec: str, messages: list[dict[str, str]], max_tokens: int, temperature: float
+    spec: str,
+    messages: list[dict[str, Any]],
+    max_tokens: int,
+    temperature: float,
+    *,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: Any = None,
+    response_format: dict[str, Any] | None = None,
+    controls: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, str], dict[str, Any]]:
     provider, model, effort = _parse_model_spec(spec)
     base_url, key_env = PROVIDERS[provider]
     key = os.environ.get(key_env)
     if not key:
         raise RuntimeError(f"{key_env} is required for {spec}")
-    body: dict[str, Any] = {"model": model, "messages": messages, "max_tokens": max_tokens}
-    if _cache_breakpoints_enabled() and model.startswith("anthropic/claude-"):
-        body["messages"] = _with_cache_breakpoints(messages)
-    if effort:
-        body["reasoning_effort"] = effort
-    if not effort and not _is_reasoning_model(model):
-        body["temperature"] = temperature
-    return (
-        f"{base_url}/chat/completions",
-        {
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-            "User-Agent": "OpenAI/Python",
-        },
-        body,
-    )
+    active_controls = controls or {}
+    if uses_responses_api(provider, model):
+        body = build_responses_body(
+            model,
+            messages,
+            max_tokens,
+            None if effort or _is_reasoning_model(model) else temperature,
+            effort,
+            tools,
+            tool_choice,
+            response_format,
+            active_controls,
+        )
+        path = "responses"
+    else:
+        body = {"model": model, "messages": messages, "max_tokens": max_tokens}
+        if _cache_breakpoints_enabled() and model.startswith("anthropic/claude-"):
+            body["messages"] = _with_cache_breakpoints(messages)
+        if effort:
+            body["reasoning_effort"] = effort
+        if not effort and not _is_reasoning_model(model):
+            body["temperature"] = temperature
+        if tools:
+            body["tools"] = tools
+        if tool_choice is not None:
+            body["tool_choice"] = tool_choice
+        if response_format is not None:
+            body["response_format"] = response_format
+        if "reasoning" in active_controls:
+            body.pop("reasoning_effort", None)
+        body.update(active_controls)
+        path = "chat/completions"
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "User-Agent": "OpenAI/Python",
+    }
+    return f"{base_url}/{path}", headers, body
 
 
 # Provider failures worth retrying on the next pool worker.
@@ -204,7 +309,7 @@ def _parse_sse_line(line: str) -> dict[str, Any] | None:
     stripped = line.strip()
     if not stripped.startswith("data:"):
         return None
-    payload = stripped[len("data:"):].strip()
+    payload = stripped[len("data:") :].strip()
     if payload == "[DONE]":
         return {}
     try:
@@ -269,16 +374,36 @@ def _assemble_streamed_completion(chunks: Any) -> dict[str, Any]:
 
 
 def _stream_completion(
-    client: Any, url: str, headers: dict[str, str], body: dict[str, Any]
+    client: Any,
+    url: str,
+    headers: dict[str, str],
+    body: dict[str, Any],
+    *,
+    responses_api: bool = False,
 ) -> dict:
-    """POST with SSE streaming; returns the reassembled completion object."""
+    """POST with SSE streaming; returns the canonical Chat-shaped result."""
     stream_body = dict(body)
     stream_body["stream"] = True
-    stream_body["stream_options"] = {"include_usage": True}
+    if not responses_api:
+        stream_body["stream_options"] = {"include_usage": True}
     with client.stream("POST", url, headers=headers, json=stream_body) as response:
-        response.raise_for_status()
-        chunks = (_parse_sse_line(line) for line in response.iter_lines())
-        return _assemble_streamed_completion(chunks)
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError:
+            # Streamed error bodies stay unread until consumed; read real httpx
+            # responses before re-raising so callers can inspect `response.text`.
+            if hasattr(response, "read"):
+                response.read()
+            raise
+
+        def chunks() -> Any:
+            for line in response.iter_lines():
+                _check_client_connected()
+                yield _parse_sse_line(line)
+
+        if responses_api:
+            return assemble_responses_stream(chunks())
+        return _assemble_streamed_completion(chunks())
 
 
 def _failover_attempts(spec: str) -> list[str]:
@@ -312,37 +437,81 @@ def _provider_response(
     tool_choice = getattr(run, "active_tool_choice", None)
     response_format = getattr(run, "active_response_format", None)
     controls = getattr(run, "active_controls", None) or {}
+    normalized_messages = _normalize_upstream_tool_ids(messages)
     failures: list[str] = []
     for index, attempt in enumerate(_failover_attempts(spec)):
+        _check_client_connected()
         if index:
             time.sleep(_FAILOVER_DELAY)
         try:
             # Failover switches model/effort/endpoint per spec; messages, tools,
             # and controls stay identical across attempts.
-            url, headers, body = _build_request(attempt, messages, max_tokens, temperature)
+            url, headers, body = _build_request(
+                attempt,
+                normalized_messages,
+                max_tokens,
+                temperature,
+                tools=tools,
+                tool_choice=tool_choice,
+                response_format=response_format,
+                controls=controls,
+            )
         except RuntimeError as error:  # provider key missing for this attempt
             failures.append(str(error))
             continue
-        if tools:
-            body["tools"] = tools
-        if tool_choice is not None:
-            body["tool_choice"] = tool_choice
-        if response_format is not None:
-            body["response_format"] = response_format
-        if "reasoning" in controls:
-            body.pop("reasoning_effort", None)
-        body.update(controls)
+        provider, model, _ = _parse_model_spec(attempt)
+        responses_api = uses_responses_api(provider, model)
+        # Session stickiness pins OpenRouter to one model+provider per
+        # conversation to maximize prompt-cache hits. Apply it to all OpenRouter
+        # backends (native Responses for "openai/*" and Chat Completions for
+        # every other OpenRouter model), not just the Responses path.
+        if provider == "openrouter":
+            namespace = getattr(run, "cache_namespace", None) or _prompt_cache_namespace(
+                messages, tools
+            )
+            body["session_id"] = f"mantis-{namespace}"
+            cache_key = hashlib.sha256(f"{model}:{namespace}".encode()).hexdigest()[:32]
+            body["prompt_cache_key"] = cache_key
+            if responses_api and _cache_breakpoints_enabled():
+                body["cache_control"] = {"type": "ephemeral"}
+        _emit_progress(
+            {
+                "type": "provider",
+                "status": "started",
+                "model": attempt,
+                "protocol": "responses" if responses_api else "chat_completions",
+                "attempt": index + 1,
+                "summary": "Calling a model",
+            }
+        )
         try:
             if _upstream_streaming_enabled():
-                data = _stream_completion(_provider_client, url, headers, body)
+                data = _stream_completion(
+                    _provider_client,
+                    url,
+                    headers,
+                    body,
+                    responses_api=responses_api,
+                )
             else:
                 response = _provider_client.post(url, headers=headers, json=body)
                 response.raise_for_status()
                 data = response.json()
+                if responses_api:
+                    data = responses_to_chat(data)
             break
         except httpx.HTTPStatusError as error:
             status = error.response.status_code
             if status not in _TRANSIENT_STATUSES:
+                _emit_progress(
+                    {
+                        "type": "provider",
+                        "status": "failed",
+                        "model": attempt,
+                        "attempt": index + 1,
+                        "summary": f"Model call failed with HTTP {status}",
+                    }
+                )
                 raise RuntimeError(
                     f"{attempt} returned HTTP {status}: {error.response.text[:500]}"
                 ) from error
@@ -356,7 +525,7 @@ def _provider_response(
                     attempt=index + 1,
                     detail=f"HTTP {status}: {error.response.text[:300]}",
                 )
-        except _TRANSIENT_EXCEPTIONS as error:
+        except (RuntimeError, *_TRANSIENT_EXCEPTIONS) as error:
             failures.append(f"{attempt}: {type(error).__name__}")
             run_record = getattr(_history_context, "active_run", None)
             if run_record is not None:
@@ -371,8 +540,10 @@ def _provider_response(
         raise RuntimeError(f"{spec} failed on every pool worker: " + "; ".join(failures))
     if not isinstance(data, dict):
         raise TypeError(f"{spec} returned a non-object response")
+    raw_usage = data.get("usage")
+    usage = cast(dict[str, Any], raw_usage) if isinstance(raw_usage, dict) else {}
     if run is not None:
-        run.add_usage(data.get("usage"), model=body["model"])
+        run.add_usage(usage, model=body["model"])
         message = (data.get("choices") or [{}])[0].get("message", {})
         if run.capture_metadata and isinstance(message, dict):
             run.response_metadata = {
@@ -380,6 +551,30 @@ def _provider_response(
                 for key in ("reasoning", "reasoning_details", "annotations", "citations")
                 if message.get(key) is not None
             }
+    prompt_details = usage.get("prompt_tokens_details")
+    cached_tokens = (
+        prompt_details.get("cached_tokens", 0) if isinstance(prompt_details, dict) else 0
+    )
+    _emit_progress(
+        {
+            "type": "provider",
+            "status": "completed",
+            "model": attempt,
+            "protocol": "responses" if responses_api else "chat_completions",
+            "attempt": index + 1,
+            "usage": {
+                key: usage[key]
+                for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                if isinstance(usage.get(key), int)
+            },
+            "cached_tokens": cached_tokens,
+            "summary": (
+                f"Model call completed ({cached_tokens} cached input tokens)"
+                if cached_tokens
+                else "Model call completed"
+            ),
+        }
+    )
     return data
 
 
@@ -497,49 +692,61 @@ def _activity_summary(activity_type: str, role: str | None = None) -> str:
         "verify_reject": "Verifier rejected the draft; requesting revision",
         "retry": "Retrying the step",
         "complete": "Run completed",
+        "provider": "Called a provider model",
+        "run": "Started Mantis orchestration",
+        "validation": "Validated the final answer",
         "error": "Run ended with an error",
     }.get(activity_type, "Orchestration step")
     return label
 
 
+def _running_summary(role: str) -> str:
+    return {
+        "Planner": "Planning the workflow",
+        "Thinker": "Analyzing the task",
+        "Verifier": "Checking the draft",
+        "Worker": "Drafting an answer",
+    }.get(role, "Calling a model")
+
+
 def _cost_breakdown(usage_models: dict[str, dict[str, int]]) -> dict[str, Any]:
-    """Per-model and aggregate cost with an explicit known flag."""
+    """Per-model cost and cache effectiveness for internal orchestration calls."""
     if not usage_models:
         return {"total": None, "known": False, "source": "unavailable", "models": []}
     prices = _price_map()
     models: list[dict[str, Any]] = []
     total = 0.0
+    total_prompt = 0
+    total_cached = 0
     known = True
     for model, tokens in usage_models.items():
+        prompt = tokens["prompt_tokens"]
+        cached = min(tokens.get("cached_tokens", 0), prompt)
+        total_prompt += prompt
+        total_cached += cached
         model_cost = _model_cost(model, tokens, prices)
         if model_cost is None:
             known = False
-            models.append(
-                {
-                    "model": model,
-                    "prompt_tokens": tokens["prompt_tokens"],
-                    "completion_tokens": tokens["completion_tokens"],
-                    "cached_tokens": tokens.get("cached_tokens", 0),
-                    "cost": None,
-                    "source": "unknown",
-                }
-            )
-            continue
-        total += model_cost
+        else:
+            total += model_cost
         models.append(
             {
                 "model": model,
-                "prompt_tokens": tokens["prompt_tokens"],
+                "prompt_tokens": prompt,
                 "completion_tokens": tokens["completion_tokens"],
-                "cached_tokens": tokens.get("cached_tokens", 0),
-                "cost": round(model_cost, 6),
-                "source": "price_table",
+                "cached_tokens": cached,
+                "cache_hit_ratio": round(cached / prompt, 4) if prompt else 0.0,
+                "cost": round(model_cost, 6) if model_cost is not None else None,
+                "source": "price_table" if model_cost is not None else "unknown",
             }
         )
     return {
         "total": round(total, 6) if known else None,
         "known": known,
         "source": "price_table" if known else "partial",
+        "prompt_tokens": total_prompt,
+        "cached_tokens": total_cached,
+        "cache_hit_ratio": round(total_cached / total_prompt, 4) if total_prompt else 0.0,
         "models": models,
     }
 
@@ -1239,9 +1446,7 @@ def _with_images(text: str, content: Any) -> Any:
     if not isinstance(content, list):
         return text
     images = [
-        part
-        for part in content
-        if isinstance(part, dict) and part.get("type") == "image_url"
+        part for part in content if isinstance(part, dict) and part.get("type") == "image_url"
     ]
     return [{"type": "text", "text": text}, *images] if images else text
 
@@ -1259,18 +1464,34 @@ def _mode_for_model(model: Any) -> str:
     return MODEL_MODES[model]
 
 
+_PUBLIC_TOOL_PREFIX = "call_m_"
+_PUBLIC_RUN_TOKEN_LENGTH = 22
+_INTERNAL_TOOL_ID = re.compile(r"c[0-9a-f]+")
+
+
 def _public_tool_id(run_id: str, internal_id: str) -> str:
-    return f"call_mantis_{run_id}_{internal_id}"
+    run_token = base64.urlsafe_b64encode(bytes.fromhex(run_id)).decode().rstrip("=")
+    return f"{_PUBLIC_TOOL_PREFIX}{run_token}_{internal_id}"
 
 
 def _parse_public_tool_id(tool_id: Any) -> tuple[str, str] | None:
-    if not isinstance(tool_id, str) or not tool_id.startswith("call_mantis_"):
+    if not isinstance(tool_id, str) or not tool_id.startswith(_PUBLIC_TOOL_PREFIX):
         return None
-    rest = tool_id[len("call_mantis_") :]
-    run_id, sep, internal_id = rest.partition("_")
-    if not sep or len(run_id) != 32 or any(c not in "0123456789abcdef" for c in run_id.lower()):
+    offset = len(_PUBLIC_TOOL_PREFIX)
+    run_token = tool_id[offset : offset + _PUBLIC_RUN_TOKEN_LENGTH]
+    internal_id = tool_id[offset + _PUBLIC_RUN_TOKEN_LENGTH + 1 :]
+    if tool_id[offset + _PUBLIC_RUN_TOKEN_LENGTH :][:1] != "_":
         return None
-    return run_id, internal_id
+    if not _INTERNAL_TOOL_ID.fullmatch(internal_id):
+        return None
+    try:
+        run_bytes = base64.urlsafe_b64decode(run_token + "==")
+    except (ValueError, UnicodeError):
+        return None
+    if len(run_bytes) != 16:
+        return None
+    canonical = base64.urlsafe_b64encode(run_bytes).decode().rstrip("=")
+    return (run_bytes.hex(), internal_id) if canonical == run_token else None
 
 
 def _continuation(messages: Any) -> tuple[str, list[dict[str, Any]]] | None:
@@ -1411,7 +1632,6 @@ def _completion_response(
     if details != "none":
         body["mantis"] = _run_mantis_details(run, details)
     return body
-
 
 
 def _parse_args() -> argparse.Namespace:
@@ -1563,7 +1783,6 @@ def get_coordinator(mode: str):
     return _coordinators[mode]
 
 
-
 # ---------------------------------------------------------------------------
 # Resumable native-tool runs
 # ---------------------------------------------------------------------------
@@ -1616,7 +1835,8 @@ def _redis_get(run_id: str) -> NativeRun | None:
 def _redis_put(run: NativeRun) -> None:
     client = _redis()
     payload = pickle.dumps(run, protocol=pickle.HIGHEST_PROTOCOL)
-    client.setex(_redis_key(run.run_id), max(1, int(RUN_TTL)), payload)
+    ttl = max(RUN_TTL, REDIS_LOCK_TIMEOUT) if run.in_flight else RUN_TTL
+    client.setex(_redis_key(run.run_id), max(1, int(ttl)), payload)
     client.sadd(_redis_index_key(), run.run_id)
     client.expire(_redis_index_key(), max(1, int(RUN_TTL)))
 
@@ -1661,7 +1881,10 @@ def _sweep_runs() -> None:
         for raw_id in client.smembers(_redis_index_key()):
             run_id = raw_id.decode() if isinstance(raw_id, bytes) else str(raw_id)
             run = _redis_get(run_id)
-            if run is None or now - run.last_active > RUN_TTL:
+            if run is None:
+                client.srem(_redis_index_key(), run_id)
+                continue
+            if run.in_flight == 0 and now - run.last_active > RUN_TTL:
                 _record_abandoned(run)
                 client.delete(_redis_key(run_id))
                 client.srem(_redis_index_key(), run_id)
@@ -1742,7 +1965,6 @@ def _model_completion(
     text = str(msg.get("content") or "")
     tcs = msg.get("tool_calls") or []
     calls: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
     for tc in tcs:
         fn = tc.get("function", {})
         raw_arguments = fn.get("arguments")
@@ -1752,17 +1974,10 @@ def _model_completion(
             args = {}
         if not isinstance(args, dict):
             args = {}
-        call_id = str(tc.get("id") or f"tc_{uuid.uuid4().hex}")
-        if call_id in seen_ids:
-            call_id = f"tc_{uuid.uuid4().hex}"
-        seen_ids.add(call_id)
-        calls.append(
-            {
-                "id": call_id,
-                "name": str(fn.get("name")),
-                "arguments": args,
-            }
-        )
+        calls.append({"name": str(fn.get("name")), "arguments": args})
+    reasoning_details = msg.get("reasoning_details")
+    if calls and isinstance(reasoning_details, list):
+        calls[0]["_message_metadata"] = {"reasoning_details": reasoning_details}
     return text, calls
 
 
@@ -1948,6 +2163,15 @@ class NativeRun:
         self.usage_models: dict[str, dict[str, int]] = {}
         self._activity: list[dict[str, Any]] = []
         self._started_monotonic = time.monotonic()
+        self._next_tool_call = 0
+        self.cache_namespace = ""
+
+    def own_tool_calls(self, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        owned: list[dict[str, Any]] = []
+        for call in calls:
+            owned.append({**call, "id": f"c{self._next_tool_call:x}"})
+            self._next_tool_call += 1
+        return owned
 
     def record_activity(
         self,
@@ -1975,6 +2199,7 @@ class NativeRun:
         if attempt is not None:
             entry["attempt"] = attempt
         self._activity.append(entry)
+        _emit_progress({"run_id": self.run_id, **{k: v for k, v in entry.items() if k != "error"}})
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
@@ -2214,6 +2439,12 @@ class TrinityRun(NativeRun):
             if self._parse_verification(reply):
                 self.terminated_by = "verifier_accept"
                 self.final_text = self.last_response or reply
+                self.record_activity(
+                    "verify_accept",
+                    role=role,
+                    model=self._model_name(agent_id),
+                    summary="Verifier accepted the draft",
+                )
         if role == "Worker" and not reply.strip():
             self.force_worker = True
             nope = "produce a complete answer."
@@ -2221,6 +2452,12 @@ class TrinityRun(NativeRun):
         elif role == "Verifier" and reply.strip().upper().startswith("REJECT"):
             self.force_worker = True
             self.revision_feedback = reply
+            self.record_activity(
+                "verify_reject",
+                role=role,
+                model=self._model_name(agent_id),
+                summary="Verifier requested a revision",
+            )
         step = {
             "turn": turn,
             "role": role,
@@ -2244,8 +2481,16 @@ class TrinityRun(NativeRun):
         self.active_controls = self.controls if role == "Worker" else {}
         self.capture_metadata = role == "Worker"
         started = time.monotonic()
+        self.record_activity(
+            "step",
+            role=role,
+            model=model,
+            status="started",
+            summary=_running_summary(role),
+        )
         try:
             text, calls = _model_completion(model, messages, self.tools)
+            calls = self.own_tool_calls(calls)
             duration_ms = (time.monotonic() - started) * 1000.0
         except Exception as error:
             self.record_activity(
@@ -2270,6 +2515,7 @@ class TrinityRun(NativeRun):
         )
         if calls:
             self.record_activity("tool_call", role=role, model=model)
+            message_metadata = calls[0].pop("_message_metadata", {})
             asst: dict[str, Any] = {
                 "role": "assistant",
                 "content": text,
@@ -2277,6 +2523,7 @@ class TrinityRun(NativeRun):
                     _openai_tool_call(c["name"], c["id"], c["arguments"]) for c in calls
                 ],
             }
+            asst.update(message_metadata)
             self._pending = {
                 "role": role,
                 "agent_id": agent_id,
@@ -2465,11 +2712,21 @@ class ConductorRun(NativeRun):
                 f"</Agent {prev_mid} response>"
             )
         user = (
-            f"USER QUESTION context:\n{ctx}\n\nYour subtask: {sub}"
+            f"Relevant completed subtasks:\n{ctx}\n\nYour subtask: {sub}"
             if ctx
             else f"Your subtask: {sub}"
         )
-        return [{"role": "user", "content": _with_images(user, self.query_content)}]
+        return [
+            {
+                "role": "system",
+                "content": "Complete the assigned subtask in the context of the original request.",
+            },
+            {
+                "role": "user",
+                "content": _with_images(f"Original request:\n{self.query}", self.query_content),
+            },
+            {"role": "user", "content": user},
+        ]
 
     def _run_model(self, role: str, model: str, messages: list) -> dict[str, Any]:
         seq = len(self.steps)
@@ -2485,8 +2742,16 @@ class ConductorRun(NativeRun):
         self.active_controls = self.controls if role == "Worker" else {}
         self.capture_metadata = is_final_worker
         started = time.monotonic()
+        self.record_activity(
+            "step",
+            role=role,
+            model=model,
+            status="started",
+            summary=_running_summary(role),
+        )
         try:
             text, calls = _model_completion(model, messages, self.tools)
+            calls = self.own_tool_calls(calls)
             duration_ms = (time.monotonic() - started) * 1000.0
         except Exception as error:
             self.record_activity(
@@ -2511,6 +2776,7 @@ class ConductorRun(NativeRun):
         )
         if calls:
             self.record_activity("tool_call", role=role, model=model)
+            message_metadata = calls[0].pop("_message_metadata", {})
             asst = {
                 "role": "assistant",
                 "content": text,
@@ -2518,6 +2784,7 @@ class ConductorRun(NativeRun):
                     _openai_tool_call(c["name"], c["id"], c["arguments"]) for c in calls
                 ],
             }
+            asst.update(message_metadata)
             self._pending = {"role": role, "model": model, "messages": messages, "asst": asst}
             self._expected_ids = {c["id"] for c in calls}
             self._tool_rounds = 1
@@ -2713,6 +2980,7 @@ def create_run(mode: str, body: dict[str, Any]) -> NativeRun:
         run = TrinityRun(run_id, messages, tools, slot_models=slot_models)
     run.tool_choice = body.get("tool_choice")
     run.response_format = body.get("response_format")
+    run.cache_namespace = _prompt_cache_namespace(messages, tools)
     output_limit = body.get("max_completion_tokens", body.get("max_tokens"))
     if output_limit is not None:
         run.controls["max_tokens"] = output_limit
@@ -2722,6 +2990,7 @@ def create_run(mode: str, body: dict[str, Any]) -> NativeRun:
         run.controls["reasoning_effort"] = body["reasoning_effort"]
     if body.get("web_search_options") is not None:
         run.controls["web_search_options"] = body["web_search_options"]
+    run.record_activity("run", status="started", summary=f"Started Mantis {mode} orchestration")
     _register_run(run)
     return run
 
@@ -2767,8 +3036,6 @@ def delete_run(run_id: str, error: str | None = None) -> bool:
             run = _runs.pop(run_id, None)
         if run is None:
             return False
-    _write_learning_record(
-        run, {"type": "error", "terminated_by": "deleted", "error": error}
-    )
+    _write_learning_record(run, {"type": "error", "terminated_by": "deleted", "error": error})
     run.close()
     return True

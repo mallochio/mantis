@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import os
@@ -12,6 +13,7 @@ import uuid
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from typing import Any, Literal, cast
+from urllib.parse import urlsplit, urlunsplit
 
 import serve
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
@@ -160,6 +162,15 @@ class ChatRequest(BaseModel):
 _MAX_REQUESTS = int(os.environ.get("MANTIS_MAX_CONCURRENT_REQUESTS", "32"))
 _MAX_BODY_BYTES = int(os.environ.get("MANTIS_MAX_BODY_BYTES", str(50 * 1024 * 1024)))
 _KEEPALIVE_SECONDS = float(os.environ.get("MANTIS_SSE_KEEPALIVE_SECONDS", "10"))
+_STREAM_EVENTS_DEFAULT = os.environ.get("MANTIS_STREAM_EVENTS", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+_FINAL_CHUNK_DELAY_SECONDS = max(
+    0.0, float(os.environ.get("MANTIS_FINAL_CHUNK_DELAY_MS", "5")) / 1000.0
+)
 _capacity = threading.BoundedSemaphore(_MAX_REQUESTS)
 
 
@@ -208,7 +219,9 @@ app.add_middleware(BodyLimitMiddleware, max_bytes=_MAX_BODY_BYTES)
 
 
 def _error(status: int, message: str, error_type: str) -> JSONResponse:
-    return JSONResponse(status_code=status, content={"error": {"message": message, "type": error_type}})
+    return JSONResponse(
+        status_code=status, content={"error": {"message": message, "type": error_type}}
+    )
 
 
 def _authorize(authorization: str | None = Header(default=None)) -> None:
@@ -223,16 +236,22 @@ def _authorize(authorization: str | None = Header(default=None)) -> None:
 def _advance(request: ChatRequest, body: dict[str, Any]) -> tuple[Any, str, dict[str, Any]]:
     mode = serve._mode_for_model(request.model)
     continuation = serve._continuation(body["messages"])
-    if continuation is None:
-        run = serve.create_run(mode, body)
-        run_id = run.run_id
-        event = serve._advance_to_boundary(run_id)
-    else:
-        run_id, tool_results = continuation
-        run = serve.get_run(run_id)
-        if run.kind != mode:
-            raise ValueError("model does not match the active Mantis run")
-        event = serve._advance_to_boundary(run_id, tool_results)
+    run_id: str | None = None
+    try:
+        if continuation is None:
+            run = serve.create_run(mode, body)
+            run_id = run.run_id
+            event = serve._advance_to_boundary(run_id)
+        else:
+            run_id, tool_results = continuation
+            run = serve.get_run(run_id)
+            if run.kind != mode:
+                raise ValueError("model does not match the active Mantis run")
+            event = serve._advance_to_boundary(run_id, tool_results)
+    except serve.ClientDisconnectedError:
+        if run_id:
+            serve.delete_run(run_id, error="client disconnected")
+        raise
     if event.get("type") == "error":
         raise RuntimeError(str(event.get("error", "orchestration failed")))
     # Redis-backed stores deserialize a fresh run object on every advance.
@@ -284,11 +303,18 @@ def _complete(request: ChatRequest, headers: dict[str, str] | None = None) -> di
             serve.delete_run(run_id, error=str(error))
         raise HTTPException(502, str(error)) from error
     if event.get("type") == "final":
+        record_activity = getattr(run, "record_activity", lambda *_a, **_k: None)
+        record_activity("validation", status="started", summary="Validating the final answer")
         try:
             run.validate_output(str(event.get("text", "")))
         except ValueError as error:
+            record_activity("validation", status="failed", summary="Final answer validation failed")
             serve.delete_run(run_id, error=str(error))
             raise HTTPException(502, str(error)) from error
+        record_activity(
+            "validation", status="completed", summary="Final answer validation completed"
+        )
+        record_activity("complete", summary="Final answer ready")
     response = serve._completion_response(
         request.model, body["messages"], run, event, details=detail_level
     )
@@ -327,8 +353,7 @@ def _sse(body: dict[str, Any], include_usage: bool) -> Iterator[bytes]:
             {
                 "role": "assistant",
                 "tool_calls": [
-                    {**call, "index": index}
-                    for index, call in enumerate(message["tool_calls"])
+                    {**call, "index": index} for index, call in enumerate(message["tool_calls"])
                 ],
             }
         )
@@ -348,6 +373,8 @@ def _sse(body: dict[str, Any], include_usage: bool) -> Iterator[bytes]:
         if not deltas:
             deltas.append({"content": ""})
         for number, delta in enumerate(deltas):
+            if number and delta.get("content") and _FINAL_CHUNK_DELAY_SECONDS:
+                time.sleep(_FINAL_CHUNK_DELAY_SECONDS)
             yield chunk({"role": "assistant", **delta} if number == 0 else delta)
     yield chunk({}, choice["finish_reason"])
     if include_usage:
@@ -357,38 +384,105 @@ def _sse(body: dict[str, Any], include_usage: bool) -> Iterator[bytes]:
     yield b"data: [DONE]\n\n"
 
 
-def _stream(request: ChatRequest, headers: dict[str, str] | None = None) -> Iterator[bytes]:
-    results: queue.Queue[dict[str, Any] | HTTPException] = queue.Queue(maxsize=1)
+def _stream_events_enabled(headers: dict[str, str] | None) -> bool:
+    value = (headers or {}).get("x-mantis-events")
+    if value is None:
+        return _STREAM_EVENTS_DEFAULT
+    return value.strip().lower() not in {"0", "false", "none", "off"}
+
+
+def _progress_sse(base: dict[str, Any], event: dict[str, Any], first: bool) -> bytes:
+    summary = str(event.get("summary") or "Mantis is working")
+    model = event.get("model")
+    status_line = f"Mantis · {summary}" + (f" · {model}" if model else "") + "\n"
+    delta = {"reasoning": status_line}
+    if first:
+        delta["role"] = "assistant"
+    payload = {
+        **base,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+        "mantis_event": event,
+    }
+    return f"data: {json.dumps(payload)}\n\n".encode()
+
+
+def _stream(
+    request: ChatRequest,
+    headers: dict[str, str] | None = None,
+    completion_id: str | None = None,
+) -> Iterator[bytes]:
+    results: queue.Queue[tuple[str, Any]] = queue.Queue()
+    cancelled = threading.Event()
+    started = time.monotonic()
+    sequence = 0
+    stream_id = completion_id or "chatcmpl-" + uuid.uuid4().hex[:24]
+    base = {
+        "id": stream_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": request.model,
+    }
+
+    def emit(raw: dict[str, Any]) -> None:
+        nonlocal sequence
+        if cancelled.is_set():
+            return
+        event = {
+            "version": 1,
+            "sequence": sequence,
+            "elapsed_ms": round((time.monotonic() - started) * 1000.0, 1),
+            **raw,
+        }
+        sequence += 1
+        results.put(("event", event))
 
     def complete() -> None:
         try:
-            results.put(_complete(request, headers))
+            with (
+                serve.progress_events(emit),
+                serve.client_connection(lambda: not cancelled.is_set()),
+            ):
+                result = _complete(request, headers)
+                result["id"] = stream_id
+                results.put(("result", result))
         except HTTPException as error:
-            results.put(error)
+            results.put(("error", error))
         except Exception as error:  # noqa: BLE001 - never leave the stream hanging
-            results.put(HTTPException(502, f"orchestration failed: {error}"))
+            results.put(("error", HTTPException(502, f"orchestration failed: {error}")))
         finally:
             _capacity.release()
 
     threading.Thread(target=complete, daemon=True).start()
-    while True:
-        try:
-            result = results.get(timeout=_KEEPALIVE_SECONDS)
-            break
-        except queue.Empty:
-            yield b": keep-alive\n\n"
-    if isinstance(result, HTTPException):
-        payload = {
-            "error": {"message": str(result.detail), "type": "upstream_error"},
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
-        }
-        yield f"data: {json.dumps(payload)}\n\n".encode()
-        yield b"data: [DONE]\n\n"
-        return
-    yield from _sse(
-        result,
-        bool(request.stream_options and request.stream_options.include_usage),
-    )
+    show_events = _stream_events_enabled(headers)
+    first_event = True
+    try:
+        while True:
+            try:
+                kind, value = results.get(timeout=_KEEPALIVE_SECONDS)
+            except queue.Empty:
+                yield b": keep-alive\n\n"
+                continue
+            if kind == "event":
+                if show_events:
+                    yield _progress_sse(base, value, first_event)
+                    first_event = False
+                continue
+            if kind == "error":
+                payload = {
+                    **base,
+                    "error": {"message": str(value.detail), "type": "upstream_error"},
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+                }
+                yield f"data: {json.dumps(payload)}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+                return
+            yield from _sse(
+                value,
+                bool(request.stream_options and request.stream_options.include_usage),
+            )
+            return
+    finally:
+        cancelled.set()
 
 
 @app.exception_handler(RequestValidationError)
@@ -413,12 +507,38 @@ def health(response: Response) -> dict[str, Any]:
     return {"status": "ok", "model": serve.MODEL_NAME}
 
 
+def _endpoint_readiness(url: str) -> tuple[str | None, str]:
+    parsed = urlsplit(url)
+    hostname = parsed.hostname
+    host = f"[{hostname}]" if hostname and ":" in hostname else hostname or ""
+    port = parsed.port
+    default_port = (parsed.scheme.lower() == "http" and port == 80) or (
+        parsed.scheme.lower() == "https" and port == 443
+    )
+    netloc = f"{host}:{port}" if port is not None and not default_port else host
+    normalized = urlunsplit(
+        (parsed.scheme.lower(), netloc.lower(), parsed.path.rstrip("/"), "", "")
+    )
+    return hostname, hashlib.sha256(normalized.encode()).hexdigest()[:12]
+
+
 @app.get("/ready")
 def ready(response: Response) -> dict[str, Any]:
     response.headers["X-Request-Id"] = uuid.uuid4().hex
     if not os.environ.get("MANTIS_API_KEY"):
         raise HTTPException(503, "MANTIS_API_KEY is not configured")
-    return {"status": "ready", "model": serve.MODEL_NAME}
+    endpoint_urls = {
+        "openrouter": os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+        "opencode": os.environ.get("OPENCODE_GO_ENDPOINT_URL", "https://opencode.ai/zen/go/v1"),
+    }
+    metadata = {name: _endpoint_readiness(url) for name, url in endpoint_urls.items()}
+    return {
+        "status": "ready",
+        "model": serve.MODEL_NAME,
+        "endpoint_profile": os.environ.get("MANTIS_ENDPOINT_PROFILE", "direct"),
+        "endpoint_hosts": {name: values[0] for name, values in metadata.items()},
+        "endpoint_fingerprints": {name: values[1] for name, values in metadata.items()},
+    }
 
 
 _MODEL_CREATED = int(time.time())
@@ -465,15 +585,16 @@ def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Respons
         return _error(429, "Mantis is at capacity", "rate_limit_error")
     if request.stream:
         return StreamingResponse(
-            _stream(request, headers),
+            _stream(request, headers, "chatcmpl-" + request_id[:24]),
             media_type="text/event-stream",
-            headers={"X-Request-Id": request_id, "X-Mantis-Streaming": "buffered"},
+            headers={
+                "X-Request-Id": request_id,
+                "X-Mantis-Streaming": "live-status,verified-buffered-content",
+            },
         )
     try:
         body = _complete(request, headers)
         extra = _mantis_headers(body.get("mantis", {}), body) if body.get("mantis") else {}
-        return JSONResponse(
-            body, headers={"X-Request-Id": request_id, **extra}
-        )
+        return JSONResponse(body, headers={"X-Request-Id": request_id, **extra})
     finally:
         _capacity.release()

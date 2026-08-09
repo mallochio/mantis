@@ -7,12 +7,14 @@ class FakeRedis:
     def __init__(self):
         self.values = {}
         self.members = set()
+        self.ttls = {}
 
     def get(self, key):
         return self.values.get(key)
 
-    def setex(self, key, _ttl, value):
+    def setex(self, key, ttl, value):
         self.values[key] = value
+        self.ttls[key] = ttl
 
     def sadd(self, _key, value):
         self.members.add(value)
@@ -68,4 +70,22 @@ def test_redis_sweep_removes_expired_state(monkeypatch):
     serve._register_run(run)
     serve._sweep_runs()
     assert run.run_id not in fake.members
+    monkeypatch.setattr(serve, "_redis_client", None)
+
+
+def test_redis_sweep_preserves_in_flight_run_and_extends_ttl(monkeypatch):
+    fake = FakeRedis()
+    monkeypatch.setattr(serve, "RUN_STORE", "redis")
+    monkeypatch.setattr(serve, "_redis_client", fake)
+    monkeypatch.setattr(serve, "RUN_TTL", 10)
+    monkeypatch.setattr(serve, "REDIS_LOCK_TIMEOUT", 300)
+    run = serve.TrinityRun("c" * 32, [{"role": "user", "content": "hi"}], [])
+    run.last_active = 0
+    run.in_flight = 1
+
+    serve._register_run(run)
+    serve._sweep_runs()
+
+    assert run.run_id in fake.members
+    assert fake.ttls[serve._redis_key(run.run_id)] == 300
     monkeypatch.setattr(serve, "_redis_client", None)

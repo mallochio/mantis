@@ -36,10 +36,34 @@ single source of truth and picks the runtime automatically:
 - **docker**: `docker compose` everywhere else
 
 Override with `MANTIS_STACK_BACKEND=auto|native|docker`. Subcommands:
-`up`, `down`, `build`, `logs`, `status`. Optional flags: `--redis`
+`up`, `restart`, `down`, `build`, `logs`, `status`. `restart` replaces an
+existing container (`--force-recreate` on Docker). On the native backend,
+`restart` preserves an already-running Redis sidecar even when `--redis` is
+omitted; use `down` first if you also want to remove Redis. Optional flags: `--redis`
 (also runs the redis service; the native backend injects the redis IP since
 Apple containers do not resolve service names), `--conductor DIR`
 (eval override that mounts a retrained conductor checkpoint read-only).
+
+The default `--endpoint-profile direct` keeps the OpenRouter and OpenCode
+endpoints and uses `OPENROUTER_API_KEY` and `OPENCODE_API_KEY`. To route both
+providers through the configured Cloudflare gateway, set
+`MANTIS_GATEWAY_API_KEY` (or `AI_GATEWAY_API_KEY`) and restart:
+
+```bash
+uv run scripts/stack.py restart --endpoint-profile cloudflare
+```
+
+The Cloudflare profile fails before invoking the runtime if its token is
+missing. It maps the gateway token to both provider key variables only inside
+the launched environment. `OPENROUTER_BASE_URL` and
+`OPENCODE_GO_ENDPOINT_URL` override only the direct profile. The Cloudflare
+profile intentionally ignores those variables, so direct URLs already present
+in the host environment cannot bypass the gateway. Use `MANTIS_GATEWAY_URL` to
+override both Cloudflare endpoints, or `MANTIS_GATEWAY_OPENROUTER_URL` and
+`MANTIS_GATEWAY_OPENCODE_URL` for separate overrides. CLI diagnostics and
+`GET /ready` expose only the selected profile and endpoint hostnames, never
+credentials or URL paths. Values can be exported or stored in the repository
+`.env` file.
 
 For native MPS/CUDA execution on the host (no container):
 
@@ -67,10 +91,14 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-`stream=True` returns standard `text/event-stream` Chat Completions chunks,
-sends SSE keep-alive comments during hidden orchestration, and ends with
-`data: [DONE]`. Answer content is buffered until orchestration verifies the
-final response; responses include `X-Mantis-Streaming: buffered`.
+`stream=True` returns standard `text/event-stream` Chat Completions chunks.
+During orchestration it streams safe model, role, order, retry, and verification
+status through `delta.reasoning` plus a versioned `mantis_event`. Answer content
+remains buffered until verification and output validation succeed, then it is
+replayed as paced content chunks before `data: [DONE]`. Set
+`X-Mantis-Events: none` to suppress status
+frames. Responses include
+`X-Mantis-Streaming: live-status,verified-buffered-content`.
 
 ## Agent tools
 
@@ -143,17 +171,22 @@ reasoning engine or search crawler.
 | `MANTIS_MAX_CONCURRENT_RUNS` | Bounded tool-run count per backend | `32` |
 | `MANTIS_MAX_CONCURRENT_REQUESTS` | Concurrent HTTP request limit; excess receives `429` | `32` |
 | `MANTIS_SSE_KEEPALIVE_SECONDS` | SSE keep-alive interval during orchestration | `10` |
+| `MANTIS_STREAM_EVENTS` | Stream safe orchestration status and model-order events | `1` |
+| `MANTIS_FINAL_CHUNK_DELAY_MS` | Delay between verified final-answer chunks | `5` |
 | `MANTIS_MAX_BODY_BYTES` | Maximum request body size | `52428800` |
 | `MANTIS_UPSTREAM_STREAM` | Stream provider responses upstream (SSE) instead of buffering | `1` |
 | `MANTIS_CACHE_BREAKPOINTS` | Add prompt-cache breakpoints to Claude-family requests | `1` |
 
 Supported hosted model prefixes are currently `openrouter/` and `opencode-go/`.
-Provider base URLs are overridable with `OPENROUTER_BASE_URL` and
-`OPENCODE_GO_ENDPOINT_URL`, so the whole pool can be pointed at a pass-through
-proxy (e.g. a Cloudflare Worker gateway) by setting the matching API key to the
-gateway secret. Upstream streaming keeps long generations alive through such
-proxies. Cached prompt tokens are accounted per model in the `mantis` details
-and billed at the model's cache-read price when known.
+OpenRouter `openai/*` workers use the stateless Responses API with stable,
+privacy-safe cache keys, sticky session routing, and automatic prompt-cache
+breakpoints; all other hosted workers use Chat Completions. Provider base URLs are overridable with
+`OPENROUTER_BASE_URL` and `OPENCODE_GO_ENDPOINT_URL`, so the whole pool can be
+pointed at a pass-through proxy (e.g. a Cloudflare Worker gateway) by setting the
+matching API key to the gateway secret. An OpenRouter proxy must forward both
+`/v1/chat/completions` and `/v1/responses`. Upstream streaming keeps long
+generations alive through such proxies. Cached prompt tokens are accounted per
+model in the `mantis` details and billed at the model's cache-read price when known.
 Reasoning effort is appended with `|`, for example
 `openrouter/openai/gpt-5.6-luna|max`.
 

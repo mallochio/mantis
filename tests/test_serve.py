@@ -31,10 +31,12 @@ def test_build_request_routes_providers(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
     monkeypatch.setenv("OPENCODE_API_KEY", "oc-key")
     url, headers, body = serve._build_request("openrouter/openai/gpt-5.6-sol|medium", [], 1024, 0.2)
-    assert url == "https://openrouter.ai/api/v1/chat/completions"
+    assert url == "https://openrouter.ai/api/v1/responses"
     assert headers["Authorization"] == "Bearer or-key"
     assert body["model"] == "openai/gpt-5.6-sol"
-    assert body["reasoning_effort"] == "medium"
+    assert body["reasoning"] == {"effort": "medium"}
+    assert body["input"] == []
+    assert body["max_output_tokens"] == 1024
     assert "temperature" not in body
 
     url, headers, body = serve._build_request("opencode-go/deepseek-v4-flash", [], 1024, 0.2)
@@ -42,6 +44,81 @@ def test_build_request_routes_providers(monkeypatch):
     assert headers["Authorization"] == "Bearer oc-key"
     assert body["model"] == "deepseek-v4-flash"
     assert body["temperature"] == 0.2
+
+
+def test_normalize_upstream_tool_ids_without_mutating_input():
+    long_id = "call_mantis_" + "a" * 68
+    second_id = "provider/unsafe/id"
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": long_id, "type": "function", "function": {}},
+                {"id": second_id, "type": "function", "function": {}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": second_id, "content": "second"},
+        {"role": "tool", "tool_call_id": long_id, "content": "first"},
+    ]
+    original = json.loads(json.dumps(messages))
+
+    normalized = serve._normalize_upstream_tool_ids(messages)
+
+    first_id = normalized[0]["tool_calls"][0]["id"]
+    second_id = normalized[0]["tool_calls"][1]["id"]
+    assert (first_id, second_id) == ("m00000000", "m00000001")
+    assert normalized[1]["tool_call_id"] == second_id
+    assert normalized[2]["tool_call_id"] == first_id
+    assert messages == original
+
+
+def test_prompt_cache_namespace_is_stable_for_conversation_tail():
+    root = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "first request"},
+    ]
+    one = serve._prompt_cache_namespace(
+        [*root, {"role": "user", "content": "dynamic worker prompt"}], []
+    )
+    two = serve._prompt_cache_namespace(
+        [*root, {"role": "assistant", "content": "prior answer"}], []
+    )
+    changed = serve._prompt_cache_namespace(
+        [{"role": "system", "content": "system"}, {"role": "user", "content": "other"}],
+        [],
+    )
+    assert one == two
+    assert one != changed
+    assert len(one) == 32
+
+
+def test_public_tool_id_is_compact_and_reversible():
+    public_id = serve._public_tool_id("a" * 32, "c0")
+    assert len(public_id) == 32
+    assert serve._parse_public_tool_id(public_id) == ("a" * 32, "c0")
+    assert serve._parse_public_tool_id("call_mantis_" + "a" * 32 + "_c0") is None
+    assert serve._parse_public_tool_id(public_id[:-1] + "_") is None
+
+
+def test_public_tool_id_continuation_round_trip():
+    public_id = serve._public_tool_id("b" * 32, "c2")
+    messages = [
+        {"role": "assistant", "tool_calls": [{"id": public_id}]},
+        {"role": "tool", "tool_call_id": public_id, "content": "done"},
+    ]
+    assert serve._continuation(messages) == (
+        "b" * 32,
+        [{"tool_call_id": "c2", "content": "done", "is_error": False}],
+    )
+
+
+def test_native_run_owns_unique_tool_ids_across_serialization():
+    run = serve.NativeRun("a" * 32)
+    assert [call["id"] for call in run.own_tool_calls([{}, {}])] == ["c0", "c1"]
+    restored = serve.NativeRun.__new__(serve.NativeRun)
+    restored.__setstate__(run.__getstate__())
+    assert restored.own_tool_calls([{}])[0]["id"] == "c2"
 
 
 def test_resolve_conductor_model_env(monkeypatch):
@@ -131,7 +208,10 @@ def test_direct_provider_completions(monkeypatch):
         [{"type": "function", "function": {"name": "read"}}],
     )
     assert text == ""
-    assert calls == [{"id": "call-1", "name": "read", "arguments": {"path": "README.md"}}]
+    assert len(calls) == 1
+    assert "id" not in calls[0]
+    assert calls[0]["name"] == "read"
+    assert calls[0]["arguments"] == {"path": "README.md"}
 
 
 def test_provider_metadata_is_captured_for_public_response(monkeypatch):
@@ -161,17 +241,83 @@ def test_provider_metadata_is_captured_for_public_response(monkeypatch):
     serve._history_context.active_run = run
     monkeypatch.setenv("OPENROUTER_API_KEY", "provider-key")
     monkeypatch.setattr(serve, "_upstream_streaming_enabled", lambda: False)
-    monkeypatch.setattr(serve, "_provider_client", SimpleNamespace(post=lambda *_a, **_k: Response()))
+    monkeypatch.setattr(
+        serve, "_provider_client", SimpleNamespace(post=lambda *_a, **_k: Response())
+    )
     try:
         serve._provider_response("openrouter/model", [], 10, 0.7)
     finally:
         serve._history_context.active_run = None
-    body = serve._completion_response(
-        "mantis", [], run, {"type": "final", "text": "answer"}
-    )
+    body = serve._completion_response("mantis", [], run, {"type": "final", "text": "answer"})
     message = body["choices"][0]["message"]
     assert message["reasoning_details"][0]["text"] == "checked"
     assert message["citations"][0]["url"] == "https://example.test"
+
+
+class _StubServer:
+    """Tiny upstream that always answers 400 with a provider error body."""
+
+    def __init__(self):
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.dumps({"error": {"message": "provider says no"}}).encode()
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.server.server_port}/v1/chat/completions"
+
+    def close(self):
+        self.server.shutdown()
+        self.thread.join()
+
+
+def test_stream_completion_error_body_readable():
+    # Regression: error responses on the streamed path must be read before
+    # raise_for_status, or callers crash with httpx.ResponseNotRead instead of
+    # surfacing the real provider error.
+    import httpx
+
+    stub = _StubServer()
+    try:
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            serve._stream_completion(httpx.Client(timeout=5), stub.url, {}, {"model": "m"})
+        assert exc_info.value.response.status_code == 400
+        assert "provider says no" in exc_info.value.response.text
+    finally:
+        stub.close()
+
+
+def test_provider_response_reports_upstream_error(monkeypatch):
+    # The 400 must surface as a RuntimeError with the provider message even
+    # when upstream streaming is enabled (the default in production).
+    import httpx
+
+    stub = _StubServer()
+    monkeypatch.setattr(serve, "_upstream_streaming_enabled", lambda: True)
+    monkeypatch.setattr(serve, "_provider_client", httpx.Client(timeout=5))
+    monkeypatch.setattr(serve, "_build_request", lambda *a, **k: (stub.url, {}, {"model": "m"}))
+    try:
+        with pytest.raises(RuntimeError, match="provider says no"):
+            serve._provider_response(
+                "openrouter/model", [{"role": "user", "content": "hi"}], 10, 0.7
+            )
+    finally:
+        stub.close()
 
 
 def test_split_messages():
@@ -511,7 +657,6 @@ def test_env_conductor_coordinator_litellm(monkeypatch):
     assert res.final == "done"
 
 
-
 def test_direct_conductor_worker(monkeypatch):
     captured: list[Any] = []
     monkeypatch.setattr(serve, "_direct_completion", lambda *args: captured.extend(args) or "ok")
@@ -786,7 +931,6 @@ def test_get_coordinator_caches(monkeypatch):
         assert serve.load_coordinator.call_count == 1
     finally:
         serve._coordinators = old
-
 
 
 def test_worker_from_args_no_torch(monkeypatch):
@@ -1151,9 +1295,19 @@ def test_trinity_native_tool_run_and_accept(monkeypatch):
     def complete(model, messages, tools):
         calls.append((model, list(messages), tools))
         if len(calls) == 1:
-            return "", [{"id": "read-1", "name": "read", "arguments": {"path": "README.md"}}]
+            return "", [
+                {
+                    "id": "provider-id",
+                    "name": "read",
+                    "arguments": {"path": "README.md"},
+                    "_message_metadata": {
+                        "reasoning_details": [{"type": "reasoning", "id": "rs_1"}]
+                    },
+                }
+            ]
         if len(calls) == 2:
-            assert messages[-1] == {"role": "tool", "tool_call_id": "read-1", "content": "file"}
+            assert messages[-2]["reasoning_details"] == [{"type": "reasoning", "id": "rs_1"}]
+            assert messages[-1] == {"role": "tool", "tool_call_id": "c0", "content": "file"}
             return "answer", []
         return "ACCEPT", []
 
@@ -1162,7 +1316,7 @@ def test_trinity_native_tool_run_and_accept(monkeypatch):
         "r1", _run_messages(), [{"type": "function"}], slot_models=["worker"], max_turns=4
     )
     assert run.advance(None)["type"] == "tool_calls"
-    worker = run.advance([{"tool_call_id": "read-1", "content": "file"}])
+    worker = run.advance([{"tool_call_id": "c0", "content": "file"}])
     assert worker["type"] == "step_complete" and worker["reply"] == "answer"
     verifier = run.advance(None)
     assert verifier["role"] == "Verifier" and verifier["reply"] == "ACCEPT"
@@ -1208,7 +1362,7 @@ def test_conductor_native_tool_run(monkeypatch):
     run = serve.ConductorRun("c1", _run_messages(), [], slot_models=["worker"])
     assert run.advance(None)["role"] == "Planner"
     assert run.advance(None)["type"] == "tool_calls"
-    step = run.advance([{"tool_call_id": "bash-1", "content": "working-dir"}])
+    step = run.advance([{"tool_call_id": "c0", "content": "working-dir"}])
     assert step["type"] == "step_complete" and step["reply"] == "done"
     final = run.advance(None)
     assert final["type"] == "final" and final["text"] == "done"
@@ -1243,7 +1397,6 @@ def test_create_run_validates_messages_and_slots():
         serve.create_run("trinity", {"messages": []})
     with pytest.raises(TypeError):
         serve.create_run("trinity", {"messages": _run_messages(), "slot_models": "bad"})
-
 
 
 def test_run_registry_sweep_and_capacity(monkeypatch):
@@ -1326,7 +1479,12 @@ def test_conductor_errors_visibility_and_state(monkeypatch):
         run._node_messages(0, 0, "task")
     run._workflow = ([0, 0], ["first", "second"], [[], [0]])
     run._outputs = ["first output"]
-    assert "first output" in run._node_messages(1, 0, "second")[0]["content"]
+    node_messages = run._node_messages(1, 0, "second")
+    first_node = run._node_messages(0, 0, "first")
+    assert node_messages[:2] == first_node[:2]
+    assert node_messages[0]["role"] == "system"
+    assert "Original request" in node_messages[1]["content"]
+    assert "first output" in node_messages[-1]["content"]
 
     monkeypatch.setattr(
         serve, "parse_workflow", lambda _text: (_ for _ in ()).throw(ValueError("bad plan"))
@@ -1417,7 +1575,6 @@ def test_learning_record_skips_ambiguous_runs(monkeypatch):
     run.turns = [{"role": "Worker", "agent_id": 0, "reply": "answer"}]
     record = serve._learning_record(run, {"type": "final", "terminated_by": "max_turns"})
     assert not record["trainable"] and not record["test_seen"]
-
 
 
 def test_standard_tool_validation_and_model_ids():

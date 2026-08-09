@@ -136,6 +136,48 @@ def test_transient_error_fails_over_to_next_pool_worker(pool_env, monkeypatch):
     assert run.usage["total_tokens"] == 8
 
 
+def test_failover_switches_from_responses_to_chat_protocol(pool_env, monkeypatch):
+    monkeypatch.setenv(
+        "MANTIS_WORKER_MODELS",
+        "openrouter/openai/gpt-alpha,opencode-go/deepseek-beta",
+    )
+    ok = {"choices": [{"message": {"content": "ok"}}]}
+    client = _Client([_Response(500), _Response(200, ok)])
+    monkeypatch.setattr(serve, "_provider_client", client)
+
+    data = serve._provider_response("openrouter/openai/gpt-alpha", _messages(), 10, 0.7)
+
+    assert data["choices"][0]["message"]["content"] == "ok"
+    assert client.posts[0]["url"].endswith("/responses")
+    assert "input" in client.posts[0]["json"]
+    assert "stream_options" not in client.posts[0]["json"]
+    assert client.posts[1]["url"].endswith("/chat/completions")
+    assert "messages" in client.posts[1]["json"]
+
+
+def test_responses_stream_failure_fails_over(pool_env, monkeypatch):
+    monkeypatch.setenv(
+        "MANTIS_WORKER_MODELS",
+        "openrouter/openai/gpt-alpha,opencode-go/deepseek-beta",
+    )
+    results = iter(
+        [
+            RuntimeError("provider stream error: failed response"),
+            {"choices": [{"message": {"content": "fallback"}}], "usage": None},
+        ]
+    )
+
+    def complete(*_args, **_kwargs):
+        result = next(results)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(serve, "_stream_completion", complete)
+    data = serve._provider_response("openrouter/openai/gpt-alpha", _messages(), 10, 0.7)
+    assert data["choices"][0]["message"]["content"] == "fallback"
+
+
 def test_exhausted_pool_raises_naming_every_attempt(pool_env, monkeypatch):
     client = _Client([_Response(429), _Response(429, {"error": "also busy"})])
     monkeypatch.setattr(serve, "_provider_client", client)

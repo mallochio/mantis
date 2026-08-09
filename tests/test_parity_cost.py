@@ -79,8 +79,14 @@ def test_provider_response_records_bare_model_id(monkeypatch):
 
         def json(self) -> dict[str, Any]:
             return {
-                "choices": [{"message": {"content": "answer"}}],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "answer"}],
+                    }
+                ],
+                "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
             }
 
     run = serve.NativeRun("provider")

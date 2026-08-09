@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir 'transformers>=4.52,<5' accelerate safetensors hu
 COPY ./OpenFugu /app
 COPY ./openfugu-patch/serve.py /app/openfugu/serve.py
 COPY ./openfugu-patch/api.py /app/openfugu/api.py
+COPY ./openfugu-patch/provider_protocols.py /app/openfugu/provider_protocols.py
 # Router head artifact used to build the TRINITY SVF+head vector.
 COPY ./artifacts /app/artifacts
 COPY ./scripts/make_vec.py /app/scripts/make_vec.py

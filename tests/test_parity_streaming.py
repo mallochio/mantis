@@ -49,9 +49,7 @@ def _stream(client, monkeypatch, event, run, **request):
 
 def _events(response):
     return [
-        json.loads(line[6:])
-        for line in response.text.splitlines()
-        if line.startswith("data: {")
+        json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: {")
     ]
 
 
@@ -147,3 +145,24 @@ def test_tool_call_stream_stays_single_delta(client, monkeypatch):
     assert deltas[1] == {}
     events = _events(response)
     assert events[-1]["choices"] == [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+
+
+def test_verified_final_chunks_are_paced(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(api, "_FINAL_CHUNK_DELAY_SECONDS", 0.005)
+    monkeypatch.setattr(api.time, "sleep", sleeps.append)
+    body = {
+        "id": "chatcmpl-test",
+        "created": 1,
+        "model": "mantis",
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": "word " * 40},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {},
+    }
+    list(api._sse(body, include_usage=False))
+    assert sleeps
+    assert all(delay == 0.005 for delay in sleeps)
