@@ -36,8 +36,9 @@ Required provider configuration is `EXPENSIVE_BASE`, `EXPENSIVE_KEY`,
   discarded.
 - Response replay is off by default. To opt in, send `Idempotency-Key`.
   Tool-bearing requests and responses, refusals, and incomplete responses are
-  never cached. Entry count and total bytes are bounded. Cache counters appear
-  in `/healthz`.
+  never cached. Entry count, buffered streams, and total bytes are bounded.
+  Concurrent identical keyed requests share one bounded in-flight result.
+  Cache counters appear in `/healthz`.
 
 Every routed response includes `x-request-id`, `x-route-decision`,
 `x-route-model`, `x-route-score`, `x-route-attempts`, and `x-route-fallback`.
@@ -51,8 +52,10 @@ explicitly required. Directories use mode `0700`; private files use `0600`.
 Request and outcome occurrence IDs support exact evaluation joins. Old outcome
 rows without IDs use the legacy prompt-hash join.
 
-`pseudo_label.py` validates closed label enums/schema. It fsyncs both result
-files before atomically advancing its state checkpoint.
+`pseudo_label.py` validates closed label enums/schema. A fsynced append-only
+journal is canonical; both output projections are rebuilt atomically from its
+committed offset before the state checkpoint advances. Recovery truncates an
+uncommitted journal tail after a crash.
 
 ## Checks
 

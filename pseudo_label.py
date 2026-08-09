@@ -298,6 +298,80 @@ def save_state(state_path: Path, hashes: set[str]) -> None:
         os.fsync(handle.fileno())
     os.replace(tmp, state_path)
     state_path.chmod(0o600)
+    try:
+        directory_fd = os.open(state_path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        pass
+
+
+def _journal_path(output_path: Path) -> Path:
+    return output_path.with_suffix(output_path.suffix + ".journal")
+
+
+def _fsync_replace(path: Path, lines: list[str]) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.writelines(lines)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    path.chmod(0o600)
+    try:
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        pass
+
+
+def _migrate_journal(output_path: Path, supra_output_path: Path, journal: Path) -> None:
+    if journal.exists() or not output_path.exists() or not supra_output_path.exists():
+        return
+    records = output_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    supra = supra_output_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    entries = []
+    for record_line, supra_line in zip(records, supra, strict=False):
+        try:
+            entries.append(json.dumps({"record": json.loads(record_line), "supra": json.loads(supra_line)}) + "\n")
+        except json.JSONDecodeError:
+            break
+    _fsync_replace(journal, entries)
+
+
+def recover_outputs(output_path: Path, supra_output_path: Path) -> set[str]:
+    """Rebuild both projections from the fsynced canonical journal."""
+    journal = _journal_path(output_path)
+    _migrate_journal(output_path, supra_output_path, journal)
+    if not journal.exists():
+        return set()
+    records, supra, hashes = [], [], set()
+    committed_offset = 0
+    with journal.open("rb") as handle:
+        for line in handle:
+            try:
+                entry = json.loads(line)
+                records.append(json.dumps(entry["record"]) + "\n")
+                supra.append(json.dumps(entry["supra"]) + "\n")
+                if entry["record"].get("hash"):
+                    hashes.add(entry["record"]["hash"])
+                committed_offset = handle.tell()
+            except (json.JSONDecodeError, KeyError, TypeError):
+                break
+    if journal.stat().st_size != committed_offset:
+        with journal.open("r+b") as handle:
+            handle.truncate(committed_offset)
+            handle.flush()
+            os.fsync(handle.fileno())
+    _fsync_replace(output_path, records)
+    _fsync_replace(supra_output_path, supra)
+    return hashes
 
 
 def write_batch(
@@ -305,18 +379,17 @@ def write_batch(
     supra_output_path: Path,
     batch: list[dict[str, Any]],
 ) -> None:
-    _ensure_0600(output_path)
-    _ensure_0600(supra_output_path)
-    with output_path.open("a", encoding="utf-8") as jf, supra_output_path.open(
-        "a", encoding="utf-8"
-    ) as sf:
+    journal = _journal_path(output_path)
+    existing = recover_outputs(output_path, supra_output_path)
+    _ensure_0600(journal)
+    with journal.open("a", encoding="utf-8") as handle:
         for item in batch:
-            jf.write(json.dumps(item["record"]) + "\n")
-            sf.write(json.dumps(item["supra"]) + "\n")
-        jf.flush()
-        sf.flush()
-        os.fsync(jf.fileno())
-        os.fsync(sf.fileno())
+            item_hash = item.get("hash") or item["record"].get("hash")
+            if item_hash not in existing:
+                handle.write(json.dumps({"record": item["record"], "supra": item["supra"]}) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    recover_outputs(output_path, supra_output_path)
 
 
 def build_records(item, parsed, model, elapsed_ms, raw="") -> tuple[dict, dict]:
@@ -547,6 +620,10 @@ def main() -> None:
     supra_output_path.parent.mkdir(parents=True, exist_ok=True)
     state_path = output_path.with_suffix(".state")
     state = load_state(state_path)
+    recovered = recover_outputs(output_path, supra_output_path)
+    if recovered - state:
+        state.update(recovered)
+        save_state(state_path, state)
 
     rows = load_prompts(input_path, state)
     if args.limit is not None:

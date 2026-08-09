@@ -402,6 +402,8 @@ RESP_CACHE_TTL_S = float(os.environ.get("ROUTELLM_RESP_CACHE_TTL_S", "120"))
 RESP_CACHE_MAX_ENTRIES = int(os.environ.get("ROUTELLM_RESP_CACHE_MAX_ENTRIES", "128"))
 RESP_CACHE_MAX_BYTES = int(os.environ.get("ROUTELLM_RESP_CACHE_MAX_BYTES", str(8 * 1024 * 1024)))
 _resp_cache: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
+_inflight: dict[str, asyncio.Future] = {}
+_inflight_lock = asyncio.Lock()
 _cache_bytes = 0
 _cache_metrics = {"hits": 0, "misses": 0, "stores": 0, "evictions": 0}
 
@@ -440,7 +442,11 @@ def _cache_get(key: str | None) -> bytes | None:
 
 def _response_replay_safe(body: dict, content: bytes) -> bool:
     if body.get("stream"):
-        return content.rstrip().endswith(b"data: [DONE]") and b'"tool_calls"' not in content
+        text = content.decode("utf-8", errors="replace")
+        return (content.rstrip().endswith(b"data: [DONE]")
+                and '"tool_calls"' not in text
+                and not re.search(r'"finish_reason"\s*:\s*"content_filter"', text)
+                and not _REFUSAL_RE.search(text))
     data = _safe_json(content)
     choices = data.get("choices") or []
     return (bool(choices) and not _is_refusal(200, data)
@@ -452,6 +458,9 @@ def _cache_put(key: str | None, body: dict, content: bytes) -> None:
     global _cache_bytes
     if key is None or len(content) > RESP_CACHE_MAX_BYTES or not _response_replay_safe(body, content):
         return
+    existing = _resp_cache.pop(key, None)
+    if existing is not None:
+        _cache_bytes -= len(existing[1])
     while _resp_cache and (len(_resp_cache) >= RESP_CACHE_MAX_ENTRIES or _cache_bytes + len(content) > RESP_CACHE_MAX_BYTES):
         _, (_, old) = _resp_cache.popitem(last=False)
         _cache_bytes -= len(old)
@@ -460,6 +469,36 @@ def _cache_put(key: str | None, body: dict, content: bytes) -> None:
         _resp_cache[key] = (time.monotonic(), content)
         _cache_bytes += len(content)
         _cache_metrics["stores"] += 1
+
+
+async def _claim_inflight(key: str | None):
+    if key is None:
+        return True, None
+    async with _inflight_lock:
+        future = _inflight.get(key)
+        if future is None:
+            future = asyncio.get_running_loop().create_future()
+            _inflight[key] = future
+            return True, future
+        return False, future
+
+
+async def _finish_inflight(key: str | None, future, result) -> None:
+    if key is None or future is None:
+        return
+    async with _inflight_lock:
+        if _inflight.get(key) is future:
+            _inflight.pop(key, None)
+        if not future.done():
+            future.set_result(result)
+
+
+def _replayed_response(result, request_id: str):
+    content, status, media, headers = result
+    replay_headers = {**headers, "x-route-coalesced": "true", "x-request-id": request_id}
+    if media == "text/event-stream":
+        return StreamingResponse(iter([content]), status_code=status, media_type=media, headers=replay_headers)
+    return Response(content=content, status_code=status, media_type=media, headers=replay_headers)
 
 
 def _request_hash(body: dict) -> str:
@@ -623,13 +662,25 @@ async def _open_with_failover(body: dict, decision: str, deadline: float, *, str
                 raise TimeoutError
             async with asyncio.timeout(remaining):
                 response = await _send(backend, body, stream=stream)
-            attempts.append((current, backend, response.status_code, None))
-            if response.status_code == 200 or not _retryable(response.status_code) or index == len(routes) - 1:
+                data = None
+                if not stream or response.status_code != 200:
+                    data = _safe_json(await response.aread())
+            refusal = data is not None and _is_refusal(response.status_code, data)
+            attempts.append((current, backend, response.status_code, "refusal" if refusal else None))
+            retry = refusal or _retryable(response.status_code)
+            if not retry or index == len(routes) - 1:
                 return current, backend, response, attempts
             await response.aclose()
         except (httpx.TransportError, TimeoutError, asyncio.TimeoutError) as exc:
             attempts.append((current, backend, None, type(exc).__name__))
     return attempts[-1][0], attempts[-1][1], None, attempts
+
+
+def _log_attempts(attempts, prompt: str, score: float, request_id: str, occurrence_id: str) -> None:
+    for index, (decision, backend, status, error) in enumerate(attempts, 1):
+        _log(decision, score, backend["model"], prompt, None, request_id=request_id,
+             occurrence_id=occurrence_id, record_type="attempt", attempt=index,
+             status=status, error=error)
 
 
 @app.get("/healthz")
@@ -645,6 +696,66 @@ async def list_models():
         "context_window": await _get_context_window(), "max_tokens": ROUTELLM_MAX_TOKENS,
     }]}
 
+
+MAX_SSE_EVENT_BYTES = int(os.environ.get("ROUTELLM_MAX_SSE_EVENT_BYTES", str(1024 * 1024)))
+
+
+async def _iter_sse_events(response: httpx.Response):
+    """Yield exact SSE event frames while bounding a single provider event."""
+    buffer = bytearray()
+    separators = (
+        b"\r\n\r\n", b"\r\n\n", b"\n\r\n", b"\r\n\r", b"\r\r\n",
+        b"\n\n", b"\r\r",
+    )
+    async for chunk in response.aiter_bytes():
+        buffer.extend(chunk)
+        while True:
+            found = [(buffer.find(sep), sep) for sep in separators]
+            found = [(index, sep) for index, sep in found if index >= 0]
+            if not found:
+                if len(buffer) > MAX_SSE_EVENT_BYTES:
+                    raise ValueError("upstream SSE event is too large")
+                break
+            index, sep = min(found, key=lambda item: item[0])
+            end = index + len(sep)
+            yield bytes(buffer[:end])
+            del buffer[:end]
+    if buffer:
+        if len(buffer) > MAX_SSE_EVENT_BYTES:
+            raise ValueError("upstream SSE event is too large")
+        yield bytes(buffer)
+
+
+def _sse_data(event: bytes) -> str | None:
+    values = []
+    for raw_line in event.splitlines():
+        if raw_line.startswith(b"data:"):
+            value = raw_line[5:]
+            if value.startswith(b" "):
+                value = value[1:]
+            values.append(value.decode("utf-8", errors="replace"))
+    return "\n".join(values) if values else None
+
+
+async def _prefetch_sse(events, deadline: float):
+    prefix = []
+    prefix_bytes = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError
+        try:
+            async with asyncio.timeout(remaining):
+                event = await anext(events)
+        except StopAsyncIteration:
+            return prefix, None
+        prefix.append(event)
+        prefix_bytes += len(event)
+        if prefix_bytes >= MAX_SSE_EVENT_BYTES:
+            return prefix, None
+        data = _sse_data(event)
+        if data is not None:
+            return prefix, data
 
 def _stream_error(message: str, code: str, request_id: str) -> bytes:
     return ("data: " + json.dumps({"error": {"message": message, "type": "upstream_error", "code": code},
@@ -673,10 +784,16 @@ async def chat_completions(
     cached = _cache_get(cache_key)
     if cached is not None:
         media = "text/event-stream" if body.get("stream") else "application/json"
-        response_cls = StreamingResponse if body.get("stream") else Response
-        content = iter([cached]) if body.get("stream") else cached
-        return response_cls(content=content, media_type=media, headers={"x-route-cache": "hit", "x-request-id": request_id})
+        result = (cached, 200, media, {"x-route-cache": "hit"})
+        return _replayed_response(result, request_id)
+    leader, inflight = await _claim_inflight(cache_key)
+    if not leader:
+        result = await asyncio.shield(inflight)
+        if result is not None:
+            return _replayed_response(result, request_id)
+        leader, inflight = await _claim_inflight(cache_key)
 
+    occurrence_id = uuid.uuid4().hex
     prompt = _extract_prompt(body)
     if prompt.strip():
         decision, score, supra_complexity, supra_ms = await asyncio.to_thread(_decide, prompt)
@@ -686,11 +803,45 @@ async def chat_completions(
     _record_and_detect_retry(_request_hash(body), decision, backend["model"], _prompt_hash(prompt), request_id)
     headers = _route_headers(decision, score, backend, request_id, supra_complexity, supra_ms)
     deadline = time.monotonic() + TIMEOUT_S
-    selected, backend, upstream, attempts = await _open_with_failover(body, decision, deadline, stream=bool(body.get("stream")))
+    selected, backend, upstream, attempts = await _open_with_failover(
+        body, decision, deadline, stream=bool(body.get("stream")))
+
+    prefix = []
+    events = None
+    if upstream is not None and body.get("stream") and upstream.status_code == 200:
+        try:
+            events = _iter_sse_events(upstream)
+            prefix, first_data = await _prefetch_sse(events, deadline)
+            first_payload = None
+            if first_data and first_data.strip() != "[DONE]":
+                try:
+                    first_payload = json.loads(first_data)
+                except json.JSONDecodeError:
+                    pass
+            refusal = isinstance(first_payload, dict) and _is_refusal(200, first_payload)
+            if refusal and len(attempts) < 2:
+                await upstream.aclose()
+                selected = "cheap" if selected == "expensive" else "expensive"
+                backend = _backend_for(selected)
+                remaining = deadline - time.monotonic()
+                async with asyncio.timeout(max(0, remaining)):
+                    upstream = await _send(backend, body, stream=True)
+                attempts.append((selected, backend, upstream.status_code, "refusal_fallback"))
+                events = _iter_sse_events(upstream) if upstream.status_code == 200 else None
+                prefix, _ = await _prefetch_sse(events, deadline) if events is not None else ([], None)
+        except (httpx.TransportError, TimeoutError, asyncio.TimeoutError, ValueError) as exc:
+            if upstream is not None:
+                await upstream.aclose()
+            attempts.append((selected, backend, None, type(exc).__name__))
+            upstream = None
+
     headers.update({"x-route-decision": selected, "x-route-model": backend["model"],
                     "x-route-fallback": str(selected != decision).lower(), "x-route-attempts": str(len(attempts))})
+    _log_attempts(attempts, prompt, score, request_id, occurrence_id)
     if upstream is None:
-        _log_outcome(_prompt_hash(prompt), "upstream_error", request_id=request_id, attempts=len(attempts))
+        _log_outcome(_prompt_hash(prompt), "upstream_error", request_id=request_id,
+                     decision_occurrence_id=occurrence_id, attempts=len(attempts))
+        await _finish_inflight(cache_key, inflight, None)
         return _openai_error("Upstream providers were unavailable", 502, error_type="upstream_error", code="upstream_unavailable")
 
     if not body.get("stream"):
@@ -700,76 +851,133 @@ async def chat_completions(
                 content = await upstream.aread()
         except (httpx.TransportError, TimeoutError, asyncio.TimeoutError):
             await upstream.aclose()
-            _log_outcome(_prompt_hash(prompt), "upstream_error", request_id=request_id, model=backend["model"])
+            _log_outcome(_prompt_hash(prompt), "upstream_error", request_id=request_id,
+                         decision_occurrence_id=occurrence_id, model=backend["model"])
+            await _finish_inflight(cache_key, inflight, None)
             return _openai_error("Upstream response timed out", 504, error_type="upstream_error", code="upstream_timeout")
         finally:
             await upstream.aclose()
         data = _safe_json(content)
         if upstream.status_code != 200:
-            _log_outcome(_prompt_hash(prompt), "upstream_error", request_id=request_id, model=backend["model"], status=upstream.status_code)
+            _log_outcome(_prompt_hash(prompt), "upstream_error", request_id=request_id,
+                         decision_occurrence_id=occurrence_id, model=backend["model"], status=upstream.status_code)
         if _length_truncated(data):
-            _log_outcome(_prompt_hash(prompt), "truncated", request_id=request_id, model=backend["model"])
-        _cache_put(cache_key, body, content)
+            _log_outcome(_prompt_hash(prompt), "truncated", request_id=request_id,
+                         decision_occurrence_id=occurrence_id, model=backend["model"])
+        if upstream.status_code == 200:
+            _cache_put(cache_key, body, content)
         _log(selected, score, backend["model"], prompt, None, supra_complexity, supra_ms,
              cost_usd=_extract_cost(data), usage=data.get("usage"), request_id=request_id,
-             attempts=len(attempts), status=upstream.status_code)
+             occurrence_id=occurrence_id, record_type="decision", attempts=len(attempts), status=upstream.status_code)
+        result = ((content, upstream.status_code, "application/json", headers)
+                  if (cache_key and upstream.status_code == 200 and len(content) <= RESP_CACHE_MAX_BYTES
+                      and _response_replay_safe(body, content)) else None)
+        await _finish_inflight(cache_key, inflight, result)
+        return Response(content=content, status_code=upstream.status_code, media_type="application/json", headers=headers)
+
+    if upstream.status_code != 200 or events is None:
+        content = await upstream.aread()
+        await upstream.aclose()
+        _log_outcome(_prompt_hash(prompt), "upstream_error", request_id=request_id,
+                     decision_occurrence_id=occurrence_id, model=backend["model"], status=upstream.status_code)
+        _log(selected, score, backend["model"], prompt, None, request_id=request_id,
+             occurrence_id=occurrence_id, record_type="decision", status=upstream.status_code)
+        await _finish_inflight(cache_key, inflight, None)
         return Response(content=content, status_code=upstream.status_code, media_type="application/json", headers=headers)
 
     async def event_stream():
-        chunks: list[bytes] = []
-        saw_done = False
-        saw_finish = False
-        saw_length = False
+        cache_parts: list[bytes] | None = [] if cache_key is not None else None
+        cache_size = 0
+        saw_done = saw_finish = saw_length = False
+        emitted_error = False
         usage: dict = {}
         started = time.monotonic()
+
+        def remember(event: bytes) -> None:
+            nonlocal cache_parts, cache_size
+            if cache_parts is None:
+                return
+            cache_size += len(event)
+            if cache_size > RESP_CACHE_MAX_BYTES:
+                cache_parts = None
+            else:
+                cache_parts.append(event)
+
+        def track(event: bytes) -> bool:
+            nonlocal saw_done, saw_finish, saw_length
+            data_text = _sse_data(event)
+            if data_text is None:
+                return False
+            if data_text.strip() == "[DONE]":
+                saw_done = True
+                return True
+            try:
+                payload = json.loads(data_text)
+            except json.JSONDecodeError:
+                return False
+            choices = payload.get("choices") or []
+            if choices and choices[0].get("finish_reason") is not None:
+                saw_finish = True
+                saw_length = choices[0].get("finish_reason") == "length"
+            if isinstance(payload.get("usage"), dict):
+                usage.update(payload["usage"])
+            return False
+
         try:
             remaining = deadline - time.monotonic()
             async with asyncio.timeout(max(0, remaining)):
-                async for line in upstream.aiter_lines():
+                async def all_events():
+                    for event in prefix:
+                        yield event
+                    async for event in events:
+                        yield event
+                async for event in all_events():
                     if await request.is_disconnected():
                         raise asyncio.CancelledError
-                    stripped = line.strip()
-                    if not stripped:
-                        continue
-                    chunk = (line + "\n\n").encode()
-                    if stripped == "data: [DONE]":
-                        saw_done = True
-                        chunks.append(chunk)
-                        yield chunk
+                    done = track(event)
+                    if done and not saw_finish:
+                        saw_done = False
+                        emitted_error = True
+                        yield _stream_error("Upstream stream ended without a finish reason", "upstream_truncated", request_id)
                         break
-                    if stripped.startswith("data: "):
-                        try:
-                            payload = json.loads(stripped[6:])
-                            choices = payload.get("choices") or []
-                            if choices and choices[0].get("finish_reason") is not None:
-                                saw_finish = True
-                                saw_length = choices[0].get("finish_reason") == "length"
-                            if isinstance(payload.get("usage"), dict):
-                                usage.update(payload["usage"])
-                        except (json.JSONDecodeError, AttributeError, TypeError):
-                            pass
-                    chunks.append(chunk)
-                    yield chunk
+                    remember(event)
+                    yield event
+                    if done:
+                        break
             if not saw_done or not saw_finish:
-                _log_outcome(_prompt_hash(prompt), "truncated", request_id=request_id, model=backend["model"], abrupt_eof=True)
-                yield _stream_error("Upstream stream ended before completion", "upstream_truncated", request_id)
+                _log_outcome(_prompt_hash(prompt), "truncated", request_id=request_id,
+                             decision_occurrence_id=occurrence_id, model=backend["model"], abrupt_eof=True)
+                if not saw_done and not emitted_error:
+                    yield _stream_error("Upstream stream ended before completion", "upstream_truncated", request_id)
             elif saw_length:
-                _log_outcome(_prompt_hash(prompt), "truncated", request_id=request_id, model=backend["model"])
-            else:
-                _cache_put(cache_key, body, b"".join(chunks))
+                _log_outcome(_prompt_hash(prompt), "truncated", request_id=request_id,
+                             decision_occurrence_id=occurrence_id, model=backend["model"])
+            elif cache_parts is not None:
+                content = b"".join(cache_parts)
+                _cache_put(cache_key, body, content)
         except asyncio.CancelledError:
-            _log_outcome(_prompt_hash(prompt), "disconnected", request_id=request_id, model=backend["model"])
+            _log_outcome(_prompt_hash(prompt), "disconnected", request_id=request_id,
+                         decision_occurrence_id=occurrence_id, model=backend["model"])
             raise
-        except (httpx.TransportError, TimeoutError, asyncio.TimeoutError):
-            _log_outcome(_prompt_hash(prompt), "upstream_error", request_id=request_id, model=backend["model"])
+        except (httpx.TransportError, TimeoutError, asyncio.TimeoutError, ValueError):
+            _log_outcome(_prompt_hash(prompt), "upstream_error", request_id=request_id,
+                         decision_occurrence_id=occurrence_id, model=backend["model"])
             yield _stream_error("Upstream stream failed", "upstream_transport_error", request_id)
         finally:
             await upstream.aclose()
             _log(selected, score, backend["model"], prompt, int((time.monotonic() - started) * 1000),
                  supra_complexity, supra_ms, usage=usage or None, request_id=request_id,
+                 occurrence_id=occurrence_id, record_type="decision",
                  attempts=len(attempts), completed=saw_done and saw_finish)
+            result = None
+            if cache_parts is not None and saw_done and saw_finish:
+                content = b"".join(cache_parts)
+                if _response_replay_safe(body, content):
+                    result = (content, 200, "text/event-stream", headers)
+            await _finish_inflight(cache_key, inflight, result)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream", headers=headers)
+
 
 def _bind_is_loopback(host: str) -> bool:
     return host in {"127.0.0.1", "::1", "localhost"}
