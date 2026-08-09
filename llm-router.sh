@@ -21,6 +21,8 @@ if [ ! -d "$REPO_DIR" ]; then
   exit 1
 fi
 cd "$REPO_DIR"
+# shellcheck source=endpoint-profile.sh
+. "$REPO_DIR/endpoint-profile.sh"
 
 # Ensure system CLIs (lsof, security) are found under launchd's minimal PATH
 # as well as an interactive shell.
@@ -59,6 +61,9 @@ export CHEAP_KEY="${CHEAP_KEY:-${OPENCODE_API_KEY:-}}"
 export CHEAP_MODEL="${CHEAP_MODEL:-deepseek-v4-flash}"
 export CHEAP_REASONING_EFFORT="${CHEAP_REASONING_EFFORT:-}"
 export CHEAP_MAX_TOKENS="${CHEAP_MAX_TOKENS:-131072}"
+# Preserve direct-provider credentials unless a gateway endpoint/profile is selected.
+# Base-host auto-detection keeps existing Cloudflare gateway configurations working.
+router_select_endpoint_keys
 if [ -z "$EXPENSIVE_KEY" ]; then
   echo 'ERROR: EXPENSIVE_KEY or OPENROUTER_API_KEY required for the expensive backend.' >&2
   exit 1

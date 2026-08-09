@@ -23,6 +23,19 @@ Required provider configuration is `EXPENSIVE_BASE`, `EXPENSIVE_KEY`,
 `EXPENSIVE_MODEL`, `CHEAP_BASE`, `CHEAP_KEY`, and `CHEAP_MODEL`.
 `OPENAI_API_KEY` is required by MF scoring. See `server.py` for optional limits.
 
+### Endpoint credential profiles
+
+The launcher keeps provider keys for direct provider URLs. If either base URL's
+parsed host is `unified-ai-gateway.siddsantham.workers.dev`, it automatically
+uses `AI_GATEWAY_API_KEY` (or `MANTIS_GATEWAY_API_KEY`) for that backend. It
+fails closed when the gateway token is absent. URL hosts are parsed and
+compared without displaying credentials.
+
+Set `ROUTELLM_ENDPOINT_PROFILE=direct` or `cloudflare` to override base-host
+auto-detection for both backends. The legacy `ROUTELLM_GATEWAY_MODE=1` also
+selects the Cloudflare profile when no explicit profile is set. Direct bases
+continue to use `EXPENSIVE_KEY` and `CHEAP_KEY`.
+
 ## Behavior
 
 - Request JSON and supported Chat Completions field types are validated.
