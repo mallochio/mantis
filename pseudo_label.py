@@ -37,6 +37,20 @@ API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY
 
 # Prompts may be very long; the tail usually carries the current intent.
 DEFAULT_MAX_PROMPT_CHARS = 4_000
+DOMAINS = {"Programming", "Communication", "Math", "Science", "Creative", "General", "Business"}
+LABEL_SCHEMA = {
+    "name": "router_label", "strict": True,
+    "schema": {"type": "object", "additionalProperties": False,
+        "required": ["domain", "complexity", "coding_task", "math_task", "reasoning", "route", "analysis"],
+        "properties": {
+            "domain": {"type": "string", "enum": sorted(DOMAINS)},
+            "complexity": {"type": "integer", "minimum": 1, "maximum": 5},
+            "coding_task": {"type": "boolean"}, "math_task": {"type": "boolean"},
+            "reasoning": {"type": "boolean"},
+            "route": {"type": "string", "enum": ["small model", "big model"]},
+            "analysis": {"type": "string", "maxLength": 300},
+        }},
+}
 
 # Classification prompt shared across all calls. We ask for JSON plus a free-form
 # `analysis` string that mirrors the format Supra-Router-51M was trained on.
@@ -179,6 +193,7 @@ def classify_one(
         "messages": build_openai_messages(prompt),
         "temperature": 0,
         "max_tokens": 256,
+        "response_format": {"type": "json_schema", "json_schema": LABEL_SCHEMA},
     }
 
     last_error: Exception | None = None
@@ -207,7 +222,9 @@ def classify_one(
 
 def normalize_label(parsed: dict[str, Any]) -> dict[str, Any]:
     """Sanitize model output into a consistent schema."""
-    domain = str(parsed.get("domain", "General")).strip() or "General"
+    domain = str(parsed.get("domain", "General")).strip()
+    if domain not in DOMAINS:
+        domain = "General"
     complexity = parsed.get("complexity")
     try:
         complexity = max(1, min(5, int(complexity)))
@@ -239,7 +256,7 @@ def normalize_label(parsed: dict[str, Any]) -> dict[str, Any]:
         "math_task": math_task,
         "reasoning": reasoning,
         "route": route,
-        "analysis": str(parsed.get("analysis", "")).strip(),
+        "analysis": " ".join(str(parsed.get("analysis", "")).split())[:300],
     }
 
 
@@ -270,10 +287,17 @@ def _ensure_0600(path: Path) -> None:
 
 
 def save_state(state_path: Path, hashes: set[str]) -> None:
-    _ensure_0600(state_path)
-    with state_path.open("w") as f:
-        for h in sorted(hashes):
-            f.write(f"{h}\n")
+    """Atomically checkpoint only records already fsynced to both outputs."""
+    state_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    tmp = state_path.with_name(state_path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        for value in sorted(hashes):
+            handle.write(f"{value}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, state_path)
+    state_path.chmod(0o600)
 
 
 def write_batch(
@@ -289,6 +313,10 @@ def write_batch(
         for item in batch:
             jf.write(json.dumps(item["record"]) + "\n")
             sf.write(json.dumps(item["supra"]) + "\n")
+        jf.flush()
+        sf.flush()
+        os.fsync(jf.fileno())
+        os.fsync(sf.fileno())
 
 
 def build_records(item, parsed, model, elapsed_ms, raw="") -> tuple[dict, dict]:
@@ -361,6 +389,7 @@ def run_batch(
                 "messages": build_openai_messages(truncate_prompt(item["prompt"], DEFAULT_MAX_PROMPT_CHARS)),
                 "temperature": 0,
                 "max_tokens": 256,
+                "response_format": {"type": "json_schema", "json_schema": LABEL_SCHEMA},
             },
         }
         for item in rows
@@ -480,7 +509,7 @@ def main() -> None:
     parser.add_argument(
         "--batch",
         action="store_true",
-        help="Label via OpenRouter's inline batch API (~50% cost, async)",
+        help="Label via OpenRouter's inline batch API (~50%% cost, async)",
     )
     parser.add_argument(
         "--workers",
@@ -534,14 +563,11 @@ def main() -> None:
 
     stats = {"ok": 0, "errors": 0, "prompt_tokens": 0, "completion_tokens": 0}
     latencies: list[int] = []
-    new_hashes: set[str] = set()
     batch: list[dict[str, Any]] = []
     batch_size = 10
 
     def process_one(item: dict[str, Any]) -> dict[str, Any] | None:
         out = process(item, args.model, args.max_chars, args.delay)
-        if out is not None:
-            new_hashes.add(out["hash"])
         return out
 
     if args.workers > 1:
@@ -564,10 +590,9 @@ def main() -> None:
                 batch.append({"record": out["record"], "supra": out["supra"], "hash": out["hash"]})
                 if len(batch) >= batch_size:
                     write_batch(output_path, supra_output_path, batch)
-                    state.update(new_hashes)
+                    state.update(entry["hash"] for entry in batch)
                     save_state(state_path, state)
                     batch.clear()
-                    new_hashes.clear()
     else:
         for item in rows:
             out = process_one(item)
@@ -581,14 +606,13 @@ def main() -> None:
             batch.append({"record": out["record"], "supra": out["supra"], "hash": out["hash"]})
             if len(batch) >= batch_size:
                 write_batch(output_path, supra_output_path, batch)
-                state.update(new_hashes)
+                state.update(entry["hash"] for entry in batch)
                 save_state(state_path, state)
                 batch.clear()
-                new_hashes.clear()
 
     if batch:
         write_batch(output_path, supra_output_path, batch)
-        state.update(new_hashes)
+        state.update(entry["hash"] for entry in batch)
         save_state(state_path, state)
 
     print("\nDone.")

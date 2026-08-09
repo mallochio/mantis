@@ -46,16 +46,23 @@ def band_of(score: float) -> str:
 
 
 def evaluate(decisions: list[dict], outcomes: list[dict], labels: list[dict]) -> dict:
-    # outcome failures per prompt_hash (the decision that failed)
-    failed: set[str] = set()
-    for o in outcomes:
-        if o.get("outcome") in FAILURES:
-            failed.add(o.get("prompt_hash", ""))
+    # Modern rows join one outcome occurrence to one routed request. Legacy rows
+    # without IDs retain the old prompt-hash join for backward compatibility.
+    failed_ids: set[str] = set()
+    legacy_failed_hashes: set[str] = set()
+    for outcome in outcomes:
+        if outcome.get("outcome") not in FAILURES:
+            continue
+        occurrence = outcome.get("related_request_id") or outcome.get("request_id") or outcome.get("decision_occurrence_id")
+        if occurrence:
+            failed_ids.add(str(occurrence))
+        elif outcome.get("prompt_hash"):
+            legacy_failed_hashes.add(str(outcome["prompt_hash"]))
 
     lab = {}
-    for l in labels:
-        if "domain" in l and l.get("prompt"):
-            lab[l["prompt"].strip()] = "expensive" if l.get("route") == "big model" else "cheap"
+    for label in labels:
+        if "domain" in label and label.get("prompt"):
+            lab[label["prompt"].strip()] = "expensive" if label.get("route") == "big model" else "cheap"
 
     cells = {d: {b: [0, 0] for b, _, _ in BANDS} for d in ("cheap", "expensive")}
     lab_cells = {d: {r: [0, 0] for r in ("cheap", "expensive")} for d in ("cheap", "expensive")}
@@ -67,12 +74,14 @@ def evaluate(decisions: list[dict], outcomes: list[dict], labels: list[dict]) ->
         if d not in cells:
             continue
         cells[d][band_of(score)][0] += 1
-        if r.get("prompt_hash") in failed:
+        row_id = r.get("request_id") or r.get("occurrence_id")
+        is_failed = (str(row_id) in failed_ids if row_id else r.get("prompt_hash") in legacy_failed_hashes)
+        if is_failed:
             cells[d][band_of(score)][1] += 1
         lr = lab.get(str(r.get("prompt", "")).strip())
         if lr:
             lab_cells[d][lr][0] += 1
-            if r.get("prompt_hash") in failed:
+            if is_failed:
                 lab_cells[d][lr][1] += 1
     return {"cells": cells, "lab_cells": lab_cells}
 

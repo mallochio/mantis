@@ -78,22 +78,27 @@ export ROUTELLM_USE_SUPRA="${ROUTELLM_USE_SUPRA:-1}"
 export ROUTELLM_KEY="${ROUTELLM_KEY:-sk-route-local}"
 export ROUTELLM_HOST="${ROUTELLM_HOST:-127.0.0.1}"
 export ROUTELLM_PORT="${ROUTELLM_PORT:-5500}"
+if [ "$ROUTELLM_HOST" != "127.0.0.1" ] && [ "$ROUTELLM_HOST" != "::1" ] && [ "$ROUTELLM_HOST" != "localhost" ]; then
+  if [ -z "${ROUTELLM_KEY:-}" ] || [ "$ROUTELLM_KEY" = "sk-route-local" ]; then
+    echo 'ERROR: non-loopback binding requires an externally supplied, non-default ROUTELLM_KEY.' >&2
+    exit 1
+  fi
+fi
 
 # If the router is already listening, stop it so we start a clean instance.
 # The router is owned here and restarted to pick up config/env changes.
 if lsof -nP -iTCP:"$ROUTELLM_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   echo "router already running on :$ROUTELLM_PORT — stopping for restart"
-  # Trust the recorded pid only if it still owns the port; otherwise take the
-  # current listener so a stale/reused pid file can't kill the wrong process.
+  # Refuse to kill a listener unless the recorded PID owns this port and its
+  # command is this checkout's server. A stale PID file must fail closed.
   ROUTER_PID=""
-  if [ -f "$ROUTER_LOG_DIR/server.pid" ]; then
-    CANDIDATE=$(cat "$ROUTER_LOG_DIR/server.pid" 2>/dev/null || true)
-    if [ -n "${CANDIDATE:-}" ] && lsof -nP -iTCP:"$ROUTELLM_PORT" -sTCP:LISTEN -t 2>/dev/null | grep -qx "$CANDIDATE"; then
-      ROUTER_PID="$CANDIDATE"
-    fi
-  fi
-  if [ -z "${ROUTER_PID:-}" ]; then
-    ROUTER_PID=$(lsof -nP -iTCP:"$ROUTELLM_PORT" -sTCP:LISTEN -t 2>/dev/null | head -n1 || true)
+  CANDIDATE=$(cat "$ROUTER_LOG_DIR/server.pid" 2>/dev/null || true)
+  if [ -n "${CANDIDATE:-}" ]      && lsof -nP -iTCP:"$ROUTELLM_PORT" -sTCP:LISTEN -t 2>/dev/null | grep -qx "$CANDIDATE"      && [ "$(lsof -a -p "$CANDIDATE" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')" = "$REPO_DIR" ] \
+     && ps -p "$CANDIDATE" -o command= 2>/dev/null | grep -Fq -- "server.py"; then
+    ROUTER_PID="$CANDIDATE"
+  else
+    echo "ERROR: port $ROUTELLM_PORT is owned by an unverified process; refusing to kill it" >&2
+    exit 1
   fi
   if [ -n "${ROUTER_PID:-}" ]; then
     kill "$ROUTER_PID" 2>/dev/null || true

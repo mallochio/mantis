@@ -26,7 +26,10 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import time
+import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
@@ -63,11 +66,10 @@ CHEAP = {
     "max_tokens": int(os.environ.get("CHEAP_MAX_TOKENS", str(ROUTELLM_MAX_TOKENS))),
 }
 
-# Shared connection pool: reuse TCP/TLS to upstream providers instead of
-# handshaking per request (sync Client is thread-safe). A total timeout bounds
-# stalled upstreams so a hung provider cannot pin the router forever.
+# One async pool is created and closed by the ASGI lifespan.
 TIMEOUT_S = float(os.environ.get("ROUTELLM_TIMEOUT_S", "600"))
-_client = httpx.Client(timeout=httpx.Timeout(TIMEOUT_S, connect=10.0))
+_client: httpx.AsyncClient | None = None
+RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 # Reject oversized bodies before they are buffered into memory (413).
 MAX_BODY_BYTES = int(os.environ.get("ROUTELLM_MAX_BODY_BYTES", str(50 * 1024 * 1024)))
@@ -88,7 +90,8 @@ RETRY_WINDOW_S = float(os.environ.get("ROUTELLM_RETRY_WINDOW_S", "900"))
 # Aug 5-8 log, labeler called them cheap). Force cheap unless MF is very sure.
 SHORT_PROMPT_MAX_CHARS = int(os.environ.get("ROUTELLM_SHORT_PROMPT_MAX_CHARS", "120"))
 SHORT_PROMPT_FORCE_CHEAP_SCORE = float(os.environ.get("ROUTELLM_SHORT_PROMPT_SCORE", "0.25"))
-LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+LOG_PATH.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+LOG_PATH.parent.chmod(0o700)
 if TRAINING_LOG_ENABLED:
     TRAINING_LOG_PATH.touch(mode=0o600, exist_ok=True)
     TRAINING_LOG_PATH.chmod(0o600)
@@ -96,53 +99,45 @@ if TRAINING_LOG_ENABLED:
 _cached_context_window = None
 
 
-def _fetch_model_context_length(base: str, key: str, model_id: str) -> int | None:
+async def _fetch_model_context_length(base: str, key: str, model_id: str) -> int | None:
+    """Discover capability without blocking the event loop."""
+    if _client is None:
+        return None
     try:
-        if "openrouter.ai" in base:
-            url = "https://openrouter.ai/api/v1/models"
-            resp = httpx.get(url, timeout=5.0)
-            if resp.status_code == 200:
-                for item in resp.json().get("data", []):
-                    if item.get("id") == model_id:
-                        return item.get("context_length")
-        else:
-            url = base.rstrip("/") + "/models"
-            headers = {"Authorization": f"Bearer {key}"} if key else {}
-            resp = httpx.get(url, headers=headers, timeout=5.0)
-            if resp.status_code == 200:
-                for item in resp.json().get("data", []):
-                    if item.get("id") == model_id or item.get("model_name") == model_id:
-                        return item.get("context_window") or item.get("context_length")
-    except Exception:
-        pass
+        url = ("https://openrouter.ai/api/v1/models" if "openrouter.ai" in base
+               else base.rstrip("/") + "/models")
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
+        resp = await _client.get(url, headers=headers, timeout=5.0)
+        if resp.status_code != 200:
+            return None
+        for item in resp.json().get("data", []):
+            item_id = item.get("id") or item.get("model_name")
+            # Providers can return either a bare name or provider/name.
+            if item_id == model_id or str(item_id).rsplit("/", 1)[-1] == model_id.rsplit("/", 1)[-1]:
+                value = item.get("context_window") or item.get("context_length")
+                if isinstance(value, int) and value > 0:
+                    return value
+    except (httpx.HTTPError, ValueError, TypeError):
+        return None
     return None
 
 
-def _get_context_window() -> int:
+async def _get_context_window() -> int:
     global _cached_context_window
     if _cached_context_window is not None:
         return _cached_context_window
-
     env_val = os.environ.get("ROUTELLM_CONTEXT_WINDOW")
     if env_val and env_val.isdigit() and int(env_val) > 0:
         _cached_context_window = int(env_val)
         return _cached_context_window
-
-    ctx_exp = _fetch_model_context_length(EXPENSIVE["base"], EXPENSIVE["key"], EXPENSIVE["model"])
-    ctx_cheap = _fetch_model_context_length(CHEAP["base"], CHEAP["key"], CHEAP["model"])
-
-    valid = [c for c in (ctx_exp, ctx_cheap) if isinstance(c, int) and c > 0]
-    if valid:
-        _cached_context_window = min(valid)
-        return _cached_context_window
-
-    _cached_context_window = 1000000
-    print(
-        "WARNING: could not determine context window from model lists; "
-        "falling back to 1000000. Set ROUTELLM_CONTEXT_WINDOW to override.",
-        flush=True,
+    values = await asyncio.gather(
+        _fetch_model_context_length(EXPENSIVE["base"], EXPENSIVE["key"], EXPENSIVE["model"]),
+        _fetch_model_context_length(CHEAP["base"], CHEAP["key"], CHEAP["model"]),
     )
+    valid = [value for value in values if isinstance(value, int) and value > 0]
+    _cached_context_window = min(valid) if valid else 1_000_000
     return _cached_context_window
+
 
 _router = None  # lazy global
 
@@ -306,12 +301,6 @@ def _is_refusal(status: int, data: dict) -> bool:
     return bool(_REFUSAL_RE.search(s))
 
 
-def _do_post(backend: dict, out_body: dict):
-    url = backend["base"].rstrip("/") + "/chat/completions"
-    headers = {"Authorization": f"Bearer {backend['key']}", "Content-Type": "application/json"}
-    return _client.post(url, json=out_body, headers=headers)
-
-
 def _build_outgoing_body(body: dict, backend: dict) -> dict:
     out_body = dict(body)
     if isinstance(out_body.get("messages"), list):
@@ -322,7 +311,7 @@ def _build_outgoing_body(body: dict, backend: dict) -> dict:
     if isinstance(out_body.get("max_completion_tokens"), int) and backend.get("max_tokens"):
         out_body["max_completion_tokens"] = min(out_body["max_completion_tokens"], backend["max_tokens"])
     out_body.pop("stop", None)
-    if backend["model"].startswith("gpt-5.6-") and out_body.get("temperature") not in (None, 1):
+    if backend["model"].rsplit("/", 1)[-1].startswith("gpt-5.6-") and out_body.get("temperature") not in (None, 1):
         out_body.pop("temperature")
     if backend["effort"]:
         out_body["reasoning_effort"] = backend["effort"]
@@ -355,93 +344,122 @@ def _authorize(authorization: str | None) -> bool:
         return False
     if not authorization.startswith("Bearer "):
         return False
-    return authorization[7:] == SERVER_KEY
+    return secrets.compare_digest(authorization[7:].encode(), SERVER_KEY.encode())
+
+
+def _secure_append(path: Path, row: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        path.parent.chmod(0o700)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        path.chmod(0o600)
+    except OSError:
+        # Telemetry must never fail a user request.
+        return
 
 
 def _log(
-    decision: str,
-    score: float,
-    backend_model: str,
-    prompt: str,
-    ttfb_ms: int | None,
-    supra_complexity: int | None = None,
-    supra_ms: int | None = None,
-    cost_usd: float | None = None,
-    usage: dict | None = None,
+    decision: str, score: float, backend_model: str, prompt: str,
+    ttfb_ms: int | None, supra_complexity: int | None = None,
+    supra_ms: int | None = None, cost_usd: float | None = None,
+    usage: dict | None = None, request_id: str | None = None,
+    occurrence_id: str | None = None, **detail,
 ):
     row = {
-        "ts": time.time(),
-        "router": ROUTER_NAME,
-        "threshold": THRESHOLD,
-        "score": round(score, 4),
-        "supra_complexity": supra_complexity,
-        "supra_ms": supra_ms,
-        "decision": decision,
-        "model": backend_model,
-        "ttfb_ms": ttfb_ms,
-        "prompt": prompt[:200],
-        "prompt_hash": _prompt_hash(prompt),
+        "ts": time.time(), "request_id": request_id,
+        "occurrence_id": occurrence_id or uuid.uuid4().hex,
+        "router": ROUTER_NAME, "threshold": THRESHOLD, "score": round(score, 4),
+        "supra_complexity": supra_complexity, "supra_ms": supra_ms,
+        "decision": decision, "model": backend_model, "ttfb_ms": ttfb_ms,
+        "prompt_hash": _prompt_hash(prompt), **detail,
     }
     if cost_usd is not None:
         row["cost_usd"] = cost_usd
     if usage:
         row["usage"] = usage
-    with LOG_PATH.open("a") as f:
-        f.write(json.dumps(row) + "\n")
+    _secure_append(LOG_PATH, row)
     if TRAINING_LOG_ENABLED:
-        row["prompt"] = prompt
-        with TRAINING_LOG_PATH.open("a") as f:
-            f.write(json.dumps(row) + "\n")
+        _secure_append(TRAINING_LOG_PATH, {**row, "prompt": prompt})
 
 
 def _prompt_hash(prompt: str) -> str:
-    return hashlib.sha1(prompt.encode("utf-8", errors="replace")).hexdigest()[:16]
+    return hashlib.sha256(prompt.encode("utf-8", errors="replace")).hexdigest()[:24]
 
 
 def _log_outcome(prompt_hash: str, outcome: str, **detail) -> None:
-    """Outcome feedback for retraining, joined to decisions via prompt_hash."""
-    row = {"ts": time.time(), "prompt_hash": prompt_hash, "outcome": outcome, **detail}
-    try:
-        OUTCOME_LOG_PATH.touch(mode=0o600, exist_ok=True)
-        OUTCOME_LOG_PATH.chmod(0o600)
-        with OUTCOME_LOG_PATH.open("a") as f:
-            f.write(json.dumps(row) + "\n")
-    except Exception:
-        pass
+    row = {
+        "ts": time.time(), "occurrence_id": uuid.uuid4().hex,
+        "prompt_hash": prompt_hash, "outcome": outcome, **detail,
+    }
+    _secure_append(OUTCOME_LOG_PATH, row)
 
 
-_recent_prompts: dict[str, tuple[str, str, float]] = {}  # request_hash -> (decision, model, ts)
+_recent_prompts: dict[str, tuple[str, str, float, str]] = {}
 
-# ---- response cache: identical resends (timeout retries) served without
-# hitting upstream. Keyed on the full request body so agent-loop iterations
-# (which append tool results) never match. ----
 RESP_CACHE_TTL_S = float(os.environ.get("ROUTELLM_RESP_CACHE_TTL_S", "120"))
-_RESP_CACHE_MAX = 512
-_resp_cache: dict[str, tuple[float, list[bytes]]] = {}  # body hash -> (ts, chunks)
+RESP_CACHE_MAX_ENTRIES = int(os.environ.get("ROUTELLM_RESP_CACHE_MAX_ENTRIES", "128"))
+RESP_CACHE_MAX_BYTES = int(os.environ.get("ROUTELLM_RESP_CACHE_MAX_BYTES", str(8 * 1024 * 1024)))
+_resp_cache: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
+_cache_bytes = 0
+_cache_metrics = {"hits": 0, "misses": 0, "stores": 0, "evictions": 0}
 
 
 def _request_body_hash(body: dict) -> str:
-    return hashlib.sha1(
-        json.dumps(body, sort_keys=True, ensure_ascii=False, default=str).encode()
-    ).hexdigest()[:16]
+    return hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
 
 
-def _cache_get(req_hash: str) -> list[bytes] | None:
-    hit = _resp_cache.get(req_hash)
-    if not hit:
+def _cache_key(body: dict, idempotency_key: str | None) -> str | None:
+    if not idempotency_key or len(idempotency_key) > 200:
         return None
-    ts, chunks = hit
-    if time.time() - ts > RESP_CACHE_TTL_S:
-        _resp_cache.pop(req_hash, None)
+    # Tool traffic can have external side effects and is never replay-safe.
+    if body.get("tools") or any(isinstance(m, dict) and m.get("role") == "tool" for m in body.get("messages", [])):
         return None
-    return chunks
+    return hashlib.sha256((idempotency_key + ":" + _request_body_hash(body)).encode()).hexdigest()
 
 
-def _cache_put(req_hash: str, chunks: list[bytes]) -> None:
-    if len(_resp_cache) >= _RESP_CACHE_MAX:
-        oldest = min(_resp_cache, key=lambda k: _resp_cache[k][0])
-        _resp_cache.pop(oldest, None)
-    _resp_cache[req_hash] = (time.time(), chunks)
+def _cache_get(key: str | None) -> bytes | None:
+    global _cache_bytes
+    if key is None:
+        return None
+    hit = _resp_cache.get(key)
+    if hit is None:
+        _cache_metrics["misses"] += 1
+        return None
+    ts, content = hit
+    if time.monotonic() - ts > RESP_CACHE_TTL_S:
+        _cache_bytes -= len(content)
+        del _resp_cache[key]
+        _cache_metrics["misses"] += 1
+        return None
+    _resp_cache.move_to_end(key)
+    _cache_metrics["hits"] += 1
+    return content
+
+
+def _response_replay_safe(body: dict, content: bytes) -> bool:
+    if body.get("stream"):
+        return content.rstrip().endswith(b"data: [DONE]") and b'"tool_calls"' not in content
+    data = _safe_json(content)
+    choices = data.get("choices") or []
+    return (bool(choices) and not _is_refusal(200, data)
+            and all(choice.get("finish_reason") != "content_filter"
+                    and not (choice.get("message") or {}).get("tool_calls") for choice in choices))
+
+
+def _cache_put(key: str | None, body: dict, content: bytes) -> None:
+    global _cache_bytes
+    if key is None or len(content) > RESP_CACHE_MAX_BYTES or not _response_replay_safe(body, content):
+        return
+    while _resp_cache and (len(_resp_cache) >= RESP_CACHE_MAX_ENTRIES or _cache_bytes + len(content) > RESP_CACHE_MAX_BYTES):
+        _, (_, old) = _resp_cache.popitem(last=False)
+        _cache_bytes -= len(old)
+        _cache_metrics["evictions"] += 1
+    if _cache_bytes + len(content) <= RESP_CACHE_MAX_BYTES:
+        _resp_cache[key] = (time.monotonic(), content)
+        _cache_bytes += len(content)
+        _cache_metrics["stores"] += 1
 
 
 def _request_hash(body: dict) -> str:
@@ -454,16 +472,17 @@ def _request_hash(body: dict) -> str:
     ).hexdigest()[:16]
 
 
-def _record_and_detect_retry(req_hash: str, decision: str, model: str, prompt_hash: str) -> None:
+def _record_and_detect_retry(req_hash: str, decision: str, model: str, prompt_hash: str, request_id: str) -> None:
     now = time.time()
-    for k, (_, _, ts) in list(_recent_prompts.items()):
-        if now - ts > RETRY_WINDOW_S:
-            del _recent_prompts[k]
+    for key, value in list(_recent_prompts.items()):
+        if now - value[2] > RETRY_WINDOW_S:
+            del _recent_prompts[key]
     prev = _recent_prompts.pop(req_hash, None)
     if prev and now - prev[2] <= RETRY_WINDOW_S:
         _log_outcome(prompt_hash, "retried", decision=prev[0], model=prev[1],
-                     request_hash=req_hash, retry_after_s=round(now - prev[2], 1))
-    _recent_prompts[req_hash] = (decision, model, now)
+                     request_hash=req_hash, request_id=request_id,
+                     related_request_id=prev[3], retry_after_s=round(now - prev[2], 1))
+    _recent_prompts[req_hash] = (decision, model, now, request_id)
 
 
 def _length_truncated(data: dict) -> bool:
@@ -476,31 +495,37 @@ _READY = False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Load both scoring models before serving so the first request is fast and
-    # load failures (missing OPENAI_API_KEY, HF unreachable) fail startup
-    # instead of silently degrading routing mid-request.
+    global _READY, _client
+    _client = httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT_S, connect=min(10.0, TIMEOUT_S)))
     try:
-        _load_router()
+        # Model initialization is CPU/blocking work and must not block the loop.
+        await asyncio.to_thread(_load_router)
         if SUPRA_ENABLED:
-            _load_supra()
-    finally:
-        global _READY
+            await asyncio.to_thread(_load_supra)
         _READY = True
-    yield
-    _client.close()
+        yield
+    finally:
+        _READY = False
+        if _client is not None:
+            await _client.aclose()
+        _client = None
 
 
 app = FastAPI(title="RouteLLM coding-router", lifespan=lifespan)
+
+
+def _openai_error(message: str, status: int, *, error_type: str = "invalid_request_error", param=None, code=None):
+    return JSONResponse(
+        {"error": {"message": message, "type": error_type, "param": param, "code": code}},
+        status_code=status,
+    )
 
 
 @app.middleware("http")
 async def _body_limit(request: Request, call_next):
     length = request.headers.get("content-length")
     if _body_too_large(length):
-        return JSONResponse(
-            {"error": {"message": "request body too large", "type": "request_too_large"}},
-            status_code=413,
-        )
+        return _openai_error("Request body is too large", 413, code="request_too_large")
     return await call_next(request)
 
 
@@ -508,197 +533,256 @@ def _body_too_large(content_length: str | None) -> bool:
     return bool(content_length and content_length.isdigit() and int(content_length) > MAX_BODY_BYTES)
 
 
+async def _read_json_body(request: Request) -> dict:
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > MAX_BODY_BYTES:
+            raise OverflowError
+        chunks.append(chunk)
+    try:
+        data = json.loads(b"".join(chunks))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError("Invalid JSON body") from exc
+    if not isinstance(data, dict):
+        raise ValueError("Request body must be a JSON object")
+    return data
+
+
+def _validate_request(body: dict) -> tuple[str, str | None] | None:
+    if body.get("model") != MODEL_ID:
+        return "Only model 'auto' is supported", "model"
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return "'messages' must be a non-empty array", "messages"
+    roles = {"system", "developer", "user", "assistant", "tool", "function"}
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") not in roles:
+            return "Each message must contain a supported role", f"messages.{index}.role"
+        content = message.get("content")
+        if content is not None and not isinstance(content, (str, list)):
+            return "Message content must be text, an array, or null", f"messages.{index}.content"
+    checks = {
+        "stream": bool, "temperature": (int, float), "top_p": (int, float),
+        "n": int, "max_tokens": int, "max_completion_tokens": int,
+        "presence_penalty": (int, float), "frequency_penalty": (int, float),
+        "tools": list, "tool_choice": (str, dict), "response_format": dict,
+        "stream_options": dict, "seed": int, "stop": (str, list),
+    }
+    for name, expected in checks.items():
+        if name in body and (isinstance(body[name], bool) and expected is not bool or not isinstance(body[name], expected)):
+            return f"'{name}' has an invalid type", name
+    for name in ("n", "max_tokens", "max_completion_tokens"):
+        if name in body and body[name] <= 0:
+            return f"'{name}' must be greater than zero", name
+    # Unknown keys are intentionally preserved as reviewed provider extensions.
+    return None
+
+
+def _route_headers(decision, score, backend, request_id, supra_complexity, supra_ms):
+    headers = {
+        "x-request-id": request_id, "x-route-decision": decision,
+        "x-route-score": f"{score:.4f}", "x-route-model": backend["model"],
+        "x-route-router": ROUTER_NAME, "x-route-fallback": "false",
+        "x-route-attempts": "1",
+    }
+    if supra_complexity is not None:
+        headers["x-route-supra-complexity"] = str(supra_complexity)
+    if supra_ms is not None:
+        headers["x-route-supra-ms"] = str(supra_ms)
+    return headers
+
+
+def _upstream_request(backend: dict, body: dict) -> httpx.Request:
+    assert _client is not None
+    return _client.build_request(
+        "POST", backend["base"].rstrip("/") + "/chat/completions",
+        json=_build_outgoing_body(body, backend),
+        headers={"Authorization": f"Bearer {backend['key']}", "Content-Type": "application/json"},
+    )
+
+
+async def _send(backend: dict, body: dict, *, stream: bool) -> httpx.Response:
+    if _client is None:
+        raise RuntimeError("router is not ready")
+    return await _client.send(_upstream_request(backend, body), stream=stream)
+
+
+def _retryable(status: int) -> bool:
+    return status in RETRY_STATUSES
+
+
+async def _open_with_failover(body: dict, decision: str, deadline: float, *, stream: bool):
+    attempts = []
+    routes = (decision, "cheap" if decision == "expensive" else "expensive")
+    for index, current in enumerate(routes):
+        backend = _backend_for(current)
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            async with asyncio.timeout(remaining):
+                response = await _send(backend, body, stream=stream)
+            attempts.append((current, backend, response.status_code, None))
+            if response.status_code == 200 or not _retryable(response.status_code) or index == len(routes) - 1:
+                return current, backend, response, attempts
+            await response.aclose()
+        except (httpx.TransportError, TimeoutError, asyncio.TimeoutError) as exc:
+            attempts.append((current, backend, None, type(exc).__name__))
+    return attempts[-1][0], attempts[-1][1], None, attempts
+
+
 @app.get("/healthz")
 async def healthz():
     return {"ok": _READY, "router": ROUTER_NAME, "threshold": THRESHOLD,
-            "backend": "direct", "ready": _READY}
+            "backend": "direct", "ready": _READY, "cache": {**_cache_metrics, "entries": len(_resp_cache), "bytes": _cache_bytes}}
 
 
 @app.get("/v1/models")
 async def list_models():
     return {"object": "list", "data": [{
         "id": MODEL_ID, "object": "model", "owned_by": "routellm",
-        "context_window": _get_context_window(), "max_tokens": ROUTELLM_MAX_TOKENS,
+        "context_window": await _get_context_window(), "max_tokens": ROUTELLM_MAX_TOKENS,
     }]}
 
 
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request, authorization: str | None = Header(default=None)):
-    if not _authorize(authorization):
-        return JSONResponse({"error": {"message": "Invalid API key", "type": "auth_error"}}, status_code=401)
+def _stream_error(message: str, code: str, request_id: str) -> bytes:
+    return ("data: " + json.dumps({"error": {"message": message, "type": "upstream_error", "code": code},
+                                   "request_id": request_id}) + "\n\n").encode()
 
-    body = await request.json()
-    cache_key = _request_body_hash(body)
-    cached_chunks = _cache_get(cache_key)
-    if cached_chunks is not None:
-        if bool(body.get("stream")):
-            return StreamingResponse(iter(cached_chunks), media_type="text/event-stream",
-                                     headers={"x-route-cache": "hit"})
-        return Response(content=b"".join(cached_chunks), status_code=200,
-                        media_type="application/json", headers={"x-route-cache": "hit"})
+
+@app.post("/v1/chat/completions")
+async def chat_completions(
+    request: Request, authorization: str | None = Header(default=None),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    request_id = request.headers.get("x-request-id") or f"req_{uuid.uuid4().hex}"
+    if not _authorize(authorization):
+        return _openai_error("Invalid API key", 401, error_type="authentication_error", code="invalid_api_key")
+    try:
+        body = await _read_json_body(request)
+    except OverflowError:
+        return _openai_error("Request body is too large", 413, code="request_too_large")
+    except ValueError as exc:
+        return _openai_error(str(exc), 400, code="invalid_json")
+    invalid = _validate_request(body)
+    if invalid:
+        return _openai_error(invalid[0], 400, param=invalid[1], code="invalid_request")
+
+    cache_key = _cache_key(body, idempotency_key)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        media = "text/event-stream" if body.get("stream") else "application/json"
+        response_cls = StreamingResponse if body.get("stream") else Response
+        content = iter([cached]) if body.get("stream") else cached
+        return response_cls(content=content, media_type=media, headers={"x-route-cache": "hit", "x-request-id": request_id})
+
     prompt = _extract_prompt(body)
     if prompt.strip():
         decision, score, supra_complexity, supra_ms = await asyncio.to_thread(_decide, prompt)
     else:
         decision, score, supra_complexity, supra_ms = "cheap", 0.0, None, None
     backend = _backend_for(decision)
-    _record_and_detect_retry(_request_hash(body), decision, backend["model"], _prompt_hash(prompt))
+    _record_and_detect_retry(_request_hash(body), decision, backend["model"], _prompt_hash(prompt), request_id)
+    headers = _route_headers(decision, score, backend, request_id, supra_complexity, supra_ms)
+    deadline = time.monotonic() + TIMEOUT_S
+    selected, backend, upstream, attempts = await _open_with_failover(body, decision, deadline, stream=bool(body.get("stream")))
+    headers.update({"x-route-decision": selected, "x-route-model": backend["model"],
+                    "x-route-fallback": str(selected != decision).lower(), "x-route-attempts": str(len(attempts))})
+    if upstream is None:
+        _log_outcome(_prompt_hash(prompt), "upstream_error", request_id=request_id, attempts=len(attempts))
+        return _openai_error("Upstream providers were unavailable", 502, error_type="upstream_error", code="upstream_unavailable")
 
-    out_body = _build_outgoing_body(body, backend)
+    if not body.get("stream"):
+        try:
+            remaining = deadline - time.monotonic()
+            async with asyncio.timeout(max(0, remaining)):
+                content = await upstream.aread()
+        except (httpx.TransportError, TimeoutError, asyncio.TimeoutError):
+            await upstream.aclose()
+            _log_outcome(_prompt_hash(prompt), "upstream_error", request_id=request_id, model=backend["model"])
+            return _openai_error("Upstream response timed out", 504, error_type="upstream_error", code="upstream_timeout")
+        finally:
+            await upstream.aclose()
+        data = _safe_json(content)
+        if upstream.status_code != 200:
+            _log_outcome(_prompt_hash(prompt), "upstream_error", request_id=request_id, model=backend["model"], status=upstream.status_code)
+        if _length_truncated(data):
+            _log_outcome(_prompt_hash(prompt), "truncated", request_id=request_id, model=backend["model"])
+        _cache_put(cache_key, body, content)
+        _log(selected, score, backend["model"], prompt, None, supra_complexity, supra_ms,
+             cost_usd=_extract_cost(data), usage=data.get("usage"), request_id=request_id,
+             attempts=len(attempts), status=upstream.status_code)
+        return Response(content=content, status_code=upstream.status_code, media_type="application/json", headers=headers)
 
-    want_stream = bool(body.get("stream"))
-    headers = {"Authorization": f"Bearer {backend['key']}", "Content-Type": "application/json"}
-    url = backend["base"].rstrip("/") + "/chat/completions"
-    route_hdr = {
-        "x-route-decision": decision,
-        "x-route-score": f"{score:.4f}",
-        "x-route-model": backend["model"],
-        "x-route-router": ROUTER_NAME,
-    }
-    if supra_complexity is not None:
-        route_hdr["x-route-supra-complexity"] = str(supra_complexity)
-    if supra_ms is not None:
-        route_hdr["x-route-supra-ms"] = str(supra_ms)
+    async def event_stream():
+        chunks: list[bytes] = []
+        saw_done = False
+        saw_finish = False
+        saw_length = False
+        usage: dict = {}
+        started = time.monotonic()
+        try:
+            remaining = deadline - time.monotonic()
+            async with asyncio.timeout(max(0, remaining)):
+                async for line in upstream.aiter_lines():
+                    if await request.is_disconnected():
+                        raise asyncio.CancelledError
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    chunk = (line + "\n\n").encode()
+                    if stripped == "data: [DONE]":
+                        saw_done = True
+                        chunks.append(chunk)
+                        yield chunk
+                        break
+                    if stripped.startswith("data: "):
+                        try:
+                            payload = json.loads(stripped[6:])
+                            choices = payload.get("choices") or []
+                            if choices and choices[0].get("finish_reason") is not None:
+                                saw_finish = True
+                                saw_length = choices[0].get("finish_reason") == "length"
+                            if isinstance(payload.get("usage"), dict):
+                                usage.update(payload["usage"])
+                        except (json.JSONDecodeError, AttributeError, TypeError):
+                            pass
+                    chunks.append(chunk)
+                    yield chunk
+            if not saw_done or not saw_finish:
+                _log_outcome(_prompt_hash(prompt), "truncated", request_id=request_id, model=backend["model"], abrupt_eof=True)
+                yield _stream_error("Upstream stream ended before completion", "upstream_truncated", request_id)
+            elif saw_length:
+                _log_outcome(_prompt_hash(prompt), "truncated", request_id=request_id, model=backend["model"])
+            else:
+                _cache_put(cache_key, body, b"".join(chunks))
+        except asyncio.CancelledError:
+            _log_outcome(_prompt_hash(prompt), "disconnected", request_id=request_id, model=backend["model"])
+            raise
+        except (httpx.TransportError, TimeoutError, asyncio.TimeoutError):
+            _log_outcome(_prompt_hash(prompt), "upstream_error", request_id=request_id, model=backend["model"])
+            yield _stream_error("Upstream stream failed", "upstream_transport_error", request_id)
+        finally:
+            await upstream.aclose()
+            _log(selected, score, backend["model"], prompt, int((time.monotonic() - started) * 1000),
+                 supra_complexity, supra_ms, usage=usage or None, request_id=request_id,
+                 attempts=len(attempts), completed=saw_done and saw_finish)
 
-    if want_stream:
-        def gen():
-            t0 = time.time()
-            ttfb = None
-            cache_chunks: list[bytes] = []
-            saw_finish_reason = False
-            saw_done = False
-            saw_length = False
-            usage_seen: dict = {}
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=headers)
 
-            def track(payload: dict) -> None:
-                nonlocal saw_finish_reason, saw_length
-                ch = payload.get("choices")
-                if isinstance(ch, list) and ch and ch[0].get("finish_reason") is not None:
-                    saw_finish_reason = True
-                    if ch[0].get("finish_reason") == "length":
-                        saw_length = True
-                u = payload.get("usage")
-                if isinstance(u, dict):
-                    usage_seen.update(u)
-            with _client.stream("POST", url, json=out_body, headers=headers) as resp:
-                if resp.status_code != 200:
-                    # Refusal/content-filter surfaced as an HTTP error: retry the other model.
-                    err = resp.read()
-                    if _is_refusal(resp.status_code, _safe_json(err)):
-                        _log_outcome(_prompt_hash(prompt), "refused", decision=decision,
-                                     model=backend["model"], status=resp.status_code)
-                        flip = "cheap" if decision == "expensive" else "expensive"
-                        fb = _backend_for(flip)
-                        fb_url = fb["base"].rstrip("/") + "/chat/completions"
-                        fb_headers = {"Authorization": f"Bearer {fb['key']}", "Content-Type": "application/json"}
-                        with _client.stream("POST", fb_url, json=_build_outgoing_body(body, fb), headers=fb_headers) as resp:
-                            if resp.status_code == 200:
-                                # route_hdr was already sealed by StreamingResponse;
-                                # the fallback is only visible in decisions.log.
-                                for line in resp.iter_lines():
-                                    if ttfb is None:
-                                        ttfb = int((time.time() - t0) * 1000)
-                                    if line:
-                                        sline = line.strip()
-                                        if sline == "data: [DONE]":
-                                            saw_done = True
-                                            yield (line + "\n").encode()
-                                            break
-                                        elif sline.startswith("data: "):
-                                            try:
-                                                track(json.loads(sline[6:]))
-                                            except Exception:
-                                                pass
-                                        yield (line + "\n").encode()
-                                    else:
-                                        yield b"\n"
-                                _log(flip, score, fb["model"], prompt, ttfb, supra_complexity, supra_ms,
-                                     cost_usd=_extract_cost({"usage": usage_seen}), usage=usage_seen or None)
-                                return
-                    _log_outcome(_prompt_hash(prompt), "upstream_error", decision=decision,
-                                 model=backend["model"], status=resp.status_code)
-                    yield b'data: ' + json.dumps({"error": {"status": resp.status_code, "message": err.decode(errors="replace")[:500]}}).encode() + b'\n\ndata: [DONE]\n\n'
-                    return
-                for line in resp.iter_lines():
-                    if ttfb is None:
-                        ttfb = int((time.time() - t0) * 1000)
-                    if line:
-                        sline = line.strip()
-                        if sline == "data: [DONE]":
-                            saw_done = True
-                            cache_chunks.append((line + "\n").encode())
-                            yield (line + "\n").encode()
-                            break
-                        elif sline.startswith("data: "):
-                            try:
-                                track(json.loads(sline[6:]))
-                            except Exception:
-                                pass
-                        cache_chunks.append((line + "\n").encode())
-                        yield (line + "\n").encode()
-                    else:
-                        cache_chunks.append(b"\n")
-                        yield b"\n"
-                if not saw_finish_reason:
-                    finish_chunk = {
-                        "id": "gen-finish",
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": backend["model"],
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                    }
-                    cache_chunks.append(f"data: {json.dumps(finish_chunk)}\n\n".encode())
-                    yield f"data: {json.dumps(finish_chunk)}\n\n".encode()
-                if not saw_done:
-                    cache_chunks.append(b"data: [DONE]\n\n")
-                    yield b"data: [DONE]\n\n"
-            if saw_done and not saw_length:
-                _cache_put(cache_key, cache_chunks)
-            if saw_length:
-                _log_outcome(_prompt_hash(prompt), "truncated", decision=decision,
-                             model=backend["model"])
-            _log(decision, score, backend["model"], prompt, ttfb, supra_complexity, supra_ms,
-                 cost_usd=_extract_cost({"usage": usage_seen}), usage=usage_seen or None)
+def _bind_is_loopback(host: str) -> bool:
+    return host in {"127.0.0.1", "::1", "localhost"}
 
-        return StreamingResponse(gen(), media_type="text/event-stream", headers=route_hdr)
 
-    t0 = time.time()
-    resp = _do_post(backend, out_body)
-    ttfb = int((time.time() - t0) * 1000)
-    data = _safe_json(resp.content)
-    if _is_refusal(resp.status_code, data):
-        _log_outcome(_prompt_hash(prompt), "refused", decision=decision,
-                     model=backend["model"], status=resp.status_code)
-        flip = "cheap" if decision == "expensive" else "expensive"
-        fb = _backend_for(flip)
-        t0 = time.time()
-        resp = _do_post(fb, _build_outgoing_body(body, fb))
-        ttfb = int((time.time() - t0) * 1000)
-        data = _safe_json(resp.content)
-        decision = flip
-        route_hdr["x-route-fallback"] = "true"
-        route_hdr["x-route-model"] = fb["model"]
-    if resp.status_code != 200:
-        _log_outcome(_prompt_hash(prompt), "upstream_error", decision=decision,
-                     model=route_hdr["x-route-model"], status=resp.status_code)
-    elif _length_truncated(data):
-        _log_outcome(_prompt_hash(prompt), "truncated", decision=decision,
-                     model=route_hdr["x-route-model"])
-    cost = _extract_cost(data)
-    route_hdr["x-route-ttfb-ms"] = str(ttfb)
-    if cost is not None:
-        route_hdr["x-route-cost-usd"] = f"{cost:.6f}"
-    usage = data.get("usage") if isinstance(data.get("usage"), dict) else None
-    _log(decision, score, route_hdr["x-route-model"], prompt, ttfb, supra_complexity, supra_ms,
-         cost_usd=cost, usage=usage)
-    if resp.status_code == 200 and "x-route-fallback" not in route_hdr:
-        _cache_put(cache_key, [resp.content])
-    return Response(content=resp.content, status_code=resp.status_code,
-                    media_type="application/json", headers=route_hdr)
+def _validate_bind_security() -> None:
+    if not _bind_is_loopback(HOST) and (not os.environ.get("ROUTELLM_KEY") or SERVER_KEY == "sk-route-local"):
+        raise RuntimeError("non-loopback binding requires an externally supplied, non-default ROUTELLM_KEY")
 
 
 if __name__ == "__main__":
     import uvicorn
+    _validate_bind_security()
     print(
         "effective config: "
         f"router={ROUTER_NAME} threshold={THRESHOLD} supra={SUPRA_ENABLED} "

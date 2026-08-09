@@ -1,113 +1,65 @@
 # llm-router
 
-OpenAI-compatible proxy for Pi and other clients. It uses RouteLLM MF +
-Supra-Router to choose cheap or expensive, then sends both through a local
-LiteLLM proxy. LiteLLM handles provider normalization, retries/fallbacks, and
-the Responses API bridge needed by GPT-5.6 function-tool requests.
+An OpenAI-compatible FastAPI router for `/v1/chat/completions`. RouteLLM MF and
+Supra select one of two provider backends. The server calls each configured
+provider directly with one lifespan-owned asynchronous HTTP pool.
 
-LiteLLM owns the backend model definitions and fallback behavior; MF+Supra
-only decides whether a request uses the cheap or expensive model group.
+## Setup and run
 
-## Files
-
-- `server.py` — FastAPI server exposing `/v1/chat/completions` (OpenAI-compatible)
-- `llm-router.sh` — launch script (router stop-and-restart if running, detach +
-  print status). Designed for StartupFolder or manual use.
-- `test_server_helpers.py` — unit tests for message normalization and Supra output parsing
-- `_test_scores.sh` — smoke test that routes sample prompts and prints scores/decisions
-- `requirements.txt` — pinned Python dependencies
-
-## Setup
+Use `uv`; do not put credentials in this repository.
 
 ```bash
-# Python deps (versions pinned in requirements.txt)
-python -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-
-# Minimal router config in ~/.zshrc
-export EXPENSIVE_MODEL="gpt-5.6-luna"
-export EXPENSIVE_REASONING_EFFORT="xhigh"
-export CHEAP_MODEL="deepseek-v4-pro"
-export CHEAP_REASONING_EFFORT="xhigh"
-
-# OPENAI_API_KEY is only needed for the local MF scorer.
-```
-
-## Run
-
-```bash
+uv sync --dev
 ./llm-router.sh
-# LiteLLM proxy and router running
 ```
 
-Clients connect to `http://127.0.0.1:5500/v1` with `Authorization: Bearer sk-route-local`
-and use model `auto`.
+The default listener is `http://127.0.0.1:5500/v1`, model `auto`, with the
+loopback-only development credential `sk-route-local`. A non-loopback bind
+requires an externally supplied `ROUTELLM_KEY` that is not the default. The
+launcher refuses to stop a port owner unless its recorded PID, working
+directory, command, and listening socket all identify this checkout.
 
-## Architecture
+Required provider configuration is `EXPENSIVE_BASE`, `EXPENSIVE_KEY`,
+`EXPENSIVE_MODEL`, `CHEAP_BASE`, `CHEAP_KEY`, and `CHEAP_MODEL`.
+`OPENAI_API_KEY` is required by MF scoring. See `server.py` for optional limits.
 
+## Behavior
+
+- Request JSON and supported Chat Completions field types are validated.
+  Reviewed unknown provider extensions are preserved.
+- The body limit is enforced while bytes are read, even without a valid
+  `Content-Length`.
+- A request has at most two provider attempts. Transport errors, timeouts, 429,
+  and selected 5xx statuses can fail over. Both attempts share one deadline.
+- Streams require an upstream finish reason and `[DONE]`. Abrupt EOF produces
+  an error event and never a synthetic success marker. Data after `[DONE]` is
+  discarded.
+- Response replay is off by default. To opt in, send `Idempotency-Key`.
+  Tool-bearing requests and responses, refusals, and incomplete responses are
+  never cached. Entry count and total bytes are bounded. Cache counters appear
+  in `/healthz`.
+
+Every routed response includes `x-request-id`, `x-route-decision`,
+`x-route-model`, `x-route-score`, `x-route-attempts`, and `x-route-fallback`.
+Optional Supra headers are also returned.
+
+## Logs and training
+
+Operational logs contain prompt hashes and routing metadata, not prompt text.
+Set `ROUTELLM_TRAINING_LOG=1` only when full-prompt training collection is
+explicitly required. Directories use mode `0700`; private files use `0600`.
+Request and outcome occurrence IDs support exact evaluation joins. Old outcome
+rows without IDs use the legacy prompt-hash join.
+
+`pseudo_label.py` validates closed label enums/schema. It fsyncs both result
+files before atomically advancing its state checkpoint.
+
+## Checks
+
+One command runs collected tests, static checks, syntax checks, and local
+self-tests. Tests install a strict socket guard and use ASGI plus mock upstreams;
+they make no real or billed calls.
+
+```bash
+./checks.sh
 ```
-Client (Pi, OpenCode, etc.)
-  │
-  ▼
-server.py (:5500)
-  ├── MF scorer (OpenAI embeddings API)
-  ├── Supra-Router-51M (local CPU, thread-pooled)
-  └── LiteLLM proxy (:3001)
-        ├── cheap model      (configurable in ~/.zshrc)
-        └── expensive model  (configurable in ~/.zshrc)
-```
-
-`llm-router.sh` starts the LiteLLM Docker Compose stack at
-`http://127.0.0.1:3001` when it is not already healthy, then starts the
-RouteLLM compatibility endpoint at `:5500`.
-
-## Training data
-
-Full router prompts are collected in
-`~/.local/share/mantis/router/training.jsonl` only when
-`ROUTELLM_TRAINING_LOG=1`. Change it to `0` and restart `llm-router.sh` to
-stop collection. `~/.local/share/mantis/router/decisions.log` remains the
-operational log and stores only the first 200 prompt characters.
-
-Run `./.venv/bin/python pseudo_label.py` to write deduplicated Supra labels to
-`~/.local/share/mantis/router/pseudo-labels.jsonl`. Training files are local,
-mode `0600`, and outside the repository.
-
-## Response headers
-
-Every response includes:
-
-- `x-route-decision: expensive|cheap`
-- `x-route-score: 0.1234` (MF win-rate)
-- `x-route-supra-complexity: 3` (1-5, when Supra is enabled)
-- `x-route-supra-ms: 41` (Supra scoring latency, when Supra ran)
-- `x-route-model: deepseek-v4-pro|gpt-5.6-luna` (LiteLLM model group selected)
-
-Non-streaming responses additionally include:
-
-- `x-route-ttfb-ms: 1234` (upstream time-to-first-byte)
-- `x-route-cost-usd: 0.004210` (provider-billed cost, when the upstream reports
-  `usage.cost`; OpenRouter backends ask for it via `usage.include`)
-- `x-route-fallback: true` (when a refusal retried on the other model)
-
-For streamed responses these facts are sealed before headers are known; the
-`decisions.log` row records `ttfb_ms`, `cost_usd`, and `usage` instead.
-
-## Limits and timeouts
-
-- Request bodies over `ROUTELLM_MAX_BODY_BYTES` (default 50 MiB) get 413.
-- Upstream calls time out after `ROUTELLM_TIMEOUT_S` (default 600s, 10s connect)
-  so a stalled provider cannot pin the router.
-
-## Request handling
-
-Before forwarding a client request to LiteLLM, the router applies several deliberate compatibility mutations required for LiteLLM's Responses API bridge:
-
-- `model` is always overwritten with the chosen backend model (`gpt-5.6-luna` / `deepseek-v4-pro`); the client's value is ignored.
-- `max_tokens` is renamed to `max_completion_tokens` and clamped to the backend's `CHEAP_MAX_TOKENS` (default 131072).
-- `stop` sequences are dropped.
-- `temperature` is dropped for gpt-5.6 models unless it is `1`.
-- `reasoning_effort` is injected from `EXPENSIVE_REASONING_EFFORT` / `CHEAP_REASONING_EFFORT`.
-- `developer`-role messages are rewritten to `system`.
-
