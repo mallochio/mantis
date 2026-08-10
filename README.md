@@ -79,6 +79,16 @@ provider terminal marker. Incomplete streams receive a Responses-native error
 event; no synthetic success is emitted. Local Responses caching and coalescing
 are disabled initially. Responses carry `x-route-api: responses` and
 `x-route-upstream-path: /responses`; Chat carries the corresponding chat values.
+- Encrypted reasoning, compaction items, provider-side `previous_response_id`,
+  and `conversation` state are model/provider-origin-bound. The router keeps a
+  short in-memory origin index (never the ciphertext) and binds such
+  continuations to the exact target, base URL, upstream model, and target
+  revision that produced them. Continuations with unknown, stale, or
+  cross-origin state are rejected with HTTP 409
+  (`responses_continuation_affinity_required`) instead of being rerouted or
+  failovered to another model. Completed non-stream responses return an
+  `x-route-responses-affinity` capability header as an extra origin check;
+  streamed completions are indexed automatically from their native frames.
 
 - Request JSON and supported Chat Completions field types are validated.
   Reviewed unknown provider extensions are preserved.

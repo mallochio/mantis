@@ -182,7 +182,7 @@ async def test_responses_stream_preserves_frames_and_completion(client, monkeypa
     wire = (b'event: response.output_text.delta\n'
             b'data: {"type":"response.output_text.delta","delta":"ok"}\n\n'
             b'event: response.completed\n'
-            b'data: {"type":"response.completed","response":{"id":"resp_3","usage":{"input_tokens":10}}}\n\n'
+            b'data: {"type":"response.completed","response":{"id":"resp_3","status":"completed","usage":{"input_tokens":10}}}\n\n'
             b'event: should.not.appear\ndata: {"type":"should.not.appear"}\n\n')
     mock = upstream(lambda request: httpx.Response(200, content=wire,
                                                     headers={"content-type": "text/event-stream"}))

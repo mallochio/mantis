@@ -230,8 +230,10 @@ def test_journal_truncates_uncommitted_tail(tmp_path):
 @pytest.mark.anyio
 async def test_realistic_delta_refusal_falls_back(client, monkeypatch):
     calls = 0
-    refusal = (b'data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
-               b'data: {"choices":[{"delta":{"content":"I cannot"},"finish_reason":null}]}\n\n'
+    # Refusal prose beginning in the first content chunk is caught before any
+    # bytes escape and fails over. (A leading role-only chunk now commits
+    # immediately so normal/sparse streams are never starved.)
+    refusal = (b'data: {"choices":[{"delta":{"content":"I cannot"},"finish_reason":null}]}\n\n'
                b'data: {"choices":[{"delta":{"content":" assist with that"},"finish_reason":"stop"}]}\n\n'
                b'data: [DONE]\n\n')
     success = (b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n'
@@ -252,8 +254,7 @@ async def test_realistic_delta_refusal_falls_back(client, monkeypatch):
 @pytest.mark.anyio
 async def test_stream_content_filter_falls_back(client, monkeypatch):
     calls = 0
-    filtered = (b'data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
-                b'data: {"choices":[{"delta":{},"finish_reason":"content_filter"}]}\n\n')
+    filtered = (b'data: {"choices":[{"delta":{},"finish_reason":"content_filter"}]}\n\n')
     success = (b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
                b'data: [DONE]\n\n')
     def handler(request):
@@ -372,3 +373,16 @@ def test_legacy_migration_mismatched_counts_fails_without_changes(tmp_path):
         pseudo_label.recover_outputs(output, supra)
     assert (output.read_bytes(), supra.read_bytes()) == before
     assert not pseudo_label._journal_path(output).exists()
+
+
+@pytest.mark.anyio
+async def test_chat_prefetch_commits_role_only_chunk(client, monkeypatch):
+    role = b'data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+
+    async def role_then_silence():
+        yield role
+        await asyncio.Event().wait()
+
+    prefix, refusal = await asyncio.wait_for(
+        server._prefetch_sse(role_then_silence(), asyncio.get_running_loop().time() + 30), timeout=1)
+    assert refusal is False and role in prefix

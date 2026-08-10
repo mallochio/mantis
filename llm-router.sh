@@ -42,6 +42,16 @@ mkdir -p "$ROUTER_LOG_DIR"
 chmod 700 "$DATA_DIR" "$ROUTER_LOG_DIR"
 export MANTIS_DATA_DIR="$DATA_DIR"
 
+# An explicit target source (ROUTELLM_TARGETS_JSON or the AI_ROUTING_CONFIG
+# catalog) carries its own provider/credential bindings. Legacy gateway/direct
+# key requirements below must not block such a deployment.
+if [ -n "${ROUTELLM_TARGETS_JSON:-}" ] || [ -n "${AI_ROUTING_CONFIG:-}" ] || \
+   [ -f "$HOME/.config/ai-routing/catalog.toml" ]; then
+  ROUTER_EXPLICIT_SOURCE=1
+else
+  ROUTER_EXPLICIT_SOURCE=0
+fi
+
 # --- router ---
 . ./.venv/bin/activate
 # MF scoring uses OpenAI text-embedding-3-small; needed only in mf/bert mode
@@ -79,7 +89,7 @@ if [ "$ROUTER_GATEWAY" -eq 1 ]; then
   export EXPENSIVE_KEY="${AI_GATEWAY_API_KEY}"
   export CHEAP_KEY="${AI_GATEWAY_API_KEY}"
   export MIDDLE_KEY="${AI_GATEWAY_API_KEY}"
-  if [ -z "$AI_GATEWAY_API_KEY" ]; then
+  if [ -z "$AI_GATEWAY_API_KEY" ] && [ "$ROUTER_EXPLICIT_SOURCE" -eq 0 ]; then
     echo 'ERROR: Cloudflare gateway endpoint requires AI_GATEWAY_API_KEY or MANTIS_GATEWAY_API_KEY' >&2
     exit 2
   fi
@@ -103,18 +113,20 @@ export MIDDLE_MAX_TOKENS="${MIDDLE_MAX_TOKENS:-131072}"
 export ROUTELLM_EXPENSIVE_MIN_COMPLEXITY="${ROUTELLM_EXPENSIVE_MIN_COMPLEXITY:-5}"
 # Preserve direct-provider credentials unless a gateway endpoint/profile is selected.
 # Base-host auto-detection keeps existing Cloudflare gateway configurations working.
-router_select_endpoint_keys
-if [ -z "$EXPENSIVE_KEY" ]; then
-  echo 'ERROR: EXPENSIVE_KEY or OPENROUTER_API_KEY required for the expensive backend.' >&2
-  exit 1
-fi
-if [ -z "$CHEAP_KEY" ]; then
-  echo 'ERROR: CHEAP_KEY or OPENCODE_API_KEY required for the cheap backend.' >&2
-  exit 1
-fi
-if [ -n "${MIDDLE_BASE:-}" ] && [ -z "${MIDDLE_KEY:-}" ]; then
-  echo 'ERROR: MIDDLE_KEY is required when MIDDLE_BASE is configured.' >&2
-  exit 1
+if [ "$ROUTER_EXPLICIT_SOURCE" -eq 0 ]; then
+  router_select_endpoint_keys
+  if [ -z "$EXPENSIVE_KEY" ]; then
+    echo 'ERROR: EXPENSIVE_KEY or OPENROUTER_API_KEY required for the expensive backend.' >&2
+    exit 1
+  fi
+  if [ -z "$CHEAP_KEY" ]; then
+    echo 'ERROR: CHEAP_KEY or OPENCODE_API_KEY required for the cheap backend.' >&2
+    exit 1
+  fi
+  if [ -n "${MIDDLE_BASE:-}" ] && [ -z "${MIDDLE_KEY:-}" ]; then
+    echo 'ERROR: MIDDLE_KEY is required when MIDDLE_BASE is configured.' >&2
+    exit 1
+  fi
 fi
 export ROUTELLM_CONTEXT_WINDOW="${ROUTELLM_CONTEXT_WINDOW:-262144}"
 export ROUTELLM_MAX_TOKENS="${ROUTELLM_MAX_TOKENS:-131072}"
