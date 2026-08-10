@@ -70,7 +70,7 @@ def _shared_catalog(contract: str) -> str:
     """Combined fixture for the Mantis and llm-router (RouteLLM) consumers."""
     abi = model_catalog.load_abi_manifest()
     provider_order = [
-        "modal.prod", "generic.openai", "code", "gateway",
+        "modal.prod", "generic.openai", "code", "router",
         "router", "generic.openai", "generic.openai",
     ]
     # The conductor slot speaks responses; route it through a responses-capable
@@ -108,10 +108,6 @@ def _shared_catalog(contract: str) -> str:
         'adapter = "modal"\n'
         'base_url = "https://modal.example.test/v1"\n'
         'credential_env = "MODAL_KEY"\n\n'
-        "[providers.gateway]\n"
-        'adapter = "cloudflare-gateway"\n'
-        'base_url = "https://gateway.example.test/v1"\n'
-        'credential_env = "GATEWAY_KEY"\n\n'
         "[providers.\"generic.openai\"]\n"
         'adapter = "openai-compatible"\n'
         'base_url = "https://generic.example.test/v1"\n'
@@ -135,12 +131,12 @@ def _shared_catalog(contract: str) -> str:
         'protocols = ["chat_completions"]\n'
         "rank = 2\n\n"
         "[routellm.targets.responses]\n"
-        'provider = "gateway"\n'
+        'provider = "router"\n'
         'upstream_model = "openai/responses"\n'
         'protocols = ["chat_completions", "responses"]\n'
         "rank = 3\n\n"
         "[routellm.targets.safe]\n"
-        'provider = "gateway"\n'
+        'provider = "router"\n'
         'upstream_model = "openai/safe"\n'
         'protocols = ["chat_completions", "responses"]\n'
         "rank = 4\n\n"
@@ -408,10 +404,10 @@ def test_adapter_protocol_incompatibility_rejected(tmp_path):
 
 
 def test_router_provider_ids_and_identifier_grammar_accepted(tmp_path):
-    """Modal, openai-compatible, and cloudflare-gateway adapters are shared ids."""
+    """Modal and openai-compatible adapters are shared ids."""
     abi = model_catalog.load_abi_manifest()
     provider_order = [
-        "modal.prod", "generic.openai", "code", "gateway",
+        "modal.prod", "generic.openai", "code", "router",
         "router", "generic.openai", "generic.openai",
     ]
     # The conductor slot speaks responses; route it through a responses-capable
@@ -447,10 +443,6 @@ def test_router_provider_ids_and_identifier_grammar_accepted(tmp_path):
         'adapter = "modal"\n'
         'base_url = "https://modal.example.test/v1"\n'
         'credential_env = "MODAL_KEY"\n\n'
-        "[providers.gateway]\n"
-        'adapter = "cloudflare-gateway"\n'
-        'base_url = "https://gateway.example.test/v1"\n'
-        'credential_env = "GATEWAY_KEY"\n\n'
         "[providers.\"generic.openai\"]\n"
         'adapter = "openai-compatible"\n'
         'base_url = "https://generic.example.test/v1"\n'
@@ -469,7 +461,6 @@ def test_router_provider_ids_and_identifier_grammar_accepted(tmp_path):
         "opencode-go",
         "modal",
         "openai-compatible",
-        "cloudflare-gateway",
     }
 
 
@@ -488,7 +479,6 @@ def test_shared_catalog_fixture_both_consumers_parse(tmp_path, monkeypatch):
         "opencode-go",
         "modal",
         "openai-compatible",
-        "cloudflare-gateway",
     }
     monkeypatch.setenv("AI_ROUTING_CONFIG", str(path))
     monkeypatch.delenv("ROUTELLM_TARGETS_JSON", raising=False)
@@ -496,7 +486,7 @@ def test_shared_catalog_fixture_both_consumers_parse(tmp_path, monkeypatch):
     monkeypatch.delenv("ROUTELLM_SUPRA_INVALID_TARGET", raising=False)
     monkeypatch.delenv("ROUTELLM_TRAINING_LOG", raising=False)
     monkeypatch.setenv("MANTIS_DATA_DIR", str(tmp_path / "router-data"))
-    for name in ("ROUTER_KEY", "CODE_KEY", "MODAL_KEY", "GATEWAY_KEY", "GENERIC_KEY"):
+    for name in ("ROUTER_KEY", "CODE_KEY", "MODAL_KEY", "GENERIC_KEY"):
         monkeypatch.setenv(name, "fixture-key")
     sys.path.insert(0, str(router_server.parent))
     try:

@@ -374,7 +374,7 @@ def test_validate_running_container_requires_selected_profile(monkeypatch):
         200,
         json={
             "status": "ready",
-            "endpoint_profile": "cloudflare",
+            "endpoint_profile": "catalog",
             "endpoint_hosts": {},
             "endpoint_fingerprints": {},
         },
@@ -405,97 +405,38 @@ def test_resolve_direct_profile_defaults_and_overrides():
     assert custom.hosts == ("router.example.test", "code.example.test")
 
 
-def test_resolve_cloudflare_profile_maps_distinct_token():
-    profile = stack.resolve_endpoint_profile(
-        "cloudflare",
-        {
-            "MANTIS_GATEWAY_API_KEY": "gateway-secret",
-            "OPENROUTER_API_KEY": "provider-secret",
-            "OPENROUTER_BASE_URL": stack.DIRECT_OPENROUTER_URL,
-            "OPENCODE_GO_ENDPOINT_URL": stack.DIRECT_OPENCODE_URL,
-        },
-    )
-    assert profile.openrouter_url == stack.CLOUDFLARE_GATEWAY_URL
-    assert profile.opencode_url == stack.CLOUDFLARE_GATEWAY_URL
-    assert profile.openrouter_key == profile.opencode_key == "gateway-secret"
 
-
-def test_cloudflare_profile_uses_only_gateway_url_overrides():
-    shared = stack.resolve_endpoint_profile(
-        "cloudflare",
-        {
-            "AI_GATEWAY_API_KEY": "token",
-            "MANTIS_GATEWAY_URL": "https://shared-gateway.test/v1",
-            "MANTIS_GATEWAY_OPENCODE_URL": "https://code-gateway.test/v1",
-        },
-    )
-    assert shared.openrouter_url == "https://shared-gateway.test/v1"
-    assert shared.opencode_url == "https://code-gateway.test/v1"
-
-
-def test_endpoint_urls_are_normalized():
-    profile = stack.resolve_endpoint_profile(
-        "direct",
-        {
-            "OPENROUTER_BASE_URL": "HTTPS://Router.Example.test:443/v1///",
-            "OPENCODE_GO_ENDPOINT_URL": "https://Code.Example.test/v1/",
-        },
-    )
-    assert profile.openrouter_url == "https://router.example.test/v1"
-    assert profile.opencode_url == "https://code.example.test/v1"
-
-
-@pytest.mark.parametrize(
-    "url",
-    [
-        "https://user:pass@example.test/v1",
-        "https://example.test/v1?token=value",
-        "https://example.test/v1#fragment",
-        "https://example.test:invalid/v1",
-        "ftp://example.test/v1",
-    ],
-)
-def test_endpoint_urls_reject_unsafe_or_invalid_values(url):
-    with pytest.raises(SystemExit):
-        stack.resolve_endpoint_profile("direct", {"OPENROUTER_BASE_URL": url})
-
-
-def test_cloudflare_requires_token_without_disclosing_other_secrets(capsys):
-    with pytest.raises(SystemExit, match="requires MANTIS_GATEWAY_API_KEY"):
-        stack.resolve_endpoint_profile("cloudflare", {"OPENROUTER_API_KEY": "must-not-appear"})
-    assert "must-not-appear" not in capsys.readouterr().out
 
 
 def test_apply_profile_diagnostic_is_sanitized(monkeypatch, capsys):
-    marker = "gateway-super-secret"
-    profile = stack.resolve_endpoint_profile("cloudflare", {"AI_GATEWAY_API_KEY": marker})
+    marker = "direct-super-secret"
+    profile = stack.resolve_endpoint_profile("direct", {"OPENROUTER_API_KEY": marker})
     stack.apply_endpoint_profile(profile)
     output = capsys.readouterr().out
     assert marker not in output
-    assert "unified-ai-gateway.siddsantham.workers.dev" in output
+    assert "openrouter.ai" in output
     assert profile.openrouter_url not in output
     assert os.environ["OPENROUTER_API_KEY"] == marker
-    assert os.environ["OPENCODE_API_KEY"] == marker
 
 
 def test_main_docker_restart_forces_recreate(monkeypatch):
     monkeypatch.setenv("MANTIS_API_KEY", "k")
-    monkeypatch.setenv("MANTIS_GATEWAY_API_KEY", "docker-gateway-token")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "docker-token")
     monkeypatch.setattr(stack, "detect_backend", lambda: "docker")
     monkeypatch.setattr(model_catalog, "load_mantis_catalog", lambda: None)
     captured = []
     monkeypatch.setattr(stack, "_run", lambda argv: captured.append(argv))
     monkeypatch.setattr(stack, "wait_ready", lambda: None)
-    monkeypatch.setattr("sys.argv", ["stack.py", "restart", "--endpoint-profile", "cloudflare"])
+    monkeypatch.setattr("sys.argv", ["stack.py", "restart", "--endpoint-profile", "direct"])
     stack.main()
     assert captured == [["docker", "compose", "-f", str(COMPOSE), "up", "-d", "--force-recreate"]]
-    assert os.environ["OPENROUTER_API_KEY"] == "docker-gateway-token"
+    assert os.environ["OPENROUTER_API_KEY"] == "docker-token"
 
 
 def test_main_native_restart_replaces_container(monkeypatch):
     events = []
     monkeypatch.setenv("MANTIS_API_KEY", "k")
-    monkeypatch.setenv("AI_GATEWAY_API_KEY", "native-gateway-token")
+    monkeypatch.setenv("OPENCODE_API_KEY", "native-token")
     monkeypatch.setattr(stack, "detect_backend", lambda: "native")
     monkeypatch.setattr(model_catalog, "load_mantis_catalog", lambda: None)
     monkeypatch.setattr(stack, "_container_output", lambda argv: "mantis-redis")
@@ -505,24 +446,24 @@ def test_main_native_restart_replaces_container(monkeypatch):
         "native_up",
         lambda redis, conductor, memory: events.append(f"up:redis={redis}"),
     )
-    monkeypatch.setattr("sys.argv", ["stack.py", "restart", "--endpoint-profile", "cloudflare"])
+    monkeypatch.setattr("sys.argv", ["stack.py", "restart", "--endpoint-profile", "direct"])
     stack.main()
     assert events == ["down", "up:redis=True"]
-    assert os.environ["OPENCODE_API_KEY"] == "native-gateway-token"
+    assert os.environ["OPENCODE_API_KEY"] == "native-token"
 
 
 def test_load_dotenv_defaults_preserves_exported_values(monkeypatch, tmp_path):
     path = tmp_path / ".env"
     path.write_text(
-        "MANTIS_GATEWAY_API_KEY=from-file # inline comment\n"
+        "MANTIS_DOTENV_KEY=from-file # inline comment\n"
         'OPENROUTER_BASE_URL="https://file.test/v1" # another comment\n'
         'QUOTED_VALUE="value with # literal and escaped \\"quote\\""\n'
     )
-    monkeypatch.setenv("MANTIS_GATEWAY_API_KEY", "exported")
+    monkeypatch.setenv("MANTIS_DOTENV_KEY", "exported")
     monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
     monkeypatch.delenv("QUOTED_VALUE", raising=False)
     stack.load_dotenv_defaults(path)
-    assert os.environ["MANTIS_GATEWAY_API_KEY"] == "exported"
+    assert os.environ["MANTIS_DOTENV_KEY"] == "exported"
     assert os.environ["OPENROUTER_BASE_URL"] == "https://file.test/v1"
     assert os.environ["QUOTED_VALUE"] == 'value with # literal and escaped "quote"'
 

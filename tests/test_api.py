@@ -494,23 +494,23 @@ def test_capacity_returns_429(client, monkeypatch):
 
 def test_ready_reports_only_sanitized_endpoint_metadata(client, monkeypatch):
     marker = "never-return-this-secret"
-    monkeypatch.setenv("MANTIS_ENDPOINT_PROFILE", "cloudflare")
-    monkeypatch.setenv("OPENROUTER_BASE_URL", "https://gateway.example.test/v1?token=" + marker)
-    monkeypatch.setenv("OPENCODE_GO_ENDPOINT_URL", "https://gateway.example.test/private")
+    monkeypatch.setenv("MANTIS_ENDPOINT_PROFILE", "direct")
+    monkeypatch.setenv("OPENROUTER_BASE_URL", "https://direct.example.test/v1?token=" + marker)
+    monkeypatch.setenv("OPENCODE_GO_ENDPOINT_URL", "https://opencode.example.test/private")
     body = client.get("/ready").json()
-    assert body["endpoint_profile"] == "cloudflare"
+    assert body["endpoint_profile"] == "direct"
     assert body["endpoint_hosts"] == {
-        "openrouter": "gateway.example.test",
-        "opencode": "gateway.example.test",
+        "openrouter": "direct.example.test",
+        "opencode": "opencode.example.test",
     }
     assert set(body["endpoint_fingerprints"]) == {"openrouter", "opencode"}
     assert body["endpoint_fingerprints"]["openrouter"] != body["endpoint_fingerprints"]["opencode"]
     assert marker not in str(body)
 
     first_fingerprint = body["endpoint_fingerprints"]["openrouter"]
-    monkeypatch.setenv("OPENROUTER_BASE_URL", "https://gateway.example.test/v2")
+    monkeypatch.setenv("OPENROUTER_BASE_URL", "https://direct.example.test/v2")
     changed = client.get("/ready").json()
-    assert changed["endpoint_hosts"]["openrouter"] == "gateway.example.test"
+    assert changed["endpoint_hosts"]["openrouter"] == "direct.example.test"
     assert changed["endpoint_fingerprints"]["openrouter"] != first_fingerprint
 
 

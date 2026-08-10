@@ -42,7 +42,6 @@ READY_URL = "http://127.0.0.1:8088/ready"
 START_TIMEOUT = 90
 DIRECT_OPENROUTER_URL = "https://openrouter.ai/api/v1"
 DIRECT_OPENCODE_URL = "https://opencode.ai/zen/go/v1"
-CLOUDFLARE_GATEWAY_URL = "https://unified-ai-gateway.siddsantham.workers.dev/v1"
 
 
 class ReadinessMetadata(TypedDict):
@@ -147,20 +146,6 @@ def resolve_endpoint_profile(name: str, env: dict[str, str] | None = None) -> En
             opencode_url=source.get("OPENCODE_GO_ENDPOINT_URL", DIRECT_OPENCODE_URL),
             openrouter_key=source.get("OPENROUTER_API_KEY", ""),
             opencode_key=source.get("OPENCODE_API_KEY", ""),
-        )
-    elif name == "cloudflare":
-        token = source.get("MANTIS_GATEWAY_API_KEY") or source.get("AI_GATEWAY_API_KEY")
-        if not token:
-            raise SystemExit(
-                "cloudflare endpoint profile requires MANTIS_GATEWAY_API_KEY or AI_GATEWAY_API_KEY"
-            )
-        gateway_url = source.get("MANTIS_GATEWAY_URL", CLOUDFLARE_GATEWAY_URL)
-        profile = EndpointProfile(
-            name=name,
-            openrouter_url=source.get("MANTIS_GATEWAY_OPENROUTER_URL", gateway_url),
-            opencode_url=source.get("MANTIS_GATEWAY_OPENCODE_URL", gateway_url),
-            openrouter_key=token,
-            opencode_key=token,
         )
     else:
         raise SystemExit(f"unknown endpoint profile: {name}")
@@ -535,7 +520,7 @@ def main() -> None:
     parser.add_argument("--redis", action="store_true", help="also run the redis service")
     parser.add_argument(
         "--endpoint-profile",
-        choices=["direct", "cloudflare"],
+        choices=["direct"],
         default="direct",
         help="provider endpoint and credential profile (default: direct)",
     )

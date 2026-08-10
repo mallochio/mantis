@@ -25,7 +25,6 @@ ADAPTER_PROTOCOLS = {
     "opencode-go": frozenset({"chat_completions"}),
     "modal": frozenset({"chat_completions"}),
     "openai-compatible": frozenset({"chat_completions", "responses"}),
-    "cloudflare-gateway": frozenset({"chat_completions", "responses"}),
 }
 ADAPTERS = frozenset(ADAPTER_PROTOCOLS)
 

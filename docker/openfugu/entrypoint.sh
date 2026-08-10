@@ -6,7 +6,7 @@
 # catalog file and the rendered bindings and validates the catalog against the
 # trained ABI manifest before the server starts.  Any failure exits non-zero so
 # `docker compose up` reports an error instead of silently serving legacy
-# defaults.  Direct/cloudflare profiles are unchanged.
+# defaults.  Direct profiles are unchanged.
 set -eu
 
 profile="${MANTIS_ENDPOINT_PROFILE:-direct}"
