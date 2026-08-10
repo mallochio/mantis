@@ -81,9 +81,11 @@ restarts:
 - A prompt that completes cleanly on the cheap backend `ROUTELLM_PIN_CHEAP_AFTER`
   (default 5) times is pinned cheap and skips all scoring (no embedding call,
   no Supra inference) until `ROUTELLM_PIN_TTL_S` (default 7 days) elapses.
-- A prompt whose cheap attempt refuses (or is retried by the client)
+- A prompt whose cheap attempt explicitly refuses
   `ROUTELLM_PIN_EXPENSIVE_AFTER` (default 2) times is pinned expensive, so
-  later requests skip the doomed cheap attempt entirely.
+  later requests skip the doomed cheap attempt entirely. Repeated identical
+  requests are deliberately not escalation signals because agent loops often
+  repeat prompts such as `Proceed` and polling instructions.
 - Stats reset after 24h without a new note, so changed prompt behavior
   re-learns. Pinned responses carry `x-route-pinned: true`.
 - Supra generation stops as soon as the `Complexity:` digit is emitted

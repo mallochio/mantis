@@ -153,6 +153,19 @@ def test_cheap_successes_pin_cheap(monkeypatch):
     assert entry.get("pin_until", 0) > time.time()
 
 
+def test_identical_repeats_do_not_pin_expensive(monkeypatch):
+    monkeypatch.setattr(server, "RETRY_WINDOW_S", 900)
+    h = server._prompt_hash("Proceed")
+    req_hash = "same-request"
+    # Three ordinary repeats should be logged as retried outcomes but must not
+    # poison routing for common agent-loop prompts.
+    for i in range(3):
+        server._record_and_detect_retry(req_hash, "cheap", "deepseek-v4-flash", h,
+                                        f"req_{i}", f"occ_{i}")
+    assert server._store_pinned(h) is None
+    assert h not in server._decision_store
+
+
 def test_cheap_refusals_pin_expensive(monkeypatch):
     monkeypatch.setattr(server, "PIN_EXPENSIVE_AFTER", 2)
     h = server._prompt_hash("hardening-case")

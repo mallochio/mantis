@@ -459,8 +459,8 @@ _recent_prompts: dict[str, tuple[str, str, float, str]] = {}
 # This workload is dominated by repeated prompts (top 25 prompts = ~38% of
 # calls). Pins let the router learn per-prompt routing: prompts that succeed
 # cheaply N times stop paying embedding + Supra scoring cost; prompts that
-# refuse (or get retried) on the cheap backend K times skip the doomed cheap
-# attempt and go straight to the expensive backend. The store is append-only
+# explicitly refuse on the cheap backend K times skip the doomed cheap attempt
+# and go straight to the expensive backend. The store is append-only
 # JSONL (like the other telemetry journals) and reloaded on startup, so pins
 # survive restarts. Pins expire after PIN_TTL_S and stats reset after 24h
 # without a new note, so a changed prompt behavior re-learns.
@@ -515,8 +515,8 @@ def _store_note(prompt_hash: str, decision: str, *, ok: bool = False, score=None
     """Record one routed outcome for a prompt and update pins (write-through).
 
     ok=True marks a clean completion (cheap successes build the cheap pin);
-    ok=False marks a refusal/retry/failure (repeated cheap failures flip the
-    pin to expensive so the next request skips the doomed cheap attempt).
+    ok=False marks an explicit refusal (repeated cheap refusals flip the pin
+    to expensive so the next request skips the doomed cheap attempt).
     """
     if not prompt_hash:
         return
@@ -681,11 +681,10 @@ def _record_and_detect_retry(req_hash: str, decision: str, model: str, prompt_ha
         _log_outcome(prompt_hash, "retried", decision=prev[0], model=prev[1],
                      request_hash=req_hash, request_id=request_id,
                      decision_occurrence_id=prev[3], retry_after_s=round(now - prev[2], 1))
-        # A client re-sent the same request within the retry window: the
-        # previous answer was not acceptable. Count it as a cheap failure so
-        # repeated retries escalate the prompt to the expensive backend.
-        if prev[0] == "cheap":
-            _store_note(prompt_hash, "cheap", ok=False)
+        # Repeated identical bodies are useful outcome telemetry, but are not
+        # a safe escalation signal: agent loops legitimately repeat prompts
+        # such as "Proceed" and polling instructions. Only an explicit cheap
+        # refusal (recorded from the upstream response) may pin expensive.
     _recent_prompts[req_hash] = (decision, model, now, occurrence_id)
 
 
