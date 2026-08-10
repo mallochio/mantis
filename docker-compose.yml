@@ -10,6 +10,12 @@ services:
     environment:
       MANTIS_API_KEY: ${MANTIS_API_KEY:?set MANTIS_API_KEY}
       MANTIS_ENDPOINT_PROFILE: ${MANTIS_ENDPOINT_PROFILE:-direct}
+      MANTIS_PROVIDER_BINDINGS: ${MANTIS_PROVIDER_BINDINGS:-}
+      MANTIS_WORKER_BINDINGS: ${MANTIS_WORKER_BINDINGS:-}
+      MANTIS_PROVIDER_KEYS: ${MANTIS_PROVIDER_KEYS:-}
+      MANTIS_IDENTITY_CONTRACT: ${MANTIS_IDENTITY_CONTRACT:-}
+      MANTIS_CATALOG_PATH: ${MANTIS_CATALOG_PATH:-}
+      AI_ROUTING_CONFIG: ${AI_ROUTING_CONFIG:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
       OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
       OPENCODE_API_KEY: ${OPENCODE_API_KEY}
@@ -44,6 +50,10 @@ services:
     volumes:
       - hf-cache:/root/.cache/huggingface
       - ${MANTIS_LEARNING_HOST_DIR:-${HOME}/.local/share/mantis/learning}:/app/learning
+      # The shared catalog is mounted read-only at its standard location so the
+      # entrypoint can validate it before start. In direct mode the mount is
+      # inert; the catalog profile fails closed when the file is missing.
+      - ${MANTIS_CATALOG_PATH:-${HOME}/.config/ai-routing/catalog.toml}:/app/catalog/catalog.toml:ro
       - ./artifacts:/app/artifacts:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8088/ready"]

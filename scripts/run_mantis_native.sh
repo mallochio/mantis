@@ -36,6 +36,26 @@ set -a
 source "$REPO_ROOT/.env"
 set +a
 
+# A present Mantis section is authoritative. The renderer prints shell-quoted
+# metadata only; credentials are resolved from already-exported host variables.
+export PYTHONPATH="$REPO_ROOT/scripts:${PYTHONPATH:-}"
+CATALOG_RENDER=$(python3 "$REPO_ROOT/scripts/model_catalog.py" render 2>&1) || {
+    echo "ERROR: Mantis catalog validation failed" >&2
+    exit 1
+}
+if [[ -n "$CATALOG_RENDER" ]]; then
+    eval "$CATALOG_RENDER"
+    MANTIS_PROVIDER_KEYS=$(python3 - <<'PY'
+import json
+import model_catalog
+catalog = model_catalog.load_mantis_catalog()
+if catalog is not None:
+    print(json.dumps(model_catalog.resolve_provider_keys(catalog), separators=(",", ":")))
+PY
+)
+    export MANTIS_PROVIDER_KEYS MANTIS_ENDPOINT_PROFILE=catalog
+fi
+
 CONDUCTOR_DEV="${MANTIS_CONDUCTOR_DEVICE:-}"
 # Auto-detect device unless explicitly set.
 if [[ -z "$CONDUCTOR_DEV" || "$CONDUCTOR_DEV" == "auto" ]]; then

@@ -6,8 +6,16 @@ import json
 from typing import Any
 
 
-def uses_responses_api(provider: str, model: str) -> bool:
-    """Use OpenRouter's native Responses API for OpenAI-family models."""
+def uses_responses_api(
+    provider: str, model: str, protocols: tuple[str, ...] | None = None
+) -> bool:
+    """Return whether this binding uses the native Responses API.
+
+    Catalog bindings declare their protocol explicitly. Raw legacy model specs
+    retain the former OpenRouter/OpenAI-family behavior for tests and old envs.
+    """
+    if protocols is not None:
+        return "responses" in protocols
     return provider == "openrouter" and model.startswith("openai/")
 
 

@@ -15,8 +15,34 @@ Individual tests that explicitly monkeypatch ``serve._provider_client`` or
 
 from __future__ import annotations
 
+import os
+
 import httpx
 import pytest
+
+# Interactive shells export endpoint/catalog overrides (~/.zshrc sets
+# OPENROUTER_BASE_URL/OPENCODE_GO_ENDPOINT_URL to gateway URLs, exports
+# AI_ROUTING_CONFIG and rendered catalog bindings).  Serve/stack capture some
+# of these at module import, so scrub them before any test module imports
+# them; tests that need a value set it explicitly via monkeypatch.
+for _name in (
+    "AI_ROUTING_CONFIG",
+    "MANTIS_CATALOG_PATH",
+    "MANTIS_ENDPOINT_PROFILE",
+    "MANTIS_PROVIDER_BINDINGS",
+    "MANTIS_WORKER_BINDINGS",
+    "MANTIS_IDENTITY_CONTRACT",
+    "MANTIS_PROVIDER_KEYS",
+    "MANTIS_WORKER_MODELS",
+    "MANTIS_CONDUCTOR_MODEL",
+    "OPENROUTER_BASE_URL",
+    "OPENCODE_GO_ENDPOINT_URL",
+    "CLOUDFLARE_GATEWAY_BASE_URL",
+    "MANTIS_GATEWAY_URL",
+    "MANTIS_GATEWAY_OPENCODE_URL",
+    "AI_GATEWAY_API_KEY",
+):
+    os.environ.pop(_name, None)
 
 
 @pytest.fixture(autouse=True)
@@ -27,6 +53,30 @@ def _block_external_provider_calls(monkeypatch: pytest.MonkeyPatch):
     # learning file with test runs (pool=test-worker etc.). Tests that need
     # learning set MANTIS_LEARNING=1 themselves.
     monkeypatch.setenv("MANTIS_LEARNING", "0")
+
+    # Scrub ambient endpoint/catalog overrides exported by an interactive
+    # shell (~/.zshrc exports OPENROUTER_BASE_URL/OPENCODE_GO_ENDPOINT_URL
+    # gateway URLs, AI_ROUTING_CONFIG, rendered catalog bindings, ...).
+    # Serve/stack code reads os.environ directly, so tests must not inherit
+    # the host environment; tests that need these set them via monkeypatch.
+    for name in (
+        "AI_ROUTING_CONFIG",
+        "MANTIS_CATALOG_PATH",
+        "MANTIS_ENDPOINT_PROFILE",
+        "MANTIS_PROVIDER_BINDINGS",
+        "MANTIS_WORKER_BINDINGS",
+        "MANTIS_IDENTITY_CONTRACT",
+        "MANTIS_PROVIDER_KEYS",
+        "MANTIS_WORKER_MODELS",
+        "MANTIS_CONDUCTOR_MODEL",
+        "OPENROUTER_BASE_URL",
+        "OPENCODE_GO_ENDPOINT_URL",
+        "CLOUDFLARE_GATEWAY_BASE_URL",
+        "MANTIS_GATEWAY_URL",
+        "MANTIS_GATEWAY_OPENCODE_URL",
+        "AI_GATEWAY_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
     def blocked_post(*_args, **_kwargs):
         raise httpx.NetworkError(

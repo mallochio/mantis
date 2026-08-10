@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "training_artifact": "artifacts/router_head.safetensors",
+  "training_artifact_sha256": "7ff2db0e6659cac4dd68c5fff47a112768042b31321127aeb1412a6d8e6c09be",
+  "slot_order": [
+    "gemini-3_6-flash",
+    "gpt-5_6-luna",
+    "gpt-5_6-sol",
+    "deepseek-v4-flash",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "gemini-3_1-pro-preview"
+  ],
+  "conductor": "gpt-5_6-luna",
+  "workers": {
+    "gemini-3_6-flash": {
+      "model_identity": "gemini-3.6-flash",
+      "reasoning_effort": "high"
+    },
+    "gpt-5_6-luna": {
+      "model_identity": "gpt-5.6-luna",
+      "reasoning_effort": "max"
+    },
+    "gpt-5_6-sol": {
+      "model_identity": "gpt-5.6-sol",
+      "reasoning_effort": "medium"
+    },
+    "deepseek-v4-flash": {
+      "model_identity": "deepseek-v4-flash"
+    },
+    "claude-opus-5": {
+      "model_identity": "claude-opus-5",
+      "reasoning_effort": "medium"
+    },
+    "claude-sonnet-5": {
+      "model_identity": "claude-sonnet-5",
+      "reasoning_effort": "medium"
+    },
+    "gemini-3_1-pro-preview": {
+      "model_identity": "gemini-3.1-pro-preview",
+      "reasoning_effort": "high"
+    }
+  }
+}

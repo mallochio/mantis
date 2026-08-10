@@ -55,6 +55,7 @@ from mini import (
     Coordinator,
     FuguRouter,
 )
+from model_catalog import CatalogError, RuntimeBindings, load_runtime_bindings
 from provider_protocols import (
     assemble_responses_stream,
     build_responses_body,
@@ -91,6 +92,49 @@ PROVIDERS = {
     ),
 }
 
+
+def _runtime_bindings() -> RuntimeBindings | None:
+    """Load rendered catalog bindings without altering legacy env behavior."""
+    try:
+        return load_runtime_bindings()
+    except CatalogError as error:
+        raise RuntimeError(f"invalid Mantis catalog bindings: {error}") from error
+
+
+def _binding_for_slot(slot: str):
+    bindings = _runtime_bindings()
+    return bindings.workers.get(slot) if bindings is not None else None
+
+
+def _provider_binding(name: str):
+    bindings = _runtime_bindings()
+    return bindings.providers.get(name) if bindings is not None else None
+
+
+def _provider_keys() -> dict[str, str]:
+    """Return launch-injected catalog credentials without logging their values."""
+    raw = os.environ.get("MANTIS_PROVIDER_KEYS", "").strip()
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("invalid MANTIS_PROVIDER_KEYS") from error
+    if not isinstance(value, dict) or not all(
+        isinstance(name, str) and isinstance(key, str) and key
+        for name, key in value.items()
+    ):
+        raise RuntimeError("invalid MANTIS_PROVIDER_KEYS")
+    return value
+
+
+def _catalog_key(binding: str, credential_env: str, spec: str) -> str:
+    key = _provider_keys().get(binding) or os.environ.get(credential_env)
+    if not key:
+        raise RuntimeError(f"{credential_env} is required for {spec}")
+    return key
+
+
 _args: argparse.Namespace | None = None
 _coordinators: dict[str, object] = {}
 _coordinator_lock = threading.Lock()
@@ -117,12 +161,37 @@ def _check_client_connected() -> None:
 
 
 def _parse_model_spec(spec: str) -> tuple[str, str, str | None]:
-    """Parse provider/model[|reasoning_effort]."""
+    """Resolve a stable catalog slot or parse a legacy provider/model spec."""
+    worker = _binding_for_slot(spec)
+    if worker is not None:
+        provider = _provider_binding(worker.provider)
+        if provider is None:
+            raise ValueError(f"catalog worker {spec} has no provider binding")
+        return provider.adapter, worker.upstream_model, worker.reasoning_effort
     provider, sep, rest = spec.partition("/")
     if not sep or provider not in PROVIDERS:
-        raise ValueError(f"model must start with {' or '.join(PROVIDERS)}: {spec}")
+        supported = " or ".join(PROVIDERS)
+        raise ValueError(f"model must be a catalog slot or start with {supported}: {spec}")
     model, marker, effort = rest.partition("|")
     return provider, model, effort if marker and effort != "none" else None
+
+
+def _binding_protocols(spec: str) -> tuple[str, ...] | None:
+    worker = _binding_for_slot(spec)
+    return worker.protocols if worker is not None else None
+
+
+def _provider_for_spec(spec: str) -> tuple[str, str, str | None]:
+    """Resolve endpoint, credential source, and optional catalog binding."""
+    worker = _binding_for_slot(spec)
+    if worker is not None:
+        provider = _provider_binding(worker.provider)
+        if provider is None:
+            raise ValueError(f"catalog worker {spec} has no provider binding")
+        return provider.base_url, provider.credential_env, worker.provider
+    provider, _, _ = _parse_model_spec(spec)
+    base_url, credential_env = PROVIDERS[provider]
+    return base_url, credential_env, None
 
 
 def _is_reasoning_model(model: str) -> bool:
@@ -248,12 +317,12 @@ def _build_request(
     controls: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, str], dict[str, Any]]:
     provider, model, effort = _parse_model_spec(spec)
-    base_url, key_env = PROVIDERS[provider]
-    key = os.environ.get(key_env)
+    base_url, key_env, binding = _provider_for_spec(spec)
+    key = _catalog_key(binding, key_env, spec) if binding else os.environ.get(key_env)
     if not key:
         raise RuntimeError(f"{key_env} is required for {spec}")
     active_controls = controls or {}
-    if uses_responses_api(provider, model):
+    if uses_responses_api(provider, model, _binding_protocols(spec)):
         body = build_responses_body(
             model,
             messages,
@@ -460,7 +529,7 @@ def _provider_response(
             failures.append(str(error))
             continue
         provider, model, _ = _parse_model_spec(attempt)
-        responses_api = uses_responses_api(provider, model)
+        responses_api = uses_responses_api(provider, model, _binding_protocols(attempt))
         # Session stickiness pins OpenRouter to one model+provider per
         # conversation to maximize prompt-cache hits. Apply it to all OpenRouter
         # backends (native Responses for "openai/*" and Chat Completions for
@@ -543,7 +612,10 @@ def _provider_response(
     raw_usage = data.get("usage")
     usage = cast(dict[str, Any], raw_usage) if isinstance(raw_usage, dict) else {}
     if run is not None:
-        run.add_usage(usage, model=body["model"])
+        # Catalog slots are the trained-router identities. Legacy raw specs
+        # retain their upstream model attribution for existing cost reports.
+        usage_model = attempt if _binding_for_slot(attempt) is not None else body["model"]
+        run.add_usage(usage, model=usage_model)
         message = (data.get("choices") or [{}])[0].get("message", {})
         if run.capture_metadata and isinstance(message, dict):
             run.response_metadata = {

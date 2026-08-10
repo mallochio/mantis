@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
+import model_catalog
 import serve
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi import Request as HttpRequest
@@ -527,18 +528,45 @@ def ready(response: Response) -> dict[str, Any]:
     response.headers["X-Request-Id"] = uuid.uuid4().hex
     if not os.environ.get("MANTIS_API_KEY"):
         raise HTTPException(503, "MANTIS_API_KEY is not configured")
-    endpoint_urls = {
-        "openrouter": os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-        "opencode": os.environ.get("OPENCODE_GO_ENDPOINT_URL", "https://opencode.ai/zen/go/v1"),
-    }
+    profile = os.environ.get("MANTIS_ENDPOINT_PROFILE", "direct")
+    if profile == "catalog":
+        try:
+            bindings = model_catalog.load_runtime_bindings()
+        except model_catalog.CatalogError as error:
+            raise HTTPException(503, str(error)) from error
+        if bindings is None:
+            raise HTTPException(503, "Mantis catalog bindings are not configured")
+        try:
+            keys = model_catalog.resolve_runtime_credentials(bindings)
+        except model_catalog.CatalogError as error:
+            raise HTTPException(503, str(error)) from error
+        contract = os.environ.get("MANTIS_IDENTITY_CONTRACT", "")
+        if not contract:
+            raise HTTPException(503, "Mantis catalog bindings are not configured")
+        if not keys:
+            raise HTTPException(503, "Mantis catalog provider credentials are not configured")
+        endpoint_urls = {
+            name: binding.base_url for name, binding in bindings.providers.items()
+        }
+    else:
+        contract = ""
+        keys = {}
+        endpoint_urls = {
+            "openrouter": os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+            "opencode": os.environ.get("OPENCODE_GO_ENDPOINT_URL", "https://opencode.ai/zen/go/v1"),
+        }
     metadata = {name: _endpoint_readiness(url) for name, url in endpoint_urls.items()}
-    return {
+    body: dict[str, Any] = {
         "status": "ready",
         "model": serve.MODEL_NAME,
-        "endpoint_profile": os.environ.get("MANTIS_ENDPOINT_PROFILE", "direct"),
+        "endpoint_profile": profile,
         "endpoint_hosts": {name: values[0] for name, values in metadata.items()},
         "endpoint_fingerprints": {name: values[1] for name, values in metadata.items()},
     }
+    if contract:
+        body["catalog_identity_contract"] = contract
+        body["binding_fingerprint"] = model_catalog.runtime_binding_fingerprint()
+    return body
 
 
 _MODEL_CREATED = int(time.time())

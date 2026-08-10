@@ -22,11 +22,12 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypedDict
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+import model_catalog
 import stack_compose
+from typing_extensions import NotRequired, TypedDict
 
 load_spec = stack_compose.load_spec
 
@@ -35,6 +36,7 @@ COMPOSE_FILE = REPO / "docker-compose.yml"
 CONDUCTOR_FILE = REPO / "eval" / "docker-compose.conductor.yml"
 IMAGE_TAG = "mantis/openfugu:local"
 ORCHESTRATOR = "mantis-orchestrator"
+CATALOG_MOUNT_TARGET = "/app/catalog/catalog.toml"
 REDIS_NAME = "mantis-redis"
 READY_URL = "http://127.0.0.1:8088/ready"
 START_TIMEOUT = 90
@@ -43,16 +45,13 @@ DIRECT_OPENCODE_URL = "https://opencode.ai/zen/go/v1"
 CLOUDFLARE_GATEWAY_URL = "https://unified-ai-gateway.siddsantham.workers.dev/v1"
 
 
-class EndpointValues(TypedDict):
-    openrouter: str
-    opencode: str
-
-
 class ReadinessMetadata(TypedDict):
     status: str
     endpoint_profile: str
-    endpoint_hosts: EndpointValues
-    endpoint_fingerprints: EndpointValues
+    endpoint_hosts: dict[str, str]
+    endpoint_fingerprints: dict[str, str]
+    catalog_identity_contract: NotRequired[str]
+    binding_fingerprint: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -180,6 +179,34 @@ def apply_endpoint_profile(profile: EndpointProfile) -> None:
     print(
         f"endpoint profile: {profile.name} (openrouter={openrouter_host}, opencode={opencode_host})"
     )
+
+
+def catalog_environment(catalog: model_catalog.MantisCatalog) -> dict[str, str]:
+    """Render catalog metadata and credentials for the child process only."""
+    environment = model_catalog.render_mantis_environment(catalog)
+    keys = model_catalog.resolve_provider_keys(catalog)
+    environment.update(
+        MANTIS_ENDPOINT_PROFILE="catalog",
+        MANTIS_PROVIDER_KEYS=json.dumps(keys, sort_keys=True, separators=(",", ":")),
+    )
+    return environment
+
+
+def apply_catalog(catalog: model_catalog.MantisCatalog) -> None:
+    """Select catalog bindings without writing a credential to terminal output."""
+    try:
+        environment = catalog_environment(catalog)
+    except model_catalog.CatalogError as error:
+        raise SystemExit(str(error)) from error
+    os.environ.update(environment)
+    # The host catalog path drives the mount source; the container always sees
+    # the file at the fixed mount target (the entrypoint falls back to it).
+    os.environ["MANTIS_CATALOG_PATH"] = str(catalog.path)
+    providers = catalog.bindings.providers
+    hosts = ", ".join(
+        f"{name}={_endpoint_host(binding.base_url)}" for name, binding in sorted(providers.items())
+    )
+    print(f"catalog: active ({hosts})")
 
 
 def detect_backend() -> str:
@@ -311,6 +338,41 @@ def _native_run_redis(spec: dict) -> None:
     )
 
 
+def _native_catalog_mount(
+    argv: list[str], env: dict[str, str]
+) -> tuple[list[str], dict[str, str]]:
+    """Translate the catalog file bind into a directory bind for the native runtime.
+
+    The Apple ``container`` runtime only binds directories (docker binds files
+    fine).  The compose spec mounts the catalog file at ``CATALOG_MOUNT_TARGET``;
+    native runs instead bind the catalog's parent directory at the target's
+    parent directory and set ``MANTIS_CATALOG_PATH`` to the in-container file
+    path so the entrypoint validates the same file.
+    """
+    out: list[str] = []
+    for arg in argv:
+        if not arg.startswith("type=bind,source="):
+            out.append(arg)
+            continue
+        parts = arg.split(",")
+        source = next((p[len("source="):] for p in parts if p.startswith("source=")), "")
+        target = next((p[len("target="):] for p in parts if p.startswith("target=")), "")
+        if target != CATALOG_MOUNT_TARGET or not source or os.path.isdir(source):
+            out.append(arg)
+            continue
+        parent = os.path.dirname(source)
+        if not parent or not os.path.isdir(parent):
+            out.append(arg)
+            continue
+        rebuilt = [
+            f"type=bind,source={parent},target={os.path.dirname(CATALOG_MOUNT_TARGET)}"
+        ]
+        rebuilt += [part for part in parts if part == "readonly"]
+        out.append(",".join(rebuilt))
+        env["MANTIS_CATALOG_PATH"] = CATALOG_MOUNT_TARGET
+    return out, env
+
+
 def native_up(redis: bool, conductor: str | None, memory: str = "8G") -> None:
     spec = load_spec(COMPOSE_FILE)
     svc = spec["services"]["openfugu"]
@@ -344,7 +406,17 @@ def native_up(redis: bool, conductor: str | None, memory: str = "8G") -> None:
     ]
     for port in svc["ports"]:
         argv += ["-p", port]
-    argv += _mount_args(spec, svc["volumes"])
+    volumes = svc["volumes"]
+    if os.environ.get("MANTIS_ENDPOINT_PROFILE", "direct") != "catalog":
+        # Outside catalog mode the catalog bind mount may point at a path that
+        # does not exist; a missing bind source would fail the run for nothing.
+        volumes = [
+            volume for volume in volumes
+            if not volume.endswith(f":{CATALOG_MOUNT_TARGET}:ro")
+        ]
+    argv += _mount_args(spec, volumes)
+    if os.environ.get("MANTIS_ENDPOINT_PROFILE", "direct") == "catalog":
+        argv, env = _native_catalog_mount(argv, env)
     if conductor:
         argv += ["--mount", f"type=bind,source={conductor},target=/app/checkpoint,readonly"]
     with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as tmp:
@@ -358,11 +430,33 @@ def native_up(redis: bool, conductor: str | None, memory: str = "8G") -> None:
 
 
 def _expected_readiness_metadata() -> ReadinessMetadata:
+    profile = os.environ.get("MANTIS_ENDPOINT_PROFILE", "direct")
+    if profile == "catalog":
+        try:
+            bindings = model_catalog.load_runtime_bindings()
+        except model_catalog.CatalogError as error:
+            raise SystemExit(str(error)) from error
+        if bindings is None:
+            raise SystemExit("catalog endpoint profile requires rendered provider bindings")
+        urls = {name: binding.base_url for name, binding in bindings.providers.items()}
+        contract = os.environ.get("MANTIS_IDENTITY_CONTRACT", "")
+        if not contract:
+            raise SystemExit("catalog endpoint profile requires an identity contract")
+        return {
+            "status": "ready",
+            "endpoint_profile": profile,
+            "endpoint_hosts": {name: _endpoint_host(url) for name, url in urls.items()},
+            "endpoint_fingerprints": {
+                name: _endpoint_fingerprint(url) for name, url in urls.items()
+            },
+            "catalog_identity_contract": contract,
+            "binding_fingerprint": model_catalog.runtime_binding_fingerprint(),
+        }
     openrouter_url = os.environ.get("OPENROUTER_BASE_URL", DIRECT_OPENROUTER_URL)
     opencode_url = os.environ.get("OPENCODE_GO_ENDPOINT_URL", DIRECT_OPENCODE_URL)
     return {
         "status": "ready",
-        "endpoint_profile": os.environ.get("MANTIS_ENDPOINT_PROFILE", "direct"),
+        "endpoint_profile": profile,
         "endpoint_hosts": {
             "openrouter": _endpoint_host(openrouter_url),
             "opencode": _endpoint_host(opencode_url),
@@ -410,7 +504,7 @@ def wait_ready(timeout: int = START_TIMEOUT) -> None:
             pass
         time.sleep(3)
     endpoint_hosts = expected["endpoint_hosts"]
-    hosts = ", ".join(sorted({endpoint_hosts["openrouter"], endpoint_hosts["opencode"]}))
+    hosts = ", ".join(sorted(set(endpoint_hosts.values())))
     raise SystemExit(
         f"not ready within {timeout}s: expected endpoint profile "
         f"{expected['endpoint_profile']} on {hosts}; readiness metadata did not match"
@@ -454,7 +548,14 @@ def main() -> None:
     args = parser.parse_args()
     if args.command in ("up", "restart"):
         load_dotenv_defaults()
-        apply_endpoint_profile(resolve_endpoint_profile(args.endpoint_profile))
+        try:
+            catalog = model_catalog.load_mantis_catalog()
+        except model_catalog.CatalogError as error:
+            raise SystemExit(str(error)) from error
+        if catalog is None:
+            apply_endpoint_profile(resolve_endpoint_profile(args.endpoint_profile))
+        else:
+            apply_catalog(catalog)
     backend = detect_backend()
     print(f"backend: {backend}")
     if backend == "docker":

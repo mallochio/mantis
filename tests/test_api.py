@@ -512,3 +512,112 @@ def test_ready_reports_only_sanitized_endpoint_metadata(client, monkeypatch):
     changed = client.get("/ready").json()
     assert changed["endpoint_hosts"]["openrouter"] == "gateway.example.test"
     assert changed["endpoint_fingerprints"]["openrouter"] != first_fingerprint
+
+
+# --- catalog readiness: credentials and binding fingerprint -------------------
+
+
+def _catalog_runtime_env(monkeypatch, keys: dict | None = None, env_keys: dict | None = None):
+    import json as _json
+
+    import model_catalog
+    import model_catalog_runtime
+
+    abi = model_catalog.load_abi_manifest()
+    slots = tuple(abi.slot_order)
+    conductor = abi.conductor
+    providers = {
+        "edge": {
+            "adapter": "openrouter",
+            "base_url": "https://edge.example.test/v1",
+            "credential_env": "EDGE_KEY",
+        }
+    }
+    workers = {
+        slot: {
+            "provider": "edge",
+            "upstream_model": f"vendor/{slot}",
+            "model_identity": f"logical/{slot}",
+            "protocols": ["responses"] if slot == conductor else ["chat_completions"],
+        }
+        for slot in slots
+    }
+    bindings = model_catalog._runtime_bindings(providers, workers)
+    contract = model_catalog_runtime._runtime_contract_hash(bindings, slots, conductor)
+    monkeypatch.setenv("MANTIS_ENDPOINT_PROFILE", "catalog")
+    monkeypatch.setenv("MANTIS_PROVIDER_BINDINGS", _json.dumps(providers))
+    monkeypatch.setenv("MANTIS_WORKER_BINDINGS", _json.dumps(workers))
+    monkeypatch.setenv("MANTIS_WORKER_MODELS", ",".join(slots))
+    monkeypatch.setenv("MANTIS_CONDUCTOR_MODEL", conductor)
+    monkeypatch.setenv("MANTIS_IDENTITY_CONTRACT", contract)
+    monkeypatch.setenv("MANTIS_PROVIDER_KEYS", _json.dumps(keys) if keys else "")
+    for name, value in (env_keys or {}).items():
+        monkeypatch.setenv(name, value)
+    return contract
+
+
+def test_ready_catalog_requires_credentials(client, monkeypatch):
+    _catalog_runtime_env(monkeypatch)
+    monkeypatch.delenv("EDGE_KEY", raising=False)
+    response = client.get("/ready")
+    assert response.status_code == 503
+    assert "EDGE_KEY" in response.json()["error"]["message"]
+
+
+def test_ready_catalog_accepts_injected_credentials(client, monkeypatch):
+    _catalog_runtime_env(monkeypatch, keys={"edge": "injected-key"})
+    body = client.get("/ready").json()
+    assert body["status"] == "ready"
+    assert body["endpoint_profile"] == "catalog"
+    assert body["endpoint_hosts"] == {"edge": "edge.example.test"}
+    assert len(body["catalog_identity_contract"]) == 64
+    assert len(body["binding_fingerprint"]) == 64
+    assert "injected-key" not in str(body)
+
+
+def test_ready_catalog_accepts_named_env_credentials(client, monkeypatch):
+    _catalog_runtime_env(monkeypatch, env_keys={"EDGE_KEY": "native-key"})
+    assert client.get("/ready").status_code == 200
+
+
+def test_ready_catalog_rejects_partial_credentials(client, monkeypatch):
+    _catalog_runtime_env(monkeypatch, keys={})
+    monkeypatch.delenv("EDGE_KEY", raising=False)
+    assert client.get("/ready").status_code == 503
+
+
+def test_ready_catalog_rejects_stale_binding_fingerprint_change(client, monkeypatch):
+    """A mutable binding change must be visible in the readiness metadata."""
+    _catalog_runtime_env(monkeypatch, keys={"edge": "injected-key"})
+    baseline = client.get("/ready").json()["binding_fingerprint"]
+    import json as _json
+
+    import model_catalog
+    import model_catalog_runtime
+
+    abi = model_catalog.load_abi_manifest()
+    slots = tuple(abi.slot_order)
+    conductor = abi.conductor
+    providers = {
+        "edge": {
+            "adapter": "openrouter",
+            "base_url": "https://edge.example.test/v1",
+            "credential_env": "EDGE_KEY",
+        }
+    }
+    workers = {
+        slot: {
+            "provider": "edge",
+            "upstream_model": f"vendor/{slot}",
+            "model_identity": f"logical/{slot}",
+            "protocols": ["responses"] if slot == conductor else ["chat_completions"],
+        }
+        for slot in slots
+    }
+    workers[conductor]["upstream_model"] = "vendor/renamed"
+    bindings = model_catalog._runtime_bindings(providers, workers)
+    contract = model_catalog_runtime._runtime_contract_hash(bindings, slots, conductor)
+    monkeypatch.setenv("MANTIS_WORKER_BINDINGS", _json.dumps(workers))
+    monkeypatch.setenv("MANTIS_IDENTITY_CONTRACT", contract)
+    changed = client.get("/ready").json()["binding_fingerprint"]
+    assert changed != baseline
