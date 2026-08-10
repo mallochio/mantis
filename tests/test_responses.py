@@ -316,3 +316,22 @@ async def test_responses_session_proceed_ignores_global_pin(client, monkeypatch)
     # Session success is stored separately and the global pin remains untouched.
     assert len(server._decision_store) == 1 and server._session_state
     await mock.aclose()
+
+
+
+def test_gateway_three_tier_configuration_points_at_cloudflare(monkeypatch):
+    cheap, middle, expensive = configure_three_tiers(monkeypatch)
+    host = "unified-ai-gateway.siddsantham.workers.dev"
+    assert host in cheap["base"] and host in middle["base"] and host in expensive["base"]
+    assert expensive["model"] == "openai/gpt-5.6-sol"
+    assert middle["model"] == "kimi-k3"
+
+
+def test_middle_reasoning_body_preserves_cloudflare_model():
+    body = {"model": "auto", "messages": [{"role": "user", "content": "refactor"}]}
+    outgoing = server._build_outgoing_body(body, {
+        **server.MIDDLE,
+        "base": "https://unified-ai-gateway.siddsantham.workers.dev/v1",
+        "model": "kimi-k3", "effort": "medium",
+    })
+    assert outgoing["model"] == "kimi-k3" and outgoing["reasoning_effort"] == "medium"
