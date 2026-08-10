@@ -26,12 +26,12 @@ def upstream(handler):
 
 
 def configure_three_tiers(monkeypatch):
-    gateway = "https://unified-ai-gateway.siddsantham.workers.dev/v1"
-    cheap = {**server.CHEAP, "tier": "cheap", "base": gateway,
+    base = "https://openrouter.ai/v1"
+    cheap = {**server.CHEAP, "tier": "cheap", "base": base,
              "model": "deepseek-v4-flash", "key": "test"}
-    middle = {**server.MIDDLE, "tier": "middle", "base": gateway,
+    middle = {**server.MIDDLE, "tier": "middle", "base": base,
               "model": "openai/gpt-5.6-terra", "effort": "max", "key": "test"}
-    expensive = {**server.EXPENSIVE, "tier": "expensive", "base": gateway,
+    expensive = {**server.EXPENSIVE, "tier": "expensive", "base": base,
                  "model": "openai/gpt-5.6-sol", "key": "test"}
     monkeypatch.setattr(server, "CHEAP", cheap)
     monkeypatch.setattr(server, "MIDDLE", middle)
@@ -45,11 +45,10 @@ def configure_three_tiers(monkeypatch):
 
 def test_responses_capability_requires_openai_and_supported_host():
     assert server._supports_responses({
-        "base": "https://unified-ai-gateway.siddsantham.workers.dev/v1",
-        "model": "openai/gpt-5.6-sol",
-    })
-    assert server._supports_responses({
         "base": "https://openrouter.ai/api/v1", "model": "openai/gpt-5.6-sol",
+    })
+    assert not server._supports_responses({
+        "base": "https://router.example.test/v1", "model": "openai/gpt-5.6-sol",
     })
     assert not server._supports_responses({
         "base": "https://modal.example/v1", "model": "kimi-k3",
@@ -113,11 +112,11 @@ async def test_chat_still_uses_chat_completions(client, monkeypatch):
 
 @pytest.mark.anyio
 async def test_responses_fails_when_no_capable_backend(client, monkeypatch):
-    gateway = "https://unified-ai-gateway.siddsantham.workers.dev/v1"
+    base = "https://router.example.test/v1"
     backends = {
-        "cheap": {**server.CHEAP, "tier": "cheap", "base": gateway, "model": "deepseek-v4-flash"},
-        "middle": {**server.MIDDLE, "tier": "middle", "base": gateway, "model": "kimi-k3"},
-        "expensive": {**server.EXPENSIVE, "tier": "expensive", "base": gateway, "model": "kimi-k3"},
+        "cheap": {**server.CHEAP, "tier": "cheap", "base": base, "model": "deepseek-v4-flash"},
+        "middle": {**server.MIDDLE, "tier": "middle", "base": base, "model": "kimi-k3"},
+        "expensive": {**server.EXPENSIVE, "tier": "expensive", "base": base, "model": "kimi-k3"},
     }
     monkeypatch.setattr(server, "BACKENDS", backends)
     monkeypatch.setattr(server, "CHEAP", backends["cheap"])
@@ -344,19 +343,12 @@ async def test_responses_session_proceed_ignores_global_pin(client, monkeypatch)
 
 
 
-def test_gateway_three_tier_configuration_points_at_cloudflare(monkeypatch):
-    cheap, middle, expensive = configure_three_tiers(monkeypatch)
-    host = "unified-ai-gateway.siddsantham.workers.dev"
-    assert host in cheap["base"] and host in middle["base"] and host in expensive["base"]
-    assert expensive["model"] == "openai/gpt-5.6-sol"
-    assert middle["model"] == "openai/gpt-5.6-terra"
 
-
-def test_middle_reasoning_body_preserves_cloudflare_model():
+def test_middle_reasoning_body_preserves_model():
     body = {"model": "auto", "messages": [{"role": "user", "content": "refactor"}]}
     outgoing = server._build_outgoing_body(body, {
         **server.MIDDLE,
-        "base": "https://unified-ai-gateway.siddsantham.workers.dev/v1",
+        "base": "https://router.example.test/v1",
         "model": "openai/gpt-5.6-terra", "effort": "max",
     })
     assert outgoing["model"] == "openai/gpt-5.6-terra" and outgoing["reasoning_effort"] == "max"

@@ -273,7 +273,7 @@ def test_adapter_capabilities_and_fingerprint_cover_adapter_and_policy(catalog_s
 
     fingerprint = catalog_server.TARGET_CONFIG_FINGERPRINT
     changed_adapter = {name: dict(value) for name, value in catalog_server.BACKENDS.items()}
-    changed_adapter["responses"]["adapter"] = "cloudflare-gateway"
+    changed_adapter["responses"]["adapter"] = "modal"
     assert catalog_server._target_config_fingerprint(
         "catalog", changed_adapter, catalog_server.SUPRA_TARGETS, catalog_server.SUPRA_INVALID_TARGET,
     ) != fingerprint

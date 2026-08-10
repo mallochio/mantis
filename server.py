@@ -3,8 +3,8 @@
 Exposes one OpenAI-compatible model ("auto") on explicit Chat Completions
 and Responses endpoints. Requests are routed by the Supra-Router-51M complexity
 gate (default; see ROUTELLM_ROUTER below for the legacy RouteLLM MF mode).
-Responses requests are restricted to OpenAI models via OpenRouter or the
-Cloudflare gateway; Chat Completions behavior remains independent.
+Responses requests are restricted to OpenAI models via OpenRouter;
+Chat Completions behavior remains independent.
 
 Config via env:
   ROUTELLM_HOST=127.0.0.1
@@ -100,58 +100,12 @@ ROUTELLM_CONTEXT_WINDOW = os.environ.get("ROUTELLM_CONTEXT_WINDOW", "auto")
 ROUTELLM_MAX_TOKENS = _env_int("ROUTELLM_MAX_TOKENS", 131072)
 MODEL_ID = "auto"
 
-GATEWAY_BASE = os.environ.get(
-    "ROUTELLM_GATEWAY_BASE", "https://unified-ai-gateway.siddsantham.workers.dev/v1",
-)
-GATEWAY_KEY = os.environ.get("AI_GATEWAY_API_KEY") or os.environ.get("MANTIS_GATEWAY_API_KEY", "")
-GATEWAY_HOST = "unified-ai-gateway.siddsantham.workers.dev"
+def _base(name: str, direct_default: str) -> str:
+    return os.environ.get(name) or direct_default
 
 
-def _gateway_force_bases() -> bool:
-    profile = os.environ.get("ROUTELLM_ENDPOINT_PROFILE", "").lower()
-    if profile == "direct":
-        return False
-    if profile == "cloudflare":
-        return True
-    mode = os.environ.get("ROUTELLM_GATEWAY_MODE", "").lower()
-    valid = {"1", "true", "yes", "on", "cloudflare", "0", "false", "no", "off"}
-    if mode and mode not in valid:
-        if _EXPLICIT_SOURCE_PRESENT:
-            # Legacy gateway mode is irrelevant to an explicit source and must
-            # not block it; fall through to the configured-bases heuristic.
-            mode = ""
-        else:
-            raise ValueError("invalid ROUTELLM_GATEWAY_MODE")
-    if mode in {"1", "true", "yes", "on", "cloudflare"}:
-        return True
-    if mode in {"0", "false", "no", "off"}:
-        return False
-    configured = (os.environ.get("EXPENSIVE_BASE"), os.environ.get("CHEAP_BASE"),
-                  os.environ.get("MIDDLE_BASE"))
-    # If one configured tier already uses the gateway, normalize all tiers to
-    # it rather than accidentally sending a gateway credential to a direct URL.
-    return any(GATEWAY_HOST in (base or "").lower() for base in configured) or not any(configured)
-
-
-def _gateway_requested() -> bool:
-    return _gateway_force_bases()
-
-
-def _base(name: str, direct_default: str, gateway: bool) -> str:
-    if gateway and _gateway_force_bases():
-        return GATEWAY_BASE
-    value = os.environ.get(name)
-    if value is not None:
-        return value
-    return GATEWAY_BASE if gateway else direct_default
-
-
-def _key(name: str, base: str) -> str:
-    value = os.environ.get(name, "")
-    profile = os.environ.get("ROUTELLM_ENDPOINT_PROFILE", "").lower()
-    if profile != "direct" and (_gateway_requested() and base == GATEWAY_BASE or GATEWAY_HOST in base.lower()):
-        return GATEWAY_KEY or value
-    return value
+def _key(name: str) -> str:
+    return os.environ.get(name, "")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -184,7 +138,6 @@ _ADAPTER_PROTOCOLS = {
     "opencode-go": frozenset({"chat_completions"}),
     "modal": frozenset({"chat_completions"}),
     "openai-compatible": frozenset({"chat_completions", "responses"}),
-    "cloudflare-gateway": frozenset({"chat_completions", "responses"}),
 }
 _LITERAL_CREDENTIAL_FIELDS = frozenset({
     "key", "api_key", "token", "credential", "credential_value", "secret", "password",
@@ -330,16 +283,13 @@ def _backend(name: str, *, base: str, key: str, model: str, effort: str,
     # `usage.include` is an OpenRouter wire extension.  Adapter identity is
     # therefore operationally meaningful (and participates in revisioning),
     # rather than merely descriptive metadata.
-    openrouter_model = model.split("/", 1)[0] in {"openai", "google", "anthropic", "openrouter"}
     if adapter == "openrouter":
         default_usage = True
-    elif adapter == "cloudflare-gateway":
-        default_usage = openrouter_model
     elif adapter is not None:
         default_usage = False
     else:
         # Preserve legacy endpoint-derived behavior while no catalog is active.
-        default_usage = "openrouter.ai" in base or (GATEWAY_HOST in base and openrouter_model)
+        default_usage = "openrouter.ai" in base
     usage_name = re.sub(r"[^A-Z0-9]", "_", name.upper())
     usage_name = f"ROUTELLM_{usage_name}_USAGE_INCLUDE"
     return {
@@ -645,24 +595,23 @@ def _target_config_revision(source: str, explicit: str | None, fingerprint: str)
     return f"{label}-{fingerprint}"
 
 
-_GATEWAY_SELECTED = _gateway_requested()
-EXPENSIVE_BASE = _base("EXPENSIVE_BASE", "https://openrouter.ai/api/v1", _GATEWAY_SELECTED)
-CHEAP_BASE = _base("CHEAP_BASE", "https://opencode.ai/zen/go/v1", _GATEWAY_SELECTED)
-MIDDLE_BASE = _base("MIDDLE_BASE", "", _GATEWAY_SELECTED)
+EXPENSIVE_BASE = _base("EXPENSIVE_BASE", "https://openrouter.ai/api/v1")
+CHEAP_BASE = _base("CHEAP_BASE", "https://opencode.ai/zen/go/v1")
+MIDDLE_BASE = _base("MIDDLE_BASE", "")
 EXPENSIVE = _backend(
-    "expensive", base=EXPENSIVE_BASE, key=_key("EXPENSIVE_KEY", EXPENSIVE_BASE),
+    "expensive", base=EXPENSIVE_BASE, key=_key("EXPENSIVE_KEY"),
     model=os.environ.get("EXPENSIVE_MODEL", "openai/gpt-5.6-sol"),
     effort=os.environ.get("EXPENSIVE_REASONING_EFFORT", "medium"),
     max_tokens=_optional_int("EXPENSIVE_MAX_TOKENS"), rank=2,
 )
 CHEAP = _backend(
-    "cheap", base=CHEAP_BASE, key=_key("CHEAP_KEY", CHEAP_BASE),
+    "cheap", base=CHEAP_BASE, key=_key("CHEAP_KEY"),
     model=os.environ.get("CHEAP_MODEL", "deepseek-v4-flash"),
     effort=os.environ.get("CHEAP_REASONING_EFFORT", "none"),
     max_tokens=_env_int("CHEAP_MAX_TOKENS", ROUTELLM_MAX_TOKENS), rank=0,
 )
 MIDDLE = _backend(
-    "middle", base=MIDDLE_BASE, key=_key("MIDDLE_KEY", MIDDLE_BASE),
+    "middle", base=MIDDLE_BASE, key=_key("MIDDLE_KEY"),
     model=os.environ.get("MIDDLE_MODEL", "openai/gpt-5.6-terra"),
     effort=os.environ.get("MIDDLE_REASONING_EFFORT", "max"),
     max_tokens=_env_int("MIDDLE_MAX_TOKENS", ROUTELLM_MAX_TOKENS), rank=1,
@@ -1271,7 +1220,7 @@ def _supports_responses(backend: dict) -> bool:
         host = (urlsplit(base).hostname or "").lower()
     except ValueError:
         return False
-    return host in {"openrouter.ai", GATEWAY_HOST}
+    return host == "openrouter.ai"
 
 
 _REFUSAL_RE = re.compile(
@@ -2428,8 +2377,7 @@ def _log_attempts(attempts, prompt: str, score: float, request_id: str, occurren
 async def healthz():
     return {
         "ok": _READY, "router": ROUTER_NAME, "threshold": THRESHOLD,
-        "backend": "cloudflare" if _GATEWAY_SELECTED else "direct",
-        "gateway": _GATEWAY_SELECTED, "tiers": list(BACKENDS),
+        "backend": "direct", "tiers": list(BACKENDS),
         "targets": {
             target: {
                 "model": backend["model"], "provider": backend.get("provider"),

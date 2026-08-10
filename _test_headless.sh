@@ -22,7 +22,7 @@ H=$(mktemp)
 SESSION="headless-$(date +%s)"
 route_one "EASY (cheap/middle/expensive tier)"  "Write hello world in Python, one line"
 route_one "HARD (expensive tier)"    "Implement Paxos with byzantine fault tolerance and prove liveness and safety; include the formal invariant argument and the fail-stop vs fail-beautiful distinction"
-route_one "MEDIUM (middle tier when gateway is enabled)"     "Refactor this pymongo query to avoid N+1 by adding a covering compound index, and explain the query planner interaction with the ESR rule"
+route_one "MEDIUM (middle tier)"     "Refactor this pymongo query to avoid N+1 by adding a covering compound index, and explain the query planner interaction with the ESR rule"
 # A short continuation should report the same session affinity decision.
 route_one "CONTINUATION (sticky session)" "Proceed"
 echo "=== RESPONSES (explicit endpoint) ==="

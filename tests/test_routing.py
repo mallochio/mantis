@@ -26,9 +26,9 @@ def isolate_store(tmp_path, monkeypatch):
     server._decision_store.clear()
 
 
-def test_gateway_default_maps_level_3_and_4_to_middle_and_5_to_expensive(monkeypatch):
-    assert server.MIDDLE_CONFIGURED
-    assert server.EXPENSIVE_MIN_COMPLEXITY == 5
+def test_default_maps_level_3_and_4_to_middle_and_5_to_expensive(monkeypatch):
+    monkeypatch.setattr(server, "MIDDLE_CONFIGURED", True)
+    monkeypatch.setattr(server, "EXPENSIVE_MIN_COMPLEXITY", 5)
 
     monkeypatch.setattr(server, "MIDDLE_MIN_COMPLEXITY", 3)
     monkeypatch.setattr(server, "EXPENSIVE_MIN_COMPLEXITY", 5)

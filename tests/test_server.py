@@ -132,8 +132,12 @@ def test_usage_cache_metrics_are_normalized(tmp_path, monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_gateway_middle_failover_uses_middle_model(client, monkeypatch):
+async def test_middle_failover_uses_middle_model(client, monkeypatch):
     monkeypatch.setattr(server, "MIDDLE_CONFIGURED", True)
+    monkeypatch.setattr(server, "MIDDLE", {**server.MIDDLE, "base": "https://openrouter.ai/v1"})
+    monkeypatch.setattr(server, "BACKENDS", {
+        **server.BACKENDS, "middle": {**server.MIDDLE, "base": "https://openrouter.ai/v1"},
+    })
     monkeypatch.setattr(server, "_decide", lambda *args: ("cheap", None, 1, 10))
     calls = []
     def handler(request):

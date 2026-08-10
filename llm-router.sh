@@ -63,56 +63,15 @@ if [ -z "${OPENAI_API_KEY:-}" ] && [ "${ROUTELLM_ROUTER:-supra}" != "supra" ]; t
   echo 'ERROR: OPENAI_API_KEY not set and not found in Keychain; MF scoring needs it for embeddings.' >&2
   exit 1
 fi
-# Select the endpoint profile before assigning defaults. This avoids turning
-# gateway mode into a mixed direct/gateway configuration.
-ROUTER_GATEWAY=0
-case "${ROUTELLM_ENDPOINT_PROFILE:-}" in
-  cloudflare) ROUTER_GATEWAY=1 ;;
-  direct) ROUTER_GATEWAY=0 ;;
-  *)
-    case "${ROUTELLM_GATEWAY_MODE:-}" in
-      1|true|TRUE|yes|YES|on|ON|cloudflare) ROUTER_GATEWAY=1 ;;
-      ""|0|false|FALSE|no|NO|off|OFF) ;;
-      *) echo 'ERROR: invalid ROUTELLM_GATEWAY_MODE' >&2; exit 2 ;;
-    esac
-    [[ "${EXPENSIVE_BASE:-}${CHEAP_BASE:-}${MIDDLE_BASE:-}" == *unified-ai-gateway.siddsantham.workers.dev* ]] && ROUTER_GATEWAY=1
-    if [ -z "${EXPENSIVE_BASE:-}" ] && [ -z "${CHEAP_BASE:-}" ] && [ -z "${MIDDLE_BASE:-}" ]; then
-      ROUTER_GATEWAY=1
-    fi
-    ;;
-esac
-if [ "$ROUTER_GATEWAY" -eq 1 ]; then
-  export EXPENSIVE_BASE="https://unified-ai-gateway.siddsantham.workers.dev/v1"
-  export CHEAP_BASE="https://unified-ai-gateway.siddsantham.workers.dev/v1"
-  export MIDDLE_BASE="https://unified-ai-gateway.siddsantham.workers.dev/v1"
-  export AI_GATEWAY_API_KEY="${AI_GATEWAY_API_KEY:-${MANTIS_GATEWAY_API_KEY:-}}"
-  export EXPENSIVE_KEY="${AI_GATEWAY_API_KEY}"
-  export CHEAP_KEY="${AI_GATEWAY_API_KEY}"
-  export MIDDLE_KEY="${AI_GATEWAY_API_KEY}"
-  if [ -z "$AI_GATEWAY_API_KEY" ] && [ "$ROUTER_EXPLICIT_SOURCE" -eq 0 ]; then
-    echo 'ERROR: Cloudflare gateway endpoint requires AI_GATEWAY_API_KEY or MANTIS_GATEWAY_API_KEY' >&2
-    exit 2
-  fi
-else
-  export EXPENSIVE_BASE="${EXPENSIVE_BASE:-https://openrouter.ai/api/v1}"
-  export EXPENSIVE_KEY="${EXPENSIVE_KEY:-${OPENROUTER_API_KEY:-}}"
-  export CHEAP_BASE="${CHEAP_BASE:-https://opencode.ai/zen/go/v1}"
-  export CHEAP_KEY="${CHEAP_KEY:-${OPENCODE_API_KEY:-}}"
-  export MIDDLE_BASE="${MIDDLE_BASE:-}"
-  export MIDDLE_KEY="${MIDDLE_KEY:-}"
-fi
-export EXPENSIVE_MODEL="${EXPENSIVE_MODEL:-openai/gpt-5.6-sol}"
-export EXPENSIVE_REASONING_EFFORT="${EXPENSIVE_REASONING_EFFORT:-medium}"
-export CHEAP_MODEL="${CHEAP_MODEL:-deepseek-v4-flash}"
-export CHEAP_REASONING_EFFORT="${CHEAP_REASONING_EFFORT:-}"
-export CHEAP_MAX_TOKENS="${CHEAP_MAX_TOKENS:-131072}"
-export MIDDLE_MODEL="${MIDDLE_MODEL:-openai/gpt-5.6-terra}"
-export MIDDLE_REASONING_EFFORT="${MIDDLE_REASONING_EFFORT:-max}"
-export MIDDLE_MAX_TOKENS="${MIDDLE_MAX_TOKENS:-131072}"
-# Terra handles Supra levels 3–4; reserve Sol for level 5+.
-export ROUTELLM_EXPENSIVE_MIN_COMPLEXITY="${ROUTELLM_EXPENSIVE_MIN_COMPLEXITY:-5}"
-# Preserve direct-provider credentials unless a gateway endpoint/profile is selected.
-# Base-host auto-detection keeps existing Cloudflare gateway configurations working.
+# Direct endpoints only (Cloudflare gateway retired); the shared catalog or
+# launcher-supplied legacy env provides provider bases and keys.
+export EXPENSIVE_BASE="${EXPENSIVE_BASE:-https://openrouter.ai/api/v1}"
+export EXPENSIVE_KEY="${EXPENSIVE_KEY:-${OPENROUTER_API_KEY:-}}"
+export CHEAP_BASE="${CHEAP_BASE:-https://opencode.ai/zen/go/v1}"
+export CHEAP_KEY="${CHEAP_KEY:-${OPENCODE_API_KEY:-}}"
+export MIDDLE_BASE="${MIDDLE_BASE:-}"
+export MIDDLE_KEY="${MIDDLE_KEY:-}"
+# Preserve direct-provider credentials unless an explicit source is active.
 if [ "$ROUTER_EXPLICIT_SOURCE" -eq 0 ]; then
   router_select_endpoint_keys
   if [ -z "$EXPENSIVE_KEY" ]; then
