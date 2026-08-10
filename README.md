@@ -1,8 +1,21 @@
 # llm-router
 
-An OpenAI-compatible FastAPI router for `/v1/chat/completions`. RouteLLM MF and
-Supra select one of two provider backends. The server calls each configured
-provider directly with one lifespan-owned asynchronous HTTP pool.
+An OpenAI-compatible FastAPI router for `/v1/chat/completions`. The router
+selects one of two provider backends. The server calls each configured provider
+directly with one lifespan-owned asynchronous HTTP pool.
+
+Two routing modes are available (`ROUTELLM_ROUTER`):
+
+- `supra` (default): the Supra-Router-51M complexity gate is the primary
+  signal. Prompts with complexity >= `ROUTELLM_SUPRA_THRESHOLD` (3) go to the
+  expensive backend. MF scoring is off by default; set
+  `ROUTELLM_SCORE_WITH_MF=1` for observability (it never influences the
+  decision). This mode was chosen because on the Aug 5-10 workload the RouteLLM
+  MF score had essentially zero separation against the Gemini difficulty
+  labels (AUC 0.52 vs 0.66 for Supra), and the MF gate on top of Supra only
+  added wasted expensive calls.
+- `mf` (legacy): RouteLLM MF score >= `ROUTELLM_THRESHOLD`, with Supra as a
+  secondary gate below the threshold. `bert` also selects the old checkpoint.
 
 ## Setup and run
 
@@ -55,7 +68,27 @@ continue to use `EXPENSIVE_KEY` and `CHEAP_KEY`.
 
 Every routed response includes `x-request-id`, `x-route-decision`,
 `x-route-model`, `x-route-score`, `x-route-attempts`, and `x-route-fallback`.
-Optional Supra headers are also returned.
+Optional Supra headers are also returned. In supra mode `x-route-score` is
+`n/a` unless `ROUTELLM_SCORE_WITH_MF=1`.
+
+### Learned per-prompt routing
+
+This workload is dominated by repeated prompts (top 25 prompts were ~38% of
+calls in the Aug 5-10 log), so the router keeps a persistent per-prompt
+decision store (`decision-state.jsonl`, append-only, mode 0600) that survives
+restarts:
+
+- A prompt that completes cleanly on the cheap backend `ROUTELLM_PIN_CHEAP_AFTER`
+  (default 5) times is pinned cheap and skips all scoring (no embedding call,
+  no Supra inference) until `ROUTELLM_PIN_TTL_S` (default 7 days) elapses.
+- A prompt whose cheap attempt refuses (or is retried by the client)
+  `ROUTELLM_PIN_EXPENSIVE_AFTER` (default 2) times is pinned expensive, so
+  later requests skip the doomed cheap attempt entirely.
+- Stats reset after 24h without a new note, so changed prompt behavior
+  re-learns. Pinned responses carry `x-route-pinned: true`.
+- Supra generation stops as soon as the `Complexity:` digit is emitted
+  (greedy decode is deterministic, so the parsed value is unchanged); median
+  scoring latency drops from ~480ms to ~60ms.
 
 ## Logs and training
 

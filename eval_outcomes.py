@@ -45,6 +45,22 @@ def band_of(score: float) -> str:
     return BANDS[-1][0]
 
 
+# Supra mode logs complexity instead of an MF score; band by complexity so the
+# weekly verdict still has a signal axis when x-route-score is "n/a".
+SUPRA_BANDS = [("<2", 0, 2), ("2", 2, 3), ("3", 3, 4), (">=4", 4, 100)]
+
+
+def supra_band_of(complexity) -> str:
+    try:
+        value = float(complexity)
+    except (TypeError, ValueError):
+        return "n/a"
+    for name, lo, hi in SUPRA_BANDS:
+        if lo <= value < hi:
+            return name
+    return SUPRA_BANDS[-1][0]
+
+
 def evaluate(decisions: list[dict], outcomes: list[dict], labels: list[dict]) -> dict:
     # Modern rows join one outcome occurrence to one routed request. Legacy rows
     # without IDs retain the old prompt-hash join for backward compatibility.
@@ -65,7 +81,8 @@ def evaluate(decisions: list[dict], outcomes: list[dict], labels: list[dict]) ->
         if "domain" in label and label.get("prompt"):
             lab[label["prompt"].strip()] = "expensive" if label.get("route") == "big model" else "cheap"
 
-    cells = {d: {b: [0, 0] for b, _, _ in BANDS} for d in ("cheap", "expensive")}
+    all_bands = [b for b, _, _ in BANDS] + [b for b, _, _ in SUPRA_BANDS]
+    cells = {d: {b: [0, 0] for b in all_bands} for d in ("cheap", "expensive")}
     lab_cells = {d: {r: [0, 0] for r in ("cheap", "expensive")} for d in ("cheap", "expensive")}
     for r in decisions:
         # Attempt telemetry is operational detail, not a routed-call outcome.
@@ -73,16 +90,21 @@ def evaluate(decisions: list[dict], outcomes: list[dict], labels: list[dict]) ->
         if r.get("record_type") not in (None, "decision"):
             continue
         score = r.get("score")
-        if not isinstance(score, (int, float)):
-            continue
+        if isinstance(score, (int, float)):
+            key = band_of(score)
+        else:
+            # Supra-first mode: band by Supra complexity instead of MF score.
+            key = supra_band_of(r.get("supra_complexity"))
+            if key == "n/a":
+                continue
         d = r.get("decision")
-        if d not in cells:
+        if d not in cells or key not in cells[d]:
             continue
-        cells[d][band_of(score)][0] += 1
+        cells[d][key][0] += 1
         row_id = r.get("decision_occurrence_id") or r.get("occurrence_id") or r.get("request_id")
         is_failed = (str(row_id) in failed_ids if row_id else r.get("prompt_hash") in legacy_failed_hashes)
         if is_failed:
-            cells[d][band_of(score)][1] += 1
+            cells[d][key][1] += 1
         lr = lab.get(str(r.get("prompt", "")).strip())
         if lr:
             lab_cells[d][lr][0] += 1
@@ -123,17 +145,20 @@ def report(decisions, outcomes, labels) -> str:
     lines = [
         f"Router outcome evaluation ({len(decisions)} routed calls, {len(outcomes)} outcome events)",
         "",
-        "Failure rate (retried/refused/truncated/upstream_error) by score band x decision:",
+        "Failure rate (retried/refused/truncated/upstream_error) by band x decision:",
     ]
     header = "  band       | cheap        | expensive"
     lines.append(header)
     lines.append("  -----------+--------------+-------------")
-    for b, _, _ in BANDS:
-        row = []
-        for d in ("cheap", "expensive"):
-            n, f = res["cells"][d][b]
-            row.append(f"{f}/{n} ({rate([n, f]) or 0:.0%})" if n else "-")
-        lines.append(f"  {b:10s} | {row[0]:12s} | {row[1]:11s}")
+    for group in (BANDS, SUPRA_BANDS):
+        for b, _, _ in group:
+            row = []
+            for d in ("cheap", "expensive"):
+                n, f = res["cells"][d][b]
+                row.append(f"{f}/{n} ({rate([n, f]) or 0:.0%})" if n else "-")
+            lines.append(f"  {b:10s} | {row[0]:12s} | {row[1]:11s}")
+        if group is BANDS and any(res["cells"]["cheap"].get(b) and res["cells"]["cheap"][b][0] for b, _, _ in SUPRA_BANDS):
+            lines.append("  -- supra complexity bands --")
     lines.append("")
     lines.append("Failure rate by route decision x labeler call:")
     for d in ("cheap", "expensive"):
@@ -157,6 +182,10 @@ def demo() -> None:
     v = verdicts(evaluate(dec, out, labs))
     assert any(x.startswith("RAISE") for x in v), v
     assert not any(x.startswith("RAISE") for x in verdicts(evaluate(dec, [], labs)))
+    # Supra-first rows (no MF score) are banded by complexity and counted.
+    supra_rows = [{"record_type": "decision", "decision": "cheap", "supra_complexity": 3, "prompt": "b", "prompt_hash": "h2"}] * 30
+    res = evaluate(supra_rows, out, labs)
+    assert res["cells"]["cheap"]["3"][0] == 30, res["cells"]
     print("self-test passed:", v[0])
 
 

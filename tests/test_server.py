@@ -11,6 +11,7 @@ async def client(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "LOG_PATH", tmp_path / "decisions.log")
     monkeypatch.setattr(server, "OUTCOME_LOG_PATH", tmp_path / "outcomes.log")
     monkeypatch.setattr(server, "TRAINING_LOG_PATH", tmp_path / "training.log")
+    monkeypatch.setattr(server, "DECISION_STORE_PATH", tmp_path / "decision-state.jsonl")
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=server.app), base_url="http://router") as value:
         yield value
 

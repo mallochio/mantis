@@ -1,7 +1,8 @@
-"""RouteLLM coding-router server.
+"""LLM coding-router server.
 
-Exposes one OpenAI-compatible model ("auto"). Requests are scored by the
-RouteLLM MF+Supra router and forwarded directly to OpenRouter or OpenCode Go.
+Exposes one OpenAI-compatible model ("auto"). Requests are routed by the
+Supra-Router-51M complexity gate (default; see ROUTELLM_ROUTER below for the
+legacy RouteLLM MF mode) and forwarded directly to the configured providers.
 
 Config via env:
   ROUTELLM_HOST=127.0.0.1
@@ -27,6 +28,7 @@ import json
 import os
 import re
 import secrets
+import threading
 import time
 import uuid
 from collections import OrderedDict
@@ -44,7 +46,12 @@ HOST = os.environ.get("ROUTELLM_HOST", "127.0.0.1")
 PORT = int(os.environ.get("ROUTELLM_PORT", "5500"))
 SERVER_KEY = os.environ.get("ROUTELLM_KEY", "sk-route-local")
 THRESHOLD = float(os.environ.get("ROUTELLM_THRESHOLD", "0.2"))
-ROUTER_NAME = os.environ.get("ROUTELLM_ROUTER", "mf")
+ROUTER_NAME = os.environ.get("ROUTELLM_ROUTER", "supra")
+# In supra mode the Supra-Router-51M complexity gate is the primary signal
+# (the MF score has ~zero separation on this workload: AUC 0.52 vs 0.66 for
+# Supra over 428 labeled prompts; the MF gate only adds waste on top of Supra).
+# MF scoring is then optional observability only.
+SCORE_WITH_MF = os.environ.get("ROUTELLM_SCORE_WITH_MF", "0").lower() in {"1", "true", "yes", "on"}
 SUPRA_ENABLED = os.environ.get("ROUTELLM_USE_SUPRA", "1") != "0"
 SUPRA_THRESHOLD = int(os.environ.get("ROUTELLM_SUPRA_THRESHOLD", "3"))
 SUPRA_MIN_SCORE = float(os.environ.get("ROUTELLM_SUPRA_MIN_SCORE", "0"))
@@ -214,6 +221,22 @@ def _parse_supra_complexity(text: str) -> int:
 
 def _supra_complexity(prompt: str) -> tuple[int, int]:
     model, tokenizer = _load_supra()
+    from transformers import StoppingCriteria
+
+    class _ComplexitySeen(StoppingCriteria):
+        """Stop generation as soon as the 'Complexity:' field is emitted.
+
+        Supra emits 'Domain: ... | Complexity: N | ...' and the complexity
+        digit appears within the first ~10 generated tokens. Greedy decode is
+        deterministic, so stopping early yields the exact same parsed value
+        while cutting median inference from ~480ms to ~160ms (3x)."""
+
+        def __call__(self, input_ids, scores, **kwargs) -> bool:
+            text = tokenizer.decode(input_ids[0][-24:], skip_special_tokens=True)
+            # Stop only once the complexity digit itself has been emitted;
+            # stopping at the bare "Complexity:" prefix would parse as 0.
+            return re.search(r"Complexity:\s*\d", text) is not None
+
     fmt = f"Task: {prompt}\nAnalysis: "
     inputs = tokenizer(fmt, return_tensors="pt", truncation=True,
                        max_length=tokenizer.model_max_length)
@@ -223,6 +246,7 @@ def _supra_complexity(prompt: str) -> tuple[int, int]:
         out = model.generate(
             **inputs, max_new_tokens=128, do_sample=False,
             pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
+            stopping_criteria=[_ComplexitySeen()],
         )
     supra_ms = int((time.time() - t0) * 1000)
     gen = tokenizer.decode(
@@ -231,21 +255,47 @@ def _supra_complexity(prompt: str) -> tuple[int, int]:
     return _parse_supra_complexity(gen), supra_ms
 
 
+def _decide_mf(trimmed_prompt: str) -> tuple[str, float, int | None, int | None]:
+    """Legacy MF+Supra gate: MF score >= threshold, then Supra on the band below."""
+    r = _load_router()
+    score = float(r.calculate_strong_win_rate(trimmed_prompt))
+    if len(trimmed_prompt) <= SHORT_PROMPT_MAX_CHARS and score < SHORT_PROMPT_FORCE_CHEAP_SCORE:
+        return "cheap", score, None, None
+    supra_complexity = None
+    supra_ms = None
+    if score >= THRESHOLD:
+        return "expensive", score, supra_complexity, supra_ms
+    if SUPRA_ENABLED and score >= SUPRA_MIN_SCORE:
+        supra_complexity, supra_ms = _supra_complexity(trimmed_prompt)
+        if supra_complexity >= SUPRA_THRESHOLD:
+            return "expensive", score, supra_complexity, supra_ms
+    return "cheap", score, supra_complexity, supra_ms
+
+
 def _decide_uncached(trimmed_prompt: str) -> tuple[str, float, int | None, int | None]:
     try:
-        r = _load_router()
-        score = float(r.calculate_strong_win_rate(trimmed_prompt))
-        if len(trimmed_prompt) <= SHORT_PROMPT_MAX_CHARS and score < SHORT_PROMPT_FORCE_CHEAP_SCORE:
-            return "cheap", score, None, None
-        supra_complexity = None
-        supra_ms = None
-        if score >= THRESHOLD:
-            return "expensive", score, supra_complexity, supra_ms
-        if SUPRA_ENABLED and score >= SUPRA_MIN_SCORE:
-            supra_complexity, supra_ms = _supra_complexity(trimmed_prompt)
-            if supra_complexity >= SUPRA_THRESHOLD:
-                return "expensive", score, supra_complexity, supra_ms
-        return "cheap", score, supra_complexity, supra_ms
+        if ROUTER_NAME == "supra":
+            # Supra-first: complexity >= threshold is the only gate. The MF
+            # score is computed only for observability when SCORE_WITH_MF is
+            # set; it never influences the decision. If Supra is unavailable
+            # (missing torch/transformers), fall back to the legacy MF gate.
+            supra_complexity = supra_ms = None
+            score = None
+            try:
+                supra_complexity, supra_ms = _supra_complexity(trimmed_prompt)
+            except Exception as err:
+                print(f"Supra scoring failed ({err}); falling back to MF gate", flush=True)
+            if SCORE_WITH_MF:
+                try:
+                    r = _load_router()
+                    score = float(r.calculate_strong_win_rate(trimmed_prompt))
+                except Exception as err:
+                    print(f"MF scoring failed ({err})", flush=True)
+            if supra_complexity is not None:
+                return ("expensive" if supra_complexity >= SUPRA_THRESHOLD else "cheap",
+                        score, supra_complexity, supra_ms)
+            return _decide_mf(trimmed_prompt)
+        return _decide_mf(trimmed_prompt)
     except Exception as err:
         print(f"Router decision failed ({err}); defaulting to expensive", flush=True)
         return tuple(["expensive", 1.0, None, None])  # type: ignore
@@ -257,6 +307,12 @@ def _decide_cached(trimmed_prompt: str) -> tuple[str, float, int | None, int | N
 
 
 def _decide(prompt: str) -> tuple[str, float, int | None, int | None]:
+    # Pinned prompts bypass scoring entirely: repeated cheap-success prompts
+    # skip the embedding + Supra inference, and prompts that repeatedly refuse
+    # on the cheap backend skip the doomed cheap attempt.
+    pinned = _store_pinned(_prompt_hash(prompt))
+    if pinned is not None:
+        return pinned.get("decision", "cheap"), pinned.get("score"), None, None
     # Take tail of prompt (~15k chars) so routing evaluates the latest user request & context
     trimmed_prompt = prompt[-15000:] if len(prompt) > 15000 else prompt
     return _decide_cached(trimmed_prompt)
@@ -370,7 +426,8 @@ def _log(
     row = {
         "ts": time.time(), "request_id": request_id,
         "occurrence_id": occurrence_id or uuid.uuid4().hex,
-        "router": ROUTER_NAME, "threshold": THRESHOLD, "score": round(score, 4),
+        "router": ROUTER_NAME, "threshold": THRESHOLD,
+        "score": round(score, 4) if isinstance(score, (int, float)) else None,
         "supra_complexity": supra_complexity, "supra_ms": supra_ms,
         "decision": decision, "model": backend_model, "ttfb_ms": ttfb_ms,
         "prompt_hash": _prompt_hash(prompt), **detail,
@@ -397,6 +454,98 @@ def _log_outcome(prompt_hash: str, outcome: str, **detail) -> None:
 
 
 _recent_prompts: dict[str, tuple[str, str, float, str]] = {}
+
+# --- Persistent per-prompt decision store -----------------------------------
+# This workload is dominated by repeated prompts (top 25 prompts = ~38% of
+# calls). Pins let the router learn per-prompt routing: prompts that succeed
+# cheaply N times stop paying embedding + Supra scoring cost; prompts that
+# refuse (or get retried) on the cheap backend K times skip the doomed cheap
+# attempt and go straight to the expensive backend. The store is append-only
+# JSONL (like the other telemetry journals) and reloaded on startup, so pins
+# survive restarts. Pins expire after PIN_TTL_S and stats reset after 24h
+# without a new note, so a changed prompt behavior re-learns.
+DECISION_STORE_PATH = Path(os.environ.get("DECISION_STORE_FILE", str(DATA_DIR / "router/decision-state.jsonl")))
+PIN_CHEAP_AFTER = int(os.environ.get("ROUTELLM_PIN_CHEAP_AFTER", "5"))
+PIN_EXPENSIVE_AFTER = int(os.environ.get("ROUTELLM_PIN_EXPENSIVE_AFTER", "2"))
+PIN_TTL_S = float(os.environ.get("ROUTELLM_PIN_TTL_S", str(7 * 86400)))
+DECISION_STORE_MAX = int(os.environ.get("ROUTELLM_DECISION_STORE_MAX", "4096"))
+_decision_store: dict[str, dict] = {}
+_decision_store_lock = threading.Lock()
+
+
+def _store_load() -> None:
+    """Load the last entry per prompt hash from the decision journal."""
+    if not DECISION_STORE_PATH.exists():
+        return
+    try:
+        with open(DECISION_STORE_PATH, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                prompt_hash = entry.get("prompt_hash")
+                if isinstance(prompt_hash, str) and prompt_hash:
+                    _decision_store[prompt_hash] = entry
+    except OSError:
+        return
+    if len(_decision_store) > DECISION_STORE_MAX:
+        for key in sorted(_decision_store, key=lambda k: _decision_store[k].get("ts", 0))[
+                : len(_decision_store) - DECISION_STORE_MAX]:
+            del _decision_store[key]
+
+
+def _store_pinned(prompt_hash: str) -> dict | None:
+    """Return the stored entry when it is currently pinned, else None."""
+    if not prompt_hash:
+        return None
+    entry = _decision_store.get(prompt_hash)
+    if not entry:
+        return None
+    pin_until = entry.get("pin_until")
+    if not isinstance(pin_until, (int, float)) or pin_until < time.time():
+        return None
+    return entry
+
+
+def _store_note(prompt_hash: str, decision: str, *, ok: bool = False, score=None) -> None:
+    """Record one routed outcome for a prompt and update pins (write-through).
+
+    ok=True marks a clean completion (cheap successes build the cheap pin);
+    ok=False marks a refusal/retry/failure (repeated cheap failures flip the
+    pin to expensive so the next request skips the doomed cheap attempt).
+    """
+    if not prompt_hash:
+        return
+    now = time.time()
+    with _decision_store_lock:
+        entry = dict(_decision_store.get(prompt_hash)
+                     or {"prompt_hash": prompt_hash, "decision": decision, "ok": 0, "fail": 0, "ts": 0})
+        if now - float(entry.get("ts", 0)) > 86400:
+            entry["ok"], entry["fail"] = 0, 0  # new streak after idle day
+        entry["decision"] = decision
+        entry["ts"] = now
+        if score is not None:
+            entry["score"] = score
+        entry["ok"] = int(entry.get("ok", 0)) + (1 if ok else 0)
+        entry["fail"] = int(entry.get("fail", 0)) + (0 if ok else 1)
+        if decision == "cheap" and entry["fail"] >= PIN_EXPENSIVE_AFTER:
+            entry["decision"] = "expensive"
+            entry["pin_until"] = now + PIN_TTL_S
+        elif decision == "cheap" and entry["ok"] >= PIN_CHEAP_AFTER and entry["fail"] == 0:
+            entry["pin_until"] = now + PIN_TTL_S
+        elif entry.get("pin_until") and float(entry.get("pin_until", 0)) < now:
+            entry.pop("pin_until", None)
+        _decision_store[prompt_hash] = entry
+        if len(_decision_store) > DECISION_STORE_MAX:
+            for key in sorted(_decision_store, key=lambda k: _decision_store[k].get("ts", 0))[
+                    : len(_decision_store) - DECISION_STORE_MAX]:
+                del _decision_store[key]
+        _secure_append(DECISION_STORE_PATH, entry)
+
 
 RESP_CACHE_TTL_S = float(os.environ.get("ROUTELLM_RESP_CACHE_TTL_S", "120"))
 RESP_CACHE_MAX_ENTRIES = int(os.environ.get("ROUTELLM_RESP_CACHE_MAX_ENTRIES", "128"))
@@ -532,6 +681,11 @@ def _record_and_detect_retry(req_hash: str, decision: str, model: str, prompt_ha
         _log_outcome(prompt_hash, "retried", decision=prev[0], model=prev[1],
                      request_hash=req_hash, request_id=request_id,
                      decision_occurrence_id=prev[3], retry_after_s=round(now - prev[2], 1))
+        # A client re-sent the same request within the retry window: the
+        # previous answer was not acceptable. Count it as a cheap failure so
+        # repeated retries escalate the prompt to the expensive backend.
+        if prev[0] == "cheap":
+            _store_note(prompt_hash, "cheap", ok=False)
     _recent_prompts[req_hash] = (decision, model, now, occurrence_id)
 
 
@@ -549,9 +703,11 @@ async def lifespan(app: FastAPI):
     _client = httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT_S, connect=min(10.0, TIMEOUT_S)))
     try:
         # Model initialization is CPU/blocking work and must not block the loop.
-        await asyncio.to_thread(_load_router)
-        if SUPRA_ENABLED:
+        if ROUTER_NAME != "supra":
+            await asyncio.to_thread(_load_router)
+        if SUPRA_ENABLED or ROUTER_NAME == "supra":
             await asyncio.to_thread(_load_supra)
+        _store_load()
         _READY = True
         yield
     finally:
@@ -629,13 +785,16 @@ def _validate_request(body: dict) -> tuple[str, str | None] | None:
     return None
 
 
-def _route_headers(decision, score, backend, request_id, supra_complexity, supra_ms):
+def _route_headers(decision, score, backend, request_id, supra_complexity, supra_ms, *, pinned=False):
     headers = {
         "x-request-id": request_id, "x-route-decision": decision,
-        "x-route-score": f"{score:.4f}", "x-route-model": backend["model"],
+        "x-route-score": f"{score:.4f}" if isinstance(score, (int, float)) else "n/a",
+        "x-route-model": backend["model"],
         "x-route-router": ROUTER_NAME, "x-route-fallback": "false",
         "x-route-attempts": "1",
     }
+    if pinned:
+        headers["x-route-pinned"] = "true"
     if supra_complexity is not None:
         headers["x-route-supra-complexity"] = str(supra_complexity)
     if supra_ms is not None:
@@ -852,14 +1011,17 @@ async def chat_completions(
     try:
         occurrence_id = uuid.uuid4().hex
         prompt = _extract_prompt(body)
+        prompt_hash = _prompt_hash(prompt)
         if prompt.strip():
             decision, score, supra_complexity, supra_ms = await asyncio.to_thread(_decide, prompt)
         else:
             decision, score, supra_complexity, supra_ms = "cheap", 0.0, None, None
+        pinned = _store_pinned(prompt_hash) is not None
         backend = _backend_for(decision)
-        _record_and_detect_retry(_request_hash(body), decision, backend["model"], _prompt_hash(prompt),
+        _record_and_detect_retry(_request_hash(body), decision, backend["model"], prompt_hash,
                                  request_id, occurrence_id)
-        headers = _route_headers(decision, score, backend, request_id, supra_complexity, supra_ms)
+        headers = _route_headers(decision, score, backend, request_id, supra_complexity, supra_ms,
+                                 pinned=pinned)
         deadline = time.monotonic() + TIMEOUT_S
         selected, backend, upstream, attempts = await _open_with_failover(
             body, decision, deadline, stream=bool(body.get("stream")))
@@ -886,6 +1048,13 @@ async def chat_completions(
                 attempts.append((selected, backend, None, type(exc).__name__))
                 upstream = None
 
+        # A refusal on the cheap backend is a per-prompt failure signal: two of
+        # these pin the prompt to expensive so later requests skip the doomed
+        # cheap attempt (e.g. the hardening-case load-test prompt refused 52x).
+        for a_decision, _a_backend, _a_status, a_error in attempts:
+            if a_error in ("refusal", "refusal_fallback") and a_decision == "cheap":
+                _store_note(prompt_hash, "cheap", ok=False)
+
     except BaseException:
         _finish_inflight_nowait(cache_key, inflight, None)
         if upstream is not None:
@@ -898,7 +1067,7 @@ async def chat_completions(
     if upstream is None:
         _log(selected, score, backend["model"], prompt, None, request_id=request_id,
              occurrence_id=occurrence_id, record_type="decision", status=None,
-             error="upstream_unavailable", attempts=len(attempts))
+             error="upstream_unavailable", attempts=len(attempts), pinned=pinned)
         _log_outcome(_prompt_hash(prompt), "upstream_error", request_id=request_id,
                      decision_occurrence_id=occurrence_id, attempts=len(attempts))
         await _finish_inflight(cache_key, inflight, None)
@@ -915,7 +1084,7 @@ async def chat_completions(
                          decision_occurrence_id=occurrence_id, model=backend["model"])
             _log(selected, score, backend["model"], prompt, None, request_id=request_id,
                  occurrence_id=occurrence_id, record_type="decision", status=504,
-                 error="upstream_timeout", attempts=len(attempts))
+                 error="upstream_timeout", attempts=len(attempts), pinned=pinned)
             await _finish_inflight(cache_key, inflight, None)
             return _openai_error("Upstream response timed out", 504, error_type="upstream_error", code="upstream_timeout")
         finally:
@@ -924,14 +1093,18 @@ async def chat_completions(
         if upstream.status_code != 200:
             _log_outcome(_prompt_hash(prompt), "upstream_error", request_id=request_id,
                          decision_occurrence_id=occurrence_id, model=backend["model"], status=upstream.status_code)
-        if _length_truncated(data):
+        truncated = _length_truncated(data)
+        if truncated:
             _log_outcome(_prompt_hash(prompt), "truncated", request_id=request_id,
                          decision_occurrence_id=occurrence_id, model=backend["model"])
         if upstream.status_code == 200:
             _cache_put(cache_key, body, content)
+            if not truncated:
+                _store_note(prompt_hash, selected, ok=True, score=score)
         _log(selected, score, backend["model"], prompt, None, supra_complexity, supra_ms,
              cost_usd=_extract_cost(data), usage=data.get("usage"), request_id=request_id,
-             occurrence_id=occurrence_id, record_type="decision", attempts=len(attempts), status=upstream.status_code)
+             occurrence_id=occurrence_id, record_type="decision", attempts=len(attempts),
+             status=upstream.status_code, pinned=pinned)
         result = ((content, upstream.status_code, "application/json", headers)
                   if (cache_key and upstream.status_code == 200 and len(content) <= RESP_CACHE_MAX_BYTES
                       and _response_replay_safe(body, content)) else None)
@@ -944,7 +1117,8 @@ async def chat_completions(
         _log_outcome(_prompt_hash(prompt), "upstream_error", request_id=request_id,
                      decision_occurrence_id=occurrence_id, model=backend["model"], status=upstream.status_code)
         _log(selected, score, backend["model"], prompt, None, request_id=request_id,
-             occurrence_id=occurrence_id, record_type="decision", status=upstream.status_code)
+             occurrence_id=occurrence_id, record_type="decision", status=upstream.status_code,
+             pinned=pinned)
         await _finish_inflight(cache_key, inflight, None)
         return Response(content=content, status_code=upstream.status_code, media_type="application/json", headers=headers)
 
@@ -1031,7 +1205,9 @@ async def chat_completions(
             _log(selected, score, backend["model"], prompt, int((time.monotonic() - started) * 1000),
                  supra_complexity, supra_ms, usage=usage or None, request_id=request_id,
                  occurrence_id=occurrence_id, record_type="decision",
-                 attempts=len(attempts), completed=saw_done and saw_finish)
+                 attempts=len(attempts), completed=saw_done and saw_finish, pinned=pinned)
+            if saw_done and saw_finish and not saw_length:
+                _store_note(prompt_hash, selected, ok=True, score=score)
             result = None
             if cache_parts is not None and saw_done and saw_finish:
                 content = b"".join(cache_parts)

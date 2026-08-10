@@ -23,10 +23,12 @@ def reset_router_state():
         return
     server._resp_cache.clear()
     server._inflight.clear()
+    server._decision_store.clear()
     server._cache_bytes = 0
     for key in server._cache_metrics:
         server._cache_metrics[key] = 0
     yield
     server._resp_cache.clear()
     server._inflight.clear()
+    server._decision_store.clear()
     server._cache_bytes = 0

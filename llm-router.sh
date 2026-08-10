@@ -44,11 +44,12 @@ export MANTIS_DATA_DIR="$DATA_DIR"
 
 # --- router ---
 . ./.venv/bin/activate
-# MF scoring uses OpenAI text-embedding-3-small; retrieve the key only here.
+# MF scoring uses OpenAI text-embedding-3-small; needed only in mf/bert mode
+# or when SCORE_WITH_MF is enabled in supra mode. Retrieve the key when possible.
 if [ -z "${OPENAI_API_KEY:-}" ]; then
   export OPENAI_API_KEY=$(security find-generic-password -s 'AI.Playground.openai.apiKey' -w 2>/dev/null || true)
 fi
-if [ -z "${OPENAI_API_KEY:-}" ]; then
+if [ -z "${OPENAI_API_KEY:-}" ] && [ "${ROUTELLM_ROUTER:-supra}" != "supra" ]; then
   echo 'ERROR: OPENAI_API_KEY not set and not found in Keychain; MF scoring needs it for embeddings.' >&2
   exit 1
 fi
@@ -74,8 +75,14 @@ if [ -z "$CHEAP_KEY" ]; then
 fi
 export ROUTELLM_CONTEXT_WINDOW="${ROUTELLM_CONTEXT_WINDOW:-262144}"
 export ROUTELLM_MAX_TOKENS="${ROUTELLM_MAX_TOKENS:-131072}"
-export ROUTELLM_ROUTER="${ROUTELLM_ROUTER:-mf}"
-# 0.156 = calibrated for 30% strong-model calls via RouteLLM.
+# supra = Supra-Router-51M complexity gate is the primary signal (best
+# quality/cost on the Aug 5-10 log; MF score had ~zero labeler separation).
+# mf/bert keep the legacy RouteLLM scoring path.
+export ROUTELLM_ROUTER="${ROUTELLM_ROUTER:-supra}"
+# Optional MF score for observability (x-route-score, eval bands) in supra
+# mode; adds one embedding call per unscored prompt when enabled.
+export ROUTELLM_SCORE_WITH_MF="${ROUTELLM_SCORE_WITH_MF:-0}"
+# 0.156 = calibrated for 30% strong-model calls via RouteLLM (mf mode only).
 # Canonical defaults live here; server.py mirrors them (bare-run parity).
 export ROUTELLM_THRESHOLD="${ROUTELLM_THRESHOLD:-0.2}"
 export ROUTELLM_RESP_CACHE_TTL_S="${ROUTELLM_RESP_CACHE_TTL_S:-120}"
