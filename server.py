@@ -158,8 +158,8 @@ CHEAP = _backend(
 )
 MIDDLE = _backend(
     "middle", base=MIDDLE_BASE, key=_key("MIDDLE_KEY", MIDDLE_BASE),
-    model=os.environ.get("MIDDLE_MODEL", "kimi-k3"),
-    effort=os.environ.get("MIDDLE_REASONING_EFFORT", "medium"),
+    model=os.environ.get("MIDDLE_MODEL", "openai/gpt-5.6-terra"),
+    effort=os.environ.get("MIDDLE_REASONING_EFFORT", "max"),
     max_tokens=int(os.environ.get("MIDDLE_MAX_TOKENS", str(ROUTELLM_MAX_TOKENS))),
 )
 BACKENDS = {"cheap": CHEAP, "middle": MIDDLE, "expensive": EXPENSIVE}
@@ -550,7 +550,15 @@ def _build_responses_body(body: dict, backend: dict) -> dict:
     out_body["model"] = backend["model"]
     if isinstance(out_body.get("max_output_tokens"), int) and backend.get("max_tokens"):
         out_body["max_output_tokens"] = min(out_body["max_output_tokens"], backend["max_tokens"])
-    if backend.get("effort") and "reasoning" not in out_body:
+    # Prime Agent supplies its default thinking level in the native Responses
+    # body. Terra is the deliberately max-reasoning middle tier, so its backend
+    # policy is authoritative; other tiers preserve an explicit caller effort.
+    reasoning = out_body.get("reasoning")
+    if backend.get("tier") == "middle" and backend.get("effort"):
+        reasoning = dict(reasoning) if isinstance(reasoning, dict) else {}
+        reasoning["effort"] = backend["effort"]
+        out_body["reasoning"] = reasoning
+    elif backend.get("effort") and "reasoning" not in out_body:
         out_body["reasoning"] = {"effort": backend["effort"]}
     return out_body
 
@@ -1819,7 +1827,8 @@ if __name__ == "__main__":
         "effective config: "
         f"router={ROUTER_NAME} threshold={THRESHOLD} supra={SUPRA_ENABLED} "
         f"supra_threshold={SUPRA_THRESHOLD} supra_min_score={SUPRA_MIN_SCORE} "
-        f"expensive={EXPENSIVE['model']} cheap={CHEAP['model']} port={PORT}",
+        f"expensive={EXPENSIVE['model']} middle={MIDDLE['model']} "
+        f"middle_effort={MIDDLE['effort']} cheap={CHEAP['model']} port={PORT}",
         flush=True,
     )
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")

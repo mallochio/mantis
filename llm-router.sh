@@ -96,8 +96,8 @@ export EXPENSIVE_REASONING_EFFORT="${EXPENSIVE_REASONING_EFFORT:-medium}"
 export CHEAP_MODEL="${CHEAP_MODEL:-deepseek-v4-flash}"
 export CHEAP_REASONING_EFFORT="${CHEAP_REASONING_EFFORT:-}"
 export CHEAP_MAX_TOKENS="${CHEAP_MAX_TOKENS:-131072}"
-export MIDDLE_MODEL="${MIDDLE_MODEL:-kimi-k3}"
-export MIDDLE_REASONING_EFFORT="${MIDDLE_REASONING_EFFORT:-medium}"
+export MIDDLE_MODEL="${MIDDLE_MODEL:-openai/gpt-5.6-terra}"
+export MIDDLE_REASONING_EFFORT="${MIDDLE_REASONING_EFFORT:-max}"
 export MIDDLE_MAX_TOKENS="${MIDDLE_MAX_TOKENS:-131072}"
 # Preserve direct-provider credentials unless a gateway endpoint/profile is selected.
 # Base-host auto-detection keeps existing Cloudflare gateway configurations working.

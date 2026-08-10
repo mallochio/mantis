@@ -30,7 +30,7 @@ def configure_three_tiers(monkeypatch):
     cheap = {**server.CHEAP, "tier": "cheap", "base": gateway,
              "model": "deepseek-v4-flash", "key": "test"}
     middle = {**server.MIDDLE, "tier": "middle", "base": gateway,
-              "model": "kimi-k3", "key": "test"}
+              "model": "openai/gpt-5.6-terra", "effort": "max", "key": "test"}
     expensive = {**server.EXPENSIVE, "tier": "expensive", "base": gateway,
                  "model": "openai/gpt-5.6-sol", "key": "test"}
     monkeypatch.setattr(server, "CHEAP", cheap)
@@ -61,7 +61,9 @@ def test_responses_capability_requires_openai_and_supported_host():
 
 @pytest.mark.anyio
 async def test_responses_promotes_and_preserves_body(client, monkeypatch):
-    _, _, expensive = configure_three_tiers(monkeypatch)
+    _, middle, expensive = configure_three_tiers(monkeypatch)
+    # Use the legacy incompatible middle model for the protocol-promotion test.
+    middle.update(model="kimi-k3")
     seen = {}
 
     def handler(request):
@@ -130,6 +132,7 @@ async def test_responses_fails_when_no_capable_backend(client, monkeypatch):
 async def test_responses_failover_skips_incompatible_middle(client, monkeypatch):
     cheap, middle, expensive = configure_three_tiers(monkeypatch)
     cheap.update(model="openai/gpt-5.6-luna")
+    middle.update(model="kimi-k3")
     calls = []
 
     def handler(request):
@@ -152,7 +155,8 @@ async def test_responses_failover_skips_incompatible_middle(client, monkeypatch)
 
 @pytest.mark.anyio
 async def test_session_affinity_cannot_force_incompatible_tier(client, monkeypatch):
-    configure_three_tiers(monkeypatch)
+    _, middle, _ = configure_three_tiers(monkeypatch)
+    middle.update(model="kimi-k3")
     monkeypatch.setattr(server, "_decide", lambda *args: ("middle", None, 3, 10))
     session = "session-response"
     raw_id, _ = server._session_id({}, type("Request", (), {
@@ -261,12 +265,33 @@ def test_responses_body_clamps_and_preserves_reasoning(monkeypatch):
     backend = {**server.EXPENSIVE, "model": "openai/gpt-5.6-sol", "max_tokens": 100,
                "effort": "medium"}
     body = {"model": "auto", "input": "x", "max_output_tokens": 200,
-            "reasoning": {"effort": "high"}, "unknown_extension": {"x": 1}}
+            "reasoning": {"effort": "high", "summary": "detailed"},
+            "unknown_extension": {"x": 1}}
     outgoing = server._build_responses_body(body, backend)
     assert outgoing["model"] == backend["model"] and outgoing["max_output_tokens"] == 100
-    assert outgoing["reasoning"] == {"effort": "high"}
+    assert outgoing["reasoning"] == {"effort": "high", "summary": "detailed"}
     assert outgoing["unknown_extension"] == {"x": 1}
     assert "messages" not in outgoing and "reasoning_effort" not in outgoing
+
+
+def test_responses_body_uses_maximum_middle_effort_by_default():
+    backend = {**server.MIDDLE, "model": "openai/gpt-5.6-terra", "effort": "max"}
+    outgoing = server._build_responses_body({"model": "auto", "input": "x"}, backend)
+    assert outgoing["model"] == "openai/gpt-5.6-terra"
+    assert outgoing["reasoning"] == {"effort": "max"}
+
+
+def test_responses_body_middle_effort_overrides_prime_default_only_for_middle():
+    middle = {**server.MIDDLE, "tier": "middle", "model": "openai/gpt-5.6-terra",
+              "effort": "max"}
+    body = {"model": "auto", "input": "x",
+            "reasoning": {"effort": "medium", "summary": "auto"}}
+    outgoing = server._build_responses_body(body, middle)
+    assert outgoing["reasoning"] == {"effort": "max", "summary": "auto"}
+
+    expensive = {**server.EXPENSIVE, "tier": "expensive", "effort": "medium"}
+    preserved = server._build_responses_body(body, expensive)
+    assert preserved["reasoning"] == body["reasoning"]
 
 
 @pytest.mark.anyio
@@ -324,7 +349,7 @@ def test_gateway_three_tier_configuration_points_at_cloudflare(monkeypatch):
     host = "unified-ai-gateway.siddsantham.workers.dev"
     assert host in cheap["base"] and host in middle["base"] and host in expensive["base"]
     assert expensive["model"] == "openai/gpt-5.6-sol"
-    assert middle["model"] == "kimi-k3"
+    assert middle["model"] == "openai/gpt-5.6-terra"
 
 
 def test_middle_reasoning_body_preserves_cloudflare_model():
@@ -332,6 +357,6 @@ def test_middle_reasoning_body_preserves_cloudflare_model():
     outgoing = server._build_outgoing_body(body, {
         **server.MIDDLE,
         "base": "https://unified-ai-gateway.siddsantham.workers.dev/v1",
-        "model": "kimi-k3", "effort": "medium",
+        "model": "openai/gpt-5.6-terra", "effort": "max",
     })
-    assert outgoing["model"] == "kimi-k3" and outgoing["reasoning_effort"] == "medium"
+    assert outgoing["model"] == "openai/gpt-5.6-terra" and outgoing["reasoning_effort"] == "max"

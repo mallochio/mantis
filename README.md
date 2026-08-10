@@ -34,7 +34,7 @@ requires an externally supplied `ROUTELLM_KEY` that is not the default. The
 launcher refuses to stop a port owner unless its recorded PID, working
 directory, command, and listening socket all identify this checkout.
 
-The launcher defaults to the Cloudflare gateway (`unified-ai-gateway.siddsantham.workers.dev`) and requires `AI_GATEWAY_API_KEY` (or `MANTIS_GATEWAY_API_KEY`). Default models are `deepseek-v4-flash` (cheap), `kimi-k3` (middle), and `openai/gpt-5.6-sol` (expensive). Set `ROUTELLM_ENDPOINT_PROFILE=direct` to retain the direct two-backend contract with `EXPENSIVE_BASE`, `EXPENSIVE_KEY`, `CHEAP_BASE`, `CHEAP_KEY`, and their model variables. A direct middle tier can be enabled with `MIDDLE_BASE`, `MIDDLE_KEY`, and `MIDDLE_MODEL`. `user` is not treated as a session identifier unless `ROUTELLM_SESSION_FROM_USER=1` is set; prefer `X-Route-Session` for conversation affinity. `OPENAI_API_KEY` is required by MF scoring. See `server.py` for optional limits.
+The launcher defaults to the Cloudflare gateway (`unified-ai-gateway.siddsantham.workers.dev`) and requires `AI_GATEWAY_API_KEY` (or `MANTIS_GATEWAY_API_KEY`). Default models are `deepseek-v4-flash` (cheap), `openai/gpt-5.6-terra` at maximum reasoning (middle), and `openai/gpt-5.6-sol` (expensive). Set `ROUTELLM_ENDPOINT_PROFILE=direct` to retain the direct two-backend contract with `EXPENSIVE_BASE`, `EXPENSIVE_KEY`, `CHEAP_BASE`, `CHEAP_KEY`, and their model variables. A direct middle tier can be enabled with `MIDDLE_BASE`, `MIDDLE_KEY`, and `MIDDLE_MODEL`. `user` is not treated as a session identifier unless `ROUTELLM_SESSION_FROM_USER=1` is set; prefer `X-Route-Session` for conversation affinity. `OPENAI_API_KEY` is required by MF scoring. See `server.py` for optional limits.
 
 ### Endpoint credential profiles
 
@@ -63,9 +63,12 @@ Only `openai/*` models on OpenRouter or the configured Cloudflare gateway are
 Responses-capable. If a selected cheap or middle tier is incompatible, the
 request is promoted to the nearest higher compatible tier and returns
 `x-route-reason: responses_protocol_upgrade`. Failover also skips incompatible
-tiers. With the default gateway models, Responses promotes to
-`openai/gpt-5.6-sol`; an explicitly configured `openai/gpt-5.6-luna` cheap tier
-may serve Responses directly.
+tiers. With the default gateway models, Terra and Sol can serve Responses directly;
+an explicitly configured `openai/gpt-5.6-luna` cheap tier may also serve
+Responses directly. A non-OpenAI middle model such as `kimi-k3` is promoted to
+Sol instead. The Terra middle tier defaults to maximum reasoning (`max`) when
+callers omit the native `reasoning` object; an explicit per-request reasoning
+object remains unchanged.
 
 Responses streaming preserves provider SSE event frames and terminates on
 `response.completed`, `response.failed`, `response.incomplete`, `error`, or a
