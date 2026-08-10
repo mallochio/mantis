@@ -51,10 +51,14 @@ router_backend_profile() {
 
 router_select_endpoint_keys() {
   local gateway_key="${AI_GATEWAY_API_KEY:-${MANTIS_GATEWAY_API_KEY:-}}"
-  local expensive_profile cheap_profile
+  local expensive_profile cheap_profile middle_profile
   expensive_profile=$(router_backend_profile "$EXPENSIVE_BASE") || return
   cheap_profile=$(router_backend_profile "$CHEAP_BASE") || return
-  if [ "$expensive_profile" = cloudflare ] || [ "$cheap_profile" = cloudflare ]; then
+  middle_profile=direct
+  if [ -n "${MIDDLE_BASE:-}" ]; then
+    middle_profile=$(router_backend_profile "$MIDDLE_BASE") || return
+  fi
+  if [ "$expensive_profile" = cloudflare ] || [ "$cheap_profile" = cloudflare ] || [ "$middle_profile" = cloudflare ]; then
     if [ -z "$gateway_key" ]; then
       echo "ERROR: Cloudflare gateway endpoint requires AI_GATEWAY_API_KEY or MANTIS_GATEWAY_API_KEY" >&2
       return 2
@@ -67,5 +71,9 @@ router_select_endpoint_keys() {
   if [ "$cheap_profile" = cloudflare ]; then
     CHEAP_KEY="$gateway_key"
     export CHEAP_KEY
+  fi
+  if [ "$middle_profile" = cloudflare ]; then
+    MIDDLE_KEY="$gateway_key"
+    export MIDDLE_KEY
   fi
 }

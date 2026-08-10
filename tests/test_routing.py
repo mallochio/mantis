@@ -29,6 +29,8 @@ def isolate_store(tmp_path, monkeypatch):
 def test_supra_mode_decides_on_complexity_alone(monkeypatch):
     monkeypatch.setattr(server, "ROUTER_NAME", "supra")
     monkeypatch.setattr(server, "SCORE_WITH_MF", False)
+    monkeypatch.setattr(server, "MIDDLE_CONFIGURED", False)
+    monkeypatch.setattr(server, "EXPENSIVE_MIN_COMPLEXITY", 3)
     calls = []
 
     def fake_supra(prompt):
@@ -92,6 +94,9 @@ def test_supra_early_stop_waits_for_complexity_digit(monkeypatch):
 
 def test_supra_mode_short_prompt_still_uses_supra(monkeypatch):
     monkeypatch.setattr(server, "ROUTER_NAME", "supra")
+    monkeypatch.setattr(server, "MIDDLE_CONFIGURED", True)
+    monkeypatch.setattr(server, "MIDDLE_MIN_COMPLEXITY", 3)
+    monkeypatch.setattr(server, "EXPENSIVE_MIN_COMPLEXITY", 4)
     ran = []
 
     def fake_supra(prompt):
@@ -224,3 +229,96 @@ def test_log_and_headers_accept_missing_score(tmp_path, monkeypatch):
     headers = server._route_headers("cheap", None, server.CHEAP, "req_1", None, None, pinned=True)
     assert headers["x-route-score"] == "n/a"
     assert headers["x-route-pinned"] == "true"
+
+
+
+def test_supra_three_tier_mapping_when_middle_configured(monkeypatch):
+    monkeypatch.setattr(server, "ROUTER_NAME", "supra")
+    monkeypatch.setattr(server, "MIDDLE_CONFIGURED", True)
+    monkeypatch.setattr(server, "MIDDLE_MIN_COMPLEXITY", 3)
+    monkeypatch.setattr(server, "EXPENSIVE_MIN_COMPLEXITY", 4)
+    monkeypatch.setattr(server, "_supra_complexity", lambda p: (3, 10))
+    assert server._decide_uncached("middle work")[0] == "middle"
+    monkeypatch.setattr(server, "_supra_complexity", lambda p: (4, 10))
+    assert server._decide_uncached("hard work")[0] == "expensive"
+
+
+def test_session_ids_are_source_namespaced_and_hmac_opaque(monkeypatch):
+    from starlette.requests import Request
+
+    def req(headers):
+        return Request({"type": "http", "method": "POST", "path": "/", "headers":
+                        [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+                        "query_string": b"", "scheme": "http", "server": ("test", 80),
+                        "client": ("test", 1), "root_path": ""})
+
+    header_id, source = server._session_id({}, req({"X-Route-Session": "same"}))
+    metadata_id, metadata_source = server._session_id({"metadata": {"session_id": "same"}}, req({}))
+    assert source == "header" and metadata_source == "metadata"
+    assert header_id != metadata_id and header_id != "same"
+    assert server._session_id({"user": "same"}, req({})) == (None, None)
+    monkeypatch.setenv("ROUTELLM_SESSION_FROM_USER", "1")
+    user_id, user_source = server._session_id({"user": "same"}, req({}))
+    assert user_source == "user" and user_id not in {header_id, metadata_id}
+
+
+def test_continuation_only_sticks_existing_session(monkeypatch):
+    server._session_state.clear()
+    assert server._is_continuation("Proceed")
+    assert not server._is_continuation("Continue implementing Paxos with a proof")
+    assert server._session_route("missing", "Proceed", "expensive", 4)[0] == "expensive"
+    server._session_state["s"] = {"tier": "middle", "last_seen": time.time(), "turns": 1}
+    assert server._session_route("s", "Proceed", "cheap", 1) == ("middle", "continuation_sticky")
+    assert server._session_route("s", "new task: cleanup", "cheap", 1)[0] == "cheap"
+
+
+
+def test_failover_and_backend_matrix(monkeypatch):
+    monkeypatch.setattr(server, "MIDDLE_CONFIGURED", False)
+    assert server._failover_routes("cheap") == ("cheap", "expensive")
+    assert server._failover_routes("expensive") == ("expensive", "cheap")
+    assert server._backend_for("middle") is server.EXPENSIVE
+    monkeypatch.setattr(server, "MIDDLE_CONFIGURED", True)
+    assert server._failover_routes("cheap") == ("cheap", "middle")
+    assert server._failover_routes("middle") == ("middle", "expensive")
+    assert server._failover_routes("expensive") == ("expensive", "middle")
+    assert server._backend_for("middle") is server.MIDDLE
+
+
+def test_session_get_ttl_and_copy(monkeypatch):
+    server._session_state.clear()
+    monkeypatch.setattr(server, "SESSION_TTL_S", 10)
+    server._session_state["expired"] = {"tier": "cheap", "last_seen": time.time() - 11}
+    assert server._session_get("expired") is None and "expired" not in server._session_state
+    server._session_state["live"] = {"tier": "cheap", "last_seen": time.time(), "turns": 1}
+    got = server._session_get("live")
+    got["tier"] = "expensive"
+    assert server._session_state["live"]["tier"] == "cheap"
+
+
+def test_session_note_lru_and_usage(monkeypatch):
+    server._session_state.clear()
+    monkeypatch.setattr(server, "SESSION_STATE_MAX", 2)
+    server._session_note("a", "cheap", 1)
+    server._session_note("b", "middle", 3, {"prompt_cache_hit_tokens": 4})
+    server._session_note("a", "cheap", 1)
+    server._session_note("c", "expensive", 4)
+    assert "b" not in server._session_state and server._session_state["a"]["turns"] == 2
+
+
+def test_user_is_opt_in(monkeypatch):
+    from starlette.requests import Request
+    req = Request({"type": "http", "method": "POST", "path": "/", "headers": [],
+                   "query_string": b"", "scheme": "http", "server": ("test", 80),
+                   "client": ("test", 1), "root_path": ""})
+    monkeypatch.delenv("ROUTELLM_SESSION_FROM_USER", raising=False)
+    assert server._session_id({"user": "account"}, req) == (None, None)
+
+
+
+def test_existing_session_continuation_skips_scoring(monkeypatch):
+    server._session_state.clear()
+    server._session_state["s"] = {"tier": "middle", "last_seen": time.time(), "turns": 1,
+                                  "last_complexity": 3}
+    monkeypatch.setattr(server, "_decide_cached", lambda prompt: (_ for _ in ()).throw(AssertionError("scored")))
+    assert server._decide("Proceed", "s")[:3] == ("middle", None, 3)

@@ -1,14 +1,16 @@
 # llm-router
 
-An OpenAI-compatible FastAPI router for `/v1/chat/completions`. The router
-selects one of two provider backends. The server calls each configured provider
-directly with one lifespan-owned asynchronous HTTP pool.
+An OpenAI-compatible FastAPI router for explicit `/v1/chat/completions` and
+`/v1/responses` endpoints. The router selects cheap, middle, and expensive tiers. In the default gateway profile,
+all tiers use the Cloudflare gateway; its model catalog routes to OpenCode Go,
+Modal, or OpenRouter. Direct two-backend deployments remain supported. The
+server uses one lifespan-owned asynchronous HTTP pool.
 
 Two routing modes are available (`ROUTELLM_ROUTER`):
 
-- `supra` (default): the Supra-Router-51M complexity gate is the primary
-  signal. Prompts with complexity >= `ROUTELLM_SUPRA_THRESHOLD` (3) go to the
-  expensive backend. MF scoring is off by default; set
+- `supra` (default): the Supra-Router-51M complexity gate is the primary signal. With the gateway middle tier enabled, complexity 1–2 goes cheap,
+  complexity 3 goes middle, and complexity 4+ goes expensive. Direct two-tier
+  mode retains the legacy `ROUTELLM_SUPRA_THRESHOLD` cutoff. MF scoring is off by default; set
   `ROUTELLM_SCORE_WITH_MF=1` for observability (it never influences the
   decision). This mode was chosen because on the Aug 5-10 workload the RouteLLM
   MF score had essentially zero separation against the Gemini difficulty
@@ -32,9 +34,7 @@ requires an externally supplied `ROUTELLM_KEY` that is not the default. The
 launcher refuses to stop a port owner unless its recorded PID, working
 directory, command, and listening socket all identify this checkout.
 
-Required provider configuration is `EXPENSIVE_BASE`, `EXPENSIVE_KEY`,
-`EXPENSIVE_MODEL`, `CHEAP_BASE`, `CHEAP_KEY`, and `CHEAP_MODEL`.
-`OPENAI_API_KEY` is required by MF scoring. See `server.py` for optional limits.
+The launcher defaults to the Cloudflare gateway (`unified-ai-gateway.siddsantham.workers.dev`) and requires `AI_GATEWAY_API_KEY` (or `MANTIS_GATEWAY_API_KEY`). Default models are `deepseek-v4-flash` (cheap), `kimi-k3` (middle), and `openai/gpt-5.6-sol` (expensive). Set `ROUTELLM_ENDPOINT_PROFILE=direct` to retain the direct two-backend contract with `EXPENSIVE_BASE`, `EXPENSIVE_KEY`, `CHEAP_BASE`, `CHEAP_KEY`, and their model variables. A direct middle tier can be enabled with `MIDDLE_BASE`, `MIDDLE_KEY`, and `MIDDLE_MODEL`. `user` is not treated as a session identifier unless `ROUTELLM_SESSION_FROM_USER=1` is set; prefer `X-Route-Session` for conversation affinity. `OPENAI_API_KEY` is required by MF scoring. See `server.py` for optional limits.
 
 ### Endpoint credential profiles
 
@@ -45,11 +45,34 @@ fails closed when the gateway token is absent. URL hosts are parsed and
 compared without displaying credentials.
 
 Set `ROUTELLM_ENDPOINT_PROFILE=direct` or `cloudflare` to override base-host
-auto-detection for both backends. The legacy `ROUTELLM_GATEWAY_MODE=1` also
+auto-detection for all tiers. `ROUTELLM_GATEWAY_MODE=1` also selects the
+Cloudflare profile. The legacy `ROUTELLM_GATEWAY_MODE=1` also
 selects the Cloudflare profile when no explicit profile is set. Direct bases
 continue to use `EXPENSIVE_KEY` and `CHEAP_KEY`.
 
 ## Behavior
+
+### Responses API
+
+Clients that want Responses must call `POST /v1/responses` explicitly. The
+router preserves the Responses request and response shapes and sends the request
+to `/responses` through OpenRouter or the Cloudflare gateway. It never translates
+Chat Completions to Responses or vice versa.
+
+Only `openai/*` models on OpenRouter or the configured Cloudflare gateway are
+Responses-capable. If a selected cheap or middle tier is incompatible, the
+request is promoted to the nearest higher compatible tier and returns
+`x-route-reason: responses_protocol_upgrade`. Failover also skips incompatible
+tiers. With the default gateway models, Responses promotes to
+`openai/gpt-5.6-sol`; an explicitly configured `openai/gpt-5.6-luna` cheap tier
+may serve Responses directly.
+
+Responses streaming preserves provider SSE event frames and terminates on
+`response.completed`, `response.failed`, `response.incomplete`, `error`, or a
+provider terminal marker. Incomplete streams receive a Responses-native error
+event; no synthetic success is emitted. Local Responses caching and coalescing
+are disabled initially. Responses carry `x-route-api: responses` and
+`x-route-upstream-path: /responses`; Chat carries the corresponding chat values.
 
 - Request JSON and supported Chat Completions field types are validated.
   Reviewed unknown provider extensions are preserved.
@@ -69,7 +92,13 @@ continue to use `EXPENSIVE_KEY` and `CHEAP_KEY`.
 Every routed response includes `x-request-id`, `x-route-decision`,
 `x-route-model`, `x-route-score`, `x-route-attempts`, and `x-route-fallback`.
 Optional Supra headers are also returned. In supra mode `x-route-score` is
-`n/a` unless `ROUTELLM_SCORE_WITH_MF=1`.
+`n/a` unless `ROUTELLM_SCORE_WITH_MF=1`. Requests may provide `X-Route-Session`,
+`metadata.session_id`, or `user`; the router stores only an HMAC digest. Session
+affinity keeps short continuations on the current tier and requires an explicit
+new-task signal to downgrade. It expires after one hour and is not persisted.
+Responses expose `x-route-reason`, `x-route-sticky`, and the opaque
+`x-route-session` digest. Logs include normalized prompt/cache token metrics when
+upstream usage provides them.
 
 ### Learned per-prompt routing
 

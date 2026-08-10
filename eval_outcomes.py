@@ -20,6 +20,7 @@ from pathlib import Path
 DATA_DIR = Path.home() / ".local/share/mantis/router"
 BANDS = [("<0.1", 0.0, 0.1), ("0.1-0.156", 0.1, 0.156), ("0.156-0.2", 0.156, 0.2), (">=0.2", 0.2, 1.01)]
 FAILURES = {"retried", "refused", "truncated", "upstream_error"}
+DECISIONS = ("cheap", "middle", "expensive")
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -82,8 +83,8 @@ def evaluate(decisions: list[dict], outcomes: list[dict], labels: list[dict]) ->
             lab[label["prompt"].strip()] = "expensive" if label.get("route") == "big model" else "cheap"
 
     all_bands = [b for b, _, _ in BANDS] + [b for b, _, _ in SUPRA_BANDS]
-    cells = {d: {b: [0, 0] for b in all_bands} for d in ("cheap", "expensive")}
-    lab_cells = {d: {r: [0, 0] for r in ("cheap", "expensive")} for d in ("cheap", "expensive")}
+    cells = {d: {b: [0, 0] for b in all_bands} for d in DECISIONS}
+    lab_cells = {d: {r: [0, 0] for r in ("cheap", "expensive")} for d in DECISIONS}
     for r in decisions:
         # Attempt telemetry is operational detail, not a routed-call outcome.
         # Rows without record_type are legacy decision rows.
@@ -147,21 +148,21 @@ def report(decisions, outcomes, labels) -> str:
         "",
         "Failure rate (retried/refused/truncated/upstream_error) by band x decision:",
     ]
-    header = "  band       | cheap        | expensive"
+    header = "  band       | cheap        | middle       | expensive"
     lines.append(header)
-    lines.append("  -----------+--------------+-------------")
+    lines.append("  -----------+--------------+--------------+-------------")
     for group in (BANDS, SUPRA_BANDS):
         for b, _, _ in group:
             row = []
-            for d in ("cheap", "expensive"):
+            for d in DECISIONS:
                 n, f = res["cells"][d][b]
                 row.append(f"{f}/{n} ({rate([n, f]) or 0:.0%})" if n else "-")
-            lines.append(f"  {b:10s} | {row[0]:12s} | {row[1]:11s}")
+            lines.append(f"  {b:10s} | {row[0]:12s} | {row[1]:12s} | {row[2]:11s}")
         if group is BANDS and any(res["cells"]["cheap"].get(b) and res["cells"]["cheap"][b][0] for b, _, _ in SUPRA_BANDS):
             lines.append("  -- supra complexity bands --")
     lines.append("")
     lines.append("Failure rate by route decision x labeler call:")
-    for d in ("cheap", "expensive"):
+    for d in DECISIONS:
         parts = [f"{r}:{res['lab_cells'][d][r][1]}/{res['lab_cells'][d][r][0]}" for r in ("cheap", "expensive")]
         lines.append(f"  routed {d:9s} | " + "  ".join(parts))
     lines.append("")
@@ -186,6 +187,8 @@ def demo() -> None:
     supra_rows = [{"record_type": "decision", "decision": "cheap", "supra_complexity": 3, "prompt": "b", "prompt_hash": "h2"}] * 30
     res = evaluate(supra_rows, out, labs)
     assert res["cells"]["cheap"]["3"][0] == 30, res["cells"]
+    middle = evaluate([{"decision": "middle", "supra_complexity": 3}], [], [])
+    assert middle["cells"]["middle"]["3"] == [1, 0], middle
     print("self-test passed:", v[0])
 
 

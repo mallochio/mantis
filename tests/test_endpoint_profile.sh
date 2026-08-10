@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 . ./endpoint-profile.sh
 
 reset_case() {
-  unset ROUTELLM_ENDPOINT_PROFILE ROUTELLM_GATEWAY_MODE AI_GATEWAY_API_KEY MANTIS_GATEWAY_API_KEY
+  unset ROUTELLM_ENDPOINT_PROFILE ROUTELLM_GATEWAY_MODE AI_GATEWAY_API_KEY MANTIS_GATEWAY_API_KEY MIDDLE_BASE MIDDLE_KEY
   EXPENSIVE_BASE="https://openrouter.ai/api/v1"
   CHEAP_BASE="https://opencode.ai/zen/go/v1"
   EXPENSIVE_KEY="provider-expensive"
@@ -44,6 +44,13 @@ AI_GATEWAY_API_KEY="mode-token"
 router_select_endpoint_keys
 [ "$EXPENSIVE_KEY" = mode-token ]
 [ "$CHEAP_KEY" = mode-token ]
+
+# The launcher assigns the middle endpoint in gateway mode before calling
+# router_select_endpoint_keys; verify that endpoint is also credentialed.
+MIDDLE_BASE="https://unified-ai-gateway.siddsantham.workers.dev/v1"
+MIDDLE_KEY="provider-middle"
+router_select_endpoint_keys
+[ "$MIDDLE_KEY" = mode-token ]
 
 reset_case
 EXPENSIVE_BASE="https://unified-ai-gateway.siddsantham.workers.dev/v1"

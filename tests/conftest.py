@@ -24,6 +24,11 @@ def reset_router_state():
     server._resp_cache.clear()
     server._inflight.clear()
     server._decision_store.clear()
+    server._session_state.clear()
+    server._recent_prompts.clear()
+    clear_cache = getattr(server._decide_cached, "cache_clear", None)
+    if clear_cache:
+        clear_cache()
     server._cache_bytes = 0
     for key in server._cache_metrics:
         server._cache_metrics[key] = 0
@@ -31,4 +36,9 @@ def reset_router_state():
     server._resp_cache.clear()
     server._inflight.clear()
     server._decision_store.clear()
+    server._session_state.clear()
+    server._recent_prompts.clear()
+    clear_cache = getattr(server._decide_cached, "cache_clear", None)
+    if clear_cache:
+        clear_cache()
     server._cache_bytes = 0

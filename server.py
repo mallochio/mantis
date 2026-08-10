@@ -1,8 +1,10 @@
 """LLM coding-router server.
 
-Exposes one OpenAI-compatible model ("auto"). Requests are routed by the
-Supra-Router-51M complexity gate (default; see ROUTELLM_ROUTER below for the
-legacy RouteLLM MF mode) and forwarded directly to the configured providers.
+Exposes one OpenAI-compatible model ("auto") on explicit Chat Completions
+and Responses endpoints. Requests are routed by the Supra-Router-51M complexity
+gate (default; see ROUTELLM_ROUTER below for the legacy RouteLLM MF mode).
+Responses requests are restricted to OpenAI models via OpenRouter or the
+Cloudflare gateway; Chat Completions behavior remains independent.
 
 Config via env:
   ROUTELLM_HOST=127.0.0.1
@@ -24,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -35,6 +38,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, Header, Request
@@ -59,19 +63,114 @@ ROUTELLM_CONTEXT_WINDOW = os.environ.get("ROUTELLM_CONTEXT_WINDOW", "auto")
 ROUTELLM_MAX_TOKENS = int(os.environ.get("ROUTELLM_MAX_TOKENS", "131072"))
 MODEL_ID = "auto"
 
-EXPENSIVE = {
-    "base": os.environ.get("EXPENSIVE_BASE", "https://openrouter.ai/api/v1"),
-    "key": os.environ.get("EXPENSIVE_KEY", ""),
-    "model": os.environ.get("EXPENSIVE_MODEL", "openai/gpt-5.6-sol"),
-    "effort": os.environ.get("EXPENSIVE_REASONING_EFFORT", "medium"),
-}
-CHEAP = {
-    "base": os.environ.get("CHEAP_BASE", "https://opencode.ai/zen/go/v1"),
-    "key": os.environ.get("CHEAP_KEY", ""),
-    "model": os.environ.get("CHEAP_MODEL", "deepseek-v4-flash"),
-    "effort": os.environ.get("CHEAP_REASONING_EFFORT", "none"),
-    "max_tokens": int(os.environ.get("CHEAP_MAX_TOKENS", str(ROUTELLM_MAX_TOKENS))),
-}
+GATEWAY_BASE = os.environ.get(
+    "ROUTELLM_GATEWAY_BASE", "https://unified-ai-gateway.siddsantham.workers.dev/v1",
+)
+GATEWAY_KEY = os.environ.get("AI_GATEWAY_API_KEY") or os.environ.get("MANTIS_GATEWAY_API_KEY", "")
+GATEWAY_HOST = "unified-ai-gateway.siddsantham.workers.dev"
+
+
+def _gateway_force_bases() -> bool:
+    profile = os.environ.get("ROUTELLM_ENDPOINT_PROFILE", "").lower()
+    if profile == "direct":
+        return False
+    if profile == "cloudflare":
+        return True
+    mode = os.environ.get("ROUTELLM_GATEWAY_MODE", "").lower()
+    valid = {"1", "true", "yes", "on", "cloudflare", "0", "false", "no", "off"}
+    if mode and mode not in valid:
+        raise ValueError("invalid ROUTELLM_GATEWAY_MODE")
+    if mode in {"1", "true", "yes", "on", "cloudflare"}:
+        return True
+    if mode in {"0", "false", "no", "off"}:
+        return False
+    configured = (os.environ.get("EXPENSIVE_BASE"), os.environ.get("CHEAP_BASE"),
+                  os.environ.get("MIDDLE_BASE"))
+    # If one configured tier already uses the gateway, normalize all tiers to
+    # it rather than accidentally sending a gateway credential to a direct URL.
+    return any(GATEWAY_HOST in (base or "").lower() for base in configured) or not any(configured)
+
+
+def _gateway_requested() -> bool:
+    return _gateway_force_bases()
+
+
+def _base(name: str, direct_default: str, gateway: bool) -> str:
+    if gateway and _gateway_force_bases():
+        return GATEWAY_BASE
+    value = os.environ.get(name)
+    if value is not None:
+        return value
+    return GATEWAY_BASE if gateway else direct_default
+
+
+def _key(name: str, base: str) -> str:
+    value = os.environ.get(name, "")
+    profile = os.environ.get("ROUTELLM_ENDPOINT_PROFILE", "").lower()
+    if profile != "direct" and (_gateway_requested() and base == GATEWAY_BASE or GATEWAY_HOST in base.lower()):
+        return GATEWAY_KEY or value
+    return value
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _optional_int(name: str) -> int | None:
+    value = os.environ.get(name)
+    return int(value) if value else None
+
+
+def _backend(name: str, *, base: str, key: str, model: str, effort: str,
+             max_tokens: int | None = None, usage_include: bool | None = None) -> dict:
+    # OpenRouter accepts usage.include. OpenCode Go and Modal may reject
+    # unknown request fields, so gateway usage is enabled only for namespaced
+    # OpenRouter catalog IDs unless explicitly overridden.
+    openrouter_model = model.split("/", 1)[0] in {"openai", "google", "anthropic", "openrouter"}
+    default_usage = "openrouter.ai" in base or (GATEWAY_HOST in base and openrouter_model)
+    usage_name = f"ROUTELLM_{name.upper()}_USAGE_INCLUDE"
+    return {
+        "tier": name, "base": base, "key": key, "model": model,
+        "effort": effort, "max_tokens": max_tokens,
+        "usage_include": (_env_bool(usage_name, default_usage)
+                           if usage_include is None else usage_include),
+    }
+
+
+_GATEWAY_SELECTED = _gateway_requested()
+EXPENSIVE_BASE = _base("EXPENSIVE_BASE", "https://openrouter.ai/api/v1", _GATEWAY_SELECTED)
+CHEAP_BASE = _base("CHEAP_BASE", "https://opencode.ai/zen/go/v1", _GATEWAY_SELECTED)
+MIDDLE_BASE = _base("MIDDLE_BASE", "", _GATEWAY_SELECTED)
+EXPENSIVE = _backend(
+    "expensive", base=EXPENSIVE_BASE, key=_key("EXPENSIVE_KEY", EXPENSIVE_BASE),
+    model=os.environ.get("EXPENSIVE_MODEL", "openai/gpt-5.6-sol"),
+    effort=os.environ.get("EXPENSIVE_REASONING_EFFORT", "medium"),
+    max_tokens=_optional_int("EXPENSIVE_MAX_TOKENS"),
+)
+CHEAP = _backend(
+    "cheap", base=CHEAP_BASE, key=_key("CHEAP_KEY", CHEAP_BASE),
+    model=os.environ.get("CHEAP_MODEL", "deepseek-v4-flash"),
+    effort=os.environ.get("CHEAP_REASONING_EFFORT", "none"),
+    max_tokens=int(os.environ.get("CHEAP_MAX_TOKENS", str(ROUTELLM_MAX_TOKENS))),
+)
+MIDDLE = _backend(
+    "middle", base=MIDDLE_BASE, key=_key("MIDDLE_KEY", MIDDLE_BASE),
+    model=os.environ.get("MIDDLE_MODEL", "kimi-k3"),
+    effort=os.environ.get("MIDDLE_REASONING_EFFORT", "medium"),
+    max_tokens=int(os.environ.get("MIDDLE_MAX_TOKENS", str(ROUTELLM_MAX_TOKENS))),
+)
+BACKENDS = {"cheap": CHEAP, "middle": MIDDLE, "expensive": EXPENSIVE}
+TIER_ORDER = {"cheap": 0, "middle": 1, "expensive": 2}
+MIDDLE_MIN_COMPLEXITY = int(os.environ.get("ROUTELLM_MIDDLE_MIN_COMPLEXITY", "3"))
+MIDDLE_CONFIGURED = bool(MIDDLE["base"])
+EXPENSIVE_MIN_COMPLEXITY = int(os.environ.get(
+    "ROUTELLM_EXPENSIVE_MIN_COMPLEXITY",
+    str(SUPRA_THRESHOLD + (1 if MIDDLE_CONFIGURED else 0)),
+))
+
 
 # One async pool is created and closed by the ASGI lifespan.
 TIMEOUT_S = float(os.environ.get("ROUTELLM_TIMEOUT_S", "600"))
@@ -80,10 +179,6 @@ RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 # Reject oversized bodies before they are buffered into memory (413).
 MAX_BODY_BYTES = int(os.environ.get("ROUTELLM_MAX_BODY_BYTES", str(50 * 1024 * 1024)))
-
-for _b in (EXPENSIVE, CHEAP):
-    # OpenRouter reports provider-billed cost in usage.cost when asked.
-    _b["usage_include"] = "openrouter.ai" in _b["base"]
 
 DATA_DIR = Path(os.environ.get("MANTIS_DATA_DIR", str(Path.home()/".local/share/mantis")))
 LOG_PATH = Path(os.environ.get("LOG_FILE", str(DATA_DIR/"router/decisions.log")))
@@ -137,10 +232,11 @@ async def _get_context_window() -> int:
     if env_val and env_val.isdigit() and int(env_val) > 0:
         _cached_context_window = int(env_val)
         return _cached_context_window
-    values = await asyncio.gather(
-        _fetch_model_context_length(EXPENSIVE["base"], EXPENSIVE["key"], EXPENSIVE["model"]),
-        _fetch_model_context_length(CHEAP["base"], CHEAP["key"], CHEAP["model"]),
-    )
+    backends = [EXPENSIVE, CHEAP] + ([MIDDLE] if MIDDLE_CONFIGURED else [])
+    values = await asyncio.gather(*(
+        _fetch_model_context_length(b["base"], b["key"], b["model"])
+        for b in backends
+    ))
     valid = [value for value in values if isinstance(value, int) and value > 0]
     _cached_context_window = min(valid) if valid else 1_000_000
     return _cached_context_window
@@ -188,6 +284,33 @@ def _extract_prompt(body: dict) -> str:
                 return " ".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text")
             return str(c)
     return ""
+
+
+def _extract_responses_prompt(body: dict) -> str:
+    value = body.get("input")
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        return ""
+
+    def item_text(item: dict) -> list[str]:
+        content = item.get("content")
+        if isinstance(content, str):
+            return [content]
+        if not isinstance(content, list):
+            return []
+        return [
+            part["text"] for part in content
+            if isinstance(part, dict) and part.get("type") in {"input_text", "text"}
+            and isinstance(part.get("text"), str)
+        ]
+
+    for item in reversed(value):
+        if isinstance(item, dict) and item.get("role") == "user":
+            user_texts = item_text(item)
+            if user_texts:
+                return " ".join(user_texts)
+    return " ".join(text for item in value if isinstance(item, dict) for text in item_text(item))
 
 
 _supra_model = None
@@ -292,8 +415,14 @@ def _decide_uncached(trimmed_prompt: str) -> tuple[str, float, int | None, int |
                 except Exception as err:
                     print(f"MF scoring failed ({err})", flush=True)
             if supra_complexity is not None:
-                return ("expensive" if supra_complexity >= SUPRA_THRESHOLD else "cheap",
-                        score, supra_complexity, supra_ms)
+                expensive_cutoff = EXPENSIVE_MIN_COMPLEXITY
+                if supra_complexity >= expensive_cutoff:
+                    tier = "expensive"
+                elif MIDDLE_CONFIGURED and supra_complexity >= MIDDLE_MIN_COMPLEXITY:
+                    tier = "middle"
+                else:
+                    tier = "cheap"
+                return tier, score, supra_complexity, supra_ms
             return _decide_mf(trimmed_prompt)
         return _decide_mf(trimmed_prompt)
     except Exception as err:
@@ -306,20 +435,60 @@ def _decide_cached(trimmed_prompt: str) -> tuple[str, float, int | None, int | N
     return _decide_uncached(trimmed_prompt)
 
 
-def _decide(prompt: str) -> tuple[str, float, int | None, int | None]:
-    # Pinned prompts bypass scoring entirely: repeated cheap-success prompts
-    # skip the embedding + Supra inference, and prompts that repeatedly refuse
-    # on the cheap backend skip the doomed cheap attempt.
-    pinned = _store_pinned(_prompt_hash(prompt))
-    if pinned is not None:
-        return pinned.get("decision", "cheap"), pinned.get("score"), None, None
-    # Take tail of prompt (~15k chars) so routing evaluates the latest user request & context
+def _decide(prompt: str, session_id: str | None = None) -> tuple[str, float, int | None, int | None]:
+    # Session traffic does not consult the global prompt store: short turns
+    # like "Proceed" are not transferable across coding sessions. Once a live
+    # session exists, continuation turns also skip Supra/MF scoring entirely.
+    if session_id is not None and _is_continuation(prompt):
+        state = _session_get(session_id)
+        if state is not None:
+            return state["tier"], None, state.get("last_complexity"), None
+    if session_id is None:
+        pinned = _store_pinned(_prompt_hash(prompt))
+        if pinned is not None:
+            return pinned.get("decision", "cheap"), pinned.get("score"), None, None
     trimmed_prompt = prompt[-15000:] if len(prompt) > 15000 else prompt
     return _decide_cached(trimmed_prompt)
 
 
 def _backend_for(decision: str) -> dict:
-    return EXPENSIVE if decision == "expensive" else CHEAP
+    if decision == "middle" and not MIDDLE_CONFIGURED:
+        return EXPENSIVE if EXPENSIVE["base"] else CHEAP
+    return BACKENDS.get(decision, EXPENSIVE)
+
+
+def _supports_responses(backend: dict) -> bool:
+    """Responses is supported only by OpenAI models via OR or our gateway."""
+    base = str(backend.get("base", ""))
+    if not base or not str(backend.get("model", "")).lower().startswith("openai/"):
+        return False
+    try:
+        host = (urlsplit(base).hostname or "").lower()
+    except ValueError:
+        return False
+    return host in {"openrouter.ai", GATEWAY_HOST}
+
+
+def _responses_routes(decision: str) -> tuple[str, ...]:
+    """Return only configured compatible tiers, never below the selected tier."""
+    rank = TIER_ORDER.get(decision, TIER_ORDER["expensive"])
+    routes = []
+    seen = set()
+    for tier in sorted(BACKENDS, key=TIER_ORDER.get):
+        if TIER_ORDER[tier] < rank or (tier == "middle" and not MIDDLE_CONFIGURED):
+            continue
+        backend = _backend_for(tier)
+        identity = (backend.get("base"), backend.get("model"))
+        if identity in seen or not _supports_responses(backend):
+            continue
+        routes.append(tier)
+        seen.add(identity)
+    return tuple(routes)
+
+
+def _responses_tier(decision: str) -> str | None:
+    routes = _responses_routes(decision)
+    return routes[0] if routes else None
 
 
 _REFUSAL_RE = re.compile(
@@ -376,6 +545,16 @@ def _build_outgoing_body(body: dict, backend: dict) -> dict:
     return out_body
 
 
+def _build_responses_body(body: dict, backend: dict) -> dict:
+    out_body = dict(body)
+    out_body["model"] = backend["model"]
+    if isinstance(out_body.get("max_output_tokens"), int) and backend.get("max_tokens"):
+        out_body["max_output_tokens"] = min(out_body["max_output_tokens"], backend["max_tokens"])
+    if backend.get("effort") and "reasoning" not in out_body:
+        out_body["reasoning"] = {"effort": backend["effort"]}
+    return out_body
+
+
 def _extract_cost(data: dict) -> float | None:
     try:
         cost = (data.get("usage") or {}).get("cost")
@@ -421,12 +600,12 @@ def _log(
     ttfb_ms: int | None, supra_complexity: int | None = None,
     supra_ms: int | None = None, cost_usd: float | None = None,
     usage: dict | None = None, request_id: str | None = None,
-    occurrence_id: str | None = None, **detail,
+    occurrence_id: str | None = None, api_format: str = "chat", **detail,
 ):
     row = {
         "ts": time.time(), "request_id": request_id,
         "occurrence_id": occurrence_id or uuid.uuid4().hex,
-        "router": ROUTER_NAME, "threshold": THRESHOLD,
+        "router": ROUTER_NAME, "threshold": THRESHOLD, "api_format": api_format,
         "score": round(score, 4) if isinstance(score, (int, float)) else None,
         "supra_complexity": supra_complexity, "supra_ms": supra_ms,
         "decision": decision, "model": backend_model, "ttfb_ms": ttfb_ms,
@@ -434,8 +613,17 @@ def _log(
     }
     if cost_usd is not None:
         row["cost_usd"] = cost_usd
-    if usage:
+    if isinstance(usage, dict) and usage:
         row["usage"] = usage
+        prompt_tokens = usage.get("prompt_tokens", usage.get("input_tokens"))
+        details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
+        cached_tokens = details.get("cached_tokens", usage.get("prompt_cache_hit_tokens"))
+        if isinstance(prompt_tokens, (int, float)):
+            row["prompt_tokens"] = prompt_tokens
+        if isinstance(cached_tokens, (int, float)):
+            row["cached_tokens"] = cached_tokens
+            row["fresh_tokens"] = max(0, prompt_tokens - cached_tokens) if isinstance(prompt_tokens, (int, float)) else None
+            row["cache_hit_ratio"] = (cached_tokens / prompt_tokens if prompt_tokens else None)
     _secure_append(LOG_PATH, row)
     if TRAINING_LOG_ENABLED:
         _secure_append(TRAINING_LOG_PATH, {**row, "prompt": prompt})
@@ -454,6 +642,105 @@ def _log_outcome(prompt_hash: str, outcome: str, **detail) -> None:
 
 
 _recent_prompts: dict[str, tuple[str, str, float, str]] = {}
+
+# --- Session affinity -------------------------------------------------------
+# Session state is intentionally in-memory. A restart must not carry a model
+# choice into a new context, while the learned prompt store remains persistent.
+_CONTINUATION_RE = re.compile(
+    r"^(?:ok(?:ay)?[,. ]*)?(?:proceed|continue|go ahead|do (?:it|that)|yes|yep|sure|"
+    r"run (?:it|them|the tests)(?: again)?|try again|fix (?:it|that)|next)(?:[.! ]*)$", re.I,
+)
+_NEW_TASK_RE = re.compile(
+    r"^(?:new task|different task|unrelated|switching topics?|on another topic)\b", re.I,
+)
+SESSION_TTL_S = float(os.environ.get("ROUTELLM_SESSION_TTL_S", "3600"))
+SESSION_STATE_MAX = int(os.environ.get("ROUTELLM_SESSION_STATE_MAX", "4096"))
+_session_state: OrderedDict[str, dict] = OrderedDict()
+_session_lock = threading.Lock()
+_STICKY_REASONS = frozenset({
+    "continuation_sticky", "same_tier", "upgrade_hysteresis", "downgrade_hysteresis",
+})
+
+
+def _is_continuation(prompt: str) -> bool:
+    value = prompt.strip()
+    return len(value) <= 200 and "```" not in value and bool(_CONTINUATION_RE.fullmatch(value))
+
+
+def _session_id(body: dict, request: Request) -> tuple[str | None, str | None]:
+    """Extract an opaque, source-namespaced session identity."""
+    raw, source = request.headers.get("x-route-session"), "header"
+    if not raw and isinstance(body.get("metadata"), dict):
+        raw, source = body["metadata"].get("session_id"), "metadata"
+    if (not raw and os.environ.get("ROUTELLM_SESSION_FROM_USER", "0").lower()
+            in {"1", "true", "yes", "on"} and isinstance(body.get("user"), str)):
+        raw, source = body["user"], "user"
+    if not isinstance(raw, str) or not raw or len(raw.encode()) > 256:
+        return None, None
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw):
+        return None, None
+    secret = SERVER_KEY.encode("utf-8", errors="replace")
+    digest = hmac.new(secret, (source + "\0" + raw).encode(), hashlib.sha256).hexdigest()[:24]
+    return digest, source
+
+
+def _session_get(session_id: str | None) -> dict | None:
+    if not session_id:
+        return None
+    with _session_lock:
+        state = _session_state.get(session_id)
+        if state is None:
+            return None
+        if time.time() - state["last_seen"] > SESSION_TTL_S:
+            _session_state.pop(session_id, None)
+            return None
+        _session_state.move_to_end(session_id)
+        return dict(state)
+
+
+def _session_route(session_id: str | None, prompt: str, proposed: str,
+                   complexity: int | None, score: float | None = None,
+                   *, new_task: bool = False) -> tuple[str, str]:
+    state = _session_get(session_id)
+    if not state:
+        return proposed, "new_session"
+    if new_task or _NEW_TASK_RE.match(prompt.strip()):
+        return proposed, "new_task"
+    current = state["tier"]
+    if _is_continuation(prompt):
+        return current, "continuation_sticky"
+    if proposed == current:
+        return current, "same_tier"
+    current_rank, proposed_rank = TIER_ORDER[current], TIER_ORDER.get(proposed, 2)
+    if proposed_rank < current_rank:
+        return current, "downgrade_hysteresis"
+    expensive_cutoff = EXPENSIVE_MIN_COMPLEXITY
+    if ((complexity is not None and complexity >= expensive_cutoff)
+            or (score is not None and score >= THRESHOLD)):
+        return proposed, "strong_upgrade"
+    return current, "upgrade_hysteresis"
+
+
+def _session_note(session_id: str | None, tier: str, complexity: int | None,
+                  usage: dict | None = None) -> None:
+    if not session_id:
+        return
+    now = time.time()
+    with _session_lock:
+        prior = _session_state.get(session_id, {})
+        state = {
+            "tier": tier, "last_seen": now, "last_complexity": complexity,
+            "turns": int(prior.get("turns", 0)) + 1,
+        }
+        if isinstance(usage, dict) and usage:
+            details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
+            state["prompt_tokens"] = usage.get("prompt_tokens", usage.get("input_tokens"))
+            state["cached_tokens"] = details.get("cached_tokens", usage.get("prompt_cache_hit_tokens"))
+        _session_state[session_id] = state
+        _session_state.move_to_end(session_id)
+        while len(_session_state) > SESSION_STATE_MAX:
+            _session_state.popitem(last=False)
+
 
 # --- Persistent per-prompt decision store -----------------------------------
 # This workload is dominated by repeated prompts (top 25 prompts = ~38% of
@@ -784,13 +1071,46 @@ def _validate_request(body: dict) -> tuple[str, str | None] | None:
     return None
 
 
-def _route_headers(decision, score, backend, request_id, supra_complexity, supra_ms, *, pinned=False):
+def _validate_responses_request(body: dict) -> tuple[str, str | None] | None:
+    if body.get("model") != MODEL_ID:
+        return "Only model 'auto' is supported", "model"
+    if "input" not in body or body.get("input") is None:
+        return "'input' is required", "input"
+    input_value = body.get("input")
+    if not isinstance(input_value, (str, list)):
+        return "'input' must be text or an array", "input"
+    if not input_value:
+        return "'input' must not be empty", "input"
+    if "stream" in body and not isinstance(body["stream"], bool):
+        return "'stream' has an invalid type", "stream"
+    if "max_output_tokens" in body:
+        value = body["max_output_tokens"]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return "'max_output_tokens' must be a positive integer", "max_output_tokens"
+    stable_types = {
+        "instructions": (str, type(None)), "tools": list, "metadata": dict,
+        "reasoning": dict, "tool_choice": (str, dict),
+    }
+    for name, expected in stable_types.items():
+        if name in body and not isinstance(body[name], expected):
+            return f"'{name}' has an invalid type", name
+    for name in ("temperature", "top_p"):
+        if name in body and (isinstance(body[name], bool) or not isinstance(body[name], (int, float))):
+            return f"'{name}' has an invalid type", name
+    # Responses extensions are preserved rather than rejected.
+    return None
+
+
+def _route_headers(decision, score, backend, request_id, supra_complexity, supra_ms,
+                   *, pinned=False, api_format="chat"):
+    upstream_path = "/responses" if api_format == "responses" else "/chat/completions"
     headers = {
         "x-request-id": request_id, "x-route-decision": decision,
         "x-route-score": f"{score:.4f}" if isinstance(score, (int, float)) else "n/a",
         "x-route-model": backend["model"],
         "x-route-router": ROUTER_NAME, "x-route-fallback": "false",
-        "x-route-attempts": "1",
+        "x-route-attempts": "1", "x-route-api": api_format,
+        "x-route-upstream-path": upstream_path,
     }
     if pinned:
         headers["x-route-pinned"] = "true"
@@ -801,28 +1121,43 @@ def _route_headers(decision, score, backend, request_id, supra_complexity, supra
     return headers
 
 
-def _upstream_request(backend: dict, body: dict) -> httpx.Request:
+def _upstream_request(backend: dict, body: dict, *, api_format: str = "chat") -> httpx.Request:
     assert _client is not None
+    if api_format == "responses":
+        path, outgoing = "/responses", _build_responses_body(body, backend)
+    else:
+        path, outgoing = "/chat/completions", _build_outgoing_body(body, backend)
     return _client.build_request(
-        "POST", backend["base"].rstrip("/") + "/chat/completions",
-        json=_build_outgoing_body(body, backend),
+        "POST", backend["base"].rstrip("/") + path,
+        json=outgoing,
         headers={"Authorization": f"Bearer {backend['key']}", "Content-Type": "application/json"},
     )
 
 
-async def _send(backend: dict, body: dict, *, stream: bool) -> httpx.Response:
+async def _send(backend: dict, body: dict, *, stream: bool, api_format: str = "chat") -> httpx.Response:
     if _client is None:
         raise RuntimeError("router is not ready")
-    return await _client.send(_upstream_request(backend, body), stream=stream)
+    return await _client.send(_upstream_request(backend, body, api_format=api_format), stream=stream)
 
 
 def _retryable(status: int) -> bool:
     return status in RETRY_STATUSES
 
 
-async def _open_with_failover(body: dict, decision: str, deadline: float, *, stream: bool):
+def _failover_routes(decision: str) -> tuple[str, ...]:
+    if not MIDDLE_CONFIGURED:
+        return (decision, "cheap" if decision == "expensive" else "expensive")
+    if decision == "cheap":
+        return ("cheap", "middle")
+    if decision == "middle":
+        return ("middle", "expensive")
+    return ("expensive", "middle")
+
+
+async def _open_with_failover(body: dict, decision: str, deadline: float, *, stream: bool,
+                              api_format: str = "chat"):
     attempts = []
-    routes = (decision, "cheap" if decision == "expensive" else "expensive")
+    routes = _responses_routes(decision) if api_format == "responses" else _failover_routes(decision)
     for index, current in enumerate(routes):
         backend = _backend_for(current)
         try:
@@ -830,7 +1165,7 @@ async def _open_with_failover(body: dict, decision: str, deadline: float, *, str
             if remaining <= 0:
                 raise TimeoutError
             async with asyncio.timeout(remaining):
-                response = await _send(backend, body, stream=stream)
+                response = await _send(backend, body, stream=stream, api_format=api_format)
                 data = None
                 if not stream or response.status_code != 200:
                     data = _safe_json(await response.aread())
@@ -845,17 +1180,20 @@ async def _open_with_failover(body: dict, decision: str, deadline: float, *, str
     return attempts[-1][0], attempts[-1][1], None, attempts
 
 
-def _log_attempts(attempts, prompt: str, score: float, request_id: str, occurrence_id: str) -> None:
+def _log_attempts(attempts, prompt: str, score: float, request_id: str, occurrence_id: str,
+                  *, api_format: str = "chat") -> None:
     for index, (decision, backend, status, error) in enumerate(attempts, 1):
         _log(decision, score, backend["model"], prompt, None, request_id=request_id,
              occurrence_id=occurrence_id, record_type="attempt", attempt=index,
-             status=status, error=error)
+             tier=backend.get("tier"), status=status, error=error, api_format=api_format)
 
 
 @app.get("/healthz")
 async def healthz():
     return {"ok": _READY, "router": ROUTER_NAME, "threshold": THRESHOLD,
-            "backend": "direct", "ready": _READY, "cache": {**_cache_metrics, "entries": len(_resp_cache), "bytes": _cache_bytes}}
+            "backend": "cloudflare" if _GATEWAY_SELECTED else "direct",
+            "gateway": _GATEWAY_SELECTED, "tiers": list(BACKENDS),
+            "ready": _READY, "cache": {**_cache_metrics, "entries": len(_resp_cache), "bytes": _cache_bytes}}
 
 
 @app.get("/v1/models")
@@ -975,6 +1313,218 @@ def _stream_error(message: str, code: str, request_id: str) -> bytes:
                                    "request_id": request_id}) + "\n\n").encode()
 
 
+def _responses_event_state(event: bytes) -> tuple[bool, bool, dict | None]:
+    """Return (completed, failed, usage) without assuming Chat choices."""
+    event_name = None
+    for line in event.splitlines():
+        if line.startswith(b"event:"):
+            event_name = line[6:].strip().decode("utf-8", errors="replace")
+            break
+    data_text = _sse_data(event)
+    if data_text is None:
+        return False, event_name in {"error", "response.failed", "response.incomplete"}, None
+    if data_text.strip() == "[DONE]":
+        return True, False, None
+    try:
+        payload = json.loads(data_text)
+    except json.JSONDecodeError:
+        return False, False, None
+    event_type = payload.get("type") or event_name
+    response = payload.get("response") if isinstance(payload.get("response"), dict) else {}
+    usage = response.get("usage") or payload.get("usage")
+    if event_type == "response.completed":
+        return True, False, usage if isinstance(usage, dict) else None
+    failed = event_type in {"error", "response.failed", "response.incomplete"} or "error" in payload
+    return False, failed, usage if isinstance(usage, dict) else None
+
+
+def _responses_stream_error(message: str, code: str, request_id: str) -> bytes:
+    payload = {"type": "error", "error": {"message": message, "type": "upstream_error", "code": code},
+               "request_id": request_id}
+    return ("event: error\ndata: " + json.dumps(payload) + "\n\n").encode()
+
+
+def _responses_usage(data: dict) -> dict | None:
+    usage = data.get("usage")
+    if isinstance(usage, dict):
+        return usage
+    response = data.get("response")
+    if isinstance(response, dict) and isinstance(response.get("usage"), dict):
+        return response["usage"]
+    return None
+
+
+@app.post("/v1/responses")
+async def responses(request: Request, authorization: str | None = Header(default=None)):
+    request_id = request.headers.get("x-request-id") or f"req_{uuid.uuid4().hex}"
+    if not _authorize(authorization):
+        return _openai_error("Invalid API key", 401, error_type="authentication_error", code="invalid_api_key")
+    try:
+        body = await _read_json_body(request)
+    except OverflowError:
+        return _openai_error("Request body is too large", 413, code="request_too_large")
+    except ValueError as exc:
+        return _openai_error(str(exc), 400, code="invalid_json")
+    invalid = _validate_responses_request(body)
+    if invalid:
+        return _openai_error(invalid[0], 400, param=invalid[1], code="invalid_request")
+
+    prompt = _extract_responses_prompt(body)
+    prompt_hash = _prompt_hash(prompt)
+    session_id, session_source = _session_id(body, request)
+    if prompt.strip():
+        if session_id is None:
+            proposed, score, supra_complexity, supra_ms = await asyncio.to_thread(_decide, prompt)
+        else:
+            proposed, score, supra_complexity, supra_ms = await asyncio.to_thread(_decide, prompt, session_id)
+    else:
+        proposed, score, supra_complexity, supra_ms = "cheap", 0.0, None, None
+    decision, route_reason = _session_route(
+        session_id, prompt, proposed, supra_complexity, score,
+        new_task=request.headers.get("x-route-new-task", "").lower() in {"1", "true", "yes"},
+    )
+    compatible = _responses_tier(decision)
+    protocol_upgraded = compatible is not None and compatible != decision
+    if compatible is None:
+        return _openai_error(
+            "Responses API requires an OpenAI model routed through OpenRouter or the Cloudflare gateway",
+            503, error_type="configuration_error", code="responses_backend_unavailable",
+        )
+    if protocol_upgraded:
+        decision, route_reason = compatible, "responses_protocol_upgrade"
+    backend = _backend_for(decision)
+    pinned = session_id is None and _store_pinned(prompt_hash) is not None
+    occurrence_id = uuid.uuid4().hex
+    _record_and_detect_retry(_request_hash({"messages": body.get("input")}), decision,
+                             backend["model"], prompt_hash, request_id, occurrence_id)
+    headers = _route_headers(decision, score, backend, request_id, supra_complexity, supra_ms,
+                             pinned=pinned, api_format="responses")
+    headers["x-route-reason"] = route_reason
+    headers["x-route-sticky"] = str(route_reason in _STICKY_REASONS).lower()
+    if session_id:
+        headers["x-route-session"] = session_id
+
+    deadline = time.monotonic() + TIMEOUT_S
+    upstream = None
+    try:
+        selected, backend, upstream, attempts = await _open_with_failover(
+            body, decision, deadline, stream=bool(body.get("stream")), api_format="responses",
+        )
+    except BaseException:
+        if upstream is not None:
+            await asyncio.shield(upstream.aclose())
+        raise
+    headers.update({
+        "x-route-decision": selected, "x-route-model": backend["model"],
+        "x-route-fallback": str(selected != decision).lower(), "x-route-attempts": str(len(attempts)),
+        "x-route-switch": str(protocol_upgraded or selected != decision).lower(),
+        "x-route-affinity": "warm" if session_id and _session_get(session_id) else "unknown",
+    })
+    _log_attempts(attempts, prompt, score, request_id, occurrence_id, api_format="responses")
+    if upstream is None:
+        _log(selected, score, backend["model"], prompt, None, request_id=request_id,
+             occurrence_id=occurrence_id, record_type="decision", status=None,
+             error="upstream_unavailable", attempts=len(attempts), pinned=pinned,
+             tier=backend.get("tier"), route_reason=route_reason, session_id=session_id,
+             session_source=session_source, api_format="responses")
+        return _openai_error("Responses upstream was unavailable", 502,
+                             error_type="upstream_error", code="upstream_unavailable")
+
+    if not body.get("stream"):
+        try:
+            async with asyncio.timeout(max(0, deadline - time.monotonic())):
+                content = await upstream.aread()
+        except (httpx.TransportError, TimeoutError, asyncio.TimeoutError):
+            await upstream.aclose()
+            return _openai_error("Upstream response timed out", 504,
+                                 error_type="upstream_error", code="upstream_timeout")
+        finally:
+            await upstream.aclose()
+        data = _safe_json(content)
+        usage = _responses_usage(data)
+        clean_success = upstream.status_code == 200 and data.get("status") == "completed"
+        if upstream.status_code != 200:
+            _log_outcome(prompt_hash, "upstream_error", request_id=request_id,
+                         decision_occurrence_id=occurrence_id, model=backend["model"],
+                         status=upstream.status_code)
+        elif not clean_success:
+            _log_outcome(prompt_hash, "truncated" if data.get("status") == "incomplete" else "upstream_error",
+                         request_id=request_id, decision_occurrence_id=occurrence_id,
+                         model=backend["model"], responses_status=data.get("status"))
+        if clean_success:
+            if session_id is None:
+                _store_note(prompt_hash, selected, ok=True, score=score)
+            else:
+                _session_note(session_id, selected, supra_complexity, usage)
+        _log(selected, score, backend["model"], prompt, None, supra_complexity, supra_ms,
+             cost_usd=_extract_cost(data), usage=usage, request_id=request_id,
+             occurrence_id=occurrence_id, record_type="decision", attempts=len(attempts),
+             status=upstream.status_code, pinned=pinned, tier=backend.get("tier"),
+             route_reason=route_reason, session_id=session_id, session_source=session_source,
+             api_format="responses")
+        response_headers = {**headers, "content-type": upstream.headers.get("content-type", "application/json")}
+        return Response(content=content, status_code=upstream.status_code,
+                        media_type=None, headers=response_headers)
+
+    if upstream.status_code != 200:
+        content = await upstream.aread()
+        response_headers = {**headers, "content-type": upstream.headers.get("content-type", "application/json")}
+        await upstream.aclose()
+        return Response(content=content, status_code=upstream.status_code,
+                        media_type=None, headers=response_headers)
+
+    async def response_events():
+        completed = failed = False
+        usage: dict = {}
+        started = time.monotonic()
+        try:
+            async with asyncio.timeout(max(0, deadline - time.monotonic())):
+                async for event in _iter_sse_events(upstream):
+                    if await request.is_disconnected():
+                        raise asyncio.CancelledError
+                    event_completed, event_failed, event_usage = _responses_event_state(event)
+                    if event_usage:
+                        usage.update(event_usage)
+                    yield event
+                    completed = completed or event_completed
+                    failed = failed or event_failed
+                    if completed or failed:
+                        break
+            if failed:
+                _log_outcome(prompt_hash, "upstream_error", request_id=request_id,
+                             decision_occurrence_id=occurrence_id, model=backend["model"],
+                             responses_terminal_error=True)
+            elif not completed:
+                _log_outcome(prompt_hash, "truncated", request_id=request_id,
+                             decision_occurrence_id=occurrence_id, model=backend["model"], abrupt_eof=True)
+                yield _responses_stream_error("Upstream Responses stream ended before completion",
+                                              "upstream_truncated", request_id)
+        except asyncio.CancelledError:
+            _log_outcome(prompt_hash, "disconnected", request_id=request_id,
+                         decision_occurrence_id=occurrence_id, model=backend["model"])
+            raise
+        except (httpx.TransportError, TimeoutError, asyncio.TimeoutError, ValueError):
+            _log_outcome(prompt_hash, "upstream_error", request_id=request_id,
+                         decision_occurrence_id=occurrence_id, model=backend["model"])
+            yield _responses_stream_error("Upstream Responses stream failed",
+                                          "upstream_transport_error", request_id)
+        finally:
+            await asyncio.shield(upstream.aclose())
+            _log(selected, score, backend["model"], prompt,
+                 int((time.monotonic() - started) * 1000), supra_complexity, supra_ms,
+                 usage=usage or None, request_id=request_id, occurrence_id=occurrence_id,
+                 record_type="decision", attempts=len(attempts), completed=completed,
+                 pinned=pinned, tier=backend.get("tier"), route_reason=route_reason,
+                 session_id=session_id, session_source=session_source, api_format="responses")
+            if completed:
+                if session_id is None:
+                    _store_note(prompt_hash, selected, ok=True, score=score)
+                else:
+                    _session_note(session_id, selected, supra_complexity, usage or None)
+
+    return StreamingResponse(response_events(), media_type="text/event-stream", headers=headers)
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: Request, authorization: str | None = Header(default=None),
@@ -997,7 +1547,8 @@ async def chat_completions(
     cached = _cache_get(cache_key)
     if cached is not None:
         media = "text/event-stream" if body.get("stream") else "application/json"
-        result = (cached, 200, media, {"x-route-cache": "hit"})
+        result = (cached, 200, media, {"x-route-cache": "hit", "x-route-api": "chat",
+                                      "x-route-upstream-path": "/chat/completions"})
         return _replayed_response(result, request_id)
     leader, inflight = await _claim_inflight(cache_key)
     if not leader:
@@ -1011,16 +1562,29 @@ async def chat_completions(
         occurrence_id = uuid.uuid4().hex
         prompt = _extract_prompt(body)
         prompt_hash = _prompt_hash(prompt)
+        session_id, session_source = _session_id(body, request)
         if prompt.strip():
-            decision, score, supra_complexity, supra_ms = await asyncio.to_thread(_decide, prompt)
+            if session_id is None:
+                proposed, score, supra_complexity, supra_ms = await asyncio.to_thread(_decide, prompt)
+            else:
+                proposed, score, supra_complexity, supra_ms = await asyncio.to_thread(
+                    _decide, prompt, session_id)
         else:
-            decision, score, supra_complexity, supra_ms = "cheap", 0.0, None, None
-        pinned = _store_pinned(prompt_hash) is not None
+            proposed, score, supra_complexity, supra_ms = "cheap", 0.0, None, None
+        decision, route_reason = _session_route(
+            session_id, prompt, proposed, supra_complexity, score,
+            new_task=request.headers.get("x-route-new-task", "").lower() in {"1", "true", "yes"},
+        )
+        pinned = session_id is None and _store_pinned(prompt_hash) is not None
         backend = _backend_for(decision)
         _record_and_detect_retry(_request_hash(body), decision, backend["model"], prompt_hash,
                                  request_id, occurrence_id)
         headers = _route_headers(decision, score, backend, request_id, supra_complexity, supra_ms,
-                                 pinned=pinned)
+                                 pinned=pinned, api_format="chat")
+        headers["x-route-reason"] = route_reason
+        headers["x-route-sticky"] = str(route_reason in _STICKY_REASONS).lower()
+        if session_id:
+            headers["x-route-session"] = session_id
         deadline = time.monotonic() + TIMEOUT_S
         selected, backend, upstream, attempts = await _open_with_failover(
             body, decision, deadline, stream=bool(body.get("stream")))
@@ -1033,7 +1597,10 @@ async def chat_completions(
                 prefix, refusal = await _prefetch_sse(events, deadline)
                 if refusal and len(attempts) < 2:
                     await upstream.aclose()
-                    selected = "cheap" if selected == "expensive" else "expensive"
+                    tried = [item[0] for item in attempts]
+                    selected = next((tier for tier in _failover_routes(decision) if tier not in tried), None)
+                    if selected is None:
+                        raise ValueError("no streaming fallback route available")
                     backend = _backend_for(selected)
                     remaining = deadline - time.monotonic()
                     async with asyncio.timeout(max(0, remaining)):
@@ -1047,12 +1614,15 @@ async def chat_completions(
                 attempts.append((selected, backend, None, type(exc).__name__))
                 upstream = None
 
-        # A refusal on the cheap backend is a per-prompt failure signal: two of
-        # these pin the prompt to expensive so later requests skip the doomed
-        # cheap attempt (e.g. the hardening-case load-test prompt refused 52x).
+        # A refusal on the cheap backend is a per-prompt failure signal. Keep
+        # legacy global learning for sessionless traffic; session traffic gets
+        # a local promotion so every following turn avoids the bad tier.
         for a_decision, _a_backend, _a_status, a_error in attempts:
             if a_error in ("refusal", "refusal_fallback") and a_decision == "cheap":
-                _store_note(prompt_hash, "cheap", ok=False)
+                if session_id is None:
+                    _store_note(prompt_hash, "cheap", ok=False)
+                else:
+                    _session_note(session_id, "middle" if MIDDLE_CONFIGURED else "expensive", supra_complexity)
 
     except BaseException:
         _finish_inflight_nowait(cache_key, inflight, None)
@@ -1061,12 +1631,16 @@ async def chat_completions(
         raise
 
     headers.update({"x-route-decision": selected, "x-route-model": backend["model"],
-                    "x-route-fallback": str(selected != decision).lower(), "x-route-attempts": str(len(attempts))})
-    _log_attempts(attempts, prompt, score, request_id, occurrence_id)
+                    "x-route-fallback": str(selected != decision).lower(), "x-route-attempts": str(len(attempts)),
+                    "x-route-switch": str(selected != decision).lower(),
+                    "x-route-affinity": "warm" if session_id and _session_get(session_id) else "unknown"})
+    _log_attempts(attempts, prompt, score, request_id, occurrence_id, api_format="chat")
     if upstream is None:
         _log(selected, score, backend["model"], prompt, None, request_id=request_id,
              occurrence_id=occurrence_id, record_type="decision", status=None,
-             error="upstream_unavailable", attempts=len(attempts), pinned=pinned)
+             error="upstream_unavailable", attempts=len(attempts), pinned=pinned,
+             tier=backend.get("tier"), route_reason=route_reason,
+             session_id=session_id, session_source=session_source)
         _log_outcome(_prompt_hash(prompt), "upstream_error", request_id=request_id,
                      decision_occurrence_id=occurrence_id, attempts=len(attempts))
         await _finish_inflight(cache_key, inflight, None)
@@ -1083,7 +1657,9 @@ async def chat_completions(
                          decision_occurrence_id=occurrence_id, model=backend["model"])
             _log(selected, score, backend["model"], prompt, None, request_id=request_id,
                  occurrence_id=occurrence_id, record_type="decision", status=504,
-                 error="upstream_timeout", attempts=len(attempts), pinned=pinned)
+                 error="upstream_timeout", attempts=len(attempts), pinned=pinned,
+                 tier=backend.get("tier"), route_reason=route_reason,
+                 session_id=session_id, session_source=session_source)
             await _finish_inflight(cache_key, inflight, None)
             return _openai_error("Upstream response timed out", 504, error_type="upstream_error", code="upstream_timeout")
         finally:
@@ -1099,11 +1675,15 @@ async def chat_completions(
         if upstream.status_code == 200:
             _cache_put(cache_key, body, content)
             if not truncated:
-                _store_note(prompt_hash, selected, ok=True, score=score)
+                if session_id is None:
+                    _store_note(prompt_hash, selected, ok=True, score=score)
+                else:
+                    _session_note(session_id, selected, supra_complexity, data.get("usage"))
         _log(selected, score, backend["model"], prompt, None, supra_complexity, supra_ms,
              cost_usd=_extract_cost(data), usage=data.get("usage"), request_id=request_id,
              occurrence_id=occurrence_id, record_type="decision", attempts=len(attempts),
-             status=upstream.status_code, pinned=pinned)
+             status=upstream.status_code, pinned=pinned, tier=backend.get("tier"),
+             route_reason=route_reason, session_id=session_id, session_source=session_source)
         result = ((content, upstream.status_code, "application/json", headers)
                   if (cache_key and upstream.status_code == 200 and len(content) <= RESP_CACHE_MAX_BYTES
                       and _response_replay_safe(body, content)) else None)
@@ -1117,7 +1697,8 @@ async def chat_completions(
                      decision_occurrence_id=occurrence_id, model=backend["model"], status=upstream.status_code)
         _log(selected, score, backend["model"], prompt, None, request_id=request_id,
              occurrence_id=occurrence_id, record_type="decision", status=upstream.status_code,
-             pinned=pinned)
+             pinned=pinned, tier=backend.get("tier"), route_reason=route_reason,
+             session_id=session_id, session_source=session_source)
         await _finish_inflight(cache_key, inflight, None)
         return Response(content=content, status_code=upstream.status_code, media_type="application/json", headers=headers)
 
@@ -1204,9 +1785,14 @@ async def chat_completions(
             _log(selected, score, backend["model"], prompt, int((time.monotonic() - started) * 1000),
                  supra_complexity, supra_ms, usage=usage or None, request_id=request_id,
                  occurrence_id=occurrence_id, record_type="decision",
-                 attempts=len(attempts), completed=saw_done and saw_finish, pinned=pinned)
+                 attempts=len(attempts), completed=saw_done and saw_finish, pinned=pinned,
+                 tier=backend.get("tier"), route_reason=route_reason,
+                 session_id=session_id, session_source=session_source)
             if saw_done and saw_finish and not saw_length:
-                _store_note(prompt_hash, selected, ok=True, score=score)
+                if session_id is None:
+                    _store_note(prompt_hash, selected, ok=True, score=score)
+                else:
+                    _session_note(session_id, selected, supra_complexity, usage or None)
             result = None
             if cache_parts is not None and saw_done and saw_finish:
                 content = b"".join(cache_parts)

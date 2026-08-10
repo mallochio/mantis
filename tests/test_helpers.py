@@ -62,3 +62,9 @@ def test_outcomes_prefer_occurrence_over_duplicate_caller_request_id():
     outcomes = [{"decision_occurrence_id": "a", "request_id": "duplicate", "outcome": "upstream_error"}]
     result = eval_outcomes.evaluate(decisions, outcomes, [])
     assert result["cells"]["cheap"]["0.1-0.156"] == [2, 1]
+
+
+def test_outcomes_include_middle_decisions():
+    decisions = [{"record_type": "decision", "decision": "middle", "score": 0.1, "prompt_hash": "m"}]
+    result = eval_outcomes.evaluate(decisions, [], [])
+    assert result["cells"]["middle"]["0.1-0.156"] == [1, 0]

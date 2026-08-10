@@ -98,3 +98,55 @@ async def test_cache_requires_key_and_excludes_tools(client, monkeypatch):
     assert second.headers["x-route-cache"] == "hit"
     assert count == 3
     await mock.aclose()
+
+
+@pytest.mark.anyio
+async def test_session_affinity_keeps_continuation_on_current_tier(client, monkeypatch):
+    decisions = iter([("expensive", None, 4, 10), ("cheap", None, 1, 10)])
+    monkeypatch.setattr(server, "_decide", lambda *args: next(decisions))
+    calls = []
+    def handler(request):
+        payload = __import__("json").loads(request.content)
+        calls.append(payload["model"])
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
+    mock = upstream(handler)
+    monkeypatch.setattr(server, "_client", mock)
+    headers = {**AUTH, "X-Route-Session": "coding-1"}
+    first = await client.post("/v1/chat/completions", headers=headers,
+                              json={"model": "auto", "messages": [{"role": "user", "content": "implement"}]})
+    second = await client.post("/v1/chat/completions", headers=headers,
+                               json={"model": "auto", "messages": [{"role": "user", "content": "Proceed"}]})
+    assert first.headers["x-route-decision"] == "expensive"
+    assert second.headers["x-route-decision"] == "expensive"
+    assert second.headers["x-route-reason"] == "continuation_sticky"
+    assert len(calls) == 2
+    await mock.aclose()
+
+
+def test_usage_cache_metrics_are_normalized(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "LOG_PATH", tmp_path / "decisions.log")
+    server._log("middle", None, "kimi-k3", "hello", None,
+                usage={"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 75}})
+    row = __import__("json").loads((tmp_path / "decisions.log").read_text().strip())
+    assert row["fresh_tokens"] == 25 and row["cache_hit_ratio"] == 0.75
+
+
+@pytest.mark.anyio
+async def test_gateway_middle_failover_uses_middle_model(client, monkeypatch):
+    monkeypatch.setattr(server, "MIDDLE_CONFIGURED", True)
+    monkeypatch.setattr(server, "_decide", lambda *args: ("cheap", None, 1, 10))
+    calls = []
+    def handler(request):
+        payload = __import__("json").loads(request.content)
+        calls.append((request.url.host, payload["model"]))
+        if len(calls) == 1:
+            return httpx.Response(429, json={"error": {"message": "busy"}})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
+    mock = upstream(handler)
+    monkeypatch.setattr(server, "_client", mock)
+    response = await client.post("/v1/chat/completions", headers=AUTH,
+                                 json={"model": "auto", "messages": [{"role": "user", "content": "hello"}]})
+    assert response.status_code == 200
+    assert calls[0][1] == server.CHEAP["model"] and calls[1][1] == server.MIDDLE["model"]
+    assert response.headers["x-route-decision"] == "middle"
+    await mock.aclose()
