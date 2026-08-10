@@ -965,14 +965,13 @@ def test_legacy_env_parse_errors_do_not_block_explicit_sources(tmp_path):
     ok = subprocess.run([sys.executable, "-c", "import server"], env=env,
                         capture_output=True, text=True)
     assert ok.returncode == 0, ok.stderr[-1000:]
-    # Without an explicit source, a malformed legacy value still fails loudly.
-    env.pop("AI_ROUTING_CONFIG", None)
-    env.pop("ROUTER_CATALOG_TEST_KEY", None)
-    env.pop("ROUTELLM_TARGETS_JSON", None)
+    # An explicit source must name an existing catalog; a missing path fails
+    # loudly even when legacy env values are malformed.
+    env["AI_ROUTING_CONFIG"] = str(tmp_path / "missing.toml")
     bad = subprocess.run([sys.executable, "-c", "import server"], env=env,
                          capture_output=True, text=True)
     assert bad.returncode != 0
-    assert "invalid literal" in bad.stderr or "could not convert" in bad.stderr
+    assert "AI_ROUTING_CONFIG does not exist" in bad.stderr
 
 
 

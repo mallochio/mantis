@@ -1,6 +1,34 @@
+import importlib
+import os
 import socket
+import tempfile
 
 import pytest
+
+
+def _force_legacy_router_default() -> None:
+    """Force legacy env-based routing tests to run in legacy mode.
+
+    A catalog now normally exists at the default path, so a plain
+    ``import server`` loads the catalog instead of the legacy environment.
+    Point ``AI_ROUTING_CONFIG`` at an empty catalog (no ``[routellm]``
+    section) so ``import server`` takes the legacy fallback.  Catalog tests
+    reload ``server`` with their own fixtures and are unaffected.
+    """
+    try:
+        import server  # noqa: F401
+    except ImportError:
+        return
+    fd, path = tempfile.mkstemp(suffix=".toml")
+    try:
+        os.write(fd, b"version = 1\n")
+    finally:
+        os.close(fd)
+    os.environ["AI_ROUTING_CONFIG"] = path
+    importlib.reload(server)
+
+
+_force_legacy_router_default()
 
 
 @pytest.fixture(autouse=True)
