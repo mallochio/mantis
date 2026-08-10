@@ -168,7 +168,10 @@ MIDDLE_MIN_COMPLEXITY = int(os.environ.get("ROUTELLM_MIDDLE_MIN_COMPLEXITY", "3"
 MIDDLE_CONFIGURED = bool(MIDDLE["base"])
 EXPENSIVE_MIN_COMPLEXITY = int(os.environ.get(
     "ROUTELLM_EXPENSIVE_MIN_COMPLEXITY",
-    str(SUPRA_THRESHOLD + (1 if MIDDLE_CONFIGURED else 0)),
+    # With Terra enabled, reserve Sol for Supra's highest complexity level.
+    # Direct two-tier mode retains the historical threshold immediately above
+    # the Supra cutoff.
+    "5" if MIDDLE_CONFIGURED else str(SUPRA_THRESHOLD + 1),
 ))
 
 

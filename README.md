@@ -9,8 +9,10 @@ server uses one lifespan-owned asynchronous HTTP pool.
 Two routing modes are available (`ROUTELLM_ROUTER`):
 
 - `supra` (default): the Supra-Router-51M complexity gate is the primary signal. With the gateway middle tier enabled, complexity 1–2 goes cheap,
-  complexity 3 goes middle, and complexity 4+ goes expensive. Direct two-tier
-  mode retains the legacy `ROUTELLM_SUPRA_THRESHOLD` cutoff. MF scoring is off by default; set
+  complexity 3–4 goes middle (Terra by default), and complexity 5+ goes
+  expensive (Sol by default). Direct two-tier mode retains the legacy
+  `ROUTELLM_SUPRA_THRESHOLD` cutoff. Override the expensive boundary with
+  `ROUTELLM_EXPENSIVE_MIN_COMPLEXITY` when deliberately testing another policy. MF scoring is off by default; set
   `ROUTELLM_SCORE_WITH_MF=1` for observability (it never influences the
   decision). This mode was chosen because on the Aug 5-10 workload the RouteLLM
   MF score had essentially zero separation against the Gemini difficulty
@@ -66,9 +68,10 @@ request is promoted to the nearest higher compatible tier and returns
 tiers. With the default gateway models, Terra and Sol can serve Responses directly;
 an explicitly configured `openai/gpt-5.6-luna` cheap tier may also serve
 Responses directly. A non-OpenAI middle model such as `kimi-k3` is promoted to
-Sol instead. The Terra middle tier defaults to maximum reasoning (`max`) when
-callers omit the native `reasoning` object; an explicit per-request reasoning
-object remains unchanged.
+Sol instead. The Terra middle tier uses maximum reasoning (`max`) for every
+Responses request routed to it, overriding only the native `reasoning.effort`
+field while preserving other reasoning fields such as `summary`. Cheap and
+expensive tiers preserve the caller's explicit reasoning settings.
 
 Responses streaming preserves provider SSE event frames and terminates on
 `response.completed`, `response.failed`, `response.incomplete`, `error`, or a

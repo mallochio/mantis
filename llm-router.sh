@@ -99,6 +99,8 @@ export CHEAP_MAX_TOKENS="${CHEAP_MAX_TOKENS:-131072}"
 export MIDDLE_MODEL="${MIDDLE_MODEL:-openai/gpt-5.6-terra}"
 export MIDDLE_REASONING_EFFORT="${MIDDLE_REASONING_EFFORT:-max}"
 export MIDDLE_MAX_TOKENS="${MIDDLE_MAX_TOKENS:-131072}"
+# Terra handles Supra levels 3–4; reserve Sol for level 5+.
+export ROUTELLM_EXPENSIVE_MIN_COMPLEXITY="${ROUTELLM_EXPENSIVE_MIN_COMPLEXITY:-5}"
 # Preserve direct-provider credentials unless a gateway endpoint/profile is selected.
 # Base-host auto-detection keeps existing Cloudflare gateway configurations working.
 router_select_endpoint_keys

@@ -26,6 +26,22 @@ def isolate_store(tmp_path, monkeypatch):
     server._decision_store.clear()
 
 
+def test_gateway_default_maps_level_3_and_4_to_middle_and_5_to_expensive(monkeypatch):
+    assert server.MIDDLE_CONFIGURED
+    assert server.EXPENSIVE_MIN_COMPLEXITY == 5
+
+    monkeypatch.setattr(server, "MIDDLE_MIN_COMPLEXITY", 3)
+    monkeypatch.setattr(server, "EXPENSIVE_MIN_COMPLEXITY", 5)
+    monkeypatch.setattr(server, "ROUTER_NAME", "supra")
+    monkeypatch.setattr(server, "SCORE_WITH_MF", False)
+    monkeypatch.setattr(server, "_supra_complexity", lambda prompt: (3, 10))
+    assert server._decide_uncached("level three")[0] == "middle"
+    monkeypatch.setattr(server, "_supra_complexity", lambda prompt: (4, 10))
+    assert server._decide_uncached("level four")[0] == "middle"
+    monkeypatch.setattr(server, "_supra_complexity", lambda prompt: (5, 10))
+    assert server._decide_uncached("level five")[0] == "expensive"
+
+
 def test_supra_mode_decides_on_complexity_alone(monkeypatch):
     monkeypatch.setattr(server, "ROUTER_NAME", "supra")
     monkeypatch.setattr(server, "SCORE_WITH_MF", False)
