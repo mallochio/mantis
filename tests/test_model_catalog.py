@@ -643,3 +643,40 @@ def test_resolve_runtime_credentials_prefers_injected_keys(monkeypatch):
     monkeypatch.delenv("EDGE_KEY")
     with pytest.raises(model_catalog.CatalogError, match="EDGE_KEY"):
         model_catalog.resolve_runtime_credentials(bindings)
+
+
+def test_worker_max_tokens_must_be_positive():
+    for bad in (0, -1, "65536"):
+        workers = _full_workers()
+        workers[DEEPSEEK]["max_tokens"] = bad
+        with pytest.raises(model_catalog.CatalogError, match="max_tokens"):
+            model_catalog._runtime_bindings(_edge_provider(), workers)
+
+
+def test_rendered_worker_bindings_include_max_tokens():
+    catalog = _unchecked_catalog(
+        _catalog().replace(
+            f'upstream_model = "vendor/{DEEPSEEK}"',
+            f'max_tokens = 65536\nupstream_model = "vendor/{DEEPSEEK}"',
+            1,
+        )
+    )
+    rendered = model_catalog.render_mantis_environment(catalog)
+    workers = json.loads(rendered["MANTIS_WORKER_BINDINGS"])
+    assert workers[DEEPSEEK]["max_tokens"] == 65536
+    # Workers without a declared cap stay absent so fingerprints don't drift.
+    other = next(slot for slot in SLOTS if slot != DEEPSEEK)
+    assert "max_tokens" not in workers[other]
+
+
+def test_runtime_worker_max_tokens_clamps_upstream_request(monkeypatch):
+    providers = _edge_provider()
+    workers = _full_workers()
+    workers[DEEPSEEK]["max_tokens"] = 65536
+    _set_runtime_env(monkeypatch, providers, workers)
+    monkeypatch.setenv("MANTIS_PROVIDER_KEYS", json.dumps({"edge": "injected-key"}))
+    _, _, body = serve._build_request(DEEPSEEK, [], 384000, 0.7)
+    assert body["max_tokens"] == 65536
+    other = next(slot for slot in SLOTS if slot not in (DEEPSEEK, CONDUCTOR))
+    _, _, body = serve._build_request(other, [], 384000, 0.7)
+    assert body["max_tokens"] == 384000

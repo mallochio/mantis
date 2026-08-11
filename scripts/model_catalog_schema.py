@@ -50,6 +50,7 @@ class WorkerBinding:
     model_identity: str
     reasoning_effort: str | None
     protocols: tuple[str, ...]
+    max_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -150,12 +151,18 @@ def _worker(value: Any, label: str) -> WorkerBinding:
             raise CatalogError(f"{label}.reasoning_effort is unsupported")
         if effort == "none":
             effort = None
+    max_tokens = table.get("max_tokens")
+    if max_tokens is not None and (
+        not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0
+    ):
+        raise CatalogError(f"{label}.max_tokens must be a positive integer")
     return WorkerBinding(
         _identifier(table.get("provider"), f"{label}.provider"),
         upstream_model,
         model_identity,
         effort,
         _protocols(table.get("protocols"), f"{label}.protocols", required=True),
+        max_tokens,
     )
 
 

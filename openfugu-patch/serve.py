@@ -128,6 +128,7 @@ class ResolvedModelSpec:
     binding: str | None
     protocols: tuple[str, ...] | None
     slot: str | None
+    max_tokens: int | None = None
 
 
 def _resolve_model_spec(spec: str, bindings: RuntimeBindings | None = None) -> ResolvedModelSpec:
@@ -143,6 +144,7 @@ def _resolve_model_spec(spec: str, bindings: RuntimeBindings | None = None) -> R
         return ResolvedModelSpec(
             provider.adapter, worker.upstream_model, worker.reasoning_effort,
             provider.base_url, provider.credential_env, provider_name, worker.protocols, spec,
+            worker.max_tokens,
         )
     provider_name, separator, remainder = spec.partition("/")
     provider = bindings.providers.get(provider_name) if separator and bindings is not None else None
@@ -361,6 +363,9 @@ def _build_request(
 ) -> tuple[str, dict[str, str], dict[str, Any]]:
     resolved = _resolve_model_spec(spec) if resolved is None else resolved
     provider, model, effort = resolved.adapter, resolved.model, resolved.effort
+    if resolved.max_tokens is not None and max_tokens > resolved.max_tokens:
+        # Catalog-declared provider output cap (models.dev) for this worker.
+        max_tokens = resolved.max_tokens
     base_url, key_env, binding = resolved.base_url, resolved.credential_env, resolved.binding
     key = _catalog_key(binding, key_env, spec) if binding else os.environ.get(key_env)
     if not key:

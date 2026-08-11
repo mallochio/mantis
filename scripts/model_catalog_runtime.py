@@ -150,6 +150,7 @@ def runtime_binding_fingerprint(env: Mapping[str, str] | None = None) -> str:
             "upstream_model": binding.upstream_model,
             "model_identity": binding.model_identity,
             "reasoning_effort": binding.reasoning_effort,
+            **({"max_tokens": binding.max_tokens} if binding.max_tokens else {}),
             "protocols": list(binding.protocols),
         }
         for name, binding in sorted(bindings.workers.items())
