@@ -73,15 +73,10 @@ from ultra import ConductorExecutor, conductor_prompt, parse_workflow, visible_i
 
 ROUTER: FuguRouter | None = None
 _router_lock = threading.Lock()
-MODEL_NAME = os.environ.get("MANTIS_MODEL_NAME", "mantis")
+MODEL_NAME = "mantis-trinity"
 MODEL_MODES = {
-    MODEL_NAME: "trinity",
     "mantis-trinity": "trinity",
-    "trinity": "trinity",
-    "fugu": "trinity",
     "mantis-ultra": "conductor",
-    "conductor": "conductor",
-    "ultra": "conductor",
 }
 MAX_TURNS = 5
 DEFAULT_MAX_COMPLETION_TOKENS = 32768

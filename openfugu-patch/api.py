@@ -571,7 +571,7 @@ def ready(response: Response) -> dict[str, Any]:
 
 
 _MODEL_CREATED = int(time.time())
-_BASIC_MODEL = "mantis-basic"
+_BASIC_MODEL = "mantis"
 _ROUTER_RESPONSE_HEADERS = (
     "x-route-decision", "x-route-reason", "x-route-sticky", "x-route-model",
     "x-route-attempts", "x-route-fallback",
@@ -644,8 +644,8 @@ def models() -> dict[str, Any]:
     return {
         "object": "list",
         "data": [
-            *({"id": model, **descriptor} for model in (serve.MODEL_NAME, "mantis-trinity", "mantis-ultra")),
             {"id": _BASIC_MODEL, **basic},
+            *({"id": model, **descriptor} for model in ("mantis-trinity", "mantis-ultra")),
         ],
     }
 

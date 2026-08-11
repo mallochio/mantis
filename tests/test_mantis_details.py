@@ -62,7 +62,7 @@ def test_default_response_has_no_mantis_metadata(client, monkeypatch):
     response = client.post(
         "/v1/chat/completions",
         headers=_headers(),
-        json={"model": "mantis", "messages": [{"role": "user", "content": "hi"}]},
+        json={"model": "mantis-trinity", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert response.status_code == 200
     assert "mantis" not in response.json()
@@ -77,7 +77,7 @@ def test_summary_header_returns_metadata_and_headers(client, monkeypatch):
     response = client.post(
         "/v1/chat/completions",
         headers=_headers(X_Mantis_Details="summary"),
-        json={"model": "mantis", "messages": [{"role": "user", "content": "hi"}]},
+        json={"model": "mantis-trinity", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert response.status_code == 200
     assert response.headers["x-mantis-run-id"] == "a" * 32
@@ -106,7 +106,7 @@ def test_unknown_price_reports_known_false(client, monkeypatch):
     response = client.post(
         "/v1/chat/completions",
         headers=_headers(X_Mantis_Details="summary"),
-        json={"model": "mantis", "messages": [{"role": "user", "content": "hi"}]},
+        json={"model": "mantis-trinity", "messages": [{"role": "user", "content": "hi"}]},
     )
     usage = response.json()["mantis"]["usage"]
     assert usage["known"] is False
@@ -121,14 +121,14 @@ def test_debug_requires_opt_in_environment(client, monkeypatch):
     response = client.post(
         "/v1/chat/completions",
         headers=_headers(X_Mantis_Details="debug"),
-        json={"model": "mantis", "messages": [{"role": "user", "content": "hi"}]},
+        json={"model": "mantis-trinity", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert "duration_ms" not in response.json()["mantis"]["activity"][0]
     monkeypatch.setenv("MANTIS_ALLOW_DEBUG_TRACE", "1")
     response = client.post(
         "/v1/chat/completions",
         headers=_headers(X_Mantis_Details="debug"),
-        json={"model": "mantis", "messages": [{"role": "user", "content": "hi"}]},
+        json={"model": "mantis-trinity", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert response.json()["mantis"]["activity"][0]["duration_ms"] == 12.3
 
@@ -139,7 +139,7 @@ def test_stream_includes_mantis_frame_when_requested(client, monkeypatch):
         "/v1/chat/completions",
         headers=_headers(X_Mantis_Details="summary"),
         json={
-            "model": "mantis",
+            "model": "mantis-trinity",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
             "stream_options": {"include_usage": True},

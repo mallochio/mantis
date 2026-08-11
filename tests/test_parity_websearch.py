@@ -64,7 +64,7 @@ def _chat(
     monkeypatch.setattr(serve, "_upstream_streaming_enabled", lambda: False)
     monkeypatch.setattr(serve, "_provider_client", SimpleNamespace(post=post))
     payload: dict[str, Any] = {
-        "model": "mantis",
+        "model": "mantis-trinity",
         "messages": [{"role": "user", "content": "latest mantis news?"}],
     }
     if web_search_options is not None:

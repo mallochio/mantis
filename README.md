@@ -7,13 +7,12 @@ OpenAI Chat Completions models.
 
 | Model | Behavior |
 |---|---|
-| `mantis` | Default TRINITY orchestration |
-| `mantis-trinity` | Force TRINITY |
-| `mantis-ultra` | Force Conductor workflow orchestration |
-| `mantis-basic` | Tiered routing only: forwards to the in-repo llm-router (`router/`), which scores with Supra and dispatches cheap/middle/expensive through Bifrost |
+| `mantis` | Tiered routing only: forwards to the in-repo llm-router (`router/`), which scores with Supra and dispatches cheap/middle/expensive through Bifrost |
+| `mantis-trinity` | Explicit TRINITY orchestration |
+| `mantis-ultra` | Explicit Conductor workflow orchestration |
 
-Legacy aliases `trinity`, `fugu`, `conductor`, and `ultra` remain accepted.
-Unknown model IDs are rejected. `mantis-basic` responses carry the router's
+Only these model IDs are accepted. Select `mantis-trinity` or `mantis-ultra` manually; Mantis does not select between them.
+Unknown model IDs are rejected. `mantis` responses carry the router's
 `x-route-decision`, `x-route-reason`, `x-route-sticky`, `x-route-model`,
 `x-route-attempts`, and `x-route-fallback` headers; send `X-Route-Session` to
 keep the router's session ratchet engaged across turns.
@@ -202,9 +201,9 @@ reasoning engine or search crawler.
 | `MANTIS_MAX_BODY_BYTES` | Maximum request body size | `52428800` |
 | `MANTIS_UPSTREAM_STREAM` | Stream provider responses upstream (SSE) instead of buffering | `1` |
 | `MANTIS_CACHE_BREAKPOINTS` | Add prompt-cache breakpoints to Claude-family requests | `1` |
-| `MANTIS_ROUTER_URL` | Base URL of the in-repo llm-router for `mantis-basic` | `http://127.0.0.1:5500/v1` |
-| `MANTIS_ROUTER_TIMEOUT_S` | Upstream timeout for `mantis-basic` calls | `300` |
-| `ROUTELLM_KEY` | Bearer token used for the `mantis-basic` forward | required |
+| `MANTIS_ROUTER_URL` | Base URL of the in-repo llm-router for `mantis` | `http://127.0.0.1:5500/v1` |
+| `MANTIS_ROUTER_TIMEOUT_S` | Upstream timeout for `mantis` calls | `300` |
+| `ROUTELLM_KEY` | Bearer token used for the `mantis` forward | required |
 
 Supported hosted model prefixes are currently `openrouter/` and `opencode-go/`.
 OpenRouter `openai/*` workers use the stateless Responses API with stable,

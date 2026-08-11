@@ -45,14 +45,14 @@ def test_auth_health_and_validation(client, monkeypatch):
     bad = client.post(
         "/v1/chat/completions",
         headers=_headers(),
-        json={"model": "mantis", "messages": [], "unknown": True},
+        json={"model": "mantis-trinity", "messages": [], "unknown": True},
     )
     assert bad.status_code == 400
     no_tools = client.post(
         "/v1/chat/completions",
         headers=_headers(),
         json={
-            "model": "mantis",
+            "model": "mantis-trinity",
             "messages": [{"role": "user", "content": "hi"}],
             "tool_choice": "required",
         },
@@ -66,7 +66,7 @@ def test_auth_health_and_validation(client, monkeypatch):
         response = client.post(
             "/v1/chat/completions",
             headers=_headers(),
-            json={"model": "mantis", "messages": [message]},
+            json={"model": "mantis-trinity", "messages": [message]},
         )
         assert response.status_code == 400
     invalid_requests = [
@@ -79,7 +79,7 @@ def test_auth_health_and_validation(client, monkeypatch):
             "/v1/chat/completions",
             headers=_headers(),
             json={
-                "model": "mantis",
+                "model": "mantis-trinity",
                 "messages": [{"role": "user", "content": "hi"}],
                 **extra,
             },
@@ -97,7 +97,7 @@ def test_completion_reports_per_request_usage_and_hides_trace(client, monkeypatc
     response = client.post(
         "/v1/chat/completions",
         headers=_headers(),
-        json={"model": "mantis", "messages": [{"role": "user", "content": "hi"}]},
+        json={"model": "mantis-trinity", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert response.status_code == 200
     assert response.headers["x-request-id"]
@@ -127,7 +127,7 @@ def test_tool_choice_reaches_run(client, monkeypatch):
         "/v1/chat/completions",
         headers=_headers(),
         json={
-            "model": "mantis",
+            "model": "mantis-trinity",
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [{"type": "function", "function": {"name": "read"}}],
             "tool_choice": {"type": "function", "function": {"name": "read"}},
@@ -148,7 +148,7 @@ def test_buffered_stream_includes_usage(client, monkeypatch):
         "/v1/chat/completions",
         headers=_headers(),
         json={
-            "model": "mantis",
+            "model": "mantis-trinity",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
             "stream_options": {"include_usage": True},
@@ -175,7 +175,7 @@ def test_stream_sends_keepalive_while_waiting(client, monkeypatch):
         "/v1/chat/completions",
         headers=_headers(),
         json={
-            "model": "mantis",
+            "model": "mantis-trinity",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         },
@@ -206,7 +206,7 @@ def test_stream_emits_live_status_before_verified_content(client, monkeypatch):
         "/v1/chat/completions",
         headers=_headers(),
         json={
-            "model": "mantis",
+            "model": "mantis-trinity",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         },
@@ -227,7 +227,7 @@ def test_stream_emits_live_status_before_verified_content(client, monkeypatch):
 
     sdk = OpenAI(api_key="test-key", base_url="http://testserver/v1", http_client=client)
     with sdk.chat.completions.create(
-        model="mantis",
+        model="mantis-trinity",
         messages=[{"role": "user", "content": "hi"}],
         stream=True,
     ) as stream:
@@ -251,7 +251,7 @@ def test_stream_status_can_be_disabled(client, monkeypatch):
         "/v1/chat/completions",
         headers={**_headers(), "X-Mantis-Events": "none"},
         json={
-            "model": "mantis",
+            "model": "mantis-trinity",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         },
@@ -275,7 +275,7 @@ def test_stream_close_signals_provider_cancellation(monkeypatch):
     monkeypatch.setattr(api, "_complete", complete)
     monkeypatch.setattr(api, "_KEEPALIVE_SECONDS", 0.005)
     request = api.ChatRequest(
-        model="mantis", messages=[api.Message(role="user", content="hi")], stream=True
+        model="mantis-trinity", messages=[api.Message(role="user", content="hi")], stream=True
     )
     assert api._capacity.acquire(blocking=False)
     stream = api._stream(request)
@@ -294,7 +294,7 @@ def test_stream_reports_errors_after_headers(client, monkeypatch):
         "/v1/chat/completions",
         headers=_headers(),
         json={
-            "model": "mantis",
+            "model": "mantis-trinity",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         },
@@ -304,7 +304,9 @@ def test_stream_reports_errors_after_headers(client, monkeypatch):
 
 
 def test_api_maps_run_errors(client, monkeypatch):
-    request = api.ChatRequest(model="mantis", messages=[api.Message(role="user", content="hi")])
+    request = api.ChatRequest(
+        model="mantis-trinity", messages=[api.Message(role="user", content="hi")]
+    )
     cases = (
         (serve.RunCapacityError("full"), 429),
         (KeyError("expired"), 409),
@@ -404,7 +406,7 @@ def test_multimodal_and_structured_request_contract(client, monkeypatch):
         "/v1/chat/completions",
         headers=_headers(),
         json={
-            "model": "mantis",
+            "model": "mantis-trinity",
             "messages": [
                 {
                     "role": "user",
@@ -444,7 +446,7 @@ def test_invalid_structured_output_returns_502(client, monkeypatch):
     response = client.post(
         "/v1/chat/completions",
         headers=_headers(),
-        json={"model": "mantis", "messages": [{"role": "user", "content": "hi"}]},
+        json={"model": "mantis-trinity", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert response.status_code == 502
     assert "schema mismatch" in response.json()["error"]["message"]
@@ -472,11 +474,11 @@ def test_official_openai_sdk_contract(client, monkeypatch):
     monkeypatch.setattr(serve, "delete_run", lambda *_a: True)
     sdk = OpenAI(api_key="test-key", base_url="http://testserver/v1", http_client=client)
     completion = sdk.chat.completions.create(
-        model="mantis", messages=[{"role": "user", "content": "hi"}]
+        model="mantis-trinity", messages=[{"role": "user", "content": "hi"}]
     )
     assert completion.choices[0].message.content == "answer"
     with sdk.chat.completions.create(
-        model="mantis", messages=[{"role": "user", "content": "hi"}], stream=True
+        model="mantis-trinity", messages=[{"role": "user", "content": "hi"}], stream=True
     ) as stream:
         assert "".join(chunk.choices[0].delta.content or "" for chunk in stream) == "answer"
 
@@ -486,7 +488,7 @@ def test_capacity_returns_429(client, monkeypatch):
     response = client.post(
         "/v1/chat/completions",
         headers=_headers(),
-        json={"model": "mantis", "messages": [{"role": "user", "content": "hi"}]},
+        json={"model": "mantis-trinity", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert response.status_code == 429
     assert response.json()["error"]["type"] == "rate_limit_error"
@@ -646,7 +648,7 @@ def test_basic_model_relays_router_response_and_session(client, monkeypatch):
     response = client.post(
         "/v1/chat/completions",
         headers={**_headers(), "X-Route-Session": "pi-session"},
-        json={"model": "mantis-basic", "messages": [{"role": "user", "content": "hi"}]},
+        json={"model": "mantis", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert response.status_code == 200
     assert response.json()["id"] == "chatcmpl-router"
@@ -671,7 +673,7 @@ def test_basic_model_relays_router_stream(client, monkeypatch):
         "/v1/chat/completions",
         headers=_headers(),
         json={
-            "model": "mantis-basic",
+            "model": "mantis",
             "stream": True,
             "messages": [{"role": "user", "content": "hi"}],
         },
@@ -692,7 +694,17 @@ def test_basic_model_reports_router_connection_failure(client, monkeypatch):
     response = client.post(
         "/v1/chat/completions",
         headers=_headers(),
-        json={"model": "mantis-basic", "messages": [{"role": "user", "content": "hi"}]},
+        json={"model": "mantis", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert response.status_code == 502
     assert response.json()["error"]["type"] == "upstream_error"
+
+
+def test_only_public_mantis_model_ids_are_accepted(client):
+    for model in ("mantis-basic", "trinity", "fugu", "conductor", "ultra"):
+        response = client.post(
+            "/v1/chat/completions",
+            headers=_headers(),
+            json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert response.status_code == 400
