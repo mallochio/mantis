@@ -621,3 +621,78 @@ def test_ready_catalog_rejects_stale_binding_fingerprint_change(client, monkeypa
     monkeypatch.setenv("MANTIS_IDENTITY_CONTRACT", contract)
     changed = client.get("/ready").json()["binding_fingerprint"]
     assert changed != baseline
+
+
+def _router_client(handler):
+    import httpx
+
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
+def test_basic_model_relays_router_response_and_session(client, monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        seen["headers"] = request.headers
+        return __import__("httpx").Response(
+            200,
+            json={"id": "chatcmpl-router", "choices": [{"message": {"content": "ok"}}]},
+            headers={"x-route-decision": "middle", "x-route-reason": "strong_upgrade"},
+        )
+
+    monkeypatch.setenv("ROUTELLM_KEY", "router-key")
+    monkeypatch.setattr(api, "_router_client", lambda: _router_client(handler))
+    response = client.post(
+        "/v1/chat/completions",
+        headers={**_headers(), "X-Route-Session": "pi-session"},
+        json={"model": "mantis-basic", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
+    assert response.json()["id"] == "chatcmpl-router"
+    assert response.headers["x-route-decision"] == "middle"
+    assert response.headers["x-route-reason"] == "strong_upgrade"
+    assert seen["body"]["model"] == "auto"
+    assert seen["headers"]["authorization"] == "Bearer router-key"
+    assert seen["headers"]["x-route-session"] == "pi-session"
+
+
+def test_basic_model_relays_router_stream(client, monkeypatch):
+    def handler(_request):
+        return __import__("httpx").Response(
+            200,
+            content=b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+            headers={"content-type": "text/event-stream", "x-route-decision": "cheap"},
+        )
+
+    monkeypatch.setenv("ROUTELLM_KEY", "router-key")
+    monkeypatch.setattr(api, "_router_client", lambda: _router_client(handler))
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "mantis-basic",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["x-route-decision"] == "cheap"
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.content.endswith(b"data: [DONE]\n\n")
+
+
+def test_basic_model_reports_router_connection_failure(client, monkeypatch):
+    import httpx
+
+    monkeypatch.setenv("ROUTELLM_KEY", "router-key")
+    monkeypatch.setattr(api, "_router_client", lambda: _router_client(
+        lambda request: (_ for _ in ()).throw(httpx.ConnectError("down", request=request))
+    ))
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={"model": "mantis-basic", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 502
+    assert response.json()["error"]["type"] == "upstream_error"

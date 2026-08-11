@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
+import httpx
 import model_catalog
 import serve
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
@@ -570,6 +571,11 @@ def ready(response: Response) -> dict[str, Any]:
 
 
 _MODEL_CREATED = int(time.time())
+_BASIC_MODEL = "mantis-basic"
+_ROUTER_RESPONSE_HEADERS = (
+    "x-route-decision", "x-route-reason", "x-route-sticky", "x-route-model",
+    "x-route-attempts", "x-route-fallback",
+)
 _SUPPORTED_PARAMETERS = [
     "tools",
     "tool_choice",
@@ -584,6 +590,45 @@ _SUPPORTED_PARAMETERS = [
 ]
 
 
+def _router_client() -> httpx.Client:
+    return httpx.Client(timeout=float(os.environ.get("MANTIS_ROUTER_TIMEOUT_S", "300")))
+
+
+def _router_headers(headers: dict[str, str]) -> dict[str, str]:
+    key = os.environ.get("ROUTELLM_KEY")
+    if not key:
+        raise HTTPException(503, "ROUTELLM_KEY is not configured")
+    out = {"Authorization": f"Bearer {key}"}
+    if session := headers.get("x-route-session"):
+        out["X-Route-Session"] = session
+    return out
+
+
+def _router_body(request: ChatRequest) -> dict[str, Any]:
+    return {**request.model_dump(exclude_none=True), "model": "auto"}
+
+
+def _router_response_headers(upstream: httpx.Response) -> dict[str, str]:
+    return {name: upstream.headers[name] for name in _ROUTER_RESPONSE_HEADERS if name in upstream.headers}
+
+
+def _router_error(upstream: httpx.Response) -> JSONResponse:
+    try:
+        body = upstream.json()
+    except ValueError:
+        body = {"error": {"message": "llm-router returned an invalid response", "type": "upstream_error"}}
+    return JSONResponse(body, status_code=upstream.status_code)
+
+
+def _router_stream(client: httpx.Client, stream: Any, upstream: httpx.Response) -> Iterator[bytes]:
+    try:
+        yield from upstream.iter_bytes()
+    finally:
+        stream.__exit__(None, None, None)
+        client.close()
+        _capacity.release()
+
+
 @app.get("/v1/models", dependencies=[Depends(_authorize)])
 def models() -> dict[str, Any]:
     descriptor = {
@@ -595,11 +640,12 @@ def models() -> dict[str, Any]:
         "supported_parameters": _SUPPORTED_PARAMETERS,
         "pricing": {"prompt": "0", "completion": "0"},
     }
+    basic = {**descriptor, "context_length": 1_000_000, "max_completion_tokens": 131072}
     return {
         "object": "list",
         "data": [
-            {"id": model, **descriptor}
-            for model in (serve.MODEL_NAME, "mantis-trinity", "mantis-ultra")
+            *({"id": model, **descriptor} for model in (serve.MODEL_NAME, "mantis-trinity", "mantis-ultra")),
+            {"id": _BASIC_MODEL, **basic},
         ],
     }
 
@@ -611,6 +657,34 @@ def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Respons
     headers = dict(http.headers)
     if not _capacity.acquire(blocking=False):
         return _error(429, "Mantis is at capacity", "rate_limit_error")
+    if request.model == _BASIC_MODEL:
+        handed_off = False
+        try:
+            client = _router_client()
+            url = os.environ.get("MANTIS_ROUTER_URL", "http://127.0.0.1:5500/v1") + "/chat/completions"
+            if request.stream:
+                stream = client.stream("POST", url, headers=_router_headers(headers), json=_router_body(request))
+                upstream = stream.__enter__()
+                if upstream.is_error:
+                    error = _router_error(upstream)
+                    stream.__exit__(None, None, None)
+                    client.close()
+                    return error
+                handed_off = True
+                return StreamingResponse(
+                    _router_stream(client, stream, upstream), media_type="text/event-stream",
+                    headers={"X-Request-Id": request_id, **_router_response_headers(upstream)},
+                )
+            with client:
+                upstream = client.post(url, headers=_router_headers(headers), json=_router_body(request))
+            if upstream.is_error:
+                return _router_error(upstream)
+            return JSONResponse(upstream.json(), headers={"X-Request-Id": request_id, **_router_response_headers(upstream)})
+        except httpx.HTTPError as error:
+            return _error(502, f"llm-router unavailable: {error}", "upstream_error")
+        finally:
+            if not handed_off:
+                _capacity.release()
     if request.stream:
         return StreamingResponse(
             _stream(request, headers, "chatcmpl-" + request_id[:24]),

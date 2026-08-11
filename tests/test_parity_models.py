@@ -28,8 +28,12 @@ def test_descriptor_fields_and_defaults(client):
         assert entry["owned_by"] == "mantis"
         assert isinstance(entry["id"], str)
         assert isinstance(entry["created"], int) and entry["created"] > 0
-        assert entry["context_length"] == 262144
-        assert entry["max_completion_tokens"] == 32768
+        if entry["id"] == "mantis-basic":
+            assert entry["context_length"] == 1_000_000
+            assert entry["max_completion_tokens"] == 131072
+        else:
+            assert entry["context_length"] == 262144
+            assert entry["max_completion_tokens"] == 32768
         assert entry["pricing"] == {"prompt": "0", "completion": "0"}
         assert isinstance(entry["supported_parameters"], list)
 
@@ -38,8 +42,12 @@ def test_env_overrides(client, monkeypatch):
     monkeypatch.setenv("MANTIS_CONTEXT_LENGTH", "65536")
     monkeypatch.setenv("MANTIS_MAX_COMPLETION_TOKENS", "4096")
     for entry in _models(client):
-        assert entry["context_length"] == 65536
-        assert entry["max_completion_tokens"] == 4096
+        if entry["id"] == "mantis-basic":
+            assert entry["context_length"] == 1_000_000
+            assert entry["max_completion_tokens"] == 131072
+        else:
+            assert entry["context_length"] == 65536
+            assert entry["max_completion_tokens"] == 4096
 
 
 def test_supported_parameters_accepted_by_chat_request(client):
