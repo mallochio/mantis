@@ -129,7 +129,7 @@ def _optional_int(name: str) -> int | None:
 
 _TARGET_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_TARGET_PROTOCOLS = frozenset({"chat_completions", "responses"})
+_TARGET_PROTOCOLS = frozenset({"chat_completions", "responses", "anthropic_messages"})
 # Adapters are part of the transport contract.  They are deliberately explicit
 # rather than inferred from a hostname: a provider endpoint can move without
 # changing the provider behavior it expects from this router.
@@ -138,6 +138,9 @@ _ADAPTER_PROTOCOLS = {
     "opencode-go": frozenset({"chat_completions"}),
     "modal": frozenset({"chat_completions"}),
     "openai-compatible": frozenset({"chat_completions", "responses"}),
+    # Mantis may use Bifrost's native Anthropic endpoint. RouteLLM does not
+    # route this protocol, but must accept its provider in the shared catalog.
+    "anthropic": frozenset({"anthropic_messages"}),
 }
 _LITERAL_CREDENTIAL_FIELDS = frozenset({
     "key", "api_key", "token", "credential", "credential_value", "secret", "password",
