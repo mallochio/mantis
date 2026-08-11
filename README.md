@@ -10,9 +10,13 @@ OpenAI Chat Completions models.
 | `mantis` | Default TRINITY orchestration |
 | `mantis-trinity` | Force TRINITY |
 | `mantis-ultra` | Force Conductor workflow orchestration |
+| `mantis-basic` | Tiered routing only: forwards to the in-repo llm-router (`router/`), which scores with Supra and dispatches cheap/middle/expensive through Bifrost |
 
 Legacy aliases `trinity`, `fugu`, `conductor`, and `ultra` remain accepted.
-Unknown model IDs are rejected.
+Unknown model IDs are rejected. `mantis-basic` responses carry the router's
+`x-route-decision`, `x-route-reason`, `x-route-sticky`, `x-route-model`,
+`x-route-attempts`, and `x-route-fallback` headers; send `X-Route-Session` to
+keep the router's session ratchet engaged across turns.
 
 TRINITY selects a worker and role (Worker, Thinker, or Verifier) each turn.
 Conductor plans a bounded DAG, then executes its nodes against the configured
@@ -20,6 +24,19 @@ worker pool. Internal orchestration steps remain server-side. Only real tools
 provided by the calling harness are returned as standard OpenAI `tool_calls`.
 
 ## Run
+
+This repository now also contains the llm-router (`router/`). The canonical
+host deployment is the local launcher stack:
+
+```bash
+~/Startup/llm-stack.sh start   # Bifrost :8080 -> llm-router :5500 -> Mantis :8088
+```
+
+`config/catalog.toml` is the tracked, versioned source of truth for both
+routers; `~/.config/ai-routing/catalog.toml` is a symlink to it. `bifrost.json`
+(contains the gateway encryption key) stays local and untracked.
+
+Container deployment (optional):
 
 ```bash
 cp .env.example .env
@@ -184,6 +201,9 @@ reasoning engine or search crawler.
 | `MANTIS_MAX_BODY_BYTES` | Maximum request body size | `52428800` |
 | `MANTIS_UPSTREAM_STREAM` | Stream provider responses upstream (SSE) instead of buffering | `1` |
 | `MANTIS_CACHE_BREAKPOINTS` | Add prompt-cache breakpoints to Claude-family requests | `1` |
+| `MANTIS_ROUTER_URL` | Base URL of the in-repo llm-router for `mantis-basic` | `http://127.0.0.1:5500/v1` |
+| `MANTIS_ROUTER_TIMEOUT_S` | Upstream timeout for `mantis-basic` calls | `300` |
+| `ROUTELLM_KEY` | Bearer token used for the `mantis-basic` forward | required |
 
 Supported hosted model prefixes are currently `openrouter/` and `opencode-go/`.
 OpenRouter `openai/*` workers use the stateless Responses API with stable,
@@ -270,10 +290,14 @@ uv run pytest tests -q
 uv run ruff check .
 uv run mypy openfugu-patch scripts --exclude outputs
 ./scripts/verify.sh
+uv sync --directory router --locked --all-groups
+uv run --directory router pytest tests -q
 ```
 
 `tests/test_api.py` and `tests/test_serve.py` check completions, tools, images,
-structured output, usage, authentication, request limits, and SSE framing.
+structured output, usage, authentication, request limits, and SSE framing. The
+router's own suite lives under `router/tests/` and keeps its own lockfile and
+venv.
 
 ## Security
 

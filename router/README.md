@@ -1,5 +1,7 @@
 # llm-router
 
+> Part of the Mantis monorepo (`router/`). Full history: `git log 33b0ccd -- router/`. Run with `uv run --directory router ...`; the router serves :5500 and is exposed to clients as `mantis-basic` through Mantis :8088.
+
 An OpenAI-compatible FastAPI router for explicit `/v1/chat/completions` and
 `/v1/responses` endpoints. The router selects cheap, middle, and expensive tiers. In the default gateway profile,
 all tiers use the Cloudflare gateway; its model catalog routes to OpenCode Go,
