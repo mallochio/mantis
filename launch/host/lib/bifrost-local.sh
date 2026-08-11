@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Canonical launch script for the Bifrost AI gateway (maximhq/bifrost).
+# Lives in ~/Startup/ so StartupFolder (https://github.com/FuzzyIdeas/StartupFolder)
+# runs it at login. It detaches Bifrost, prints status, then exits.
+#
+# Loads exported env from ~/.zshrc (single source for BIFROST_API_KEY,
+# BIFROST_ENCRYPTION_KEY, OPENCODE_API_KEY, AWS_*, GOOGLE_APPLICATION_CREDENTIALS,
+# AZURE_OPENAI_*, ...), then starts the gateway with the npx wrapper. The wrapper
+# execs the Go binary in place, so the recorded PID is the gateway process and
+# inherits the zsh env natively (AWS/GCP credential chains resolve as in a shell).
+#
+# The gateway is stopped-and-restarted if already running so config/env changes
+# take effect; if it is down it is just started.
+#
+# Usage: ~/Startup/bifrost-local.sh          (gateway backgrounded, prints status)
+set -euo pipefail
+
+# StartupFolder may invoke us from / and ~/Startup/bifrost-local.sh may be a
+# symlink; resolve to the real script location for stable relative paths.
+SELF="$0"
+while [ -L "$SELF" ]; do SELF="$(readlink "$SELF")"; done
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+
+# Ensure system CLIs (lsof, curl, npx) are found under launchd's minimal PATH
+# as well as an interactive shell.
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$HOME/.local/bin:$PATH"
+
+# StartupFolder/launchd does not read shell startup files. Import exported env
+# from zsh so ~/.zshrc remains the single place for Bifrost/backend config.
+if [ -f "$HOME/.zshrc" ]; then
+  while IFS='=' read -r name value; do
+    [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && export "$name=$value"
+  done < <(/bin/zsh -lc 'source "$HOME/.zshrc" >/dev/null && env')
+fi
+
+# config.json references env.OPENCODE_API_KEY; fall back to the Go key name.
+export OPENCODE_API_KEY="${OPENCODE_API_KEY:-${OPENCODE_GO_API_KEY:-}}"
+
+DATA_DIR="${BIFROST_DATA_DIR:-$HOME/.local/share/bifrost}"
+LOG_DIR="$DATA_DIR/logs"
+mkdir -p "$LOG_DIR"
+chmod 700 "$DATA_DIR" "$LOG_DIR"
+
+HOST="${BIFROST_HOST:-127.0.0.1}"
+PORT="${BIFROST_PORT:-8080}"
+
+# If the gateway is already listening, stop it so we start a clean instance.
+# Refuse to kill a listener unless the recorded PID owns this port and its
+# command is a bifrost-http binary or the npx wrapper.
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "bifrost already running on :$PORT — stopping for restart"
+  BIFROST_PID=""
+  CANDIDATE=$(cat "$DATA_DIR/server.pid" 2>/dev/null || true)
+  if [ -n "${CANDIDATE:-}" ] \
+     && lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | grep -qx "$CANDIDATE" \
+     && ps -p "$CANDIDATE" -o command= 2>/dev/null | grep -Eq -- "bifrost-http|@maximhq/bifrost"; then
+    BIFROST_PID="$CANDIDATE"
+  else
+    echo "ERROR: port $PORT is owned by an unverified process; refusing to kill it" >&2
+    exit 1
+  fi
+  kill "$BIFROST_PID" 2>/dev/null || true
+  for _ in $(seq 1 50); do
+    kill -0 "$BIFROST_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "$BIFROST_PID" 2>/dev/null; then
+    kill -9 "$BIFROST_PID" 2>/dev/null || true
+  fi
+  for _ in $(seq 1 50); do
+    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || break
+    sleep 0.1
+  done
+  rm -f "$DATA_DIR/server.pid"
+  echo "bifrost stopped"
+fi
+
+# Prefer the npx wrapper (keeps the cached binary current); if the registry is
+# unreachable, fall back to the newest already-cached binary.
+if command -v npx >/dev/null 2>&1; then
+  LAUNCH=(npx -y @maximhq/bifrost)
+else
+  CACHED_BIN=$(ls -1t "$HOME/Library/Caches/bifrost"/*/bin/bifrost-http-* 2>/dev/null | head -n1 || true)
+  if [ -n "${CACHED_BIN:-}" ] && [ -x "$CACHED_BIN" ]; then
+    LAUNCH=("$CACHED_BIN")
+  else
+    echo "ERROR: neither npx nor a cached bifrost binary is available" >&2
+    exit 1
+  fi
+fi
+
+nohup "${LAUNCH[@]}" -app-dir "$DATA_DIR" -host "$HOST" -port "$PORT" -log-style pretty \
+  </dev/null >> "$LOG_DIR/server.out" 2>> "$LOG_DIR/server.err" &
+echo $! > "$DATA_DIR/server.pid"
+
+for _ in $(seq 1 300); do  # 60s — first boot downloads the binary
+  if curl -fsS --max-time 2 "http://$HOST:$PORT/health" >/dev/null 2>&1; then
+    # Record the actual TCP listener PID (the npx wrapper is a parent process
+    # that execs/spawns the Go binary; the listener PID is the gateway itself).
+    BIFROST_PID=$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -n1 || true)
+    [ -n "$BIFROST_PID" ] && echo "$BIFROST_PID" > "$DATA_DIR/server.pid"
+    echo "bifrost running pid $BIFROST_PID on $HOST:$PORT (data: $DATA_DIR)"
+    exit 0
+  fi
+  sleep 0.2
+done
+
+echo "ERROR: bifrost not healthy on $HOST:$PORT — see $LOG_DIR/server.err" >&2
+tail -n 40 "$LOG_DIR/server.err" >&2 2>/dev/null || true
+exit 1
