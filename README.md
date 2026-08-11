@@ -1,39 +1,39 @@
 # Mantis
 
-Mantis serves a trained router and Fugu-style Conductor as ordinary
-OpenAI Chat Completions models.
+Mantis provides three OpenAI-compatible models. Choose the level of
+orchestration explicitly.
 
 ## Models
 
-| Model | Behavior |
+| Model | Use |
 |---|---|
-| `mantis` | Tiered routing only: forwards to the in-repo llm-router (`router/`), which scores with Supra and dispatches cheap/middle/expensive through Bifrost |
-| `mantis-trinity` | Explicit TRINITY orchestration |
-| `mantis-ultra` | Explicit Conductor workflow orchestration |
+| `mantis` | Simplest path. The Mantis router scores the request with Supra and sends one request to a cheap, middle, or expensive model through Bifrost. |
+| `mantis-trinity` | Multi-agent TRINITY orchestration. It selects Worker, Thinker, and Verifier roles over several turns. |
+| `mantis-ultra` | Most complex path. Conductor plans and executes a bounded workflow DAG over the worker pool. |
 
-Only these model IDs are accepted. Select `mantis-trinity` or `mantis-ultra` manually; Mantis does not select between them.
-Unknown model IDs are rejected. `mantis` responses carry the router's
-`x-route-decision`, `x-route-reason`, `x-route-sticky`, `x-route-model`,
-`x-route-attempts`, and `x-route-fallback` headers; send `X-Route-Session` to
-keep the router's session ratchet engaged across turns.
+Only these model IDs are accepted. Select `mantis-trinity` or `mantis-ultra`
+manually; Mantis never selects between them. All three paths send model calls
+through the local Bifrost gateway. The OpenCode, Pi, and Prime harness catalogs
+advertise a 256k-token context limit for every configured local model.
 
-TRINITY selects a worker and role (Worker, Thinker, or Verifier) each turn.
-Conductor plans a bounded DAG, then executes its nodes against the configured
-worker pool. Internal orchestration steps remain server-side. Only real tools
+`mantis` responses carry `x-route-decision`, `x-route-reason`,
+`x-route-sticky`, `x-route-model`, `x-route-attempts`, and
+`x-route-fallback`. Send `X-Route-Session` to retain routing affinity across
+turns. Internal orchestration steps remain server-side. Only real tools
 provided by the calling harness are returned as standard OpenAI `tool_calls`.
 
 ## Run
 
-This repository now also contains the llm-router (`router/`). The canonical
-host deployment is the local launcher stack, versioned at `launch/host/` with
+The repository contains the Mantis router (`router/`). The canonical host
+deployment is the local launcher stack, versioned at `launch/host/` with
 `~/Startup/` symlinking to it (StartupFolder runs it at login):
 
 ```bash
-~/Startup/llm-stack.sh start   # Bifrost :8080 -> llm-router :5500 -> Mantis :8088
+~/Startup/llm-stack.sh start   # Bifrost :8080 -> Mantis router :5500 -> Mantis :8088
 ```
 
-`config/catalog.toml` is the tracked, versioned source of truth for both
-routers; `~/.config/ai-routing/catalog.toml` is a symlink to it. `bifrost.json`
+`config/catalog.toml` is the tracked, versioned source of truth for the
+Mantis router and orchestration pool; `~/.config/ai-routing/catalog.toml` is a symlink to it. `bifrost.json`
 (contains the gateway encryption key) stays local and untracked.
 
 Container deployment (optional):
@@ -201,9 +201,9 @@ reasoning engine or search crawler.
 | `MANTIS_MAX_BODY_BYTES` | Maximum request body size | `52428800` |
 | `MANTIS_UPSTREAM_STREAM` | Stream provider responses upstream (SSE) instead of buffering | `1` |
 | `MANTIS_CACHE_BREAKPOINTS` | Add prompt-cache breakpoints to Claude-family requests | `1` |
-| `MANTIS_ROUTER_URL` | Base URL of the in-repo llm-router for `mantis` | `http://127.0.0.1:5500/v1` |
+| `MANTIS_ROUTER_URL` | Base URL of the in-repo Mantis router for `mantis` | `http://127.0.0.1:5500/v1` |
 | `MANTIS_ROUTER_TIMEOUT_S` | Upstream timeout for `mantis` calls | `300` |
-| `ROUTELLM_KEY` | Bearer token used for the `mantis` forward | required |
+| `ROUTELLM_KEY` | Compatibility name for the router bearer token | required |
 
 Supported hosted model prefixes are currently `openrouter/` and `opencode-go/`.
 OpenRouter `openai/*` workers use the stateless Responses API with stable,

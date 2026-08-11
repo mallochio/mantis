@@ -1,14 +1,16 @@
-# llm-router
+# Mantis router
 
-> Part of the Mantis monorepo (`router/`). Full history: `git log 33b0ccd -- router/`. Run with `uv run --directory router ...`; the router serves :5500 and is exposed to clients as `mantis` through Mantis :8088.
+> Part of the Mantis monorepo (`router/`). Full history: `git log 33b0ccd -- router/`. Run with `uv run --directory router ...`; it serves :5500 internally and is exposed to clients as `mantis` through Mantis :8088.
 
-An OpenAI-compatible FastAPI router for explicit `/v1/chat/completions` and
-`/v1/responses` endpoints. The router selects cheap, middle, and expensive tiers. In the default gateway profile,
-all tiers use the Cloudflare gateway; its model catalog routes to OpenCode Go,
-Modal, or OpenRouter. Direct two-backend deployments remain supported. The
-server uses one lifespan-owned asynchronous HTTP pool.
+The router is Mantis's simplest model path: it scores one request and sends it
+to one cheap, middle, or expensive model through Bifrost. It exposes
+OpenAI-compatible `/v1/chat/completions` and `/v1/responses` endpoints. In the
+default gateway profile, all tiers use Bifrost's configured Cloudflare gateway
+and its catalog routes to OpenCode Go, Modal, or OpenRouter. Direct deployments
+remain supported. The server uses one lifespan-owned asynchronous HTTP pool.
 
-Two routing modes are available (`ROUTELLM_ROUTER`):
+The active routing mode is selected with the legacy-compatible
+`ROUTELLM_ROUTER` environment variable:
 
 - `supra` (default): the Supra-Router-51M complexity gate is the primary signal. With the gateway middle tier enabled, complexity 1–2 goes cheap,
   complexity 3–4 goes middle (Terra by default), and complexity 5+ goes
@@ -16,12 +18,12 @@ Two routing modes are available (`ROUTELLM_ROUTER`):
   `ROUTELLM_SUPRA_THRESHOLD` cutoff. Override the expensive boundary with
   `ROUTELLM_EXPENSIVE_MIN_COMPLEXITY` when deliberately testing another policy. MF scoring is off by default; set
   `ROUTELLM_SCORE_WITH_MF=1` for observability (it never influences the
-  decision). This mode was chosen because on the Aug 5-10 workload the RouteLLM
-  MF score had essentially zero separation against the Gemini difficulty
-  labels (AUC 0.52 vs 0.66 for Supra), and the MF gate on top of Supra only
-  added wasted expensive calls.
-- `mf` (legacy): RouteLLM MF score >= `ROUTELLM_THRESHOLD`, with Supra as a
-  secondary gate below the threshold. `bert` also selects the old checkpoint.
+  decision). This mode was chosen because the legacy MF score had essentially
+  zero separation against the Gemini difficulty labels (AUC 0.52 vs 0.66 for
+  Supra), and the MF gate on top of Supra only added wasted expensive calls.
+- `mf` (legacy): MF score >= `ROUTELLM_THRESHOLD`, with Supra as a secondary
+  gate below the threshold. `bert` also selects the old checkpoint. This path
+  remains only for compatibility; use `supra`.
 
 ## Setup and run
 
@@ -33,8 +35,10 @@ uv sync --dev
 ```
 
 The default listener is `http://127.0.0.1:5500/v1`, model `auto`, with the
-loopback-only development credential `sk-route-local`. A non-loopback bind
-requires an externally supplied `ROUTELLM_KEY` that is not the default. The
+loopback-only development credential `sk-route-local`. Clients normally use
+`mantis` at `http://127.0.0.1:8088/v1`; :5500 is the internal router endpoint.
+A non-loopback bind requires an externally supplied `ROUTELLM_KEY` (a
+legacy-compatible variable name) that is not the default. The
 launcher refuses to stop a port owner unless its recorded PID, working
 directory, command, and listening socket all identify this checkout.
 
