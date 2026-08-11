@@ -150,3 +150,7 @@ outputs/
 
 # External cloned dependencies
 llm-router/
+
+# Local Bifrost configuration contains the gateway encryption key. Track the
+# shared catalog only; keep this local file outside the repository.
+config/bifrost.json

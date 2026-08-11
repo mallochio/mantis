@@ -31,5 +31,10 @@ jobs:
       - name: Run mypy
         run: uv run mypy openfugu-patch scripts --exclude outputs
 
-      - name: Run tests
+      - name: Run Mantis tests
         run: uv run pytest tests -q
+
+      - name: Run router tests
+        run: |
+          uv sync --directory router --locked --all-groups
+          uv run --directory router pytest tests -q
