@@ -26,7 +26,8 @@ provided by the calling harness are returned as standard OpenAI `tool_calls`.
 ## Run
 
 This repository now also contains the llm-router (`router/`). The canonical
-host deployment is the local launcher stack:
+host deployment is the local launcher stack, versioned at `launch/host/` with
+`~/Startup/` symlinking to it (StartupFolder runs it at login):
 
 ```bash
 ~/Startup/llm-stack.sh start   # Bifrost :8080 -> llm-router :5500 -> Mantis :8088
