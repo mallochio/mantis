@@ -30,6 +30,7 @@ from model_catalog_schema import (
     _json,
     _mapping,
     _runtime_bindings,
+    _string,
     _slot_order,
 )
 
@@ -60,7 +61,8 @@ class MantisCatalog:
     bindings: RuntimeBindings
     slot_order: tuple[str, ...]
     conductor: str
-    trained_slot_contract: str | None
+    conductor_model: str = ""
+    trained_slot_contract: str | None = None
 
 
 def identity_contract(catalog: MantisCatalog) -> dict[str, Any]:
@@ -133,13 +135,14 @@ def load_mantis_catalog(
     section = _mapping(root["mantis"], "mantis")
     slots = _slot_order(section.get("slot_order"))
     conductor = _identifier(section.get("conductor"), "mantis.conductor")
+    conductor_model = _string(section.get("conductor_model", conductor), "mantis.conductor_model")
     bindings = _runtime_bindings(root.get("providers"), section.get("workers"))
     if set(bindings.workers) != set(slots):
         raise CatalogError("mantis.workers must contain exactly the slot_order IDs")
     if conductor not in bindings.workers:
         raise CatalogError("mantis.conductor must name a stable slot ID")
     expected = _expected_contract(section.get("trained_slot_contract"), require_contract)
-    catalog = MantisCatalog(selected, bindings, slots, conductor, expected)
+    catalog = MantisCatalog(selected, bindings, slots, conductor, conductor_model, expected)
     abi = load_abi_manifest(manifest)
     mismatch = abi_mismatch(abi, catalog.slot_order, catalog.conductor, catalog.bindings.workers)
     if mismatch is not None:
@@ -176,7 +179,8 @@ def render_mantis_environment(catalog: MantisCatalog) -> dict[str, str]:
     }
     return {
         "MANTIS_WORKER_MODELS": ",".join(catalog.slot_order),
-        "MANTIS_CONDUCTOR_MODEL": catalog.conductor,
+        "MANTIS_CONDUCTOR_SLOT": catalog.conductor,
+        "MANTIS_CONDUCTOR_MODEL": catalog.conductor_model or catalog.conductor,
         "MANTIS_PROVIDER_BINDINGS": _json(providers),
         "MANTIS_WORKER_BINDINGS": _json(workers),
         "MANTIS_IDENTITY_CONTRACT": identity_fingerprint(catalog),

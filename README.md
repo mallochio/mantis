@@ -65,14 +65,22 @@ override both Cloudflare endpoints, or `MANTIS_GATEWAY_OPENROUTER_URL` and
 credentials or URL paths. Values can be exported or stored in the repository
 `.env` file.
 
-For native MPS/CUDA execution on the host (no container):
+## Portable host installation
+
+Mantis has no container runtime requirement. Install [uv](https://docs.astral.sh/uv/),
+clone this repository, create `.env` (or configure the shared routing catalog), then run:
 
 ```bash
 ./scripts/run_mantis_native.sh
 ```
 
-The native script creates `.venv-mantis`, installs this project, prepares the
-router vector if needed, and starts the same endpoint on port 8088.
+The launcher uses the locked uv environment, prepares the router vector when
+needed, renders the same catalog bindings as the container deployment, and
+starts the same endpoint at `127.0.0.1:8088`. It works on macOS, Linux, and
+WSL. Torch chooses MPS, CUDA, or CPU automatically. Set `MANTIS_HOST=0.0.0.0`
+only when remote access is required.
+
+The container stack remains an optional deployment method, not a prerequisite.
 
 ## Call it like any OpenAI model
 

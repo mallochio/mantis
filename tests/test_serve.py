@@ -1596,3 +1596,18 @@ def test_standard_tool_validation_and_model_ids():
     assert serve._mode_for_model("mantis-ultra") == "conductor"
     with pytest.raises(ValueError):
         serve._mode_for_model("unknown")
+
+
+def test_create_run_caps_upstream_output_limit():
+    run = serve.create_run(
+        "trinity",
+        {
+            "messages": _run_messages(),
+            "slot_models": ["worker"],
+            "max_completion_tokens": 131072,
+        },
+    )
+    try:
+        assert run.controls["max_tokens"] == serve.MAX_UPSTREAM_OUTPUT_TOKENS
+    finally:
+        serve.delete_run(run.run_id)

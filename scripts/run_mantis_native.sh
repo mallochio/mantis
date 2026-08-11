@@ -1,114 +1,70 @@
 #!/usr/bin/env bash
-# Run the OpenAI-compatible Mantis orchestrator natively (MPS/CUDA/CPU).
+# Run Mantis on the host with uv. No container runtime is required.
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VENV="$REPO_ROOT/.venv-mantis"
-SERVE="$REPO_ROOT/openfugu-patch/api.py"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SERVE_DIR="$REPO_ROOT/openfugu-patch"
+cd "$REPO_ROOT"
 
-if [[ ! -f "$SERVE" ]]; then
-    echo "ERROR: $SERVE not found" >&2
-    exit 1
-fi
+[[ -f "$SERVE_DIR/api.py" ]] || { echo "missing $SERVE_DIR/api.py" >&2; exit 1; }
+command -v uv >/dev/null || { echo "uv is required: https://docs.astral.sh/uv/" >&2; exit 1; }
 
-# Create venv and install dependencies if missing.
-if [[ ! -d "$VENV/bin" ]]; then
-    echo "[native-mantis] creating venv at $VENV ..."
-    python3 -m venv "$VENV"
-fi
+# uv.lock defines the reproducible runtime. It also creates the project venv.
+uv sync --locked --no-dev
 
-# shellcheck source=/dev/null
-source "$VENV/bin/activate"
-
-# Install/upgrade core orchestrator dependencies.
-python3 -m pip install --quiet --upgrade pip
-python3 -m pip install --quiet -e "$REPO_ROOT"
-
-# Build the TRINITY base vector from the committed small safetensors head if needed.
 if [[ ! -f "$REPO_ROOT/artifacts/model_iter_60.npy" ]]; then
-    echo "[native-mantis] building artifacts/model_iter_60.npy from router_head.safetensors ..."
-    python3 "$REPO_ROOT/scripts/make_vec.py"
+    echo "[mantis] building router vector"
+    uv run --no-sync python scripts/make_vec.py
 fi
 
-# Load .env so native process gets the same config as the Docker stack.
-# shellcheck source=/dev/null
-set -a
-source "$REPO_ROOT/.env"
-set +a
+if [[ -f "$REPO_ROOT/.env" ]]; then
+    set -a
+    # .env is intentionally shell-compatible and is not committed.
+    source "$REPO_ROOT/.env"
+    set +a
+fi
 
-# A present Mantis section is authoritative. The renderer prints shell-quoted
-# metadata only; credentials are resolved from already-exported host variables.
-export PYTHONPATH="$REPO_ROOT/scripts:${PYTHONPATH:-}"
-CATALOG_RENDER=$(python3 "$REPO_ROOT/scripts/model_catalog.py" render 2>&1) || {
-    echo "ERROR: Mantis catalog validation failed" >&2
-    exit 1
-}
-if [[ -n "$CATALOG_RENDER" ]]; then
-    eval "$CATALOG_RENDER"
-    MANTIS_PROVIDER_KEYS=$(python3 - <<'PY'
+# The shared routing catalog, when present, is the authoritative configuration.
+export PYTHONPATH="$REPO_ROOT/scripts${PYTHONPATH:+:$PYTHONPATH}"
+if catalog_render=$(uv run --no-sync python scripts/model_catalog.py render); then
+    if [[ -n "$catalog_render" ]]; then
+        eval "$catalog_render"
+        export MANTIS_PROVIDER_KEYS="$(uv run --no-sync python - <<'PY'
 import json
 import model_catalog
 catalog = model_catalog.load_mantis_catalog()
 if catalog is not None:
     print(json.dumps(model_catalog.resolve_provider_keys(catalog), separators=(",", ":")))
 PY
-)
-    export MANTIS_PROVIDER_KEYS MANTIS_ENDPOINT_PROFILE=catalog
+)"
+        export MANTIS_ENDPOINT_PROFILE=catalog
+    fi
+else
+    echo "Mantis catalog validation failed" >&2
+    exit 1
 fi
 
-CONDUCTOR_DEV="${MANTIS_CONDUCTOR_DEVICE:-}"
-# Auto-detect device unless explicitly set.
-if [[ -z "$CONDUCTOR_DEV" || "$CONDUCTOR_DEV" == "auto" ]]; then
-    CONDUCTOR_DEV=$(python3 - <<'PY'
+if [[ -z "${MANTIS_CONDUCTOR_DEVICE:-}" || "${MANTIS_CONDUCTOR_DEVICE}" == auto ]]; then
+    export MANTIS_CONDUCTOR_DEVICE="$(uv run --no-sync python - <<'PY'
 import torch
-if torch.backends.mps.is_available():
-    print("mps")
-elif torch.cuda.is_available():
-    print("cuda:0")
-else:
-    print("cpu")
+print("mps" if torch.backends.mps.is_available() else "cuda:0" if torch.cuda.is_available() else "cpu")
 PY
-    )
-    export MANTIS_CONDUCTOR_DEVICE="$CONDUCTOR_DEV"
+)"
 fi
-
-CONDUCTOR_DT="${MANTIS_CONDUCTOR_DTYPE:-}"
-# Default dtype: bfloat16 on mps/cuda, float32 on cpu unless user overrides.
-if [[ -z "$CONDUCTOR_DT" ]]; then
-    if [[ "$CONDUCTOR_DEV" == mps || "$CONDUCTOR_DEV" == cuda* ]]; then
+if [[ -z "${MANTIS_CONDUCTOR_DTYPE:-}" ]]; then
+    if [[ "$MANTIS_CONDUCTOR_DEVICE" == mps || "$MANTIS_CONDUCTOR_DEVICE" == cuda* ]]; then
         export MANTIS_CONDUCTOR_DTYPE=bfloat16
     else
         export MANTIS_CONDUCTOR_DTYPE=float32
     fi
 fi
 
-VECTOR_FILE="${MANTIS_VECTOR:-}"
-[[ -f "$VECTOR_FILE" ]] || export MANTIS_VECTOR="$REPO_ROOT/artifacts/model_iter_60.npy"
-if [[ "${MANTIS_LEARNING:-0}" =~ ^(1|true|yes|on)$ ]]; then
-    LEARNING_DIR=$(python3 -c 'import os; print(os.path.expanduser(os.environ.get("MANTIS_LEARNING_DIR", "~/.local/share/mantis/learning")))')
-    if [[ -f "$LEARNING_DIR/promoted/model_iter_60.npy" ]]; then
-        export MANTIS_VECTOR="$LEARNING_DIR/promoted/model_iter_60.npy"
-        echo "[native-mantis] using promoted learning router"
-    fi
-fi
-HEAD_FILE="${MANTIS_HEAD:-}"
-[[ -f "$HEAD_FILE" ]] || export MANTIS_HEAD="$REPO_ROOT/artifacts/router_head.npy"
-HOST_VAL="${MANTIS_HOST:-0.0.0.0}"
-PORT_VAL="${MANTIS_PORT:-8088}"
+[[ -f "${MANTIS_VECTOR:-}" ]] || export MANTIS_VECTOR="$REPO_ROOT/artifacts/model_iter_60.npy"
+[[ -f "${MANTIS_HEAD:-}" ]] || export MANTIS_HEAD="$REPO_ROOT/artifacts/router_head.safetensors"
+export MANTIS_HOST="${MANTIS_HOST:-127.0.0.1}"
+export MANTIS_PORT="${MANTIS_PORT:-8088}"
+export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
-export MANTIS_HOST="$HOST_VAL"
-export MANTIS_PORT="$PORT_VAL"
-
-echo "[native-mantis] device=$MANTIS_CONDUCTOR_DEVICE dtype=$MANTIS_CONDUCTOR_DTYPE"
-echo "[native-mantis] listening on $MANTIS_HOST:$MANTIS_PORT"
-echo "[native-mantis] press Ctrl-C to stop"
-
-export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
-if [[ "${MANTIS_LEARNING:-0}" =~ ^(1|true|yes|on)$ ]]; then
-    python3 "$REPO_ROOT/scripts/learn_router.py" --watch --promote &
-    LEARN_PID=$!
-    trap 'kill "$LEARN_PID" 2>/dev/null || true' EXIT INT TERM
-    python3 -m uvicorn api:app --app-dir "$(dirname "$SERVE")" --host "$MANTIS_HOST" --port "$MANTIS_PORT"
-else
-    exec python3 -m uvicorn api:app --app-dir "$(dirname "$SERVE")" --host "$MANTIS_HOST" --port "$MANTIS_PORT"
-fi
+echo "[mantis] host=$MANTIS_HOST port=$MANTIS_PORT device=$MANTIS_CONDUCTOR_DEVICE"
+exec uv run --no-sync python -m uvicorn api:app --app-dir "$SERVE_DIR" \
+    --host "$MANTIS_HOST" --port "$MANTIS_PORT"

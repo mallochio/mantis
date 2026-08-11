@@ -27,7 +27,10 @@ def _runtime_abi(
     bindings: RuntimeBindings, source: Mapping[str, str]
 ) -> tuple[tuple[str, ...], str]:
     slots = _slot_order(source.get("MANTIS_WORKER_MODELS", "").split(","))
-    conductor = _identifier(source.get("MANTIS_CONDUCTOR_MODEL"), "MANTIS_CONDUCTOR_MODEL")
+    conductor = _identifier(
+        source.get("MANTIS_CONDUCTOR_SLOT", source.get("MANTIS_CONDUCTOR_MODEL")),
+        "MANTIS_CONDUCTOR_SLOT",
+    )
     if set(bindings.workers) != set(slots):
         raise CatalogError("runtime worker bindings must contain exactly the seven stable slots")
     if conductor not in bindings.workers:
