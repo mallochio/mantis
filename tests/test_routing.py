@@ -338,3 +338,15 @@ def test_existing_session_continuation_skips_scoring(monkeypatch):
                                   "last_complexity": 3}
     monkeypatch.setattr(server, "_decide_cached", lambda prompt: (_ for _ in ()).throw(AssertionError("scored")))
     assert server._decide("Proceed", "s")[:3] == ("middle", None, 3)
+
+
+def test_session_ratchet_never_slides_down_but_can_climb():
+    # Cache-maximizing ratchet: a session holds its warm prefix target, may
+    # only climb.  Non-continuation prompt so neither sticky path intervenes.
+    server._session_state.clear()
+    assert not server._is_continuation("Explain the page-fault handling path in this kernel")
+    prompt = "Explain the page-fault handling path in this kernel"
+    server._session_state["s"] = {"tier": "expensive", "last_seen": time.time(), "turns": 1}
+    assert server._session_route("s", prompt, "cheap", 1) == ("expensive", "downgrade_hysteresis")
+    server._session_state["s"] = {"tier": "cheap", "last_seen": time.time(), "turns": 1}
+    assert server._session_route("s", prompt, "expensive", 5) == ("expensive", "strong_upgrade")

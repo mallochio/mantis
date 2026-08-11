@@ -68,3 +68,40 @@ def test_outcomes_include_middle_decisions():
     decisions = [{"record_type": "decision", "decision": "middle", "score": 0.1, "prompt_hash": "m"}]
     result = eval_outcomes.evaluate(decisions, [], [])
     assert result["cells"]["middle"]["0.1-0.156"] == [1, 0]
+
+
+def test_orphan_tool_messages_dropped_before_upstream():
+    messages = [
+        {"role": "assistant", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "paired, kept"},
+        {"role": "tool", "tool_call_id": "call_gone", "content": "orphan from a cut conversation"},
+        {"role": "tool", "content": "no id at all"},
+        {"role": "user", "content": "continue"},
+    ]
+    out = server._normalize_messages_for_backend(messages, developer_role="system")
+    assert [m["role"] for m in out] == ["assistant", "tool", "user"]
+    assert out[1]["content"] == "paired, kept"
+
+
+def test_well_paired_tool_messages_pass_through_unchanged():
+    messages = [
+        {"role": "assistant", "tool_calls": [{"id": "call_1"}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        {"role": "assistant", "content": "done"},
+    ]
+    assert server._normalize_messages_for_backend(messages, developer_role="native") is messages
+
+
+def test_max_completion_tokens_clamped_to_router_default_when_backend_uncapped():
+    # Catalog targets carry max_tokens=None; a 131072 client ask must still
+    # be clamped to the router-wide cap so 128000-cap models don't 400.
+    backend = {"model": "openai/gpt-5.6-sol", "effort": "", "max_tokens": None}
+    body = {"model": "auto", "max_tokens": 131072}
+    out = server._build_outgoing_body(body, backend)
+    assert out["max_completion_tokens"] == min(131072, server.ROUTELLM_MAX_TOKENS)
+
+
+def test_max_output_tokens_clamped_to_router_default_when_backend_uncapped():
+    backend = {"model": "openai/gpt-5.6-sol", "effort": "", "max_tokens": None}
+    out = server._build_responses_body({"model": "auto", "max_output_tokens": 131072}, backend)
+    assert out["max_output_tokens"] == min(131072, server.ROUTELLM_MAX_TOKENS)

@@ -87,7 +87,7 @@ if [ "$ROUTER_EXPLICIT_SOURCE" -eq 0 ]; then
     exit 1
   fi
 fi
-export ROUTELLM_CONTEXT_WINDOW="${ROUTELLM_CONTEXT_WINDOW:-262144}"
+export ROUTELLM_CONTEXT_WINDOW="${ROUTELLM_CONTEXT_WINDOW:-auto}"
 export ROUTELLM_MAX_TOKENS="${ROUTELLM_MAX_TOKENS:-131072}"
 # supra = Supra-Router-51M complexity gate is the primary signal (best
 # quality/cost on the Aug 5-10 log; MF score had ~zero labeler separation).

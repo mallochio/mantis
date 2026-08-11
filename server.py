@@ -97,6 +97,9 @@ SUPRA_ENABLED = os.environ.get("ROUTELLM_USE_SUPRA", "1") != "0"
 SUPRA_THRESHOLD = _env_int("ROUTELLM_SUPRA_THRESHOLD", 3)
 SUPRA_MIN_SCORE = _env_float("ROUTELLM_SUPRA_MIN_SCORE", 0.0)
 ROUTELLM_CONTEXT_WINDOW = os.environ.get("ROUTELLM_CONTEXT_WINDOW", "auto")
+# Floor for targets without an explicit catalog max_tokens; the catalog
+# carries exact per-model output caps (models.dev): azure gpt-5.6 = 128000,
+# deepseek v4 flash = 384000.
 ROUTELLM_MAX_TOKENS = _env_int("ROUTELLM_MAX_TOKENS", 131072)
 MODEL_ID = "auto"
 
@@ -1318,6 +1321,13 @@ def _is_refusal(status: int, data: dict) -> bool:
     return bool(_REFUSAL_RE.search(text))
 
 
+def _completion_token_cap(backend: dict) -> int:
+    # Catalog targets omit max_tokens entirely (None = uncapped), so the
+    # router-wide default is the only clamp that protects them.
+    cap = backend.get("max_tokens") or ROUTELLM_MAX_TOKENS
+    return min(cap, ROUTELLM_MAX_TOKENS)
+
+
 def _build_outgoing_body(body: dict, backend: dict) -> dict:
     out_body = dict(body)
     if isinstance(out_body.get("messages"), list):
@@ -1326,8 +1336,9 @@ def _build_outgoing_body(body: dict, backend: dict) -> dict:
     out_body["model"] = backend["model"]
     if isinstance(out_body.get("max_tokens"), int):
         out_body["max_completion_tokens"] = out_body.pop("max_tokens")
-    if isinstance(out_body.get("max_completion_tokens"), int) and backend.get("max_tokens"):
-        out_body["max_completion_tokens"] = min(out_body["max_completion_tokens"], backend["max_tokens"])
+    if isinstance(out_body.get("max_completion_tokens"), int):
+        out_body["max_completion_tokens"] = min(out_body["max_completion_tokens"],
+                                                _completion_token_cap(backend))
     out_body.pop("stop", None)
     if backend["model"].rsplit("/", 1)[-1].startswith("gpt-5.6-") and out_body.get("temperature") not in (None, 1):
         out_body.pop("temperature")
@@ -1341,8 +1352,9 @@ def _build_outgoing_body(body: dict, backend: dict) -> dict:
 def _build_responses_body(body: dict, backend: dict) -> dict:
     out_body = dict(body)
     out_body["model"] = backend["model"]
-    if isinstance(out_body.get("max_output_tokens"), int) and backend.get("max_tokens"):
-        out_body["max_output_tokens"] = min(out_body["max_output_tokens"], backend["max_tokens"])
+    if isinstance(out_body.get("max_output_tokens"), int):
+        out_body["max_output_tokens"] = min(out_body["max_output_tokens"],
+                                            _completion_token_cap(backend))
     # A target can declare its backend reasoning policy authoritative without
     # coupling this protocol behavior to a particular target ID.
     reasoning = out_body.get("reasoning")
@@ -1364,12 +1376,31 @@ def _extract_cost(data: dict) -> float | None:
 
 
 def _normalize_messages_for_backend(messages, *, developer_role: str = "system"):
-    if developer_role == "native":
-        return messages
     out = []
+    seen_calls: set = set()
     changed = False
     for message in messages:
-        if isinstance(message, dict) and message.get("role") == "developer":
+        if not isinstance(message, dict):
+            out.append(message)
+            continue
+        role = message.get("role")
+        if role == "assistant":
+            calls = message.get("tool_calls")
+            if isinstance(calls, list):
+                for call in calls:
+                    if isinstance(call, dict) and isinstance(call.get("id"), str):
+                        seen_calls.add(call["id"])
+            if message.get("function_call"):
+                seen_calls.add(None)
+        elif role == "tool" and message.get("tool_call_id") not in seen_calls:
+            # Providers hard-400 on results whose call was cut from history
+            # (mid-conversation resume, compaction/truncation); drop the orphan.
+            changed = True
+            continue
+        elif role == "function" and None not in seen_calls:
+            changed = True
+            continue
+        elif role == "developer" and developer_role != "native":
             message = {**message, "role": "system"}
             changed = True
         out.append(message)
