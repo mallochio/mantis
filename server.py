@@ -129,7 +129,10 @@ def _optional_int(name: str) -> int | None:
 
 _TARGET_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_TARGET_PROTOCOLS = frozenset({"chat_completions", "responses", "anthropic_messages"})
+# The shared provider catalog includes every protocol supported by a catalog
+# consumer. RouteLLM targets use a smaller subset; see
+# _routellm_target_protocols below.
+_CATALOG_PROTOCOLS = frozenset({"chat_completions", "responses", "anthropic_messages"})
 # Adapters are part of the transport contract.  They are deliberately explicit
 # rather than inferred from a hostname: a provider endpoint can move without
 # changing the provider behavior it expects from this router.
@@ -226,16 +229,25 @@ def _valid_bool(value, field: str) -> bool:
     return value
 
 
-def _target_protocols(value, field: str, *, required: bool = True) -> tuple[str, ...]:
+def _catalog_protocols(value, field: str, *, required: bool = True) -> tuple[str, ...]:
+    """Validate protocols that may occur anywhere in the shared catalog."""
     if value is None and not required:
         return ()
     if not isinstance(value, list) or not value:
         raise _config_error(f"{field} must be a non-empty list")
-    if any(not isinstance(item, str) or item not in _TARGET_PROTOCOLS for item in value):
+    if any(not isinstance(item, str) or item not in _CATALOG_PROTOCOLS for item in value):
         raise _config_error(f"{field} contains an unsupported protocol")
     if len(set(value)) != len(value):
         raise _config_error(f"{field} must not contain duplicates")
     return tuple(value)
+
+
+def _routellm_target_protocols(value, field: str, *, required: bool = True) -> tuple[str, ...]:
+    """Validate RouteLLM target protocols, excluding Anthropic Messages."""
+    protocols = _catalog_protocols(value, field, required=required)
+    if "anthropic_messages" in protocols:
+        raise _config_error(f"{field} cannot declare anthropic_messages for a RouteLLM target")
+    return protocols
 
 
 def _valid_adapter(value, field: str) -> str:
@@ -337,7 +349,7 @@ def _parse_provider_specs(value, *, field: str) -> dict[str, dict]:
         _reject_literal_credentials(spec, f"{field}.{provider_id}")
         _ensure_fields(spec, _PROVIDER_FIELDS, f"{field}.{provider_id}")
         adapter = _valid_adapter(spec.get("adapter"), f"{field}.{provider_id}.adapter")
-        provider_protocols = _target_protocols(
+        provider_protocols = _catalog_protocols(
             spec.get("protocols"), f"{field}.{provider_id}.protocols", required=False)
         if provider_protocols and not set(provider_protocols) <= _ADAPTER_PROTOCOLS[adapter]:
             raise _config_error(f"{field}.{provider_id}.protocols exceeds adapter capabilities")
@@ -399,7 +411,8 @@ def _build_target_registry(target_specs, providers: dict[str, dict], *, require_
             effort = _valid_text(effort, f"{field}.{target_id}.reasoning_effort")
         max_tokens = _valid_optional_positive_int(
             spec.get("max_tokens"), f"{field}.{target_id}.max_tokens")
-        protocols = _target_protocols(spec.get("protocols"), f"{field}.{target_id}.protocols")
+        protocols = _routellm_target_protocols(
+            spec.get("protocols"), f"{field}.{target_id}.protocols")
         if not set(protocols) <= _ADAPTER_PROTOCOLS[binding["adapter"]]:
             raise _config_error(f"{field}.{target_id}.protocols exceeds adapter capabilities")
         if binding["protocols"] and not set(protocols) <= set(binding["protocols"]):

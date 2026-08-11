@@ -265,6 +265,27 @@ def test_json_source_is_atomic_and_validated(tmp_path):
     assert result.returncode == 0
 
 
+def test_shared_catalog_allows_anthropic_but_routellm_targets_reject_it(tmp_path):
+    shared_anthropic_provider = """
+[providers.anthropic-shared]
+adapter = "anthropic"
+base_url = "https://anthropic.test"
+credential_env = "ROUTER_CATALOG_TEST_KEY"
+protocols = ["anthropic_messages"]
+"""
+    shared_catalog = catalog_text().replace("[routellm]", shared_anthropic_provider + "\n[routellm]")
+    assert _catalog_subprocess(tmp_path, shared_catalog).returncode == 0
+
+    invalid_target = shared_catalog.replace(
+        'protocols = ["chat_completions"]',
+        'protocols = ["anthropic_messages"]',
+        1,
+    )
+    result = _catalog_subprocess(tmp_path, invalid_target)
+    assert result.returncode != 0
+    assert "cannot declare anthropic_messages for a RouteLLM target" in result.stderr
+
+
 def test_adapter_capabilities_and_fingerprint_cover_adapter_and_policy(catalog_server):
     target = catalog_server.BACKENDS["responses"]
     assert target["adapter"] == "openai-compatible"
