@@ -8,6 +8,7 @@ COPY ./OpenFugu /app
 COPY ./openfugu-patch/serve.py /app/openfugu/serve.py
 COPY ./openfugu-patch/api.py /app/openfugu/api.py
 COPY ./openfugu-patch/provider_protocols.py /app/openfugu/provider_protocols.py
+COPY ./openfugu-patch/anthropic_protocols.py /app/openfugu/anthropic_protocols.py
 # The catalog facade plus its three schema/ABI/runtime modules are copied
 # together so the container can re-validate the catalog before serving.
 COPY ./scripts/model_catalog*.py /app/openfugu/

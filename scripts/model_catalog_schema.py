@@ -17,14 +17,16 @@ from urllib.parse import urlsplit, urlunsplit
 TARGET_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _CONTRACT = re.compile(r"[0-9a-f]{64}\Z")
-PROTOCOLS = frozenset({"chat_completions", "responses"})
+PROTOCOLS = frozenset({"chat_completions", "responses", "anthropic_messages"})
 EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
-# Adapter -> supported wire protocols; identical to the router's schema.
+# Adapter -> supported wire protocols. The Anthropic adapter retains signed
+# thinking blocks across tool continuations for Claude on Bedrock.
 ADAPTER_PROTOCOLS = {
     "openrouter": frozenset({"chat_completions", "responses"}),
     "opencode-go": frozenset({"chat_completions"}),
     "modal": frozenset({"chat_completions"}),
     "openai-compatible": frozenset({"chat_completions", "responses"}),
+    "anthropic": frozenset({"anthropic_messages"}),
 }
 ADAPTERS = frozenset(ADAPTER_PROTOCOLS)
 

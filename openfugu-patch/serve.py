@@ -44,6 +44,12 @@ if not (_HERE / "mini.py").exists():
     if _OPENFUGU.exists():
         sys.path.insert(0, str(_OPENFUGU))
 
+from anthropic_protocols import (
+    anthropic_headers,
+    anthropic_to_chat,
+    assemble_anthropic_stream,
+    build_anthropic_body,
+)
 from mini import (
     DEFAULT_SLOT_LABELS,
     HEAD_ROWS,
@@ -77,6 +83,7 @@ MODEL_MODES = {
     "ultra": "conductor",
 }
 MAX_TURNS = 5
+MAX_UPSTREAM_OUTPUT_TOKENS = 32768
 WORKER_TIMEOUT = float(os.environ.get("MANTIS_WORKER_TIMEOUT", "240"))
 
 # These providers reject temperature != 1 when reasoning is enabled.
@@ -169,8 +176,12 @@ def _parse_model_spec(spec: str) -> tuple[str, str, str | None]:
             raise ValueError(f"catalog worker {spec} has no provider binding")
         return provider.adapter, worker.upstream_model, worker.reasoning_effort
     provider, sep, rest = spec.partition("/")
+    binding = _provider_binding(provider) if sep else None
+    if binding is not None:
+        model, marker, effort = rest.partition("|")
+        return binding.adapter, model, effort if marker and effort != "none" else None
     if not sep or provider not in PROVIDERS:
-        supported = " or ".join(PROVIDERS)
+        supported = " or ".join((*PROVIDERS, "<catalog-provider>"))
         raise ValueError(f"model must be a catalog slot or start with {supported}: {spec}")
     model, marker, effort = rest.partition("|")
     return provider, model, effort if marker and effort != "none" else None
@@ -178,7 +189,11 @@ def _parse_model_spec(spec: str) -> tuple[str, str, str | None]:
 
 def _binding_protocols(spec: str) -> tuple[str, ...] | None:
     worker = _binding_for_slot(spec)
-    return worker.protocols if worker is not None else None
+    if worker is not None:
+        return worker.protocols
+    provider, separator, _ = spec.partition("/")
+    binding = _provider_binding(provider) if separator else None
+    return binding.protocols if binding is not None else None
 
 
 def _provider_for_spec(spec: str) -> tuple[str, str, str | None]:
@@ -189,8 +204,12 @@ def _provider_for_spec(spec: str) -> tuple[str, str, str | None]:
         if provider is None:
             raise ValueError(f"catalog worker {spec} has no provider binding")
         return provider.base_url, provider.credential_env, worker.provider
-    provider, _, _ = _parse_model_spec(spec)
-    base_url, credential_env = PROVIDERS[provider]
+    provider, _, rest = spec.partition("/")
+    catalog_provider = _provider_binding(provider) if rest else None
+    if catalog_provider is not None:
+        return catalog_provider.base_url, catalog_provider.credential_env, provider
+    adapter, _, _ = _parse_model_spec(spec)
+    base_url, credential_env = PROVIDERS[adapter]
     return base_url, credential_env, None
 
 
@@ -260,6 +279,12 @@ def _normalize_upstream_tool_ids(messages: list[dict[str, Any]]) -> list[dict[st
         result_id = original.get("tool_call_id")
         if isinstance(result_id, str) and result_id:
             message["tool_call_id"] = alias(result_id)
+        raw_tool_ids = original.get("_anthropic_tool_ids")
+        if isinstance(raw_tool_ids, dict):
+            message["_anthropic_tool_ids"] = {
+                alias(str(call_id)): str(provider_id)
+                for call_id, provider_id in raw_tool_ids.items()
+            }
         normalized.append(message)
     return normalized
 
@@ -305,6 +330,11 @@ def client_connection(is_connected: Any):
         _history_context.is_client_connected = previous
 
 
+def _uses_anthropic_messages(spec: str) -> bool:
+    protocols = _binding_protocols(spec)
+    return protocols is not None and "anthropic_messages" in protocols
+
+
 def _build_request(
     spec: str,
     messages: list[dict[str, Any]],
@@ -322,18 +352,19 @@ def _build_request(
     if not key:
         raise RuntimeError(f"{key_env} is required for {spec}")
     active_controls = controls or {}
-    if uses_responses_api(provider, model, _binding_protocols(spec)):
-        body = build_responses_body(
-            model,
-            messages,
-            max_tokens,
-            None if effort or _is_reasoning_model(model) else temperature,
-            effort,
-            tools,
-            tool_choice,
-            response_format,
-            active_controls,
-        )
+    if _uses_anthropic_messages(spec):
+        body = build_anthropic_body(model, messages, max_tokens, effort, tools, tool_choice)
+        headers = anthropic_headers(key)
+        path = "v1/messages"
+    elif uses_responses_api(provider, model, _binding_protocols(spec)):
+        body = build_responses_body(model, messages, max_tokens,
+            None if effort or _is_reasoning_model(model) else temperature, effort, tools,
+            tool_choice, response_format, active_controls)
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "User-Agent": "OpenAI/Python",
+        }
         path = "responses"
     else:
         body = {"model": model, "messages": messages, "max_tokens": max_tokens}
@@ -352,14 +383,13 @@ def _build_request(
         if "reasoning" in active_controls:
             body.pop("reasoning_effort", None)
         body.update(active_controls)
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "User-Agent": "OpenAI/Python",
+        }
         path = "chat/completions"
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-        "User-Agent": "OpenAI/Python",
-    }
     return f"{base_url}/{path}", headers, body
-
 
 # Provider failures worth retrying on the next pool worker.
 _TRANSIENT_STATUSES = {408, 429, 500, 502, 503, 504}
@@ -449,6 +479,7 @@ def _stream_completion(
     body: dict[str, Any],
     *,
     responses_api: bool = False,
+    anthropic_messages: bool = False,
 ) -> dict:
     """POST with SSE streaming; returns the canonical Chat-shaped result."""
     stream_body = dict(body)
@@ -470,6 +501,8 @@ def _stream_completion(
                 _check_client_connected()
                 yield _parse_sse_line(line)
 
+        if anthropic_messages:
+            return assemble_anthropic_stream(chunks())
         if responses_api:
             return assemble_responses_stream(chunks())
         return _assemble_streamed_completion(chunks())
@@ -530,6 +563,7 @@ def _provider_response(
             continue
         provider, model, _ = _parse_model_spec(attempt)
         responses_api = uses_responses_api(provider, model, _binding_protocols(attempt))
+        anthropic_messages = _uses_anthropic_messages(attempt)
         # Session stickiness pins OpenRouter to one model+provider per
         # conversation to maximize prompt-cache hits. Apply it to all OpenRouter
         # backends (native Responses for "openai/*" and Chat Completions for
@@ -548,7 +582,10 @@ def _provider_response(
                 "type": "provider",
                 "status": "started",
                 "model": attempt,
-                "protocol": "responses" if responses_api else "chat_completions",
+                "protocol": (
+                    "anthropic_messages" if anthropic_messages
+                    else "responses" if responses_api else "chat_completions"
+                ),
                 "attempt": index + 1,
                 "summary": "Calling a model",
             }
@@ -561,12 +598,15 @@ def _provider_response(
                     headers,
                     body,
                     responses_api=responses_api,
+                    anthropic_messages=anthropic_messages,
                 )
             else:
                 response = _provider_client.post(url, headers=headers, json=body)
                 response.raise_for_status()
                 data = response.json()
-                if responses_api:
+                if anthropic_messages:
+                    data = anthropic_to_chat(data)
+                elif responses_api:
                     data = responses_to_chat(data)
             break
         except httpx.HTTPStatusError as error:
@@ -632,7 +672,10 @@ def _provider_response(
             "type": "provider",
             "status": "completed",
             "model": attempt,
-            "protocol": "responses" if responses_api else "chat_completions",
+            "protocol": (
+                "anthropic_messages" if anthropic_messages
+                else "responses" if responses_api else "chat_completions"
+            ),
             "attempt": index + 1,
             "usage": {
                 key: usage[key]
@@ -2047,9 +2090,13 @@ def _model_completion(
         if not isinstance(args, dict):
             args = {}
         calls.append({"name": str(fn.get("name")), "arguments": args})
-    reasoning_details = msg.get("reasoning_details")
-    if calls and isinstance(reasoning_details, list):
-        calls[0]["_message_metadata"] = {"reasoning_details": reasoning_details}
+    metadata = {
+        key: msg[key]
+        for key in ("reasoning_details", "_anthropic_content", "_anthropic_tool_ids")
+        if key in msg
+    }
+    if calls and metadata:
+        calls[0]["_message_metadata"] = metadata
     return text, calls
 
 
@@ -2241,7 +2288,15 @@ class NativeRun:
     def own_tool_calls(self, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
         owned: list[dict[str, Any]] = []
         for call in calls:
-            owned.append({**call, "id": f"c{self._next_tool_call:x}"})
+            owned_id = f"c{self._next_tool_call:x}"
+            updated = {**call, "id": owned_id}
+            metadata = updated.get("_message_metadata")
+            if isinstance(metadata, dict) and isinstance(metadata.get("_anthropic_tool_ids"), dict):
+                provider_id = metadata["_anthropic_tool_ids"].get(call.get("id"), call.get("id"))
+                updated["_message_metadata"] = {
+                    **metadata, "_anthropic_tool_ids": {owned_id: provider_id}
+                }
+            owned.append(updated)
             self._next_tool_call += 1
         return owned
 
@@ -3055,7 +3110,7 @@ def create_run(mode: str, body: dict[str, Any]) -> NativeRun:
     run.cache_namespace = _prompt_cache_namespace(messages, tools)
     output_limit = body.get("max_completion_tokens", body.get("max_tokens"))
     if output_limit is not None:
-        run.controls["max_tokens"] = output_limit
+        run.controls["max_tokens"] = min(int(output_limit), MAX_UPSTREAM_OUTPUT_TOKENS)
     if body.get("reasoning"):
         run.controls["reasoning"] = body["reasoning"]
     elif body.get("reasoning_effort") is not None:
