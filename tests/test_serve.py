@@ -1328,6 +1328,49 @@ def test_trinity_native_tool_run_and_accept(monkeypatch):
     assert run.advance(None)["error"] == "run already finished"
 
 
+
+def test_two_anthropic_tool_ids_survive_native_tool_round(monkeypatch):
+    roles = iter([("Worker", 0), ("Verifier", 0)])
+    monkeypatch.setattr(
+        serve,
+        "get_router",
+        lambda: SimpleNamespace(
+            route=lambda *_args, **_kwargs: dict(
+                zip(("role_name", "agent_id"), next(roles), strict=True)
+            )
+        ),
+    )
+    calls = 0
+
+    def complete(_model, messages, _tools):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "", [
+                {"name": "one", "arguments": {}, "_anthropic_tool_id": "provider-one"},
+                {"name": "two", "arguments": {}, "_anthropic_tool_id": "provider-two"},
+            ]
+        if calls == 2:
+            body = serve.build_anthropic_body("claude", messages, 10, None, None, None)
+            results = body["messages"][-2:]
+            assert [item["content"][0]["tool_use_id"] for item in results] == [
+                "provider-one",
+                "provider-two",
+            ]
+            return "answer", []
+        return "ACCEPT", []
+
+    monkeypatch.setattr(serve, "_model_completion", complete)
+    run = serve.TrinityRun("two-tools", _run_messages(), [{"type": "function"}], slot_models=["w"])
+    event = run.advance(None)
+    assert [call["id"] for call in event["tool_calls"]] == ["c0", "c1"]
+    assert run.advance([
+        {"tool_call_id": "c0", "content": "one"},
+        {"tool_call_id": "c1", "content": "two"},
+    ])["reply"] == "answer"
+    assert run.advance(None)["reply"] == "ACCEPT"
+
+
 def test_trinity_rejects_wrong_tool_result(monkeypatch):
     monkeypatch.setattr(
         serve,

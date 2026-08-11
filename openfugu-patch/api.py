@@ -591,7 +591,7 @@ def models() -> dict[str, Any]:
         "owned_by": "mantis",
         "created": _MODEL_CREATED,
         "context_length": int(os.environ.get("MANTIS_CONTEXT_LENGTH", "262144")),
-        "max_completion_tokens": int(os.environ.get("MANTIS_MAX_COMPLETION_TOKENS", "32768")),
+        "max_completion_tokens": serve.upstream_output_token_cap(),
         "supported_parameters": _SUPPORTED_PARAMETERS,
         "pricing": {"prompt": "0", "completion": "0"},
     }

@@ -27,6 +27,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -83,7 +84,14 @@ MODEL_MODES = {
     "ultra": "conductor",
 }
 MAX_TURNS = 5
-MAX_UPSTREAM_OUTPUT_TOKENS = 32768
+DEFAULT_MAX_COMPLETION_TOKENS = 32768
+# Compatibility name. Use upstream_output_token_cap() for request-time values.
+MAX_UPSTREAM_OUTPUT_TOKENS = DEFAULT_MAX_COMPLETION_TOKENS
+
+
+def upstream_output_token_cap() -> int:
+    """Return the output limit advertised by the API."""
+    return int(os.environ.get("MANTIS_MAX_COMPLETION_TOKENS", str(DEFAULT_MAX_COMPLETION_TOKENS)))
 WORKER_TIMEOUT = float(os.environ.get("MANTIS_WORKER_TIMEOUT", "240"))
 
 # These providers reject temperature != 1 when reasoning is enabled.
@@ -108,15 +116,65 @@ def _runtime_bindings() -> RuntimeBindings | None:
         raise RuntimeError(f"invalid Mantis catalog bindings: {error}") from error
 
 
-def _binding_for_slot(slot: str):
-    bindings = _runtime_bindings()
-    return bindings.workers.get(slot) if bindings is not None else None
+@dataclass(frozen=True)
+class ResolvedModelSpec:
+    """The complete routing decision for one model specification."""
+
+    adapter: str
+    model: str
+    effort: str | None
+    base_url: str
+    credential_env: str
+    binding: str | None
+    protocols: tuple[str, ...] | None
+    slot: str | None
 
 
-def _provider_binding(name: str):
-    bindings = _runtime_bindings()
-    return bindings.providers.get(name) if bindings is not None else None
+def _resolve_model_spec(spec: str, bindings: RuntimeBindings | None = None) -> ResolvedModelSpec:
+    """Resolve legacy and catalog specs from one runtime-binding snapshot."""
+    bindings = _runtime_bindings() if bindings is None else bindings
+    worker = bindings.workers.get(spec) if bindings is not None else None
+    provider_name: str | None = None
+    if worker is not None:
+        provider_name = worker.provider
+        provider = bindings.providers.get(provider_name) if bindings is not None else None
+        if provider is None:
+            raise ValueError(f"catalog worker {spec} has no provider binding")
+        return ResolvedModelSpec(
+            provider.adapter, worker.upstream_model, worker.reasoning_effort,
+            provider.base_url, provider.credential_env, provider_name, worker.protocols, spec,
+        )
+    provider_name, separator, remainder = spec.partition("/")
+    provider = bindings.providers.get(provider_name) if separator and bindings is not None else None
+    model, marker, effort = remainder.partition("|")
+    parsed_effort = effort if marker and effort != "none" else None
+    if provider is not None:
+        return ResolvedModelSpec(
+            provider.adapter, model, parsed_effort, provider.base_url,
+            provider.credential_env, provider_name, provider.protocols, None,
+        )
+    if not separator or provider_name not in PROVIDERS:
+        supported = " or ".join((*PROVIDERS, "<catalog-provider>"))
+        raise ValueError(f"model must be a catalog slot or start with {supported}: {spec}")
+    base_url, credential_env = PROVIDERS[provider_name]
+    return ResolvedModelSpec(
+        provider_name, model, parsed_effort, base_url, credential_env, None, None, None
+    )
 
+
+# Kept for callers that used the old helper functions.
+def _parse_model_spec(spec: str) -> tuple[str, str, str | None]:
+    resolved = _resolve_model_spec(spec)
+    return resolved.adapter, resolved.model, resolved.effort
+
+
+def _binding_protocols(spec: str) -> tuple[str, ...] | None:
+    return _resolve_model_spec(spec).protocols
+
+
+def _provider_for_spec(spec: str) -> tuple[str, str, str | None]:
+    resolved = _resolve_model_spec(spec)
+    return resolved.base_url, resolved.credential_env, resolved.binding
 
 def _provider_keys() -> dict[str, str]:
     """Return launch-injected catalog credentials without logging their values."""
@@ -165,52 +223,6 @@ def _check_client_connected() -> None:
     if is_connected is not None and not is_connected():
         _history_context.aborted = True
         raise ClientDisconnectedError("Client disconnected")
-
-
-def _parse_model_spec(spec: str) -> tuple[str, str, str | None]:
-    """Resolve a stable catalog slot or parse a legacy provider/model spec."""
-    worker = _binding_for_slot(spec)
-    if worker is not None:
-        provider = _provider_binding(worker.provider)
-        if provider is None:
-            raise ValueError(f"catalog worker {spec} has no provider binding")
-        return provider.adapter, worker.upstream_model, worker.reasoning_effort
-    provider, sep, rest = spec.partition("/")
-    binding = _provider_binding(provider) if sep else None
-    if binding is not None:
-        model, marker, effort = rest.partition("|")
-        return binding.adapter, model, effort if marker and effort != "none" else None
-    if not sep or provider not in PROVIDERS:
-        supported = " or ".join((*PROVIDERS, "<catalog-provider>"))
-        raise ValueError(f"model must be a catalog slot or start with {supported}: {spec}")
-    model, marker, effort = rest.partition("|")
-    return provider, model, effort if marker and effort != "none" else None
-
-
-def _binding_protocols(spec: str) -> tuple[str, ...] | None:
-    worker = _binding_for_slot(spec)
-    if worker is not None:
-        return worker.protocols
-    provider, separator, _ = spec.partition("/")
-    binding = _provider_binding(provider) if separator else None
-    return binding.protocols if binding is not None else None
-
-
-def _provider_for_spec(spec: str) -> tuple[str, str, str | None]:
-    """Resolve endpoint, credential source, and optional catalog binding."""
-    worker = _binding_for_slot(spec)
-    if worker is not None:
-        provider = _provider_binding(worker.provider)
-        if provider is None:
-            raise ValueError(f"catalog worker {spec} has no provider binding")
-        return provider.base_url, provider.credential_env, worker.provider
-    provider, _, rest = spec.partition("/")
-    catalog_provider = _provider_binding(provider) if rest else None
-    if catalog_provider is not None:
-        return catalog_provider.base_url, catalog_provider.credential_env, provider
-    adapter, _, _ = _parse_model_spec(spec)
-    base_url, credential_env = PROVIDERS[adapter]
-    return base_url, credential_env, None
 
 
 def _is_reasoning_model(model: str) -> bool:
@@ -330,9 +342,9 @@ def client_connection(is_connected: Any):
         _history_context.is_client_connected = previous
 
 
-def _uses_anthropic_messages(spec: str) -> bool:
-    protocols = _binding_protocols(spec)
-    return protocols is not None and "anthropic_messages" in protocols
+def _uses_anthropic_messages(spec: str | ResolvedModelSpec) -> bool:
+    resolved = _resolve_model_spec(spec) if isinstance(spec, str) else spec
+    return resolved.protocols is not None and "anthropic_messages" in resolved.protocols
 
 
 def _build_request(
@@ -345,18 +357,20 @@ def _build_request(
     tool_choice: Any = None,
     response_format: dict[str, Any] | None = None,
     controls: dict[str, Any] | None = None,
+    resolved: ResolvedModelSpec | None = None,
 ) -> tuple[str, dict[str, str], dict[str, Any]]:
-    provider, model, effort = _parse_model_spec(spec)
-    base_url, key_env, binding = _provider_for_spec(spec)
+    resolved = _resolve_model_spec(spec) if resolved is None else resolved
+    provider, model, effort = resolved.adapter, resolved.model, resolved.effort
+    base_url, key_env, binding = resolved.base_url, resolved.credential_env, resolved.binding
     key = _catalog_key(binding, key_env, spec) if binding else os.environ.get(key_env)
     if not key:
         raise RuntimeError(f"{key_env} is required for {spec}")
     active_controls = controls or {}
-    if _uses_anthropic_messages(spec):
+    if _uses_anthropic_messages(resolved):
         body = build_anthropic_body(model, messages, max_tokens, effort, tools, tool_choice)
         headers = anthropic_headers(key)
         path = "v1/messages"
-    elif uses_responses_api(provider, model, _binding_protocols(spec)):
+    elif uses_responses_api(provider, model, resolved.protocols):
         body = build_responses_body(model, messages, max_tokens,
             None if effort or _is_reasoning_model(model) else temperature, effort, tools,
             tool_choice, response_format, active_controls)
@@ -508,7 +522,7 @@ def _stream_completion(
         return _assemble_streamed_completion(chunks())
 
 
-def _failover_attempts(spec: str) -> list[str]:
+def _failover_attempts(spec: str, bindings: RuntimeBindings | None = None) -> list[str]:
     """Attempt order on transient failures: the assigned spec, then the rest of
     the configured pool in declared order, each at most once. Falls back to
     [spec] when no provider pool is configured (tests, local workers)."""
@@ -521,7 +535,7 @@ def _failover_attempts(spec: str) -> list[str]:
         if candidate in attempts:
             continue
         try:
-            _parse_model_spec(candidate)
+            _resolve_model_spec(candidate, bindings)
         except ValueError:
             continue  # bare labels are not routable failover targets
         attempts.append(candidate)
@@ -541,11 +555,13 @@ def _provider_response(
     controls = getattr(run, "active_controls", None) or {}
     normalized_messages = _normalize_upstream_tool_ids(messages)
     failures: list[str] = []
-    for index, attempt in enumerate(_failover_attempts(spec)):
+    bindings = _runtime_bindings()
+    for index, attempt in enumerate(_failover_attempts(spec, bindings)):
         _check_client_connected()
         if index:
             time.sleep(_FAILOVER_DELAY)
         try:
+            resolved = _resolve_model_spec(attempt, bindings)
             # Failover switches model/effort/endpoint per spec; messages, tools,
             # and controls stay identical across attempts.
             url, headers, body = _build_request(
@@ -557,13 +573,14 @@ def _provider_response(
                 tool_choice=tool_choice,
                 response_format=response_format,
                 controls=controls,
+                resolved=resolved,
             )
         except RuntimeError as error:  # provider key missing for this attempt
             failures.append(str(error))
             continue
-        provider, model, _ = _parse_model_spec(attempt)
-        responses_api = uses_responses_api(provider, model, _binding_protocols(attempt))
-        anthropic_messages = _uses_anthropic_messages(attempt)
+        provider, model = resolved.adapter, resolved.model
+        responses_api = uses_responses_api(provider, model, resolved.protocols)
+        anthropic_messages = _uses_anthropic_messages(resolved)
         # Session stickiness pins OpenRouter to one model+provider per
         # conversation to maximize prompt-cache hits. Apply it to all OpenRouter
         # backends (native Responses for "openai/*" and Chat Completions for
@@ -654,7 +671,7 @@ def _provider_response(
     if run is not None:
         # Catalog slots are the trained-router identities. Legacy raw specs
         # retain their upstream model attribution for existing cost reports.
-        usage_model = attempt if _binding_for_slot(attempt) is not None else body["model"]
+        usage_model = attempt if resolved.slot is not None else body["model"]
         run.add_usage(usage, model=usage_model)
         message = (data.get("choices") or [{}])[0].get("message", {})
         if run.capture_metadata and isinstance(message, dict):
@@ -2089,14 +2106,16 @@ def _model_completion(
             args = {}
         if not isinstance(args, dict):
             args = {}
-        calls.append({"name": str(fn.get("name")), "arguments": args})
+        call = {"name": str(fn.get("name")), "arguments": args}
+        provider_ids = msg.get("_anthropic_tool_ids")
+        if isinstance(provider_ids, dict) and isinstance(tc.get("id"), str):
+            call["_anthropic_tool_id"] = provider_ids.get(tc["id"], tc["id"])
+        calls.append(call)
     metadata = {
-        key: msg[key]
-        for key in ("reasoning_details", "_anthropic_content", "_anthropic_tool_ids")
-        if key in msg
+        key: msg[key] for key in ("reasoning_details", "_anthropic_content") if key in msg
     }
     if calls and metadata:
-        calls[0]["_message_metadata"] = metadata
+        calls[0]["_assistant_metadata"] = metadata
     return text, calls
 
 
@@ -2290,12 +2309,19 @@ class NativeRun:
         for call in calls:
             owned_id = f"c{self._next_tool_call:x}"
             updated = {**call, "id": owned_id}
-            metadata = updated.get("_message_metadata")
-            if isinstance(metadata, dict) and isinstance(metadata.get("_anthropic_tool_ids"), dict):
-                provider_id = metadata["_anthropic_tool_ids"].get(call.get("id"), call.get("id"))
-                updated["_message_metadata"] = {
-                    **metadata, "_anthropic_tool_ids": {owned_id: provider_id}
+            # Accept legacy call-attached metadata while keeping provider IDs on
+            # each call in the canonical representation.
+            legacy = updated.pop("_message_metadata", None)
+            if isinstance(legacy, dict) and "_assistant_metadata" not in updated:
+                updated["_assistant_metadata"] = {
+                    key: value for key, value in legacy.items() if key != "_anthropic_tool_ids"
                 }
+                raw_ids = legacy.get("_anthropic_tool_ids")
+                if isinstance(raw_ids, dict):
+                    updated["_anthropic_tool_id"] = raw_ids.get(call.get("id"), call.get("id"))
+            provider_id = updated.pop("_anthropic_tool_id", None)
+            if isinstance(provider_id, str) and provider_id:
+                updated["_anthropic_tool_id"] = provider_id
             owned.append(updated)
             self._next_tool_call += 1
         return owned
@@ -2642,7 +2668,11 @@ class TrinityRun(NativeRun):
         )
         if calls:
             self.record_activity("tool_call", role=role, model=model)
-            message_metadata = calls[0].pop("_message_metadata", {})
+            message_metadata = calls[0].pop("_assistant_metadata", {})
+            provider_ids = {
+                c["id"]: c.pop("_anthropic_tool_id")
+                for c in calls if isinstance(c.get("_anthropic_tool_id"), str)
+            }
             asst: dict[str, Any] = {
                 "role": "assistant",
                 "content": text,
@@ -2651,6 +2681,8 @@ class TrinityRun(NativeRun):
                 ],
             }
             asst.update(message_metadata)
+            if provider_ids:
+                asst["_anthropic_tool_ids"] = provider_ids
             self._pending = {
                 "role": role,
                 "agent_id": agent_id,
@@ -2903,7 +2935,11 @@ class ConductorRun(NativeRun):
         )
         if calls:
             self.record_activity("tool_call", role=role, model=model)
-            message_metadata = calls[0].pop("_message_metadata", {})
+            message_metadata = calls[0].pop("_assistant_metadata", {})
+            provider_ids = {
+                c["id"]: c.pop("_anthropic_tool_id")
+                for c in calls if isinstance(c.get("_anthropic_tool_id"), str)
+            }
             asst = {
                 "role": "assistant",
                 "content": text,
@@ -2912,6 +2948,8 @@ class ConductorRun(NativeRun):
                 ],
             }
             asst.update(message_metadata)
+            if provider_ids:
+                asst["_anthropic_tool_ids"] = provider_ids
             self._pending = {"role": role, "model": model, "messages": messages, "asst": asst}
             self._expected_ids = {c["id"] for c in calls}
             self._tool_rounds = 1
@@ -3110,7 +3148,7 @@ def create_run(mode: str, body: dict[str, Any]) -> NativeRun:
     run.cache_namespace = _prompt_cache_namespace(messages, tools)
     output_limit = body.get("max_completion_tokens", body.get("max_tokens"))
     if output_limit is not None:
-        run.controls["max_tokens"] = min(int(output_limit), MAX_UPSTREAM_OUTPUT_TOKENS)
+        run.controls["max_tokens"] = min(int(output_limit), upstream_output_token_cap())
     if body.get("reasoning"):
         run.controls["reasoning"] = body["reasoning"]
     elif body.get("reasoning_effort") is not None:
