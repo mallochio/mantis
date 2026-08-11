@@ -32,6 +32,16 @@ def _tool_blocks(message: dict[str, Any]) -> list[dict[str, Any]]:
     return blocks
 
 
+def _replayable_content(content: Any) -> list[dict[str, Any]]:
+    if not isinstance(content, list):
+        return []
+    return [
+        block for block in content
+        if isinstance(block, dict)
+        and (block.get("type") != "thinking" or isinstance(block.get("thinking"), str))
+    ]
+
+
 def chat_to_anthropic(messages: list[dict[str, Any]]) -> tuple[str | list[dict[str, Any]] | None, list[dict[str, Any]]]:
     """Convert canonical Mantis history while preserving native assistant blocks."""
     system: list[dict[str, Any]] = []
@@ -44,7 +54,11 @@ def chat_to_anthropic(messages: list[dict[str, Any]]) -> tuple[str | list[dict[s
             continue
         if role == "assistant":
             raw = message.get("_anthropic_content")
-            content = raw if isinstance(raw, list) else _text(message.get("content")) + _tool_blocks(message)
+            content = (
+                _replayable_content(raw)
+                if isinstance(raw, list)
+                else _text(message.get("content")) + _tool_blocks(message)
+            )
             mapping = message.get("_anthropic_tool_ids")
             if isinstance(mapping, dict):
                 tool_ids.update({str(key): str(value) for key, value in mapping.items()})
@@ -105,7 +119,9 @@ def anthropic_to_chat(response: dict[str, Any]) -> dict[str, Any]:
             raw_id = str(block.get("id", ""))
             calls.append({"id": raw_id, "type": "function", "function": {"name": str(block.get("name", "")), "arguments": json.dumps(block.get("input") or {})}})
             tool_ids[raw_id] = raw_id
-    message: dict[str, Any] = {"role": "assistant", "content": text, "_anthropic_content": content}
+    message: dict[str, Any] = {
+        "role": "assistant", "content": text, "_anthropic_content": _replayable_content(content),
+    }
     if calls:
         message["tool_calls"] = calls
         message["_anthropic_tool_ids"] = tool_ids

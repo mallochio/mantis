@@ -44,6 +44,17 @@ def test_signed_thinking_and_provider_tool_id_survive_tool_continuation():
     assert history[1]["content"][0]["tool_use_id"] == "provider-call"
 
 
+def test_null_thinking_is_not_replayed_to_the_provider():
+    raw = [
+        {"type": "thinking", "thinking": None, "signature": "invalid"},
+        {"type": "text", "text": "answer"},
+    ]
+    assistant = anthropic_to_chat({"content": raw})["choices"][0]["message"]
+
+    assert assistant["_anthropic_content"] == [{"type": "text", "text": "answer"}]
+    assert chat_to_anthropic([assistant])[1][0]["content"] == assistant["_anthropic_content"]
+
+
 def test_stream_assembly_retains_thinking_signature_and_tool_input():
     result = assemble_anthropic_stream([
         {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": "", "signature": "sig"}},
