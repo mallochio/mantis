@@ -1,10 +1,8 @@
-"""Hermetic tests for the router evaluation harness."""
+"""Hermetic tests for the graded router evaluation harness."""
 
 import importlib.util
-import json
+import types
 from pathlib import Path
-
-import httpx
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -22,26 +20,78 @@ metrics = _load("route_metrics", ROOT / "eval" / "route_metrics.py")
 miniswe = _load("miniswe_config", ROOT / "eval" / "miniswe_config.py")
 
 
-def _manifest() -> dict:
+def _instance() -> dict:
     return {
-        "dataset": "synthetic",
-        "dataset_revision": "test",
-        "instance_count": 1,
-        "instances": [
-            {
-                "instance_id": "demo-1",
-                "problem_statement": "implement a parser",
-                "repo": "demo/repo",
-                "base_commit": "abc",
-            }
-        ],
+        "instance_id": "demo-1",
+        "problem_statement": "implement a parser",
+        "docker_image": "demo:latest",
+        "test_cmd": "pytest tests/test_demo.py",
+        "FAIL_TO_PASS": ["tests/test_demo.py::test_fix"],
+        "PASS_TO_PASS": ["tests/test_demo.py::test_existing"],
     }
 
 
-def test_dry_run_is_free_and_projects_caps():
-    output = harness.dry_run(_manifest(), ["cheap-only", "mantis-direct", "trinity"])
-    assert "projected total: $2.35" in output
+def _patch_modules(monkeypatch, *, calls: int = 1):
+    import minisweagent.agents
+    import minisweagent.config
+    import minisweagent.environments
+    import minisweagent.models
+
+    class FakeEnvironment:
+        def cleanup(self):
+            pass
+
+    class FakeModel:
+        config = types.SimpleNamespace(model_name="cheap")
+
+        def query(self, messages, **kwargs):
+            return {"extra": {"response": {"usage": {"cost": 0.6}}}}
+
+    class FakeAgent:
+        def __init__(self, model):
+            self.model = model
+            self.messages = []
+
+        def run(self, task):
+            for _ in range(calls):
+                self.messages.append(self.model.query([]))
+            return {"submission": "diff --git a/a b/a\n"}
+
+        def serialize(self):
+            return {"messages": self.messages}
+
+    monkeypatch.setattr(minisweagent.config, "get_config_from_spec", lambda path: {
+        "model": {}, "agent": {}, "environment": {},
+    })
+    monkeypatch.setattr(
+        minisweagent.environments, "get_environment", lambda config: FakeEnvironment()
+    )
+    monkeypatch.setattr(minisweagent.models, "get_model", lambda config: FakeModel())
+    monkeypatch.setattr(
+        minisweagent.agents, "get_agent",
+        lambda model, env, config, default_type: FakeAgent(model),
+    )
+
+
+def test_dry_run_separates_caps_and_price_table():
+    output = harness.dry_run(
+        {"dataset": "synthetic", "dataset_revision": "test", "instance_count": 1},
+        ["cheap-only", "mantis-direct", "trinity"],
+        {"cheap-only": 2.0, "mantis-direct": 3.0, "trinity": 4.0},
+        Path("eval/model_prices.json"),
+    )
+    assert "projected total: $9.00" in output
+    assert "separate from caps" in output
     assert "model calls: 0 (dry-run)" in output
+
+
+def test_cost_priority_and_unknown_fallback():
+    prices = {"cheap": {"input_per_token": 2.0, "output_per_token": 3.0}}
+    assert harness.usage_cost({"cost": 0.4}, "cheap", prices) == (0.4, "usage.cost")
+    assert harness.usage_cost(
+        {"prompt_tokens": 10, "completion_tokens": 5}, "cheap", prices
+    ) == (35.0, "token_counts_x_price_table")
+    assert harness.usage_cost({}, "missing", prices) == (None, "unknown")
 
 
 def test_miniswe_local_model_configuration_is_explicit():
@@ -53,212 +103,51 @@ def test_miniswe_local_model_configuration_is_explicit():
     assert config["model_registry"]["mantis-trinity"]["litellm_provider"] == "openai"
 
 
-def test_fake_openai_server_captures_session_headers_and_usage_cost():
-    requests: list[httpx.Request] = []
+def test_grader_rejects_empty_and_runs_fresh_container(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        harness, "_run_test_command",
+        lambda image, patch, command, test_patch="", install="", timeout=300: (
+            calls.append((image, patch, command)) or (True, "PASS")
+        ),
+    )
+    assert harness.grade_patch(_instance(), "")["resolved"] is False
+    assert harness.grade_patch(_instance(), "diff --git a/a b/a\n")["resolved"] is True
+    assert "test_fix" in calls[0][2] and "test_existing" in calls[0][2]
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(
-            200,
-            headers={
-                "x-route-decision": "middle",
-                "x-route-reason": "supra",
-                "x-route-model": "gpt-5.6-terra",
-                "x-route-sticky": "true",
-                "x-route-fallback": "false",
-            },
-            json={
-                "choices": [{"message": {"content": "fixed"}}],
-                "usage": {"cost": 0.123, "prompt_tokens": 3, "completion_tokens": 4},
-            },
-        )
 
-    row = harness.run_instance(
-        _manifest()["instances"][0],
-        arm="mantis-direct",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-        endpoint="http://fake/v1/chat/completions",
+def test_agent_trajectory_patch_and_grading(monkeypatch):
+    _patch_modules(monkeypatch)
+    monkeypatch.setattr(
+        harness, "grade_patch",
+        lambda instance, patch: {"resolved": True, "grader_output": "PASS"},
+    )
+    row = harness.run_mini_agent(
+        _instance(), arm="cheap-only", endpoint="http://fake/v1/chat/completions",
         tier_models={"cheap": "cheap", "middle": "middle", "expensive": "expensive"},
-        prices={"mantis": 99.0},
-        rng=harness.random.Random(1),
-        max_steps=4,
-        max_output_tokens=12,
+        prices={"cheap": {"input_per_token": 1.0, "output_per_token": 1.0}},
+        ledger=harness.CostLedger(total_limit=2.0, instance_limit=2.0),
+        rng=harness.random.Random(1), step_limit=2, output_token_limit=32,
+        frequencies={"cheap": 1.0, "middle": 0.0, "expensive": 0.0},
     )
     assert row["resolved"] is True
-    assert row["cost_usd"] == 0.123
-    assert row["cost_method"] == "usage.cost"
-    assert row["cost_methods"] == ["usage.cost"]
-    assert row["routing_decisions"][0]["headers"]["x-route-decision"] == "middle"
-    assert requests[0].headers["x-route-session"].startswith("router-eval-")
+    assert row["model_patch"].startswith("diff --git")
+    assert row["cost_usd"] == 0.6
 
 
-def test_fake_server_falls_back_to_token_count_pricing():
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "choices": [{"message": {"content": "fixed"}}],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
-            },
-        )
-
-    row = harness.run_instance(
-        _manifest()["instances"][0],
-        arm="cheap-only",
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-        endpoint="http://fake/v1/chat/completions",
-        tier_models={"cheap": "cheap", "middle": "middle", "expensive": "expensive"},
-        prices={"cheap": 2.0},
-        rng=harness.random.Random(1),
-        max_steps=1,
-        max_output_tokens=12,
-    )
-    assert row["cost_usd"] == 0.03
-    assert row["cost_method"] == "token_counts_x_catalog_prices"
-
-
-def test_budget_abort_preserves_marker(tmp_path, monkeypatch):
-    manifest_path = tmp_path / "manifest.json"
-    manifest_path.write_text(json.dumps(_manifest()))
-    output = tmp_path / "results.jsonl"
+def test_agent_stops_on_per_instance_budget(monkeypatch):
+    _patch_modules(monkeypatch, calls=2)
     monkeypatch.setattr(
-        "sys.argv",
-        [
-            "router_eval.py",
-            "--manifest",
-            str(manifest_path),
-            "--arms",
-            "cheap-only,middle-only",
-            "--budget-usd",
-            "0",
-            "--output",
-            str(output),
-            "--endpoint",
-            "http://fake",
-        ],
+        harness, "grade_patch",
+        lambda instance, patch: {"resolved": True, "grader_output": "PASS"},
     )
-    # The first row is never sent because the ceiling is already exhausted.
-    harness.main()
-    records = [json.loads(line) for line in output.read_text().splitlines()]
-    assert records[-1]["metadata"]["aborted_on_budget"] is True
-
-
-def test_oracle_accuracy_regret_and_interpolation():
-    rows = [
-        {
-            "instance_id": "a",
-            "arm": "cheap-only",
-            "tier": "cheap",
-            "resolved": True,
-            "quality": 1,
-            "cost_usd": 1,
-        },
-        {
-            "instance_id": "a",
-            "arm": "middle-only",
-            "tier": "middle",
-            "resolved": True,
-            "quality": 1,
-            "cost_usd": 2,
-        },
-        {
-            "instance_id": "a",
-            "arm": "expensive-only",
-            "tier": "expensive",
-            "resolved": True,
-            "quality": 1,
-            "cost_usd": 4,
-        },
-        {
-            "instance_id": "a",
-            "arm": "mantis-direct",
-            "chosen_tier": "cheap",
-            "resolved": True,
-            "quality": 1,
-            "cost_usd": 2,
-        },
-        {
-            "instance_id": "b",
-            "arm": "cheap-only",
-            "tier": "cheap",
-            "resolved": False,
-            "quality": 0,
-            "cost_usd": 1,
-        },
-        {
-            "instance_id": "b",
-            "arm": "middle-only",
-            "tier": "middle",
-            "resolved": True,
-            "quality": 1,
-            "cost_usd": 2,
-        },
-        {
-            "instance_id": "b",
-            "arm": "expensive-only",
-            "tier": "expensive",
-            "resolved": True,
-            "quality": 1,
-            "cost_usd": 4,
-        },
-        {
-            "instance_id": "b",
-            "arm": "mantis-direct",
-            "chosen_tier": "cheap",
-            "resolved": True,
-            "quality": 0,
-            "cost_usd": 1,
-        },
-    ]
-    result = metrics.compute_metrics(rows)
-    assert result["oracle"] == {"a": "cheap", "b": "middle"}
-    assert result["accuracy"]["mantis-direct"]["accuracy"] == 0.5
-    assert result["regret"]["mantis-direct"]["under_routing"]["quality_lost"] == 1
-    assert result["regret"]["mantis-direct"]["under_routing"]["dollars_wasted"] == 1
-    assert result["cheap_expensive_interpolation"]["beats_interpolation"] is False
-
-
-def test_oracle_degenerate_cases_and_confusion_matrix():
-    rows = [
-        {
-            "instance_id": "a",
-            "arm": "cheap-only",
-            "tier": "cheap",
-            "resolved": True,
-            "quality": 1,
-            "cost_usd": 1,
-        },
-        {
-            "instance_id": "a",
-            "arm": "mantis-direct",
-            "chosen_tier": "cheap",
-            "resolved": True,
-            "quality": 1,
-            "cost_usd": 1,
-        },
-        {
-            "instance_id": "b",
-            "arm": "cheap-only",
-            "tier": "cheap",
-            "resolved": False,
-            "quality": 0,
-            "cost_usd": 1,
-        },
-        {
-            "instance_id": "b",
-            "arm": "mantis-direct",
-            "chosen_tier": "expensive",
-            "resolved": True,
-            "quality": 1,
-            "cost_usd": 3,
-        },
-    ]
-    assert metrics.oracle_labels(rows) == {"a": "cheap", "b": None}
-    matrix = metrics.complexity_confusion(
-        [
-            {"complexity": "1", "oracle_tier": "cheap"},
-            {"complexity": "3", "oracle_tier": "middle"},
-        ],
-        targets=("cheap", "cheap", "middle", "middle", "expensive"),
+    row = harness.run_mini_agent(
+        _instance(), arm="cheap-only", endpoint="http://fake/v1/chat/completions",
+        tier_models={"cheap": "cheap", "middle": "middle", "expensive": "expensive"},
+        prices={"cheap": {"input_per_token": 1.0, "output_per_token": 1.0}},
+        ledger=harness.CostLedger(total_limit=5.0, instance_limit=1.0),
+        rng=harness.random.Random(1), step_limit=4, output_token_limit=32,
+        frequencies={"cheap": 1.0, "middle": 0.0, "expensive": 0.0},
     )
-    assert matrix == {"1": {"cheap": 1}, "3": {"middle": 1}}
+    assert row["aborted"] is True
+    assert row["resolved"] is False

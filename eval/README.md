@@ -16,21 +16,34 @@ instance records are the reproducibility boundary; runs belong in the ignored
   the corresponding catalog `upstream_model`;
 - `mantis-direct`: the routed `model=mantis` endpoint;
 - `heuristic`: client-side prompt complexity selection;
-- `random-matched`: seeded random tier selection;
+- `random-matched`: tier sampling from observed `mantis-direct` frequencies;
 - `trinity`: independently selectable `model=mantis-trinity`.
 
 Every routed request carries `X-Route-Session` and records route decision
-headers. `--budget-usd`, `--per-instance-cost`, `--max-steps`, and
-`--max-output-tokens` are recorded in run metadata. Budget exhaustion preserves
-partial JSONL output and writes `aborted_on_budget: true`. `--dry-run` makes no
-model calls and reports worst-case per-instance-cap spend:
+headers. mini-SWE-agent 2.4.6 drives each task inside its prebuilt
+SWE-rebench Docker image. Its submitted patch is graded in a fresh container;
+`resolved` is true only when every `FAIL_TO_PASS` test passes and every
+`PASS_TO_PASS` test remains passing. Gold patches are never used by an arm.
+The harness uses mini-SWE-agent's per-instance API rather than its batch CLI so
+each arm can select its endpoint, session header, and request budget.
+
+`--budget-usd`, `--per-instance-cost`, `--step-limit`, and
+`--output-token-limit` are recorded in run metadata. Cumulative and
+per-instance ceilings are checked before every model request; an aborted
+instance is not emitted, so output remains a complete prefix with all arms
+present. Budget exhaustion preserves prior JSONL output and writes
+`aborted_on_budget: true`. `--dry-run` makes no model calls and reports
+worst-case per-instance-cap spend:
 
 ```text
 uv run python eval/router_eval.py --dry-run --include-trinity
 ```
 
 Costs use response `usage.cost` when supplied, otherwise token counts multiplied
-by the caller-supplied model price table; every row records `cost_methods`.
+by the tracked `model_prices.json` OpenRouter snapshot, which has separate
+input/output prices. Missing usage and missing price data remain `unknown`;
+there is no estimate fallback. Budget caps and prices are independent. Every
+request and result row records its cost method.
 `route_metrics.py` derives the cheapest resolving tier oracle, routing accuracy,
 under/over-routing regret, endpoint interpolation, and an injected-decider
 complexity confusion matrix. It never treats an error row as a successful

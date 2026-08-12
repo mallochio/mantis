@@ -36,8 +36,19 @@ def oracle_labels(rows: list[dict[str, Any]]) -> dict[str, str | None]:
 
 
 def _arm_mean(rows: list[dict[str, Any]], key: str) -> float | None:
-    values = [float(row[key]) for row in _successful(rows) if row.get(key) is not None]
+    values = [
+        float(row.get(key, float(bool(row.get("resolved")))))
+        for row in _successful(rows)
+        if row.get(key) is not None or key == "quality"
+    ]
     return statistics.mean(values) if values else None
+
+
+def _cost_sum(rows: list[dict[str, Any]]) -> float | None:
+    costs = [row.get("cost_usd") for row in _successful(rows)]
+    if any(cost is None for cost in costs):
+        return None
+    return sum(float(cost or 0) for cost in costs)
 
 
 def _arm_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -47,24 +58,33 @@ def _arm_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "success": len(valid),
         "errors": len(rows) - len(valid),
         "quality_mean": _arm_mean(rows, "quality"),
-        "cost_usd": sum(float(row.get("cost_usd", 0) or 0) for row in valid),
+        "cost_usd": _cost_sum(rows),
     }
 
 
 def _regret(
     chosen: str | None,
     oracle: str | None,
-    costs: dict[str, float],
+    costs: dict[str, float | None],
     qualities: dict[str, float],
-) -> tuple[float, float]:
+) -> tuple[float, float | None]:
     if not chosen or not oracle:
         return 0.0, 0.0
     chosen_rank, oracle_rank = TIERS.index(chosen), TIERS.index(oracle)
     quality_loss = max(0.0, qualities.get(oracle, 0.0) - qualities.get(chosen, 0.0))
+    chosen_cost, oracle_cost = costs.get(chosen), costs.get(oracle)
     if chosen_rank < oracle_rank:
-        return quality_loss, max(0.0, costs.get(oracle, 0.0) - costs.get(chosen, 0.0))
+        return quality_loss, (
+            max(0.0, oracle_cost - chosen_cost)
+            if chosen_cost is not None and oracle_cost is not None
+            else None
+        )
     if chosen_rank > oracle_rank:
-        return 0.0, max(0.0, costs.get(chosen, 0.0) - costs.get(oracle, 0.0))
+        return 0.0, (
+            max(0.0, chosen_cost - oracle_cost)
+            if chosen_cost is not None and oracle_cost is not None
+            else None
+        )
     return 0.0, 0.0
 
 
@@ -88,7 +108,12 @@ def compute_metrics(
         tier_by_instance[row["instance_id"]][tier] = row
     tier_costs = {
         instance: {
-            tier: float(tier_by_instance[instance].get(tier, {}).get("cost_usd", 0) or 0)
+            tier: (
+                float(value["cost_usd"])
+                if (value := tier_by_instance[instance].get(tier, {})).get("cost_usd")
+                is not None
+                else None
+            )
             for tier in TIERS
         }
         for instance in tier_by_instance
@@ -111,7 +136,9 @@ def compute_metrics(
         }
         comparable = [instance for instance in chosen if oracle.get(instance) is not None]
         correct = sum(chosen[i] == oracle[i] for i in comparable)
-        under_quality = under_cost = over_quality = over_cost = 0.0
+        under_quality = over_quality = 0.0
+        under_cost: float | None = 0.0
+        over_cost: float | None = 0.0
         for instance in comparable:
             oracle_tier = oracle[instance]
             assert oracle_tier is not None
@@ -127,14 +154,22 @@ def compute_metrics(
                     tier_quality.get(instance, {}).get(oracle_tier, 0.0)
                     - float(arm_rows_by_instance[instance].get("quality", 0.0)),
                 )
-                under_cost += wasted
+                under_cost = (
+                    under_cost + wasted
+                    if under_cost is not None and wasted is not None
+                    else None
+                )
             elif TIERS.index(chosen[instance]) > TIERS.index(oracle_tier):
                 over_quality += max(
                     0.0,
                     tier_quality.get(instance, {}).get(oracle_tier, 0.0)
                     - float(arm_rows_by_instance[instance].get("quality", 0.0)),
                 )
-                over_cost += wasted
+                over_cost = (
+                    over_cost + wasted
+                    if over_cost is not None and wasted is not None
+                    else None
+                )
         accuracy[arm] = {
             "correct": correct,
             "eligible": len(comparable),
@@ -162,6 +197,9 @@ def compute_metrics(
         and router
         and cheap["quality_mean"] is not None
         and expensive["quality_mean"] is not None
+        and router["cost_usd"] is not None
+        and cheap["cost_usd"] is not None
+        and expensive["cost_usd"] is not None
     ):
         span = expensive["cost_usd"] - cheap["cost_usd"]
         fraction = (router["cost_usd"] - cheap["cost_usd"]) / span if span else None

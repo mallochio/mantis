@@ -1,0 +1,22 @@
+{
+  "source": "https://openrouter.ai/api/v1/models",
+  "fetched_at": "2026-08-12",
+  "currency": "USD per token",
+  "models": {
+    "deepseek-v4-flash": {
+      "input_per_token": 0.00000014,
+      "output_per_token": 0.00000028,
+      "source_model_id": "deepseek/deepseek-v4-flash"
+    },
+    "gpt-5.6-terra": {
+      "input_per_token": 0.000001,
+      "output_per_token": 0.000006,
+      "source_model_id": "openai/gpt-5.6-terra"
+    },
+    "gpt-5.6-sol": {
+      "input_per_token": 0.000005,
+      "output_per_token": 0.00003,
+      "source_model_id": "openai/gpt-5.6-sol"
+    }
+  }
+}
