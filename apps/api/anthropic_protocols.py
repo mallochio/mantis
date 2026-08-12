@@ -43,7 +43,10 @@ def _replayable_content(content: Any) -> list[dict[str, Any]]:
         block
         for block in content
         if isinstance(block, dict)
-        and (block.get("type") != "thinking" or isinstance(block.get("thinking"), str))
+        and (
+            block.get("type") != "thinking"
+            or (isinstance(block.get("thinking"), str) and bool(block["thinking"].strip()))
+        )
     ]
 
 

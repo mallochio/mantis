@@ -70,6 +70,46 @@ def test_null_thinking_is_not_replayed_to_the_provider():
     assert chat_to_anthropic([assistant])[1][0]["content"] == assistant["_anthropic_content"]
 
 
+def test_empty_thinking_is_not_replayed_to_the_provider():
+    # Bedrock 400s with `reasoningText.text must not be null` when an aborted or
+    # signature-only thinking seed is replayed; the empty block carries no state
+    # worth preserving, so it must be dropped on both encode and replay.
+    raw = [
+        {"type": "thinking", "thinking": "", "signature": "sig"},
+        {"type": "text", "text": "answer"},
+    ]
+    assistant = anthropic_to_chat({"content": raw})["choices"][0]["message"]
+
+    assert assistant["_anthropic_content"] == [{"type": "text", "text": "answer"}]
+    assert chat_to_anthropic([assistant])[1][0]["content"] == assistant["_anthropic_content"]
+
+
+def test_stream_assembly_drops_thinking_seed_without_deltas():
+    result = assemble_anthropic_stream(
+        [
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": "", "signature": "sig"},
+            },
+            {
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {"type": "text", "text": ""},
+            },
+            {
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "text_delta", "text": "answer"},
+            },
+            {"type": "message_delta", "usage": {"input_tokens": 4, "output_tokens": 5}},
+        ]
+    )
+    message = result["choices"][0]["message"]
+    assert message["_anthropic_content"] == [{"type": "text", "text": "answer"}]
+    assert message["content"] == "answer"
+
+
 def test_stream_assembly_retains_thinking_signature_and_tool_input():
     result = assemble_anthropic_stream(
         [
