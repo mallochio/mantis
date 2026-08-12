@@ -1,1 +1,1 @@
-../../../router/llm-router.sh
+../../../apps/gateway/llm-router.sh

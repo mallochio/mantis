@@ -1,20 +1,27 @@
 # Mantis
 
-Mantis provides three OpenAI-compatible models. Choose the level of
-orchestration explicitly.
+Mantis provides three OpenAI-compatible routing modes. Choose the mode
+explicitly.
 
-## Models
+## Modes
 
-| Model | Use |
-|---|---|
-| `mantis` | Simplest path. The Mantis router scores the request with Supra and sends one request to a cheap, middle, or expensive model through Bifrost. |
-| `mantis-trinity` | Multi-agent TRINITY orchestration. It selects Worker, Thinker, and Verifier roles over several turns. |
-| `mantis-ultra` | Most complex path. Conductor plans and executes a bounded workflow DAG over the worker pool. |
+| Model | Mode | Use |
+|---|---|---|
+| `mantis` | Direct | The gateway scores one request with Supra and sends it to a cheap, middle, or expensive model through Bifrost. |
+| `mantis-trinity` | Trinity | Multi-agent coordination over Worker, Thinker, and Verifier roles. |
+| `mantis-ultra` | Ultra | Conductor plans and executes a bounded workflow DAG over the worker pool. |
 
 Only these model IDs are accepted. Select `mantis-trinity` or `mantis-ultra`
-manually; Mantis never selects between them. All three paths send model calls
+manually; Mantis never selects between modes. All three paths send model calls
 through the local Bifrost gateway. The OpenCode, Pi, and Prime harness catalogs
 advertise a 256k-token context limit for every configured local model.
+
+## Repository layout
+
+`apps/api/` serves the three public modes at :8088. `apps/gateway/` is the
+internal direct-mode gateway at :5500. They share the routing catalog but keep
+separate dependency locks because the API includes orchestration and training
+dependencies that the gateway does not need.
 
 `mantis` responses carry `x-route-decision`, `x-route-reason`,
 `x-route-sticky`, `x-route-model`, `x-route-attempts`, and
@@ -24,16 +31,16 @@ provided by the calling harness are returned as standard OpenAI `tool_calls`.
 
 ## Run
 
-The repository contains the Mantis router (`router/`). The canonical host
-deployment is the local launcher stack, versioned at `launch/host/` with
-`~/Startup/` symlinking to it (StartupFolder runs it at login):
+The canonical host deployment is the local launcher stack, versioned at
+`launch/host/` with `~/Startup/` symlinking to it (StartupFolder runs it at
+login):
 
 ```bash
-~/Startup/llm-stack.sh start   # Bifrost :8080 -> Mantis router :5500 -> Mantis :8088
+~/Startup/llm-stack.sh start   # Bifrost :8080 -> gateway :5500 -> Mantis API :8088
 ```
 
 `config/catalog.toml` is the tracked, versioned source of truth for the
-Mantis router and orchestration pool; `~/.config/ai-routing/catalog.toml` is a symlink to it. `bifrost.json`
+gateway and API worker pool; `~/.config/ai-routing/catalog.toml` is a symlink to it. `bifrost.json`
 (contains the gateway encryption key) stays local and untracked.
 
 ## Portable host installation
@@ -239,15 +246,15 @@ Large checkpoints and generated outputs remain outside Git.
 ```bash
 uv run pytest tests -q
 uv run ruff check .
-uv run mypy orchestrator scripts --exclude outputs
+uv run mypy apps/api scripts --exclude outputs
 ./scripts/verify.sh
-uv sync --directory router --locked --all-groups
-uv run --directory router pytest tests -q
+uv sync --directory apps/gateway --locked --all-groups
+uv run --directory apps/gateway pytest tests -q
 ```
 
 `tests/test_api.py` and `tests/test_serve.py` check completions, tools, images,
 structured output, usage, authentication, request limits, and SSE framing. The
-router's own suite lives under `router/tests/` and keeps its own lockfile and
+gateway suite lives under `apps/gateway/tests/` and keeps its own lockfile and
 venv.
 
 ## Security

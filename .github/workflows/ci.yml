@@ -29,12 +29,12 @@ jobs:
         run: uv run ruff check .
 
       - name: Run mypy
-        run: uv run mypy orchestrator scripts --exclude outputs
+        run: uv run mypy apps/api scripts --exclude outputs
 
       - name: Run Mantis tests
         run: uv run pytest tests -q
 
-      - name: Run router tests
+      - name: Run gateway tests
         run: |
-          uv sync --directory router --locked --all-groups
-          uv run --directory router pytest tests -q
+          uv sync --directory apps/gateway --locked --all-groups
+          uv run --directory apps/gateway pytest tests -q

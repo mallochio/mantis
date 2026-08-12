@@ -269,7 +269,7 @@ wheels = [
 ]
 
 [[package]]
-name = "mantis-router"
+name = "mantis-gateway"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

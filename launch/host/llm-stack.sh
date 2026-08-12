@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # llm-stack.sh — one script for the whole local LLM stack.
 #
-# Order: 1) Bifrost gateway (:8080, single upstream for both routers)
-#        2) llm-router   (:5500, Supra coding router, catalog-configured)
-#        3) Mantis       (:8088, conductor orchestrator, catalog mode)
+# Order: 1) Bifrost (:8080, shared upstream gateway)
+#        2) direct gateway (:5500, Supra routing, catalog-configured)
+#        3) Mantis API (:8088, Direct, Trinity, and Ultra modes)
 #
 # The shared catalog (~/.config/ai-routing/catalog.toml) is the source of
-# truth for both routers; Bifrost (~/.local/share/bifrost/config.json) holds
+# truth for the direct gateway and API worker pool; Bifrost (~/.local/share/bifrost/config.json) holds
 # the upstream routes (opencode-go, Azure, Bedrock-EU, Vertex) and keys.
 #
 # Usage: ~/Startup/llm-stack.sh [start|restart|status|stop]
@@ -31,7 +31,7 @@ BIFROST_URL="http://127.0.0.1:8080/health"
 ROUTER_URL="http://127.0.0.1:5500/healthz"
 MANTIS_URL="http://127.0.0.1:8088/ready"
 BIFROST_PIDFILE="$HOME/.local/share/bifrost/server.pid"
-ROUTER_PIDFILE="$HOME/.local/share/mantis/router/server.pid"
+GATEWAY_PIDFILE="$HOME/.local/share/mantis/router/server.pid"
 MANTIS_REPO="$HOME/Personal/other/mantis"
 CATALOG="$HOME/.config/ai-routing/catalog.toml"
 
@@ -41,7 +41,7 @@ warn() { printf '  \033[1;33mwarn\033[0m  %s\n' "$1"; }
 fail() { printf '  \033[1;31mFAIL\033[0m  %s\n' "$1" >&2; }
 
 health_ok()   { curl -fsS --max-time 5 "$1" >/dev/null 2>&1; }
-router_ready() { curl -fsS --max-time 5 "$ROUTER_URL" 2>/dev/null | grep -q '"ready":true'; }
+gateway_ready() { curl -fsS --max-time 5 "$ROUTER_URL" 2>/dev/null | grep -q '"ready":true'; }
 pid_on_port() { lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | head -n1 || true; }
 
 wait_ready() { # name url timeout_s [grep_pattern]
@@ -67,42 +67,42 @@ start_one() { # step_no name script url timeout_s [grep]
 }
 
 cmd_start() {
-  printf '\n\033[1mStarting the LLM stack (Bifrost -> router -> mantis)\033[0m\n'
+  printf '\n\033[1mStarting the LLM stack (Bifrost -> direct gateway -> Mantis API)\033[0m\n'
   printf '\033[2mComponents already running are restarted so the latest catalog/config is loaded.\033[0m\n'
-  [ -f "$CATALOG" ] || warn "catalog missing: $CATALOG (routers will fall back to legacy env)"
+  [ -f "$CATALOG" ] || warn "catalog missing: $CATALOG (gateway and API will fall back to legacy env)"
   start_one "1/3" "bifrost" "$LIB_DIR/bifrost-local.sh" "$BIFROST_URL" 90 || return 1
-  start_one "2/3" "llm-router" "$LIB_DIR/llm-router.sh" "$ROUTER_URL" 120 '"ready":true' || return 1
-  start_one "3/3" "mantis" "$LIB_DIR/mantis-local.sh" "$MANTIS_URL" 180 || return 1
+  start_one "2/3" "direct gateway" "$LIB_DIR/llm-router.sh" "$ROUTER_URL" 120 '"ready":true' || return 1
+  start_one "3/3" "Mantis API" "$LIB_DIR/mantis-local.sh" "$MANTIS_URL" 180 || return 1
   cmd_status
 }
 
 cmd_restart() {
-  printf '\n\033[1mRestarting the whole stack (Bifrost -> router -> mantis)\033[0m\n'
+  printf '\n\033[1mRestarting the whole stack (Bifrost -> direct gateway -> Mantis API)\033[0m\n'
   start_one "1/3" "bifrost" "$LIB_DIR/bifrost-local.sh" "$BIFROST_URL" 90 || return 1
-  start_one "2/3" "llm-router" "$LIB_DIR/llm-router.sh" "$ROUTER_URL" 120 '"ready":true' || return 1
-  start_one "3/3" "mantis" "$LIB_DIR/mantis-local.sh" "$MANTIS_URL" 180 || return 1
+  start_one "2/3" "direct gateway" "$LIB_DIR/llm-router.sh" "$ROUTER_URL" 120 '"ready":true' || return 1
+  start_one "3/3" "Mantis API" "$LIB_DIR/mantis-local.sh" "$MANTIS_URL" 180 || return 1
   cmd_status
 }
 
 cmd_stop() {
-  printf '\n\033[1mStopping the stack (mantis -> router -> bifrost)\033[0m\n'
-  step "1/3 stopping mantis (:8088)"
+  printf '\n\033[1mStopping the stack (Mantis API -> direct gateway -> Bifrost)\033[0m\n'
+  step "1/3 stopping Mantis API (:8088)"
   local mp="$HOME/.local/share/mantis/server.pid"
   if [ -f "$mp" ] && kill -0 "$(cat "$mp")" 2>/dev/null; then
     kill "$(cat "$mp")" 2>/dev/null || true
     rm -f "$mp"
-    ok "mantis host process stopped"
+    ok "Mantis API process stopped"
   else
-    ok "mantis host process not running"
+    ok "Mantis API process not running"
   fi
-  step "2/3 stopping llm-router (:5500)"
+  step "2/3 stopping direct gateway (:5500)"
   if health_ok "$ROUTER_URL"; then
-    local rp; rp=$(cat "$ROUTER_PIDFILE" 2>/dev/null || true)
+    local rp; rp=$(cat "$GATEWAY_PIDFILE" 2>/dev/null || true)
     if [ -n "${rp:-}" ] && kill -0 "$rp" 2>/dev/null; then kill "$rp" 2>/dev/null || true; fi
     for _ in $(seq 1 50); do health_ok "$ROUTER_URL" || break; sleep 0.1; done
-    ok "llm-router stopped"
+    ok "direct gateway stopped"
   else
-    ok "llm-router not running"
+    ok "direct gateway not running"
   fi
   step "3/3 stopping bifrost (:8080)"
   if health_ok "$BIFROST_URL"; then
@@ -123,19 +123,19 @@ cmd_status() {
   else
     printf '  %-12s %-7s %-8s \033[1;31mdown\033[0m\n' bifrost :8080 -
   fi
-  if router_ready; then
-    printf '  %-12s %-7s %-8s \033[1;32mup\033[0m\n' llm-router :5500 "$(pid_on_port 5500)"
+  if gateway_ready; then
+    printf '  %-12s %-7s %-8s \033[1;32mup\033[0m\n' gateway :5500 "$(pid_on_port 5500)"
   else
-    printf '  %-12s %-7s %-8s \033[1;31mdown\033[0m\n' llm-router :5500 -
+    printf '  %-12s %-7s %-8s \033[1;31mdown\033[0m\n' gateway :5500 -
   fi
   if health_ok "$MANTIS_URL"; then
-    printf '  %-12s %-7s %-8s \033[1;32mup\033[0m\n' mantis :8088 "$(pid_on_port 8088)"
+    printf '  %-12s %-7s %-8s \033[1;32mup\033[0m\n' mantis-api :8088 "$(pid_on_port 8088)"
   else
-    printf '  %-12s %-7s %-8s \033[1;31mdown\033[0m\n' mantis :8088 -
+    printf '  %-12s %-7s %-8s \033[1;31mdown\033[0m\n' mantis-api :8088 -
   fi
-  if router_ready; then
+  if gateway_ready; then
     local rev; rev=$(curl -fsS --max-time 5 "$ROUTER_URL" 2>/dev/null | grep -o '"target_config_revision":"[^"]*"' | head -n1 | cut -d'"' -f4)
-    printf '\n  router config: %s\n' "${rev:-unknown}"
+    printf '\n  gateway config: %s\n' "${rev:-unknown}"
   fi
   printf '\n'
 }

@@ -1,8 +1,8 @@
-# Mantis router
+# Mantis gateway
 
-> Mantis router component. Full history: `git log 33b0ccd -- router/`. Run with `uv run --directory router ...`; it serves :5500 internally and is exposed to clients as `mantis` through Mantis :8088.
+> Internal direct-mode gateway. Run with `uv run --directory apps/gateway ...`; it serves :5500 and is exposed to clients as `mantis` through the Mantis API at :8088.
 
-The router is Mantis's simplest model path: it scores one request and sends it
+The gateway implements Mantis's direct mode: it scores one request and sends it
 to one cheap, middle, or expensive model through Bifrost. It exposes
 OpenAI-compatible `/v1/chat/completions` and `/v1/responses` endpoints. In the
 default gateway profile, all tiers use Bifrost's configured Cloudflare gateway
@@ -23,7 +23,7 @@ uv sync --dev
 
 The default listener is `http://127.0.0.1:5500/v1`, model `auto`, with the
 loopback-only development credential `sk-route-local`. Clients normally use
-`mantis` at `http://127.0.0.1:8088/v1`; :5500 is the internal router endpoint.
+`mantis` at `http://127.0.0.1:8088/v1`; :5500 is the internal gateway endpoint.
 A non-loopback bind requires an externally supplied `ROUTELLM_KEY` (a
 legacy-compatible variable name) that is not the default. The
 launcher refuses to stop a port owner unless its recorded PID, working

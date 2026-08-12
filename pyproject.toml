@@ -102,21 +102,21 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"orchestrator/serve.py" = ["E402", "F403"]
-"orchestrator/conductor.py" = ["E402"]
-"orchestrator/providers.py" = ["E402"]
-"orchestrator/runs.py" = ["E402"]
-"orchestrator/serve_config.py" = ["E402"]
-"orchestrator/trinity.py" = ["E402"]
-"orchestrator/utils.py" = ["E402"]
+"apps/api/serve.py" = ["E402", "F403"]
+"apps/api/conductor.py" = ["E402"]
+"apps/api/providers.py" = ["E402"]
+"apps/api/runs.py" = ["E402"]
+"apps/api/serve_config.py" = ["E402"]
+"apps/api/trinity.py" = ["E402"]
+"apps/api/utils.py" = ["E402"]
 "scripts/retrain_router_pool.py" = ["E402"]
 "scripts/learn_router.py" = ["E402"]
 "scripts/retrain_conductor.py" = ["E402", "I001"]
-"orchestrator/mini.py" = ["ALL"]
-"orchestrator/ultra.py" = ["ALL"]
+"apps/api/mini.py" = ["ALL"]
+"apps/api/ultra.py" = ["ALL"]
 "scripts/toolscale_data.py" = ["ALL"]
 "tests/test_serve.py" = ["E501", "S310"]
-"orchestrator/api.py" = ["E501"]
+"apps/api/api.py" = ["E501"]
 "tests/test_retrain_router_pool.py" = ["E501"]
 "tests/test_retrain_conductor.py" = ["I001", "S105"]
 
@@ -138,11 +138,11 @@ exclude = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["scripts", "orchestrator", "OpenFugu/openfugu", "OpenFugu"]
-addopts = "--cov=scripts --cov=orchestrator --cov-report=term-missing --cov-report=xml --cov-fail-under=90"
+pythonpath = ["scripts", "apps/api", "OpenFugu/openfugu", "OpenFugu"]
+addopts = "--cov=scripts --cov=apps/api --cov-report=term-missing --cov-report=xml --cov-fail-under=90"
 
 [tool.coverage.run]
-source = ["scripts", "orchestrator"]
+source = ["scripts", "apps/api"]
 omit = [
     "*/tests/*",
     "OpenFugu/*",
@@ -151,8 +151,8 @@ omit = [
     "scripts/retrain_conductor.py",
     "scripts/verify.sh",
     "scripts/toolscale_data.py",
-    "orchestrator/mini.py",
-    "orchestrator/ultra.py",
+    "apps/api/mini.py",
+    "apps/api/ultra.py",
 ]
 
 [tool.coverage.report]

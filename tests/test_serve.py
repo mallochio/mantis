@@ -1,4 +1,4 @@
-"""Unit tests for orchestrator/serve.py."""
+"""Unit tests for apps/api/serve.py."""
 
 from __future__ import annotations
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Canonical launch script for the Mantis router.
+# Canonical launch script for the Mantis gateway.
 # Lives in ~/Startup/ so StartupFolder (https://github.com/FuzzyIdeas/StartupFolder)
 # runs it at login. It detaches the router, prints status, then exits.
 #
@@ -16,7 +16,7 @@ SELF="$0"
 while [ -L "$SELF" ]; do SELF="$(readlink "$SELF")"; done
 REPO_DIR="${LLM_ROUTER_DIR:-$(cd "$(dirname "$SELF")" && pwd)}"
 if [ ! -d "$REPO_DIR" ]; then
-  echo "ERROR: Mantis router directory not found: $REPO_DIR" >&2
+  echo "ERROR: Mantis gateway directory not found: $REPO_DIR" >&2
   exit 1
 fi
 cd "$REPO_DIR"
@@ -93,7 +93,7 @@ fi
 # If the router is already listening, stop it so we start a clean instance.
 # The router is owned here and restarted to pick up config/env changes.
 if lsof -nP -iTCP:"$ROUTELLM_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "router already running on :$ROUTELLM_PORT — stopping for restart"
+  echo "gateway already running on :$ROUTELLM_PORT — stopping for restart"
   # Refuse to kill a listener unless the recorded PID owns this port and its
   # command is this checkout's server. A stale PID file must fail closed.
   ROUTER_PID=""
@@ -122,7 +122,7 @@ if lsof -nP -iTCP:"$ROUTELLM_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
     sleep 0.1
   done
   rm -f "$ROUTER_LOG_DIR/server.pid"
-  echo "router stopped"
+  echo "gateway stopped"
 fi
 
 nohup python server.py </dev/null > "$ROUTER_LOG_DIR/server.out" 2> "$ROUTER_LOG_DIR/server.err" &
@@ -131,13 +131,13 @@ for _ in $(seq 1 600); do  # 60s — first boot downloads the Supra checkpoint
   if lsof -nP -iTCP:"$ROUTELLM_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
     if curl -fsS --max-time 2 "http://127.0.0.1:$ROUTELLM_PORT/healthz" 2>/dev/null | grep -q '"ready":true'; then
       ROUTER_PID=$(lsof -nP -iTCP:"$ROUTELLM_PORT" -sTCP:LISTEN -t 2>/dev/null | head -n1 || true)
-      echo "router running pid ${ROUTER_PID:-$(cat "$ROUTER_LOG_DIR/server.pid")} on :$ROUTELLM_PORT"
+      echo "gateway running pid ${ROUTER_PID:-$(cat "$ROUTER_LOG_DIR/server.pid")} on :$ROUTELLM_PORT"
       exit 0
     fi
   fi
   sleep 0.1
 done
 
-echo "ERROR: router not running on :$ROUTELLM_PORT — see $ROUTER_LOG_DIR/server.err" >&2
+echo "ERROR: gateway not running on :$ROUTELLM_PORT — see $ROUTER_LOG_DIR/server.err" >&2
 cat "$ROUTER_LOG_DIR/server.err" >&2 2>/dev/null || true
 exit 1
