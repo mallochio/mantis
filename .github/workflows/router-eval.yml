@@ -1,0 +1,35 @@
+name: Router evaluation (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      budget_usd:
+        description: "Measured cumulative budget ceiling in USD"
+        required: true
+        default: "250"
+      dry_run:
+        description: "Only resolve the manifest and print projected spend"
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  router-eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install uv
+        run: python -m pip install --upgrade uv
+      - name: Sync dependencies
+        run: uv sync --all-extras --locked
+      - name: Safe dry-run projection
+        if: inputs.dry_run
+        run: uv run python eval/router_eval.py --budget-usd "${{ inputs.budget_usd }}" --dry-run
+      - name: Explicit evaluation run
+        if: ${{ !inputs.dry_run }}
+        run: uv run python eval/router_eval.py --budget-usd "${{ inputs.budget_usd }}"
