@@ -26,6 +26,7 @@ def _load_gate():
     assert len(mapping) == policy["complexity_levels"] == 5
     assert policy["invalid_complexity_target"] == server.SUPRA_INVALID_TARGET
     assert tuple(server.SUPRA_TARGETS) == tuple(mapping)
+    assert server._parse_supra_complexity("Domain: coding | Complexity: 3") == 3
     prompts = [
         {"instance_id": instance_id, "prompt": item["prompt"]}
         for instance_id, item in data["labels"].items()
@@ -54,7 +55,14 @@ def test_routing_quality_gate_uses_placeholder_labels_and_real_mapping(monkeypat
     monkeypatch.setattr(
         server, "SUPRA_TARGETS", ("cheap", "cheap", "middle", "middle", "expensive")
     )
-    monkeypatch.setattr(server, "_supra_complexity", lambda prompt: (int(prompt[-1]), 0))
+    monkeypatch.setattr(
+        server,
+        "_supra_complexity",
+        lambda prompt: (
+            server._parse_supra_complexity(f"Complexity: {prompt[-1]}"),
+            0,
+        ),
+    )
     status, accuracy = _load_gate()
     assert status == "placeholder-synthetic"
     assert accuracy == 1.0
