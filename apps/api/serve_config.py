@@ -80,8 +80,8 @@ MAX_TOOL_ROUNDS = int(os.environ.get("MANTIS_MAX_TOOL_ROUNDS_PER_STEP", "8"))
 MAX_RUNS = int(os.environ.get("MANTIS_MAX_CONCURRENT_RUNS", "32"))
 RUN_MAX_MSG_BYTES = 400_000
 RUN_STORE = os.environ.get("MANTIS_RUN_STORE", "memory").lower()
-if RUN_STORE not in {"memory", "redis"}:
-    raise ValueError("MANTIS_RUN_STORE must be memory or redis")
+if RUN_STORE not in {"memory", "redis", "file"}:
+    raise ValueError("MANTIS_RUN_STORE must be memory, redis, or file")
 REDIS_URL = os.environ.get("MANTIS_REDIS_URL", "")
 _REDIS_PREFIX = os.environ.get("MANTIS_REDIS_PREFIX", "mantis:run:")
 REDIS_LOCK_TIMEOUT = max(300, int(WORKER_TIMEOUT * MAX_TURNS + 60))

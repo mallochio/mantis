@@ -63,6 +63,8 @@ fi
 [[ -f "${MANTIS_HEAD:-}" ]] || export MANTIS_HEAD="$REPO_ROOT/artifacts/router_head.safetensors"
 export MANTIS_HOST="${MANTIS_HOST:-127.0.0.1}"
 export MANTIS_PORT="${MANTIS_PORT:-8088}"
+# Persist orchestration runs on disk so an API restart does not lose in-flight runs.
+export MANTIS_RUN_STORE="${MANTIS_RUN_STORE:-file}"
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 echo "[mantis] host=$MANTIS_HOST port=$MANTIS_PORT device=$MANTIS_CONDUCTOR_DEVICE"

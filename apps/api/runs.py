@@ -184,6 +184,60 @@ def _redis_put(run: NativeRun) -> None:
     client.expire(_redis_index_key(), max(1, int(serve_config.RUN_TTL)))
 
 
+# ---- local file store (MANTIS_RUN_STORE=file) --------------------------------
+# One pickle per run under the data dir: no daemon, restart-survivable. The API
+# is deployed as a single process, so an in-memory lock per run_id is enough.
+_FILE_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _run_dir() -> Path:
+    path = Path(os.path.expanduser(os.environ.get("MANTIS_RUN_DIR", "~/.local/share/mantis/runs")))
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return path
+
+
+def _file_path(run_id: str) -> Path:
+    return _run_dir() / f"{run_id}.pkl"
+
+
+def _file_get(run_id: str) -> NativeRun | None:
+    try:
+        raw = _file_path(run_id).read_bytes()
+    except OSError:
+        return None
+    run: NativeRun = pickle.loads(raw)  # noqa: S301 - local, owner-only store
+    run.in_flight = 0  # a process restart voids any prior in-flight mark
+    return run
+
+
+def _file_put(run: NativeRun) -> None:
+    path = _file_path(run.run_id)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_bytes(pickle.dumps(run, protocol=pickle.HIGHEST_PROTOCOL))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def _file_ids() -> list[str]:
+    return [p.stem for p in _run_dir().glob("*.pkl")]
+
+
+def _file_del(run_id: str) -> None:
+    _file_path(run_id).unlink(missing_ok=True)
+
+
+@contextmanager
+def _file_run_lock(run_id: str):
+    lock = _FILE_LOCKS.setdefault(run_id, threading.Lock())
+    acquired = lock.acquire(timeout=REDIS_LOCK_TIMEOUT)
+    if not acquired:
+        raise providers.RunCapacityError("Mantis run is busy")
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 @contextmanager
 def _redis_run_lock(run_id: str):
     lock = _redis().lock(f"{_REDIS_PREFIX}lock:{run_id}", timeout=REDIS_LOCK_TIMEOUT)
@@ -218,9 +272,9 @@ def _record_abandoned(run: NativeRun | None) -> None:
 
 
 def _sweep_runs() -> None:
+    now = time.time()
     if RUN_STORE == "redis":
         client = _redis()
-        now = time.time()
         for raw_id in client.smembers(_redis_index_key()):
             run_id = raw_id.decode() if isinstance(raw_id, bytes) else str(raw_id)
             run = _redis_get(run_id)
@@ -231,6 +285,17 @@ def _sweep_runs() -> None:
                 _record_abandoned(run)
                 client.delete(_redis_key(run_id))
                 client.srem(_redis_index_key(), run_id)
+        return
+    if RUN_STORE == "file":
+        for run_id in _file_ids():
+            run = _file_get(run_id)
+            if run is None:
+                _file_del(run_id)
+                continue
+            if run.in_flight == 0 and now - run.last_active > serve_config.RUN_TTL:
+                _record_abandoned(run)
+                _file_del(run_id)
+                run.close()
         return
     now = time.time()
     stale = [
@@ -270,6 +335,16 @@ def _register_run(run: NativeRun) -> str:
             if client.scard(_redis_index_key()) >= MAX_RUNS:
                 raise providers.RunCapacityError("Mantis tool-run capacity is full")
             _redis_put(run)
+        return cast(str, run.run_id)
+    if RUN_STORE == "file":
+        _ensure_runs_sweeper()
+        if _file_get(run.run_id) is not None:
+            raise ValueError("run id already exists")
+        if len(_file_ids()) >= MAX_RUNS:
+            _sweep_runs()
+        if len(_file_ids()) >= MAX_RUNS:
+            raise providers.RunCapacityError("Mantis tool-run capacity is full")
+        _file_put(run)
         return cast(str, run.run_id)
     with serve_config._runs_lock:
         _ensure_runs_sweeper()
@@ -1183,19 +1258,32 @@ def create_run(mode: str, body: dict[str, Any]) -> NativeRun:
 
 
 def get_run(run_id: str) -> NativeRun:
-    run = _redis_get(run_id) if RUN_STORE == "redis" else serve_config._runs.get(run_id)
+    if RUN_STORE == "redis":
+        run = _redis_get(run_id)
+    elif RUN_STORE == "file":
+        run = _file_get(run_id)
+    else:
+        run = serve_config._runs.get(run_id)
     if run is None:
         raise KeyError(f"unknown or expired run: {run_id}")
     return run
 
 
 def advance_run(run_id: str, tool_results: Any, request_id: Any = None) -> dict[str, Any]:
-    lock = _redis_run_lock(run_id) if RUN_STORE == "redis" else nullcontext()
+    lock: Any
+    if RUN_STORE == "redis":
+        lock = _redis_run_lock(run_id)
+    elif RUN_STORE == "file":
+        lock = _file_run_lock(run_id)
+    else:
+        lock = nullcontext()
     with lock:
         run = get_run(run_id)
         run.in_flight += 1
         if RUN_STORE == "redis":
             _redis_put(run)
+        elif RUN_STORE == "file":
+            _file_put(run)
         try:
             serve_config._history_context.active_run = run
             event = run.advance_idempotent(tool_results, request_id)
@@ -1208,6 +1296,8 @@ def advance_run(run_id: str, tool_results: Any, request_id: Any = None) -> dict[
             run.touch()
             if RUN_STORE == "redis":
                 _redis_put(run)
+            elif RUN_STORE == "file":
+                _file_put(run)
 
 
 def delete_run(run_id: str, error: str | None = None) -> bool:
@@ -1218,6 +1308,12 @@ def delete_run(run_id: str, error: str | None = None) -> bool:
                 return False
             _redis().delete(_redis_key(run_id))
             _redis().srem(_redis_index_key(), run_id)
+    elif RUN_STORE == "file":
+        with _file_run_lock(run_id):
+            run = _file_get(run_id)
+            if run is None:
+                return False
+            _file_del(run_id)
     else:
         with serve_config._runs_lock:
             run = serve_config._runs.pop(run_id, None)

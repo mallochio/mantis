@@ -256,9 +256,9 @@ def _advance(request: ChatRequest, body: dict[str, Any]) -> tuple[Any, str, dict
         raise
     if event.get("type") == "error":
         raise RuntimeError(str(event.get("error", "orchestration failed")))
-    # Redis-backed stores deserialize a fresh run object on every advance.
+    # External stores deserialize a fresh run object on every advance.
     # Reload so response metadata and aggregate usage come from the updated state.
-    if serve.RUN_STORE == "redis":
+    if serve.RUN_STORE != "memory":
         run = serve.get_run(run_id)
     return run, run_id, event
 
