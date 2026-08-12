@@ -155,3 +155,11 @@ llm-router/
 # Local Bifrost configuration contains the gateway encryption key. Track the
 # shared catalog only; keep this local file outside the repository.
 config/bifrost.json
+
+# Generated / runtime — do not commit
+coverage.xml
+mantis.log
+model_iter_60.npy
+routing_catalog/build/
+routing_catalog/*.egg-info/
+mantis.egg-info/

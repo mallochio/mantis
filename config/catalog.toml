@@ -61,7 +61,7 @@ slot_order = [
 ]
 conductor = "gpt-5_6-luna"
 conductor_model = "bifrost/google/gemini-3.5-flash-lite"
-trained_slot_contract = "ca34e7ade7e3f4ef86f5180b56bf1689c5f12462d0be69b3eb61ee9b36dbe525"
+trained_slot_contract = "52eac89b5e96f1bf64b2bd83af4d8fbc649ddaaf162f4cabf9504aa93b6ae4cf"
 
 [mantis.workers.gemini-3_6-flash]
 provider = "bifrost"
