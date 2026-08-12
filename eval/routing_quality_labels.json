@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "provenance": {
+    "status": "placeholder-synthetic",
+    "dataset": "nebius/SWE-rebench-leaderboard",
+    "dataset_revision": "34d5a58864acf91613740a09ec5d205228dcfa39",
+    "run_id": "not-run",
+    "date": "2026-08-12",
+    "arms_used": [
+      "cheap-only",
+      "middle-only",
+      "expensive-only"
+    ],
+    "note": "Replace labels and provenance with an authorized graded W2 run; this file is not measured evidence."
+  },
+  "routing_policy": {
+    "complexity_targets": [
+      "cheap",
+      "cheap",
+      "middle",
+      "middle",
+      "expensive"
+    ],
+    "invalid_complexity_target": "expensive",
+    "complexity_levels": 5,
+    "mapping_fingerprint": "34d1db298e9100ff48897f574406650ef607e763ab947642715006675f50a626"
+  },
+  "thresholds": {
+    "accuracy_min": 1.0,
+    "under_routing_regret_max": 0.0
+  },
+  "labels": {
+    "p1": {
+      "prompt": "synthetic routing prompt complexity 1",
+      "complexity": 1,
+      "oracle_tier": "cheap"
+    },
+    "p2": {
+      "prompt": "synthetic routing prompt complexity 2",
+      "complexity": 2,
+      "oracle_tier": "cheap"
+    },
+    "p3": {
+      "prompt": "synthetic routing prompt complexity 3",
+      "complexity": 3,
+      "oracle_tier": "middle"
+    },
+    "p4": {
+      "prompt": "synthetic routing prompt complexity 4",
+      "complexity": 4,
+      "oracle_tier": "middle"
+    },
+    "p5": {
+      "prompt": "synthetic routing prompt complexity 5",
+      "complexity": 5,
+      "oracle_tier": "expensive"
+    }
+  }
+}
