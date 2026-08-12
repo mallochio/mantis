@@ -12,8 +12,13 @@ from typing import Any
 TIERS = ("cheap", "middle", "expensive")
 
 
-def _successful(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [row for row in rows if not row.get("error") and row.get("resolved", True)]
+def _completed(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [row for row in rows if not row.get("error")]
+
+
+def load_result_rows(path: Path) -> list[dict[str, Any]]:
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line]
+    return [row for row in rows if row.get("record_type") in {None, "result"} and "arm" in row]
 
 
 def oracle_labels(rows: list[dict[str, Any]]) -> dict[str, str | None]:
@@ -38,25 +43,27 @@ def oracle_labels(rows: list[dict[str, Any]]) -> dict[str, str | None]:
 def _arm_mean(rows: list[dict[str, Any]], key: str) -> float | None:
     values = [
         float(row.get(key, float(bool(row.get("resolved")))))
-        for row in _successful(rows)
+        for row in rows
         if row.get(key) is not None or key == "quality"
     ]
     return statistics.mean(values) if values else None
 
 
 def _cost_sum(rows: list[dict[str, Any]]) -> float | None:
-    costs = [row.get("cost_usd") for row in _successful(rows)]
+    costs = [row.get("cost_usd") for row in rows]
     if any(cost is None for cost in costs):
         return None
     return sum(float(cost or 0) for cost in costs)
 
 
 def _arm_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    valid = _successful(rows)
+    completed = _completed(rows)
+    resolved = [row for row in rows if row.get("resolved")]
     return {
         "total": len(rows),
-        "success": len(valid),
-        "errors": len(rows) - len(valid),
+        "completed": len(completed),
+        "resolved": len(resolved),
+        "errors": len(rows) - len(completed),
         "quality_mean": _arm_mean(rows, "quality"),
         "cost_usd": _cost_sum(rows),
     }
@@ -129,10 +136,14 @@ def compute_metrics(
     accuracy: dict[str, Any] = {}
     regrets: dict[str, Any] = {}
     for arm, arm_rows in by_arm.items():
-        arm_rows_by_instance = {row["instance_id"]: row for row in _successful(arm_rows)}
+        arm_rows_by_instance = {row["instance_id"]: row for row in _completed(arm_rows)}
         chosen = {
-            row["instance_id"]: row.get("chosen_tier") or row.get("tier")
-            for row in _successful(arm_rows)
+            row["instance_id"]: (
+                row.get("chosen_tier")
+                or row.get("tier")
+                or str(row["arm"]).removesuffix("-only")
+            )
+            for row in _completed(arm_rows)
         }
         comparable = [instance for instance in chosen if oracle.get(instance) is not None]
         correct = sum(chosen[i] == oracle[i] for i in comparable)
@@ -271,7 +282,7 @@ def main() -> None:
     parser.add_argument("results", type=Path)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    rows = [json.loads(line) for line in args.results.read_text().splitlines() if line]
+    rows = load_result_rows(args.results)
     output = json.dumps(compute_metrics(rows), indent=2, sort_keys=True) + "\n"
     if args.output:
         args.output.write_text(output)

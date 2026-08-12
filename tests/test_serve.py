@@ -1535,7 +1535,9 @@ def test_conductor_errors_visibility_and_state(monkeypatch):
     event = run._finalize_text("Planner", "bad", 0)
     assert event["type"] == "error" and "parseable" in event["error"]
     monkeypatch.setattr(serve, "parse_workflow", lambda _text: ([], [], []))
-    assert "malformed" in run._finalize_text("Planner", "bad", 0)["error"]
+    assert "invalid workflow" in run._finalize_text("Planner", "bad", 0)["error"]
+    monkeypatch.setattr(serve, "parse_workflow", lambda _text: ([1], ["task"], [[]]))
+    assert "out-of-range" in run._finalize_text("Planner", "bad", 0)["error"]
 
     run.close()
     assert run.advance(None)["error"] == "run cancelled"

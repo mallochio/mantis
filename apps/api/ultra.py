@@ -204,6 +204,11 @@ class ConductorExecutor:
                 model_ids[: self.max_steps],
                 access[: self.max_steps],
             )
+        for step, model_id in enumerate(model_ids):
+            if not isinstance(model_id, int) or isinstance(model_id, bool):
+                raise TypeError(f"step {step} has a non-integer model_id: {model_id!r}")
+            if not 0 <= model_id < len(self.slot_labels):
+                raise ValueError(f"step {step} has an out-of-range model_id: {model_id}")
         return model_ids, subtasks, access
 
     def execute(self, model_ids, subtasks, access, verbose=False) -> UltraResult:
@@ -227,7 +232,6 @@ class ConductorExecutor:
                 if ctx
                 else f"Your subtask: {sub}"
             )
-            mid = int(mid) % len(self.slot_labels)
             reply = self.worker(sub, [{"role": "user", "content": user}], mid)
             outputs.append(reply)
             res.steps.append(Step(t, mid, sub, sees, reply))

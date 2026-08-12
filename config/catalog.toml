@@ -5,7 +5,7 @@ adapter = "openai-compatible"
 base_url = "http://127.0.0.1:8080/v1"
 credential_env = "BIFROST_API_KEY"
 developer_role = "system"
-protocols = ["chat_completions"]
+protocols = ["chat_completions", "responses"]
 
 [providers.bifrost-anthropic]
 adapter = "anthropic"
@@ -22,8 +22,7 @@ provider = "bifrost"
 # deepseek-v4-flash (models.dev opencode/deepseek): ctx 1M, max output 384k
 max_tokens = 384000
 upstream_model = "deepseek-v4-flash"
-reasoning_effort = "xhigh"
-protocols = ["chat_completions"]
+protocols = ["chat_completions", "responses"]
 rank = 0
 
 [routellm.targets.middle]
@@ -31,17 +30,15 @@ provider = "bifrost"
 # gpt-5.6-terra (models.dev azure/openai): ctx 1.05M, max output 128k
 max_tokens = 128000
 upstream_model = "gpt-5.6-terra"
-reasoning_effort = "high"
-protocols = ["chat_completions"]
+protocols = ["chat_completions", "responses"]
 rank = 1
 
 [routellm.targets.expensive]
 provider = "bifrost"
-# gpt-5.6-sol (models.dev azure/openai): ctx 1.05M, max output 128k
+# claude-opus-5 (models.dev bedrock/anthropic): ctx 1M, max output 128k
 max_tokens = 128000
-upstream_model = "gpt-5.6-sol"
-reasoning_effort = "medium"
-protocols = ["chat_completions"]
+upstream_model = "bedrock/anthropic/claude-opus-5"
+protocols = ["chat_completions", "responses"]
 rank = 2
 
 [routellm.policies.coding]

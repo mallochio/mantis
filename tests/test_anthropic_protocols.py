@@ -38,6 +38,26 @@ def test_native_body_lifts_system_and_enables_thinking():
     assert body["tool_choice"] == {"type": "tool", "name": "read"}
 
 
+def test_native_body_preserves_images_and_scalar_tool_choices():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Inspect this."},
+                {"type": "image_url", "image_url": {"url": "https://image.test/example.png"}},
+            ],
+        }
+    ]
+
+    for choice, expected in (("auto", "auto"), ("required", "any"), ("none", "none")):
+        body = build_anthropic_body("claude", messages, 100, None, [], choice)
+        assert body["messages"][0]["content"] == [
+            {"type": "text", "text": "Inspect this."},
+            {"type": "image", "source": {"type": "url", "url": "https://image.test/example.png"}},
+        ]
+        assert body["tool_choice"] == {"type": expected}
+
+
 def test_signed_thinking_and_provider_tool_id_survive_tool_continuation():
     raw = [
         {"type": "thinking", "thinking": "check", "signature": "signed"},

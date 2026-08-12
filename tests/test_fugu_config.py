@@ -69,3 +69,7 @@ def test_ultra_offline_executor_and_validation():
     executor = ultra.ConductorExecutor(ultra.MockWorker())
     with pytest.raises(ValueError):
         executor.validate([0], [], [[]])
+    with pytest.raises(ValueError, match="out-of-range"):
+        executor.validate([7], ["task"], [[]])
+    with pytest.raises(TypeError, match="non-integer"):
+        executor.validate(["0"], ["task"], [[]])

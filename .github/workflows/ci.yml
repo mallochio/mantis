@@ -48,5 +48,5 @@ jobs:
         run: bash checks.sh
       - name: Report gateway coverage
         run: |
-          uv run coverage run --source=apps/gateway -m pytest apps/gateway/tests -q
-          uv run coverage report --include='apps/gateway/*'
+          uv run --directory apps/gateway coverage run --source=. -m pytest tests -q
+          uv run --directory apps/gateway coverage report --include='*'

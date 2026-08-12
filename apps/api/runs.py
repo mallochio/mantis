@@ -63,7 +63,7 @@ from serve_config import (
     RUN_MAX_MSG_BYTES,
     RUN_STORE,
 )
-from ultra import conductor_prompt, parse_workflow, visible_indices
+from ultra import ConductorExecutor, conductor_prompt, parse_workflow, visible_indices
 
 
 def _learning_enabled() -> bool:
@@ -1072,11 +1072,12 @@ class ConductorRun(NativeRun):
                     "error": f"Conductor did not emit a parseable workflow: {e}",
                 }
             mids, subs, access = self._workflow
-            if not subs or not (len(mids) == len(subs) == len(access)):
-                return {
-                    "type": "error",
-                    "error": "Conductor emitted an empty or malformed workflow",
-                }
+            try:
+                self._workflow = ConductorExecutor(
+                    lambda *_args: "", self.slot_models, self.max_steps
+                ).validate(mids, subs, access)
+            except (TypeError, ValueError) as exc:
+                return {"type": "error", "error": f"Conductor emitted an invalid workflow: {exc}"}
             self.steps.append(
                 {
                     "turn": seq,
@@ -1188,7 +1189,7 @@ class ConductorRun(NativeRun):
                     return self._final_conductor("max_steps")
                 node_index = self._next_node
                 self._next_node += 1
-                mid = int(mids[node_index]) % len(self.slot_models)
+                mid = mids[node_index]
                 model = self.slot_models[mid]
                 return self._run_model(
                     "Worker", model, self._node_messages(node_index, mid, subs[node_index])

@@ -397,7 +397,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             if resp.headers.get(key)
         }
         usage = _usage_from_response(resp)
-        cost, method = usage_cost(usage, proxy.model, proxy.prices)
+        billed_model = route.get("x-route-model", proxy.model)
+        cost, method = usage_cost(usage, billed_model, proxy.prices)
         with proxy.lock:
             proxy.records.append(
                 {"route_headers": route, "usage": usage, "cost": cost,
@@ -458,7 +459,14 @@ class _RouteRecordingProxy:
             ("127.0.0.1", 0), functools.partial(_ProxyHandler, proxy=self)
         )
         self.port = self._server.server_port
-        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def __enter__(self) -> _RouteRecordingProxy:
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self.close()
 
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self.port}/v1"
@@ -466,6 +474,7 @@ class _RouteRecordingProxy:
     def close(self) -> None:
         self._server.shutdown()
         self._server.server_close()
+        self._thread.join()
 
 
 def _render_provider_extension(
@@ -742,6 +751,8 @@ def main() -> None:
         parser.error(f"unknown arms: {sorted(set(arms) - set(ARMS))}")
     if "random-matched" in arms and "mantis-direct" not in arms:
         parser.error("random-matched requires mantis-direct for its observed distribution")
+    if "mantis-direct" not in arms and "random-matched" not in arms:
+        parser.error("a router evaluation requires mantis-direct")
     caps = {arm: DEFAULT_CAPS[arm] for arm in arms}
     if args.per_instance_cost is not None:
         caps = dict.fromkeys(arms, args.per_instance_cost)
@@ -772,7 +783,7 @@ def main() -> None:
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w") as output:
-        output.write(json.dumps({"metadata": metadata}) + "\n")
+        output.write(json.dumps({"record_type": "metadata", "metadata": metadata}) + "\n")
         instances = manifest["instances"]
         direct_rows: dict[str, dict[str, Any]] = {}
         for instance in instances:
@@ -788,7 +799,7 @@ def main() -> None:
                 worktrees_root=args.worktrees_root, pi_executable=pi_executable,
                 keep_worktrees=args.keep_worktrees,
             )
-            output.write(json.dumps(row) + "\n")
+            output.write(json.dumps({"record_type": "result", **row}) + "\n")
             output.flush()
             if row.get("abort_scope") == "instance_arm":
                 metadata["excluded_instances"].append(instance["instance_id"])
@@ -828,7 +839,7 @@ def main() -> None:
                         keep_worktrees=args.keep_worktrees,
                     )
                     rows.append(row)
-                    output.write(json.dumps(row) + "\n")
+                    output.write(json.dumps({"record_type": "result", **row}) + "\n")
                     output.flush()
                     if row.get("abort_scope") == "instance_arm":
                         metadata["excluded_instances"].append(instance_id)
@@ -838,7 +849,8 @@ def main() -> None:
                         break
                 if metadata["aborted_on_budget"]:
                     break
-        output.write(json.dumps({"metadata": {**metadata, "spent_usd": ledger.total}}) + "\n")
+        final_metadata = {**metadata, "spent_usd": ledger.total}
+        output.write(json.dumps({"record_type": "metadata", "metadata": final_metadata}) + "\n")
     print(json.dumps({**metadata, "spent_usd": ledger.total}, indent=2))
 
 

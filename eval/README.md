@@ -37,7 +37,9 @@ installed and on `PATH`.
 per-instance ceilings are enforced by the recording proxy before every model
 request; an aborted instance is not emitted, so output remains a complete
 prefix with all arms present. Budget exhaustion preserves prior JSONL output
-and writes `aborted_on_budget: true`. `--dry-run` makes no model calls and
+and writes `aborted_on_budget: true`. JSONL records are explicitly tagged as
+`metadata` or `result`; `route_metrics.py` analyzes all result attempts, while
+reporting completed, resolved, and error counts separately. `--dry-run` makes no model calls and
 reports worst-case per-instance-cap spend:
 
 ```text

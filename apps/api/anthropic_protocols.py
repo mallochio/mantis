@@ -9,9 +9,20 @@ _VERSION = "2023-06-01"
 
 
 def _text(content: Any) -> list[dict[str, Any]]:
-    if isinstance(content, list):
-        return [part for part in content if isinstance(part, dict) and part.get("type") == "text"]
-    return [{"type": "text", "text": str(content or "")}]
+    if not isinstance(content, list):
+        return [{"type": "text", "text": str(content or "")}]
+    blocks: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "text":
+            blocks.append({"type": "text", "text": str(part.get("text", ""))})
+        elif part.get("type") == "image_url":
+            image = part.get("image_url") or {}
+            url = image.get("url") if isinstance(image, dict) else None
+            if isinstance(url, str) and url:
+                blocks.append({"type": "image", "source": {"type": "url", "url": url}})
+    return blocks
 
 
 def _tool_blocks(message: dict[str, Any]) -> list[dict[str, Any]]:
@@ -129,7 +140,13 @@ def build_anthropic_body(
     native_tools = _tools(tools)
     if native_tools:
         body["tools"] = native_tools
-    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+    if tool_choice == "auto":
+        body["tool_choice"] = {"type": "auto"}
+    elif tool_choice == "required":
+        body["tool_choice"] = {"type": "any"}
+    elif tool_choice == "none":
+        body["tool_choice"] = {"type": "none"}
+    elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
         function = tool_choice.get("function") or {}
         body["tool_choice"] = {"type": "tool", "name": function.get("name")}
     return body

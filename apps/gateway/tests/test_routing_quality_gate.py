@@ -16,7 +16,7 @@ _SPEC.loader.exec_module(_MODULE)
 replay_complexity = _MODULE.replay_complexity
 
 
-def _load_gate():
+def _load_policy_contract():
     data = json.loads(LABELS.read_text())
     assert data["provenance"]["status"] == "placeholder-synthetic"
     policy = data["routing_policy"]
@@ -46,11 +46,11 @@ def _load_gate():
         "under_routing_regret_max"
     ]
     status = data["provenance"]["status"]
-    print(f"routing quality gate labels={status} accuracy={accuracy:.3f}")
+    print(f"routing policy contract labels={status} accuracy={accuracy:.3f}")
     return status, accuracy
 
 
-def test_routing_quality_gate_uses_placeholder_labels_and_real_mapping(monkeypatch):
+def test_routing_policy_contract_uses_placeholder_labels_and_real_mapping(monkeypatch):
     monkeypatch.setattr(server, "_TARGETS_ARE_EXPLICIT", True)
     monkeypatch.setattr(
         server, "SUPRA_TARGETS", ("cheap", "cheap", "middle", "middle", "expensive")
@@ -63,14 +63,14 @@ def test_routing_quality_gate_uses_placeholder_labels_and_real_mapping(monkeypat
             0,
         ),
     )
-    status, accuracy = _load_gate()
+    status, accuracy = _load_policy_contract()
     assert status == "placeholder-synthetic"
     assert accuracy == 1.0
 
 
-def test_routing_quality_gate_fails_on_mapping_perturbation(monkeypatch):
+def test_routing_policy_contract_fails_on_mapping_perturbation(monkeypatch):
     monkeypatch.setattr(
         server, "SUPRA_TARGETS", ("cheap", "middle", "middle", "middle", "expensive")
     )
     with pytest.raises(AssertionError):
-        _load_gate()
+        _load_policy_contract()
