@@ -1,21 +1,39 @@
-"""Budgeted SWE-rebench router evaluation using mini-SWE-agent and Docker."""
+"""Budgeted SWE-rebench router evaluation using pi (headless) and Docker.
+
+The agent driving each instance is `pi` in headless mode (`--mode json`,
+`-p`). pi is pointed at a local header-recording proxy that forwards chat
+completions to Bifrost / the Mantis gateway; the proxy records `x-route-*`
+response headers, per-request usage, and enforces the arm/global budget
+ceiling by refusing to forward requests once a cap is reached.
+
+The model endpoints are OpenAI-compatible (Bifrost `:8080`, Mantis `:8088`),
+so no litellm or mini-swe-agent dependency is involved.
+"""
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import functools
 import hashlib
 import json
+import os
 import random
 import secrets
 import shlex
 import subprocess
 import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, cast
+
+import requests
 
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_MANIFEST = REPO / "eval" / "router_manifest.json"
 DEFAULT_PRICES = REPO / "eval" / "model_prices.json"
+DEFAULT_WORKTREES = REPO / "eval" / "runs" / "worktrees"
 TIERS = ("cheap", "middle", "expensive")
 ARMS = (
     "cheap-only", "middle-only", "expensive-only", "mantis-direct",
@@ -26,6 +44,11 @@ DEFAULT_CAPS = {
     "mantis-direct": 0.80, "heuristic": 0.80, "random-matched": 0.80,
     "trinity": 1.50,
 }
+ROUTE_HEADER_KEYS = (
+    "x-route-decision", "x-route-reason", "x-route-model",
+    "x-route-sticky", "x-route-fallback",
+)
+PI_TOOLS = "read,bash,edit,write"
 
 
 class BudgetAbort(RuntimeError):
@@ -43,17 +66,21 @@ class CostLedger:
         self.total = 0.0
         self.pair_costs: dict[tuple[str, str], float] = {}
         self.aborted = False
+        self._lock = threading.Lock()
 
     def before_request(self, instance_id: str, arm: str, cap: float) -> None:
-        pair = self.pair_costs.get((instance_id, arm), 0.0)
-        if self.total >= self.total_limit:
-            self.aborted = True
-            raise BudgetAbort("budget ceiling reached before model request")
-        if pair >= cap:
-            raise ArmBudgetExceeded(f"per-arm cap reached for {instance_id}/{arm}")
+        with self._lock:
+            pair = self.pair_costs.get((instance_id, arm), 0.0)
+            if self.total >= self.total_limit:
+                self.aborted = True
+                raise BudgetAbort("budget ceiling reached before model request")
+            if pair >= cap:
+                raise ArmBudgetExceeded(f"per-arm cap reached for {instance_id}/{arm}")
 
     def record(self, instance_id: str, arm: str, cost: float | None, cap: float) -> None:
-        if cost is not None:
+        if cost is None:
+            return
+        with self._lock:
             self.total += cost
             key = (instance_id, arm)
             self.pair_costs[key] = self.pair_costs.get(key, 0.0) + cost
@@ -64,7 +91,8 @@ class CostLedger:
                 raise ArmBudgetExceeded(f"per-arm cap reached for {instance_id}/{arm}")
 
     def pair_cost(self, instance_id: str, arm: str) -> float:
-        return self.pair_costs.get((instance_id, arm), 0.0)
+        with self._lock:
+            return self.pair_costs.get((instance_id, arm), 0.0)
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -246,16 +274,268 @@ def grade_patch(instance: dict[str, Any], patch: str) -> dict[str, Any]:
     }
 
 
-def _route_headers(response: Any) -> dict[str, str]:
-    headers = getattr(response, "_response_headers", None) or {}
-    wanted = (
-        "x-route-decision", "x-route-reason", "x-route-model",
-        "x-route-sticky", "x-route-fallback",
+def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True
     )
-    return {key: str(headers[key]) for key in wanted if key in headers}
 
 
-def run_mini_agent(
+def _ensure_worktree(instance: dict[str, Any], root: Path) -> tuple[Path, Path | None, bool]:
+    """Materialize the instance's repo at base_commit as a host worktree.
+
+    Returns (worktree_path, cache_repo, created). A pre-existing worktree (as
+    tests provide) is reused; otherwise the repo is cloned (blob-less) into a
+    cache and a detached worktree is added at the base commit.
+    """
+    repo = instance["repo"]
+    commit = instance["base_commit"]
+    instance_id = instance["instance_id"]
+    workdir = root / instance_id
+    if workdir.exists():
+        _git("checkout", "--force", commit, cwd=workdir)
+        _git("reset", "--hard", commit, cwd=workdir)
+        return workdir, None, False
+    cache = root / "cache" / repo.replace("/", "__")
+    if not (cache / ".git").is_dir():
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "clone", "--filter=blob:none", "--no-checkout",
+             f"https://github.com/{repo}.git", str(cache)],
+            capture_output=True, text=True, check=True,
+        )
+    else:
+        _git("-C", str(cache), "fetch", "origin")
+    workdir.parent.mkdir(parents=True, exist_ok=True)
+    _git("-C", str(cache), "worktree", "add", "--detach", str(workdir), commit)
+    return workdir, cache, True
+
+
+def _remove_worktree(workdir: Path, cache: Path) -> None:
+    _git("-C", str(cache), "worktree", "remove", "--force", str(workdir))
+    _git("-C", str(cache), "worktree", "prune")
+
+
+def _worktree_patch(workdir: Path) -> str:
+    _git("add", "-A", cwd=workdir)
+    return _git("diff", "HEAD", cwd=workdir).stdout
+
+
+def _usage_from_sse(text: str) -> dict[str, Any]:
+    """Pull the last `usage` object from an OpenAI-style SSE stream."""
+    usage: dict[str, Any] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            continue
+        with contextlib.suppress(ValueError):
+            event = json.loads(payload)
+            if isinstance(event, dict) and event.get("usage"):
+                usage = event["usage"]
+    return usage
+
+
+def _usage_from_response(resp: requests.Response) -> dict[str, Any]:
+    if "text/event-stream" in resp.headers.get("Content-Type", ""):
+        return _usage_from_sse(resp.text)
+    with contextlib.suppress(ValueError):
+        return resp.json().get("usage", {}) or {}
+    return {}
+
+
+class _ProxyHandler(BaseHTTPRequestHandler):
+    """Forward chat completions to the upstream while recording route headers
+    and enforcing the arm/global budget ceiling."""
+
+    protocol_version = "HTTP/1.1"
+
+    def __init__(self, *args: Any, proxy: _RouteRecordingProxy, **kwargs: Any) -> None:
+        self.proxy = proxy
+        super().__init__(*args, **kwargs)
+
+    def log_message(self, *_args: Any) -> None:
+        pass
+
+    def do_GET(self) -> None:
+        self._error(404, "eval proxy only forwards chat completions")
+
+    def do_POST(self) -> None:
+        proxy = self.proxy
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+        try:
+            with proxy.lock:
+                proxy.ledger.before_request(proxy.instance_id, proxy.arm, proxy.cap)
+        except ArmBudgetExceeded as exc:
+            with proxy.lock:
+                proxy.exceeded = True
+            self._error(429, str(exc))
+            return
+        except BudgetAbort as exc:
+            with proxy.lock:
+                proxy.aborted = True
+            self._error(429, str(exc))
+            return
+        headers = {"Content-Type": "application/json"}
+        if proxy.api_key:
+            headers["Authorization"] = f"Bearer {proxy.api_key}"
+        session = self.headers.get("X-Route-Session") or proxy.session
+        if session:
+            headers["X-Route-Session"] = session
+        url = proxy.upstream
+        try:
+            resp = requests.post(url, data=body, headers=headers, timeout=300)
+        except requests.RequestException as exc:
+            self._error(502, f"{type(exc).__name__}: {exc}")
+            return
+        payload = resp.content
+        route = {
+            key: resp.headers[key]
+            for key in ROUTE_HEADER_KEYS
+            if resp.headers.get(key)
+        }
+        usage = _usage_from_response(resp)
+        cost, method = usage_cost(usage, proxy.model, proxy.prices)
+        with proxy.lock:
+            proxy.records.append(
+                {"route_headers": route, "usage": usage, "cost": cost,
+                 "cost_method": method}
+            )
+            try:
+                proxy.ledger.record(proxy.instance_id, proxy.arm, cost, proxy.cap)
+            except ArmBudgetExceeded:
+                proxy.exceeded = True
+            except BudgetAbort:
+                proxy.aborted = True
+        self.send_response(resp.status_code)
+        self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
+        for key in ROUTE_HEADER_KEYS:
+            if resp.headers.get(key):
+                self.send_header(key, resp.headers[key])
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _error(self, code: int, message: str) -> None:
+        body = json.dumps({"error": {"message": message, "type": "eval_budget"}}).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class _RouteRecordingProxy:
+    def __init__(
+        self,
+        *,
+        upstream: str,
+        api_key: str | None,
+        ledger: CostLedger,
+        instance_id: str,
+        arm: str,
+        cap: float,
+        prices: dict[str, dict[str, float]],
+        model: str,
+        session: str,
+    ) -> None:
+        self.upstream = upstream
+        self.api_key = api_key
+        self.ledger = ledger
+        self.instance_id = instance_id
+        self.arm = arm
+        self.cap = cap
+        self.prices = prices
+        self.model = model
+        self.session = session
+        self.records: list[dict[str, Any]] = []
+        self.exceeded = False
+        self.aborted = False
+        self.lock = threading.Lock()
+        self._server = ThreadingHTTPServer(
+            ("127.0.0.1", 0), functools.partial(_ProxyHandler, proxy=self)
+        )
+        self.port = self._server.server_port
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/v1"
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+def _render_provider_extension(
+    models: list[str], base_url: str, api_key: str, session: str,
+    max_tokens: int, out_path: Path,
+) -> None:
+    """Write a pi extension registering an `eval` provider pointed at the proxy."""
+    lines = [
+        'import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";',
+        "export default function (pi: ExtensionAPI) {",
+        '  pi.registerProvider("eval", {',
+        '    name: "Mantis eval gateway",',
+        f'    baseUrl: "{base_url}",',
+        f'    apiKey: "{api_key}",',
+        '    api: "openai-completions",',
+        f'    headers: {{ "X-Route-Session": "{session}" }},',
+        "    models: [",
+    ]
+    for model in models:
+        lines += [
+            "      {",
+            f'        id: "{model}",',
+            f'        name: "{model}",',
+            "        reasoning: false,",
+            '        input: ["text"],',
+            "        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },",
+            "        contextWindow: 262144,",
+            f"        maxTokens: {max_tokens},",
+            "      },",
+        ]
+    lines += ["    ],", "  });", "}"]
+    out_path.write_text("\n".join(lines) + "\n")
+    out_path.chmod(0o600)
+
+
+def _parse_pi_events(stdout: str) -> list[dict[str, Any]]:
+    """Extract a compact trajectory from pi's `--mode json` event stream."""
+    trajectory: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        event_type = event.get("type")
+        if event_type == "message_end":
+            message = event.get("message", {})
+            if message.get("role") == "assistant":
+                trajectory.append(
+                    {
+                        "role": "assistant",
+                        "content": message.get("content"),
+                        "usage": message.get("usage"),
+                        "stop_reason": message.get("stopReason"),
+                    }
+                )
+        elif event_type == "tool_execution_end":
+            trajectory.append(
+                {
+                    "tool": event.get("toolName"),
+                    "args": event.get("args"),
+                    "result": event.get("result"),
+                    "is_error": event.get("isError"),
+                }
+            )
+    return trajectory
+
+
+def run_pi_agent(
     instance: dict[str, Any],
     *,
     arm: str,
@@ -265,137 +545,120 @@ def run_mini_agent(
     ledger: CostLedger,
     arm_cap: float,
     rng: random.Random,
-    step_limit: int,
+    timeout: int,
     output_token_limit: int,
     frequencies: dict[str, float],
+    worktrees_root: Path | None = None,
+    pi_executable: tuple[str, ...] = ("pi",),
+    keep_worktrees: bool = False,
 ) -> dict[str, Any]:
-    """Drive mini-SWE-agent in the instance image, then grade its submission."""
-    try:
-        import litellm
-        from minisweagent.agents import get_agent
-        from minisweagent.config import builtin_config_dir, get_config_from_spec
-        from minisweagent.environments import get_environment
-        from minisweagent.models import get_model
-        from minisweagent.utils.serialize import recursive_merge
-    except ImportError as exc:
-        raise RuntimeError("install the eval extra to run mini-SWE-agent") from exc
+    """Drive `pi` headless in a host worktree, then grade its patch.
 
+    pi is pointed at a local proxy that forwards to `endpoint` (Bifrost or the
+    Mantis gateway), records `x-route-*` headers and usage, and stops
+    forwarding once the arm cap or global budget is reached.
+    """
+    root = worktrees_root or DEFAULT_WORKTREES
+    instance_id = instance["instance_id"]
     model_name, selected_tier = _model_for_arm(
         arm, instance["problem_statement"], tier_models, rng, frequencies
     )
     session = f"router-eval-{secrets.token_hex(8)}"
-    config = recursive_merge(
-        get_config_from_spec(builtin_config_dir / "benchmarks" / "swebench.yaml"),
-        {
-            "model": {
-                "model_class": "litellm",
-                "model_name": model_name,
-                "model_kwargs": {
-                    "custom_llm_provider": "openai",
-                    "api_base": endpoint.removesuffix("/chat/completions"),
-                    "max_tokens": output_token_limit,
-                    "extra_headers": {"X-Route-Session": session},
-                },
-                "cost_tracking": "ignore_errors",
-            },
-            "agent": {
-                "mode": "yolo", "step_limit": step_limit,
-                "cost_limit": 0, "confirm_exit": False,
-            },
-            "environment": {
-                "environment_class": "docker",
-                "image": instance["docker_image"], "cwd": "/testbed",
-            },
-        },
+    api_key = os.environ.get("BIFROST_API_KEY") or os.environ.get("MANTIS_API_KEY")
+    proxy = _RouteRecordingProxy(
+        upstream=endpoint, api_key=api_key, ledger=ledger, instance_id=instance_id,
+        arm=arm, cap=arm_cap, prices=prices, model=model_name, session=session,
     )
-
-    class GuardedModel:
-        """Proxy mini-SWE-agent's model while enforcing request budgets."""
-
-        def __init__(self, wrapped: Any) -> None:
-            self.wrapped = wrapped
-            self.config = wrapped.config
-
-        def __getattr__(self, name: str) -> Any:
-            return getattr(self.wrapped, name)
-
-        def query(self, messages: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
-            ledger.before_request(instance["instance_id"], arm, arm_cap)
-            result = cast(dict[str, Any], self.wrapped.query(messages, **kwargs))
-            response = result.get("extra", {}).get("response", {})
-            usage = response.get("usage", {}) if isinstance(response, dict) else {}
-            cost, method = usage_cost(usage, model_name, prices)
-            ledger.record(instance["instance_id"], arm, cost, arm_cap)
-            result.setdefault("extra", {}).update(
-                {
-                    "measured_cost": cost,
-                    "cost_method": method,
-                    "route_headers": getattr(
-                        self.wrapped, "last_route_headers", _route_headers(response)
-                    ),
-                }
-            )
-            return result
-
-    env = get_environment(config["environment"])
-    raw_model = get_model(config=config["model"])
-    litellm.register_model(
-        {
-            model_name: {
-                "model_name": model_name,
-                "litellm_provider": "openai",
-                "mode": "chat",
-                "input_cost_per_token": 0.0,
-                "output_cost_per_token": 0.0,
-            }
-        }
-    )
-    if hasattr(raw_model, "_query"):
-        original_query = raw_model._query
-
-        def traced_query(messages: list[dict[str, Any]], **kwargs: Any) -> Any:
-            response = original_query(messages, **kwargs)
-            raw_model.last_route_headers = _route_headers(response)
-            return response
-
-        raw_model._query = traced_query
-    model = GuardedModel(raw_model)
-    agent = get_agent(model, env, config["agent"], default_type="interactive")
+    workdir, cache, created = _ensure_worktree(instance, root)
+    ext_path = Path(tempfile.mkdtemp(prefix="pi-eval-")) / "eval-provider.ts"
+    error: str | None = None
+    abort_scope: str | None = None
+    patch = ""
+    trajectory: list[dict[str, Any]] = []
     try:
-        info = agent.run(instance["problem_statement"])
-        patch = cast(str, info.get("submission", ""))
-        grade = grade_patch(instance, patch)
-        return {
-            "instance_id": instance["instance_id"], "arm": arm,
-            "tier": selected_tier, "resolved": grade["resolved"],
+        models = sorted(set(tier_models.values()) | {"mantis", "mantis-trinity"})
+        _render_provider_extension(
+            models, proxy.base_url(), api_key or "", session, output_token_limit,
+            ext_path,
+        )
+        cmd = [
+            *pi_executable,
+            "-e", str(ext_path),
+            "--provider", "eval",
+            "--model", f"eval/{model_name}",
+            "--mode", "json",
+            "--no-session",
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-context-files",
+            "--no-approve",
+            "--offline",
+            "--tools", PI_TOOLS,
+            "-p", instance["problem_statement"],
+        ]
+        result = subprocess.run(
+            cmd, cwd=str(workdir), capture_output=True, text=True, timeout=timeout,
+            env={**os.environ, "EVAL_PROXY_BASE_URL": proxy.base_url()},
+        )
+        trajectory = _parse_pi_events(result.stdout)
+        if result.returncode != 0:
+            error = f"pi exited {result.returncode}: {result.stderr.strip()[:200]}"
+        if proxy.exceeded:
+            abort_scope = "instance_arm"
+        if proxy.aborted or ledger.aborted:
+            abort_scope = "global"
+        if error is None and abort_scope is None:
+            patch = _worktree_patch(workdir)
+        grade = (
+            grade_patch(instance, patch)
+            if error is None and abort_scope is None
+            else None
+        )
+        row: dict[str, Any] = {
+            "instance_id": instance_id, "arm": arm,
+            "tier": selected_tier, "model": model_name,
+            "resolved": bool(grade and grade["resolved"]),
             "model_patch": patch,
-            "cost_usd": ledger.pair_cost(instance["instance_id"], arm),
-            "trajectory": cast(dict[str, Any], agent.serialize()),
-            "route_trace": [
-                message.get("extra", {})
-                for message in agent.messages
-                if message.get("extra", {}).get("route_headers") is not None
-            ],
-            "grader_output": grade["grader_output"],
+            "cost_usd": ledger.pair_cost(instance_id, arm),
+            "cost_method": proxy.records[-1]["cost_method"] if proxy.records else None,
+            "trajectory": trajectory,
+            "route_trace": proxy.records,
         }
-    except ArmBudgetExceeded as exc:
+        if grade is not None:
+            row["grader_output"] = grade["grader_output"]
+        if abort_scope is not None:
+            row["aborted"] = True
+            row["abort_scope"] = abort_scope
+            row["error"] = error or "budget ceiling reached"
+        if error is not None and abort_scope is None:
+            row["error"] = error
+    except subprocess.TimeoutExpired:
         return {
-            "instance_id": instance["instance_id"], "arm": arm,
-            "tier": selected_tier, "resolved": False, "aborted": True,
-            "abort_scope": "instance_arm", "error": str(exc),
-            "cost_usd": ledger.pair_cost(instance["instance_id"], arm),
-            "trajectory": cast(dict[str, Any], agent.serialize()),
+            "instance_id": instance_id, "arm": arm, "tier": selected_tier,
+            "model": model_name, "resolved": False, "model_patch": "",
+            "cost_usd": ledger.pair_cost(instance_id, arm),
+            "trajectory": trajectory, "route_trace": proxy.records,
+            "error": f"pi timed out after {timeout}s", "aborted": True,
+            "abort_scope": "timeout",
         }
-    except BudgetAbort as exc:
+    except Exception as exc:  # noqa: BLE001 - an eval run keeps going on failure
         return {
-            "instance_id": instance["instance_id"], "arm": arm,
-            "tier": selected_tier, "resolved": False,
-            "aborted": True, "abort_scope": "global", "error": str(exc),
-            "cost_usd": ledger.pair_cost(instance["instance_id"], arm),
-            "trajectory": cast(dict[str, Any], agent.serialize()),
+            "instance_id": instance_id, "arm": arm, "tier": selected_tier,
+            "model": model_name, "resolved": False, "model_patch": "",
+            "cost_usd": ledger.pair_cost(instance_id, arm),
+            "trajectory": trajectory, "route_trace": proxy.records,
+            "error": f"{type(exc).__name__}: {exc}",
         }
+    else:
+        return row
     finally:
-        env.cleanup()
+        proxy.close()
+        ext_path.unlink(missing_ok=True)
+        if created and not keep_worktrees and cache is not None:
+            with contextlib.suppress(subprocess.CalledProcessError):
+                _remove_worktree(workdir, cache)
 
 
 def projected_spend(instance_count: int, arms: list[str], caps: dict[str, float]) -> float:
@@ -442,7 +705,10 @@ def main() -> None:
         "--arm-cap", action="append", default=[],
         metavar="ARM=USD", help="override one arm's per-instance cap",
     )
-    parser.add_argument("--step-limit", type=int, default=50)
+    parser.add_argument(
+        "--timeout", type=int, default=600,
+        help="wall-clock seconds per (instance, arm) pi run",
+    )
     parser.add_argument("--output-token-limit", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
@@ -460,6 +726,12 @@ def main() -> None:
         "--tier-models",
         default="cheap=deepseek-v4-flash,middle=gpt-5.6-terra,expensive=gpt-5.6-sol",
     )
+    parser.add_argument(
+        "--worktrees-root", type=Path, default=DEFAULT_WORKTREES,
+        help="host worktree root for per-instance checkouts (gitignored)",
+    )
+    parser.add_argument("--keep-worktrees", action="store_true")
+    parser.add_argument("--pi-executable", default="pi")
     args = parser.parse_args()
     manifest = load_manifest(args.manifest)
     prices = load_prices(args.prices)
@@ -486,13 +758,16 @@ def main() -> None:
     rng = random.Random(args.seed)
     ledger = CostLedger(total_limit=args.budget_usd, arm_limit=max(caps.values()))
     frequencies = {tier: 1 / len(TIERS) for tier in TIERS}
+    pi_executable = tuple(args.pi_executable.split())
     metadata = {
         "manifest": str(args.manifest),
         "manifest_sha256": hashlib.sha256(args.manifest.read_bytes()).hexdigest(),
         "arms": arms, "caps": caps, "budget_usd": args.budget_usd,
         "per_arm_caps": caps,
-        "step_limit": args.step_limit,
+        "timeout": args.timeout,
         "output_token_limit": args.output_token_limit, "seed": args.seed,
+        "pi_executable": args.pi_executable,
+        "worktrees_root": str(args.worktrees_root),
         "aborted_on_budget": False, "excluded_instances": [],
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -504,12 +779,14 @@ def main() -> None:
             if ledger.total >= ledger.total_limit:
                 metadata["aborted_on_budget"] = True
                 break
-            row = run_mini_agent(
+            row = run_pi_agent(
                 instance, arm="mantis-direct", endpoint=args.mantis_endpoint,
                 tier_models=tier_models, prices=prices, ledger=ledger,
                 arm_cap=caps["mantis-direct"], rng=rng,
-                step_limit=args.step_limit, output_token_limit=args.output_token_limit,
+                timeout=args.timeout, output_token_limit=args.output_token_limit,
                 frequencies={tier: 1 / len(TIERS) for tier in TIERS},
+                worktrees_root=args.worktrees_root, pi_executable=pi_executable,
+                keep_worktrees=args.keep_worktrees,
             )
             output.write(json.dumps(row) + "\n")
             output.flush()
@@ -540,13 +817,15 @@ def main() -> None:
                         args.mantis_endpoint if arm == "trinity"
                         else args.bifrost_endpoint
                     )
-                    row = run_mini_agent(
+                    row = run_pi_agent(
                         instance, arm=arm, endpoint=endpoint,
                         tier_models=tier_models, prices=prices, ledger=ledger,
                         arm_cap=caps[arm],
-                        rng=rng, step_limit=args.step_limit,
+                        rng=rng, timeout=args.timeout,
                         output_token_limit=args.output_token_limit,
                         frequencies=frequencies,
+                        worktrees_root=args.worktrees_root, pi_executable=pi_executable,
+                        keep_worktrees=args.keep_worktrees,
                     )
                     rows.append(row)
                     output.write(json.dumps(row) + "\n")

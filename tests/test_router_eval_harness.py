@@ -2,12 +2,13 @@
 
 import importlib.util
 import json
+import subprocess
 import threading
-import types
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+import requests
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -21,61 +22,95 @@ def _load(name: str, path: Path):
 
 
 harness = _load("router_eval", ROOT / "eval" / "router_eval.py")
-metrics = _load("route_metrics", ROOT / "eval" / "route_metrics.py")
-miniswe = _load("miniswe_config", ROOT / "eval" / "miniswe_config.py")
 
 
-def _instance() -> dict:
-    return {
+def _instance(**overrides) -> dict:
+    inst = {
         "instance_id": "demo-1",
+        "repo": "demo/demo",
+        "base_commit": "HEAD",
         "problem_statement": "implement a parser",
         "docker_image": "demo:latest",
         "test_cmd": "pytest tests/test_demo.py",
         "FAIL_TO_PASS": ["tests/test_demo.py::test_fix"],
         "PASS_TO_PASS": ["tests/test_demo.py::test_existing"],
     }
+    inst.update(overrides)
+    return inst
 
 
-def _patch_modules(monkeypatch, *, calls: int = 1):
-    import minisweagent.agents
-    import minisweagent.config
-    import minisweagent.environments
-    import minisweagent.models
+def _upstream_server(route_headers: dict | None = None):
+    seen: list[tuple[str, dict, dict]] = []
 
-    class FakeEnvironment:
-        def cleanup(self):
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            seen.append(
+                (self.path, dict(self.headers), json.loads(self.rfile.read(length)))
+            )
+            body = {
+                "id": "fake",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.42},
+            }
+            payload = json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            for key, value in (route_headers or {}).items():
+                self.send_header(key, value)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_args):
             pass
 
-    class FakeModel:
-        config = types.SimpleNamespace(model_name="cheap")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, seen
 
-        def query(self, messages, **kwargs):
-            return {"extra": {"response": {"usage": {"cost": 0.6}}}}
 
-    class FakeAgent:
-        def __init__(self, model):
-            self.model = model
-            self.messages = []
+def _make_worktree(root: Path, instance_id: str = "demo-1") -> tuple[Path, str]:
+    workdir = root / instance_id
+    workdir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=workdir, check=True)
+    subprocess.run(["git", "config", "user.email", "eval@test"], cwd=workdir, check=True)
+    subprocess.run(["git", "config", "user.name", "eval"], cwd=workdir, check=True)
+    (workdir / "solve.py").write_text("original\n")
+    subprocess.run(["git", "add", "solve.py"], cwd=workdir, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=workdir, check=True)
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=workdir, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    return workdir, head
 
-        def run(self, task):
-            for _ in range(calls):
-                self.messages.append(self.model.query([]))
-            return {"submission": "diff --git a/a b/a\n"}
 
-        def serialize(self):
-            return {"messages": self.messages}
-
-    monkeypatch.setattr(minisweagent.config, "get_config_from_spec", lambda path: {
-        "model": {}, "agent": {}, "environment": {},
-    })
-    monkeypatch.setattr(
-        minisweagent.environments, "get_environment", lambda config: FakeEnvironment()
+def _fake_pi(tmp_path: Path) -> Path:
+    script = tmp_path / "fake-pi.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        'if [ -n "$EVAL_PROXY_BASE_URL" ]; then\n'
+        '  curl -s -X POST "$EVAL_PROXY_BASE_URL/chat/completions" '
+        "-H 'Content-Type: application/json' "
+        "-d '{\"model\":\"cheap\",\"messages\":[]}' >/dev/null 2>&1\n"
+        "fi\n"
+        "echo '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\","
+        "\"content\":[],\"usage\":{\"input\":10,\"output\":5,\"totalTokens\":15}}}'\n"
+        "echo '{\"type\":\"tool_execution_end\",\"toolName\":\"bash\","
+        "\"args\":{},\"result\":\"ok\",\"isError\":false}'\n"
+        "echo '{\"type\":\"agent_end\",\"messages\":[]}'\n"
+        "echo '{\"type\":\"agent_settled\"}'\n"
+        "printf 'def patched():\\n    return 1\\n' >> solve.py\n"
+        "exit 0\n"
     )
-    monkeypatch.setattr(minisweagent.models, "get_model", lambda config: FakeModel())
-    monkeypatch.setattr(
-        minisweagent.agents, "get_agent",
-        lambda model, env, config, default_type: FakeAgent(model),
-    )
+    script.chmod(0o755)
+    return script
 
 
 def test_dry_run_separates_caps_and_price_table():
@@ -97,15 +132,6 @@ def test_cost_priority_and_unknown_fallback():
         {"prompt_tokens": 10, "completion_tokens": 5}, "cheap", prices
     ) == (35.0, "token_counts_x_price_table")
     assert harness.usage_cost({}, "missing", prices) == (None, "unknown")
-
-
-def test_miniswe_local_model_configuration_is_explicit():
-    config = miniswe.build_local_model_config("http://127.0.0.1:8088/v1", "mantis-trinity")
-    assert config["model_kwargs"] == {
-        "custom_llm_provider": "openai",
-        "api_base": "http://127.0.0.1:8088/v1",
-    }
-    assert config["model_registry"]["mantis-trinity"]["litellm_provider"] == "openai"
 
 
 def test_grader_rejects_empty_and_runs_fresh_container(monkeypatch):
@@ -163,138 +189,146 @@ def test_direct_route_frequency_uses_request_headers():
     ) == ["cheap", "middle"]
 
 
-def test_agent_trajectory_patch_and_grading(monkeypatch):
-    _patch_modules(monkeypatch)
-    monkeypatch.setattr(
-        harness, "grade_patch",
-        lambda instance, patch: {"resolved": True, "grader_output": "PASS"},
+def test_usage_from_sse_extracts_last_usage():
+    stream = (
+        'data: {"choices":[{"delta":{"content":"a"}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"b"}}],"usage":'
+        '{"prompt_tokens":10,"completion_tokens":5,"cost":0.12}}\n\n'
+        "data: [DONE]\n\n"
     )
-    row = harness.run_mini_agent(
-        _instance(), arm="cheap-only", endpoint="http://fake/v1/chat/completions",
-        tier_models={"cheap": "cheap", "middle": "middle", "expensive": "expensive"},
+    assert harness._usage_from_sse(stream) == {
+        "prompt_tokens": 10, "completion_tokens": 5, "cost": 0.12,
+    }
+
+
+def test_parse_pi_events_extracts_trajectory():
+    stdout = (
+        '{"type":"message_end","message":{"role":"assistant","content":[],'
+        '"usage":{"input":10},"stopReason":"stop"}}\n'
+        '{"type":"tool_execution_end","toolName":"bash","args":{"command":"ls"},'
+        '"result":"ok","isError":false}\n'
+        '{"type":"agent_end","messages":[]}\n'
+    )
+    trajectory = harness._parse_pi_events(stdout)
+    assert trajectory[0]["role"] == "assistant"
+    assert trajectory[0]["usage"]["input"] == 10
+    assert trajectory[1]["tool"] == "bash"
+    assert len(trajectory) == 2
+
+
+def test_provider_extension_points_at_proxy(tmp_path):
+    ext = tmp_path / "eval-provider.ts"
+    harness._render_provider_extension(
+        ["cheap", "mantis", "mantis-trinity"],
+        "http://127.0.0.1:1234/v1",
+        "sk-test", "router-eval-sess", 512, ext,
+    )
+    text = ext.read_text()
+    assert 'baseUrl: "http://127.0.0.1:1234/v1"' in text
+    assert 'id: "mantis"' in text
+    assert 'id: "mantis-trinity"' in text
+    assert "maxTokens: 512" in text
+    assert '"X-Route-Session": "router-eval-sess"' in text
+
+
+def test_proxy_forwards_and_records_route_headers():
+    upstream, seen = _upstream_server(
+        route_headers={"x-route-decision": "cheap", "x-route-model": "cheap"}
+    )
+    ledger = harness.CostLedger(total_limit=2.0, arm_limit=2.0)
+    proxy = harness._RouteRecordingProxy(
+        upstream=f"http://127.0.0.1:{upstream.server_port}/v1/chat/completions",
+        api_key="sk-test", ledger=ledger, instance_id="demo-1", arm="cheap-only",
+        cap=2.0,
         prices={"cheap": {"input_per_token": 1.0, "output_per_token": 1.0}},
-        ledger=harness.CostLedger(total_limit=2.0, arm_limit=2.0),
-        arm_cap=2.0,
-        rng=harness.random.Random(1), step_limit=2, output_token_limit=32,
-        frequencies={"cheap": 1.0, "middle": 0.0, "expensive": 0.0},
+        model="cheap", session="router-eval-test",
     )
-    assert row["resolved"] is True
-    assert row["model_patch"].startswith("diff --git")
-    assert row["cost_usd"] == 0.6
-
-
-def test_agent_stops_on_per_instance_budget(monkeypatch):
-    _patch_modules(monkeypatch, calls=2)
-    monkeypatch.setattr(
-        harness, "grade_patch",
-        lambda instance, patch: {"resolved": True, "grader_output": "PASS"},
-    )
-    row = harness.run_mini_agent(
-        _instance(), arm="cheap-only", endpoint="http://fake/v1/chat/completions",
-        tier_models={"cheap": "cheap", "middle": "middle", "expensive": "expensive"},
-        prices={"cheap": {"input_per_token": 1.0, "output_per_token": 1.0}},
-        ledger=harness.CostLedger(total_limit=5.0, arm_limit=1.0),
-        arm_cap=1.0,
-        rng=harness.random.Random(1), step_limit=4, output_token_limit=32,
-        frequencies={"cheap": 1.0, "middle": 0.0, "expensive": 0.0},
-    )
-    assert row["aborted"] is True
-    assert row["resolved"] is False
-
-
-def test_agent_model_reaches_loopback_openai_endpoint(monkeypatch):
-    requests = []
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_POST(self):
-            length = int(self.headers["Content-Length"])
-            requests.append((self.path, self.headers, json.loads(self.rfile.read(length))))
-            body = {
-                "id": "fake",
-                "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [{
-                            "id": "call-1",
-                            "type": "function",
-                            "function": {"name": "bash", "arguments": '{"command":"echo ok"}'},
-                        }],
-                    },
-                    "finish_reason": "tool_calls",
-                }],
-                "usage": {"prompt_tokens": 2, "completion_tokens": 3, "cost": 0.12},
-            }
-            payload = json.dumps(body).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("x-route-decision", "cheap")
-            self.send_header("x-route-model", "deepseek-v4-flash")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-
-        def log_message(self, *_args):
-            pass
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        import minisweagent.agents
-        import minisweagent.config
-        import minisweagent.environments
-
-        class FakeEnvironment:
-            def cleanup(self):
-                pass
-
-        class FakeAgent:
-            def __init__(self, model):
-                self.model = model
-                self.messages = []
-
-            def run(self, task):
-                self.messages.append(self.model.query([]))
-                return {"submission": "diff --git a/a b/a\n"}
-
-            def serialize(self):
-                return {"messages": self.messages}
-
-        monkeypatch.setattr(
-            minisweagent.config, "get_config_from_spec",
-            lambda path: {"model": {}, "agent": {}, "environment": {}},
+        resp = requests.post(
+            f"{proxy.base_url()}/chat/completions",
+            json={"model": "cheap", "messages": []},
+            headers={"X-Route-Session": "router-eval-test"},
+            timeout=30,
         )
-        monkeypatch.setattr(
-            minisweagent.environments, "get_environment",
-            lambda config: FakeEnvironment(),
-        )
-        monkeypatch.setattr(
-            minisweagent.agents, "get_agent",
-            lambda model, env, config, default_type: FakeAgent(model),
-        )
-        monkeypatch.setattr(
-            harness, "grade_patch",
-            lambda instance, patch: {"resolved": True, "grader_output": "PASS"},
-        )
-        row = harness.run_mini_agent(
-            _instance(),
+        assert resp.status_code == 200
+        assert proxy.records[0]["route_headers"]["x-route-decision"] == "cheap"
+        assert proxy.records[0]["cost"] == 0.42
+        assert proxy.records[0]["cost_method"] == "usage.cost"
+        assert ledger.pair_cost("demo-1", "cheap-only") == 0.42
+        assert seen and seen[0][1]["X-Route-Session"] == "router-eval-test"
+    finally:
+        proxy.close()
+        upstream.shutdown()
+
+
+def test_proxy_aborts_on_arm_cap():
+    ledger = harness.CostLedger(total_limit=5.0, arm_limit=1.0)
+    proxy = harness._RouteRecordingProxy(
+        upstream="http://127.0.0.1:1/v1/chat/completions",
+        api_key=None, ledger=ledger, instance_id="demo-1", arm="cheap-only",
+        cap=1.0, prices={}, model="cheap", session="router-eval-test",
+    )
+    try:
+        ledger.pair_costs[("demo-1", "cheap-only")] = 1.0
+        resp = requests.post(f"{proxy.base_url()}/chat/completions", json={}, timeout=30)
+        assert resp.status_code == 429
+        assert proxy.exceeded is True
+    finally:
+        proxy.close()
+
+
+def test_run_pi_agent_end_to_end(tmp_path, monkeypatch):
+    worktrees = tmp_path / "worktrees"
+    _, head = _make_worktree(worktrees)
+    upstream, seen = _upstream_server(
+        route_headers={"x-route-decision": "cheap", "x-route-model": "cheap"}
+    )
+    monkeypatch.setattr(
+        harness, "grade_patch",
+        lambda instance, patch: {"resolved": True, "grader_output": "PASS"},
+    )
+    fake = _fake_pi(tmp_path)
+    try:
+        row = harness.run_pi_agent(
+            _instance(base_commit=head),
             arm="cheap-only",
-            endpoint=f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
+            endpoint=f"http://127.0.0.1:{upstream.server_port}/v1/chat/completions",
             tier_models={"cheap": "cheap", "middle": "middle", "expensive": "expensive"},
             prices={"cheap": {"input_per_token": 1.0, "output_per_token": 1.0}},
             ledger=harness.CostLedger(total_limit=2.0, arm_limit=2.0),
             arm_cap=2.0,
-            rng=harness.random.Random(1),
-            step_limit=2,
-            output_token_limit=32,
+            rng=harness.random.Random(1), timeout=30, output_token_limit=32,
             frequencies={"cheap": 1.0, "middle": 0.0, "expensive": 0.0},
+            worktrees_root=worktrees, pi_executable=(str(fake),),
         )
-        assert row["resolved"] is True
-        assert row["cost_usd"] == 0.12
-        assert row["route_trace"][0]["route_headers"]["x-route-decision"] == "cheap"
-        assert requests and requests[0][2]["model"] == "cheap"
-        assert requests[0][1]["X-Route-Session"].startswith("router-eval-")
     finally:
-        server.shutdown()
+        upstream.shutdown()
+    assert row["resolved"] is True
+    assert row["model_patch"].startswith("diff --git")
+    assert "solve.py" in row["model_patch"]
+    assert row["cost_usd"] == 0.42
+    assert row["cost_method"] == "usage.cost"
+    assert row["route_trace"][0]["route_headers"]["x-route-decision"] == "cheap"
+    assert seen and seen[0][1]["X-Route-Session"].startswith("router-eval-")
+
+
+def test_run_pi_agent_aborts_on_instance_budget(tmp_path):
+    worktrees = tmp_path / "worktrees"
+    _, head = _make_worktree(worktrees)
+    ledger = harness.CostLedger(total_limit=5.0, arm_limit=1.0)
+    ledger.pair_costs[("demo-1", "cheap-only")] = 1.0
+    fake = _fake_pi(tmp_path)
+    row = harness.run_pi_agent(
+        _instance(base_commit=head),
+        arm="cheap-only",
+        endpoint="http://127.0.0.1:1/v1/chat/completions",
+        tier_models={"cheap": "cheap", "middle": "middle", "expensive": "expensive"},
+        prices={"cheap": {"input_per_token": 1.0, "output_per_token": 1.0}},
+        ledger=ledger, arm_cap=1.0,
+        rng=harness.random.Random(1), timeout=30, output_token_limit=32,
+        frequencies={"cheap": 1.0, "middle": 0.0, "expensive": 0.0},
+        worktrees_root=worktrees, pi_executable=(str(fake),),
+    )
+    assert row["aborted"] is True
+    assert row["abort_scope"] == "instance_arm"
+    assert row["resolved"] is False

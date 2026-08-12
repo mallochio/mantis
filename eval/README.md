@@ -22,20 +22,23 @@ directory.
 - `trinity`: independently selectable `model=mantis-trinity`.
 
 Every routed request carries `X-Route-Session` and records route decision
-headers. mini-SWE-agent 2.4.6 drives each task inside its prebuilt
-SWE-rebench Docker image. Its submitted patch is graded in a fresh container;
-`resolved` is true only when every `FAIL_TO_PASS` test passes and every
-`PASS_TO_PASS` test remains passing. Gold patches are never used by an arm.
-The harness uses mini-SWE-agent's per-instance API rather than its batch CLI so
-each arm can select its endpoint, session header, and request budget.
+headers. `pi` (headless `--mode json`, from the `@earendil-works/pi-coding-agent`
+CLI) drives each task in a host worktree checked out at the instance's
+`base_commit`; its chat-completions calls go through a local header-recording
+proxy to Bifrost or the Mantis gateway (no litellm or mini-SWE-agent involved).
+The submitted `git diff` is graded in a fresh SWE-rebench container; `resolved`
+is true only when every `FAIL_TO_PASS` test passes and every `PASS_TO_PASS`
+test remains passing. Gold patches are never used by an arm. Each arm selects
+its own endpoint, model, session header, and request budget; `pi` must be
+installed and on `PATH`.
 
-`--budget-usd`, `--per-instance-cost`, `--step-limit`, and
+`--budget-usd`, `--per-instance-cost`, `--timeout`, and
 `--output-token-limit` are recorded in run metadata. Cumulative and
-per-instance ceilings are checked before every model request; an aborted
-instance is not emitted, so output remains a complete prefix with all arms
-present. Budget exhaustion preserves prior JSONL output and writes
-`aborted_on_budget: true`. `--dry-run` makes no model calls and reports
-worst-case per-instance-cap spend:
+per-instance ceilings are enforced by the recording proxy before every model
+request; an aborted instance is not emitted, so output remains a complete
+prefix with all arms present. Budget exhaustion preserves prior JSONL output
+and writes `aborted_on_budget: true`. `--dry-run` makes no model calls and
+reports worst-case per-instance-cap spend:
 
 ```text
 uv run python eval/router_eval.py --dry-run --include-trinity
