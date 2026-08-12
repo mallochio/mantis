@@ -16,7 +16,7 @@ def _force_legacy_router_default() -> None:
     reload ``server`` with their own fixtures and are unaffected.
     """
     os.environ.pop("ROUTELLM_SESSION_FROM_USER", None)
-    os.environ.setdefault("ROUTELLM_KEY", "sk-route-local")
+    os.environ["ROUTELLM_KEY"] = "sk-route-local"  # force: real key may be exported in dev shells
     try:
         import server  # noqa: F401
     except ImportError:

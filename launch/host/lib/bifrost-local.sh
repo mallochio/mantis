@@ -18,7 +18,11 @@ set -euo pipefail
 # StartupFolder may invoke us from / and ~/Startup/bifrost-local.sh may be a
 # symlink; resolve to the real script location for stable relative paths.
 SELF="$0"
-while [ -L "$SELF" ]; do SELF="$(readlink "$SELF")"; done
+while [ -L "$SELF" ]; do
+  LINK_DIR="$(cd -P "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  [[ "$SELF" = /* ]] || SELF="$LINK_DIR/$SELF"
+done
 SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 
 # Ensure system CLIs (lsof, curl, npx) are found under launchd's minimal PATH

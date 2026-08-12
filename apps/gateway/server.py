@@ -1322,10 +1322,17 @@ def _authorize(authorization: str | None) -> bool:
     return secrets.compare_digest(authorization[7:].encode(), SERVER_KEY.encode())
 
 
+_LOG_MAX_BYTES = int(os.environ.get("ROUTER_LOG_MAX_BYTES", str(50 * 1024 * 1024)))
+
+
 def _secure_append(path: Path, row: dict) -> None:
     try:
         path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
         path.parent.chmod(0o700)
+        rotated = path.with_name(path.name + ".1")
+        if path.exists() and path.stat().st_size > _LOG_MAX_BYTES:
+            os.replace(path, rotated)  # keep one generation; bound disk growth
+            rotated.chmod(0o600)
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
