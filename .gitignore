@@ -167,3 +167,7 @@ model_iter_60.npy
 routing_catalog/build/
 routing_catalog/*.egg-info/
 mantis.egg-info/
+
+# Author-local agent instructions
+/AGENTS.md
+/apps/gateway/AGENTS.md

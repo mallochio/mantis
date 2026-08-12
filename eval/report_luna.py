@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Generate eval/report-luna-conductor.md.
+"""Generate eval/report-luna-conductor.md from tracked raw results.
 
-Merges the existing direct + trinity scored results from
-`eval/results-native-v2-scored.jsonl` with a fresh `eval/results-luna.jsonl`
-run of `conductor-luna` (LiteLLM planner = gpt-5.6-luna-max).
+Combines native-v2 direct/trinity results with a fresh
+`eval/results-luna.jsonl` run of `conductor-luna`.
 """
 from __future__ import annotations
 
@@ -12,21 +11,24 @@ import statistics
 from pathlib import Path
 from typing import Any
 
-from score import load_jsonl, score_response
+from score import load_jsonl, provenance, score_response
 
 REPO = Path(__file__).resolve().parent.parent
 
 
 def config_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    valid = [r for r in rows if not r.get("error")]
     scores = []
     latencies = []
     costs = []
-    for r in rows:
+    for r in valid:
         scores.append(r.get("auto_score", 0.0) or 0.0)
         latencies.append(r.get("latency_s", 0) or 0)
         costs.append(r.get("est_cost_usd", 0) or 0)
     return {
         "count": len(rows),
+        "success_count": len(valid),
+        "error_count": len(rows) - len(valid),
         "auto_score_mean": statistics.mean(scores) if scores else 0.0,
         "latency_sum_s": sum(latencies),
         "cost_sum_usd": sum(costs),
@@ -54,7 +56,21 @@ def main() -> None:
     fx_by_id = {f["id"]: f for f in fixtures}
     tiers = ["simple", "medium", "hard", "debug"]
 
-    baseline = load_jsonl(REPO / "eval" / "results-native-v2-scored.jsonl")
+    baseline_raw = load_jsonl(REPO / "eval" / "results-native-v2.jsonl")
+    baseline: list[dict[str, Any]] = []
+    for r in baseline_raw:
+        fx = fx_by_id.get(r["id"], {})
+        auto = (
+            None
+            if r.get("error")
+            else score_response(r.get("response_text", ""), fx.get("expect", []))
+        )
+        baseline.append(
+            {
+                **r,
+                "auto_score": round(auto, 3) if auto is not None else None,
+            }
+        )
     direct_rows = [r for r in baseline if r["config"] == "direct"]
     trinity_rows = [r for r in baseline if r["config"] == "trinity"]
 
@@ -64,10 +80,12 @@ def main() -> None:
     for r in luna_raw:
         fx = fx_by_id.get(r["id"], {})
         expect = fx.get("expect", [])
-        auto = 0.0
-        if not r.get("error"):
-            auto = score_response(r.get("response_text", ""), expect)
-        row = {**r, "config": "conductor-luna", "auto_score": round(auto, 3)}
+        auto = None if r.get("error") else score_response(r.get("response_text", ""), expect)
+        row = {
+            **r,
+            "config": "conductor-luna",
+            "auto_score": round(auto, 3) if auto is not None else None,
+        }
         luna_rows.append(row)
 
     # Write scored luna results
@@ -92,7 +110,11 @@ def main() -> None:
             rows = [r for r in by_config[c] if r.get("tier") == tier]
             tier_table[tier][c] = config_metrics(rows)
 
-    lines: list[str] = []
+    lines: list[str] = provenance(
+        config="direct,trinity,conductor-luna",
+        fixtures_path=REPO / "eval" / "fixtures.jsonl",
+        cost_method="native estimated prices; 2K prompt + 1K completion assumption",
+    )
     lines.append("# Comparative Eval: direct vs TRINITY vs Conductor-Luna\n")
     lines.append(
         "Conductor-Luna uses the LiteLLM planner `gpt-5.6-luna-max` "
@@ -100,13 +122,16 @@ def main() -> None:
     )
 
     lines.append("## Summary\n")
-    lines.append("| config | auto_score_mean | latency_sum_s | cost_sum_usd |")
-    lines.append("|---|---|---|---|")
+    lines.append(
+        "| config | success | errors | auto_score_mean | latency_sum_s | est_cost_sum_usd |"
+    )
+    lines.append("|---|---:|---:|---:|---:|---:|")
     for c in configs:
         m = metrics[c]
         lines.append(
-            f"| {c} | {m['auto_score_mean']:.3f} | "
-            f"{m['latency_sum_s']:.1f} | ${m['cost_sum_usd']:.4f} |"
+            f"| {c} | {m['success_count']}/{m['count']} | {m['error_count']} | "
+            f"{m['auto_score_mean']:.3f} | {m['latency_sum_s']:.1f} | "
+            f"${m['cost_sum_usd']:.4f} |"
         )
     lines.append("")
 
@@ -134,14 +159,17 @@ def main() -> None:
     lines.append("")
 
     lines.append("## Per-tier averages\n")
-    lines.append("| tier | config | auto_score_mean | latency_sum_s | cost_sum_usd |")
-    lines.append("|---|---|---|---|---|")
+    lines.append(
+        "| tier | config | success | errors | auto_score_mean | latency_sum_s | est_cost_sum_usd |"
+    )
+    lines.append("|---|---|---:|---:|---:|---:|---:|")
     for tier in tiers:
         for c in configs:
             m = tier_table[tier][c]
             lines.append(
-                f"| {tier} | {c} | {m['auto_score_mean']:.3f} | "
-                f"{m['latency_sum_s']:.1f} | ${m['cost_sum_usd']:.4f} |"
+                f"| {tier} | {c} | {m['success_count']}/{m['count']} | {m['error_count']} | "
+                f"{m['auto_score_mean']:.3f} | {m['latency_sum_s']:.1f} | "
+                f"${m['cost_sum_usd']:.4f} |"
             )
     lines.append("")
 
@@ -163,11 +191,24 @@ def main() -> None:
     lines.append("## Headline comparisons\n")
 
     lines.append("### a) conductor-luna vs trinity\n")
-    lines.append(f"- trinity overall mean: {trinity_overall:.3f}")
-    lines.append(f"- conductor-luna overall mean: {luna_overall:.3f}")
+    lines.append(
+        f"- trinity overall mean ({metrics['trinity']['success_count']} successful, "
+        f"{metrics['trinity']['error_count']} errors): {trinity_overall:.3f}"
+    )
+    lines.append(
+        f"- conductor-luna overall mean ({metrics['conductor-luna']['success_count']} successful, "
+        f"{metrics['conductor-luna']['error_count']} errors): {luna_overall:.3f}"
+    )
     lines.append(f"- overall quality delta: {luna_overall - trinity_overall:+.3f}")
-    lines.append(f"- hard-tier trinity mean: {hard_trinity:.3f}")
-    lines.append(f"- hard-tier conductor-luna mean: {hard_luna:.3f}")
+    lines.append(
+        f"- hard-tier trinity mean ({tier_table['hard']['trinity']['success_count']} successful, "
+        f"{tier_table['hard']['trinity']['error_count']} errors): {hard_trinity:.3f}"
+    )
+    lines.append(
+        f"- hard-tier conductor-luna mean "
+        f"({tier_table['hard']['conductor-luna']['success_count']} successful, "
+        f"{tier_table['hard']['conductor-luna']['error_count']} errors): {hard_luna:.3f}"
+    )
     lines.append(f"- hard-tier quality delta: {hard_luna - hard_trinity:+.3f}")
     lines.append("")
 

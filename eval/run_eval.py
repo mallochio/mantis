@@ -51,6 +51,16 @@ def load_worker_costs(path: Path) -> dict[str, float]:
     return {k: float(v) for k, v in data.items() if not k.startswith("_")}
 
 
+def default_worker_costs_path() -> Path:
+    return REPO / "config" / "worker-costs.json"
+
+
+def prepare_output(path: Path, *, append: bool) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not append:
+        path.write_text("")
+
+
 def _cost_key(model: str) -> str:
     return model.removeprefix("bifrost/")
 
@@ -153,6 +163,11 @@ def main() -> None:
     parser.add_argument("--bifrost-url", default="http://127.0.0.1:8080/v1/chat/completions")
     parser.add_argument("--mantis-url", default="http://localhost:8088/v1/chat/completions")
     parser.add_argument(
+        "--append",
+        action="store_true",
+        help="append to an existing output instead of starting a fresh run",
+    )
+    parser.add_argument(
         "--api-key",
         default=os.environ.get("BIFROST_API_KEY") or os.environ.get("MANTIS_API_KEY"),
     )
@@ -160,7 +175,7 @@ def main() -> None:
     if not args.api_key:
         parser.error("set BIFROST_API_KEY or MANTIS_API_KEY in the environment")
 
-    costs = load_worker_costs(REPO / "configs" / "worker-costs.json")
+    costs = load_worker_costs(default_worker_costs_path())
     slot_models, conductor_model = load_catalog_models(REPO / "config" / "catalog.toml")
     os.environ.setdefault("MANTIS_CONDUCTOR_MODEL", conductor_model)
 
@@ -172,7 +187,7 @@ def main() -> None:
                 fixtures.append(json.loads(line))
 
     out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    prepare_output(out_path, append=args.append)
 
     # Map config to endpoint/model
     if args.config == "direct":
