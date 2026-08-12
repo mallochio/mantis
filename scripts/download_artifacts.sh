@@ -34,7 +34,7 @@ else
     echo "WARN: S3 Conductor checkpoint not reachable; omitting local checkpoint." >&2
 fi
 
-echo "Done. Set these in .env before docker compose up:"
+echo "Done. Add these paths to .env before running scripts/run_mantis_native.sh:"
 echo "  MANTIS_VECTOR=$DIR/artifacts/model_iter_60.npy"
 echo "  MANTIS_HEAD=$DIR/artifacts/router_head.npy  (or $DIR/artifacts/router_head.safetensors)"
 echo "  MANTIS_LOCAL_CONDUCTOR=$DIR/outputs/conductor_retrain/retrain-conductor-20260802_003213/checkpoint"

@@ -36,52 +36,6 @@ deployment is the local launcher stack, versioned at `launch/host/` with
 Mantis router and orchestration pool; `~/.config/ai-routing/catalog.toml` is a symlink to it. `bifrost.json`
 (contains the gateway encryption key) stays local and untracked.
 
-Container deployment (optional):
-
-```bash
-cp .env.example .env
-# Set MANTIS_API_KEY and the provider keys used by your worker pool.
-
-uv run scripts/stack.py up
-curl http://127.0.0.1:8088/health
-```
-
-`scripts/stack.py` is the stack driver. It reads `docker-compose.yml` as the
-single source of truth and picks the runtime automatically:
-
-- **native**: Apple `container` CLI on macOS 26+ (no Docker daemon)
-- **docker**: `docker compose` everywhere else
-
-Override with `MANTIS_STACK_BACKEND=auto|native|docker`. Subcommands:
-`up`, `restart`, `down`, `build`, `logs`, `status`. `restart` replaces an
-existing container (`--force-recreate` on Docker). On the native backend,
-`restart` preserves an already-running Redis sidecar even when `--redis` is
-omitted; use `down` first if you also want to remove Redis. Optional flags: `--redis`
-(also runs the redis service; the native backend injects the redis IP since
-Apple containers do not resolve service names), `--conductor DIR`
-(eval override that mounts a retrained conductor checkpoint read-only).
-
-The default `--endpoint-profile direct` keeps the OpenRouter and OpenCode
-endpoints and uses `OPENROUTER_API_KEY` and `OPENCODE_API_KEY`. To route both
-providers through the configured Cloudflare gateway, set
-`MANTIS_GATEWAY_API_KEY` (or `AI_GATEWAY_API_KEY`) and restart:
-
-```bash
-uv run scripts/stack.py restart --endpoint-profile cloudflare
-```
-
-The Cloudflare profile fails before invoking the runtime if its token is
-missing. It maps the gateway token to both provider key variables only inside
-the launched environment. `OPENROUTER_BASE_URL` and
-`OPENCODE_GO_ENDPOINT_URL` override only the direct profile. The Cloudflare
-profile intentionally ignores those variables, so direct URLs already present
-in the host environment cannot bypass the gateway. Use `MANTIS_GATEWAY_URL` to
-override both Cloudflare endpoints, or `MANTIS_GATEWAY_OPENROUTER_URL` and
-`MANTIS_GATEWAY_OPENCODE_URL` for separate overrides. CLI diagnostics and
-`GET /ready` expose only the selected profile and endpoint hostnames, never
-credentials or URL paths. Values can be exported or stored in the repository
-`.env` file.
-
 ## Portable host installation
 
 Mantis has no container runtime requirement. Install [uv](https://docs.astral.sh/uv/),
@@ -92,12 +46,10 @@ clone this repository, create `.env` (or configure the shared routing catalog), 
 ```
 
 The launcher uses the locked uv environment, prepares the router vector when
-needed, renders the same catalog bindings as the container deployment, and
-starts the same endpoint at `127.0.0.1:8088`. It works on macOS, Linux, and
-WSL. Torch chooses MPS, CUDA, or CPU automatically. Set `MANTIS_HOST=0.0.0.0`
-only when remote access is required.
-
-The container stack remains an optional deployment method, not a prerequisite.
+needed, renders the catalog bindings for the host, and starts the endpoint at
+`127.0.0.1:8088`. It works on macOS, Linux, and WSL. Torch chooses MPS, CUDA,
+or CPU automatically. Set `MANTIS_HOST=0.0.0.0` only when remote access is
+required.
 
 ## Call it like any OpenAI model
 
@@ -219,11 +171,10 @@ Reasoning effort is appended with `|`, for example
 `openrouter/openai/gpt-5.6-luna|max`.
 
 Tool runs use bounded process memory by default until completion or TTL expiry.
-For multi-replica deployment, set `MANTIS_RUN_STORE=redis`, configure
-`MANTIS_REDIS_URL`, and start the optional redis service:
-`uv run scripts/stack.py up --redis`. Redis stores serialized run state
-and locks each advance, so replicas can share tool loops. Use a trusted,
-private Redis deployment; run one replica with the memory backend.
+For multi-replica deployment, set `MANTIS_RUN_STORE=redis` and configure
+`MANTIS_REDIS_URL` for a trusted, private Redis deployment. Redis stores
+serialized run state and locks each advance, so replicas can share tool loops.
+Run one replica with the memory backend.
 
 ## API
 

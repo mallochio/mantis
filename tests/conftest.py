@@ -22,7 +22,7 @@ import pytest
 
 # Interactive shells export endpoint/catalog overrides (~/.zshrc sets
 # OPENROUTER_BASE_URL/OPENCODE_GO_ENDPOINT_URL to gateway URLs, exports
-# AI_ROUTING_CONFIG and rendered catalog bindings).  Serve/stack capture some
+# AI_ROUTING_CONFIG and rendered catalog bindings).  Serve captures some
 # of these at module import, so scrub them before any test module imports
 # them; tests that need a value set it explicitly via monkeypatch.
 for _name in (
@@ -57,7 +57,7 @@ def _block_external_provider_calls(monkeypatch: pytest.MonkeyPatch):
     # Scrub ambient endpoint/catalog overrides exported by an interactive
     # shell (~/.zshrc exports OPENROUTER_BASE_URL/OPENCODE_GO_ENDPOINT_URL
     # gateway URLs, AI_ROUTING_CONFIG, rendered catalog bindings, ...).
-    # Serve/stack code reads os.environ directly, so tests must not inherit
+    # Serve code reads os.environ directly, so tests must not inherit
     # the host environment; tests that need these set them via monkeypatch.
     for name in (
         "AI_ROUTING_CONFIG",
