@@ -87,7 +87,7 @@ _REDIS_PREFIX = os.environ.get("MANTIS_REDIS_PREFIX", "mantis:run:")
 REDIS_LOCK_TIMEOUT = max(300, int(WORKER_TIMEOUT * MAX_TURNS + 60))
 _redis_client: Any | None = None
 
-_runs: dict[str, NativeRun] = {}
+_runs: dict[str, Any] = {}
 _runs_lock = threading.Lock()
 _runs_sweeper_started = False
 _learning_lock = threading.Lock()
@@ -110,4 +110,4 @@ _SECRET_PATTERNS = (
     re.compile(r"(?i)\bBearer\s+\S+"),
 )
 
-__all__ = [k for k in globals().keys() if not k.startswith("__")]
+__all__ = [k for k in globals() if not k.startswith("__")]

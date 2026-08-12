@@ -15,6 +15,8 @@ stdlib http.server only — no FastAPI/uvicorn.
 from __future__ import annotations
 
 import sys
+import types
+from contextlib import suppress
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -25,9 +27,6 @@ if not (_HERE / "mini.py").exists():
     if _OPENFUGU.exists():
         sys.path.insert(0, str(_OPENFUGU))
 
-
-import sys
-import types
 
 import conductor
 import providers
@@ -58,10 +57,8 @@ class ServeProxy(types.ModuleType):
         super().__setattr__(name, value)
 
 
-try:
+with suppress(KeyError):
     sys.modules[__name__].__class__ = ServeProxy
-except KeyError:
-    pass
 
 
 def __getattr__(name):

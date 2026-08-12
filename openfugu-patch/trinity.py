@@ -40,17 +40,9 @@ from mini import (
     FuguRouter,
 )
 from serve_config import (
-    _HERE,
-    _OPENFUGU,
     ROUTER,
     WORKER_TIMEOUT,
-    Any,
-    FuguRouter,
-    Path,
     _router_lock,
-    argparse,
-    os,
-    sys,
 )
 
 
@@ -449,4 +441,4 @@ def _worker_from_args(args: argparse.Namespace, mode: str) -> Any:
     raise ValueError(f"unknown coordinator mode: {mode}")
 
 
-__all__ = [k for k in globals().keys() if not k.startswith("__")]
+__all__ = [k for k in globals() if not k.startswith("__")]

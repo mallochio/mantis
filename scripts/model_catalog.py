@@ -30,8 +30,8 @@ from model_catalog_schema import (
     _json,
     _mapping,
     _runtime_bindings,
-    _string,
     _slot_order,
+    _string,
 )
 
 __all__ = [
@@ -93,8 +93,10 @@ def identity_fingerprint(catalog: MantisCatalog) -> str:
 def _expected_contract(value: Any, required: bool) -> str | None:
     if value is None and not required:
         return None
-    if not isinstance(value, str) or len(value) != 64 or any(
-        char not in "0123456789abcdef" for char in value
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(char not in "0123456789abcdef" for char in value)
     ):
         raise CatalogError("mantis.trained_slot_contract must be a SHA-256 fingerprint")
     return value
@@ -149,8 +151,7 @@ def load_mantis_catalog(
         raise CatalogError(f"{mismatch}; retraining is required")
     if expected is not None and expected != abi_contract(abi):
         raise CatalogError(
-            "Mantis identity contract differs from the trained ABI manifest; "
-            "retraining is required"
+            "Mantis identity contract differs from the trained ABI manifest; retraining is required"
         )
     return catalog
 
