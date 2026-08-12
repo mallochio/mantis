@@ -13,10 +13,10 @@ from typing import Any
 
 from score import (
     MIN_SUCCESSFUL_ROWS,
-    comparable,
-    comparison_display,
     load_jsonl,
     metric_display,
+    paired_comparable,
+    paired_success_count,
     provenance,
     score_response,
 )
@@ -126,7 +126,7 @@ def main() -> None:
     lines.append("# Comparative Eval: direct vs TRINITY vs Conductor-Luna\n")
     lines.append(
         f"Scoring rule: report a mean only with at least {MIN_SUCCESSFUL_ROWS} "
-        "successful rows; comparisons also require matching successful counts.\n"
+        "successful rows; comparisons use successful-item intersections.\n"
     )
     lines.append(
         "Scoring note: an empty response without an error scores 0.0 under the "
@@ -191,8 +191,6 @@ def main() -> None:
     lines.append("")
 
     # Headline comparisons
-    trinity_overall = metrics["trinity"]["auto_score_mean"]
-    luna_overall = metrics["conductor-luna"]["auto_score_mean"]
     trinity_cost = metrics["trinity"]["cost_sum_usd"]
     luna_cost = metrics["conductor-luna"]["cost_sum_usd"]
 
@@ -208,54 +206,75 @@ def main() -> None:
     lines.append("## Headline comparisons\n")
 
     lines.append("### a) conductor-luna vs trinity\n")
-    overall_comparable = comparable(metrics["conductor-luna"], metrics["trinity"])
-    hard_comparable = comparable(
-        tier_table["hard"]["conductor-luna"], tier_table["hard"]["trinity"]
+    overall_left, overall_right = paired_comparable(
+        luna_rows, trinity_rows, fx_by_id
     )
-    lines.append(
-        f"- trinity overall mean: "
-        f"{comparison_display(metrics['trinity'], metrics['conductor-luna'])}"
+    hard_left, hard_right = paired_comparable(
+        [r for r in luna_rows if r.get("tier") == "hard"],
+        [r for r in trinity_rows if r.get("tier") == "hard"],
+        fx_by_id,
     )
-    lines.append(
-        f"- conductor-luna overall mean: "
-        f"{comparison_display(metrics['conductor-luna'], metrics['trinity'])}"
-    )
-    if overall_comparable:
-        lines.append(f"- overall quality delta: {luna_overall - trinity_overall:+.3f}")
-    lines.append(
-        f"- hard-tier trinity mean: "
-        f"{comparison_display(tier_table['hard']['trinity'], tier_table['hard']['conductor-luna'])}"
-    )
+    hard_luna_rows = [r for r in luna_rows if r.get("tier") == "hard"]
+    hard_trinity_rows = [r for r in trinity_rows if r.get("tier") == "hard"]
+    lines.append(f"- trinity overall mean: {metric_display(metrics['trinity'])}")
+    lines.append(f"- conductor-luna overall mean: {metric_display(metrics['conductor-luna'])}")
+    if overall_left:
+        paired_trinity = statistics.mean(overall_right)
+        paired_luna = statistics.mean(overall_left)
+        lines.append(
+            f"- overall quality delta (paired n={len(overall_left)}): "
+            f"{paired_luna - paired_trinity:+.3f}"
+        )
+    else:
+        lines.append(
+            f"- paired successful intersection: "
+            f"n={paired_success_count(luna_rows, trinity_rows)} "
+            f"(<{MIN_SUCCESSFUL_ROWS}); quality comparison omitted"
+        )
+    lines.append(f"- hard-tier trinity mean: {metric_display(tier_table['hard']['trinity'])}")
     lines.append(
         f"- hard-tier conductor-luna mean: "
-        f"{comparison_display(tier_table['hard']['conductor-luna'], tier_table['hard']['trinity'])}"
+        f"{metric_display(tier_table['hard']['conductor-luna'])}"
     )
-    if hard_comparable:
-        lines.append(f"- hard-tier quality delta: {hard_luna - hard_trinity:+.3f}")
+    if hard_left:
+        paired_hard_trinity = statistics.mean(hard_right)
+        paired_hard_luna = statistics.mean(hard_left)
+        lines.append(
+            f"- hard-tier quality delta (paired n={len(hard_left)}): "
+            f"{paired_hard_luna - paired_hard_trinity:+.3f}"
+        )
+    else:
+        lines.append(
+            f"- hard-tier paired successful intersection: "
+            f"n={paired_success_count(hard_luna_rows, hard_trinity_rows)} "
+            f"(<{MIN_SUCCESSFUL_ROWS}); quality comparison omitted"
+        )
     lines.append("")
 
     lines.append("### b) cost-per-quality-point\n")
-    score_delta = luna_overall - trinity_overall
     cost_delta = luna_cost - trinity_cost
-    if not overall_comparable:
+    if not overall_left:
         lines.append(
             f"- overall: insufficient comparable successful rows; "
-            f"each arm requires at least {MIN_SUCCESSFUL_ROWS} with matching counts"
+            f"the paired intersection requires at least {MIN_SUCCESSFUL_ROWS} items"
         )
-    elif score_delta > 0 and cost_delta >= 0:
-        cpp = cost_delta / score_delta if score_delta else 0.0
+    elif (paired_luna - paired_trinity) > 0 and cost_delta >= 0:
+        paired_score_delta = paired_luna - paired_trinity
+        cpp = cost_delta / paired_score_delta if paired_score_delta else 0.0
         lines.append(
             wrap(
                 "- overall: "
-                f"${cost_delta:.4f} extra spend for +{score_delta:.3f} quality "
+                f"${cost_delta:.4f} extra spend for "
+                f"+{paired_luna - paired_trinity:.3f} quality "
                 f"= ${cpp:.4f} per quality point"
             )
         )
-    elif score_delta > 0 and cost_delta < 0:
+    elif (paired_luna - paired_trinity) > 0 and cost_delta < 0:
         lines.append(
             wrap(
                 "- overall: conductor-luna is both cheaper "
-                f"(save ${-cost_delta:.4f}) and better (+{score_delta:.3f}), "
+                f"(save ${-cost_delta:.4f}) and better "
+                f"(+{paired_luna - paired_trinity:.3f}), "
                 "so cost per quality point is negative"
             )
         )
@@ -263,39 +282,45 @@ def main() -> None:
         lines.append(
             wrap(
                 "- overall: conductor-luna is not a quality win "
-                f"(delta {score_delta:+.3f}) despite ${cost_delta:+.4f} cost delta"
+                f"(delta {paired_luna - paired_trinity:+.3f}) "
+                f"despite ${cost_delta:+.4f} cost delta"
             )
         )
 
-    hard_score_delta = hard_luna - hard_trinity
     hard_cost_delta = hard_luna_cost - hard_trinity_cost
-    if not hard_comparable:
+    if not hard_left:
         lines.append(
             f"- hard tier: insufficient comparable successful rows; "
-            f"each arm requires at least {MIN_SUCCESSFUL_ROWS} with matching counts"
+            f"the paired intersection requires at least {MIN_SUCCESSFUL_ROWS} items"
         )
-    elif hard_score_delta > 0 and hard_cost_delta >= 0:
-        hard_cpp = hard_cost_delta / hard_score_delta if hard_score_delta else 0.0
+    elif (paired_hard_luna - paired_hard_trinity) > 0 and hard_cost_delta >= 0:
+        paired_hard_score_delta = paired_hard_luna - paired_hard_trinity
+        hard_cpp = (
+            hard_cost_delta / paired_hard_score_delta
+            if paired_hard_score_delta
+            else 0.0
+        )
         lines.append(
             wrap(
                 "- hard tier: "
-                f"${hard_cost_delta:.4f} extra spend for +{hard_score_delta:.3f} "
+                f"${hard_cost_delta:.4f} extra spend for "
+                f"+{paired_hard_luna - paired_hard_trinity:.3f} "
                 f"quality = ${hard_cpp:.4f} per quality point"
             )
         )
-    elif hard_score_delta > 0 and hard_cost_delta < 0:
+    elif (paired_hard_luna - paired_hard_trinity) > 0 and hard_cost_delta < 0:
         lines.append(
             wrap(
                 "- hard tier: conductor-luna is both cheaper "
                 f"(save ${-hard_cost_delta:.4f}) and better "
-                f"(+{hard_score_delta:.3f})"
+                f"(+{paired_hard_luna - paired_hard_trinity:.3f})"
             )
         )
     else:
         lines.append(
             wrap(
                 "- hard tier: conductor-luna is not a quality win "
-                f"(delta {hard_score_delta:+.3f}) on hard tasks"
+                f"(delta {paired_hard_luna - paired_hard_trinity:+.3f}) on hard tasks"
             )
         )
     lines.append("")
@@ -308,7 +333,7 @@ def main() -> None:
     lines.append("")
 
     lines.append("## Decision table\n")
-    if not hard_comparable:
+    if not hard_left:
         decision = "insufficient comparable successful rows on hard tier"
         threshold = 6
         reason = (

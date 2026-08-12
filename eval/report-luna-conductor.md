@@ -1,14 +1,14 @@
 ## Provenance
 - config/arm: `direct,trinity,conductor-luna`
-- git SHA: `ab92432004acfcbdfcf2762c80a0985c36065d1d`
+- git SHA: `1bf1909dea0bd5b66e3a3a43cd514fd54c8dd79e`
 - catalog revision: `bifrost-2026-08-12`
 - fixtures: `eval/fixtures.jsonl` (sha256 `3fdd2ae72173ee1f91b1eae60edd223a8e0a433c32d1c1d2d6c81c8afdeee366`)
-- generated at: `2026-08-12T19:03:41.202454+00:00`
+- generated at: `2026-08-12T19:08:07.764372+00:00`
 - cost method: `native estimated prices; 2K prompt + 1K completion assumption`
 
 # Comparative Eval: direct vs TRINITY vs Conductor-Luna
 
-Scoring rule: report a mean only with at least 4 successful rows; comparisons also require matching successful counts.
+Scoring rule: report a mean only with at least 4 successful rows; comparisons use successful-item intersections.
 
 Scoring note: an empty response without an error scores 0.0 under the current keyword scorer; row output does not distinguish an empty answer from a wrong answer.
 
@@ -66,10 +66,10 @@ Conductor-Luna uses the LiteLLM planner `gpt-5.6-luna-max` instead of a local 3B
 
 - trinity overall mean: 0.890
 - conductor-luna overall mean: 0.626
-- overall quality delta: -0.264
+- overall quality delta (paired n=16): -0.264
 - hard-tier trinity mean: 0.714
 - hard-tier conductor-luna mean: 0.250
-- hard-tier quality delta: -0.464
+- hard-tier quality delta (paired n=4): -0.464
 
 ### b) cost-per-quality-point
 

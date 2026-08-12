@@ -1,9 +1,9 @@
 ## Provenance
 - config/arm: `mantis,openrouter-fugu`
-- git SHA: `ab92432004acfcbdfcf2762c80a0985c36065d1d`
+- git SHA: `1bf1909dea0bd5b66e3a3a43cd514fd54c8dd79e`
 - catalog revision: `bifrost-2026-08-12`
 - fixtures: `eval/fixtures.jsonl` (sha256 `3fdd2ae72173ee1f91b1eae60edd223a8e0a433c32d1c1d2d6c81c8afdeee366`)
-- generated at: `2026-08-12T19:03:41.311733+00:00`
+- generated at: `2026-08-12T19:07:55.350891+00:00`
 - cost method: `provider-reported usage.cost (real USD when supplied)`
 
 # A/B: mantis vs sakana/fugu-ultra

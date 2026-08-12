@@ -29,5 +29,6 @@ derived projections are regenerated on demand. Reports must be reproducible
 from tracked fixtures and raw results.
 
 Reports display a quality or latency mean only when an arm has at least four
-successful rows. Comparisons additionally require matching successful counts;
-otherwise the report uses `n/a` and omits derived deltas and percentages.
+successful rows. Comparisons use the intersection of successful item IDs and
+require that paired intersection to contain at least four items; otherwise the
+report omits derived deltas and percentages.

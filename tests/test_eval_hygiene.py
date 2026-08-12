@@ -103,5 +103,22 @@ def test_report_suppresses_low_success_means_and_zero_baseline_delta(tmp_path, m
     assert "quality delta:" not in text.split("### b) conductor-new vs conductor-old", 1)[1].split(
         "### c)", 1
     )[0]
-    assert "- trinity mean auto_score: n/a (4/4 successful)" in text
+    assert "- trinity mean auto_score: 1.000" in text
     assert "quality delta percentage:" not in text
+
+
+def test_paired_comparison_uses_successful_intersection():
+    fixtures = {f"t{i}": {"expect": ["answer"]} for i in range(1, 6)}
+    left = [
+        {"id": f"t{i}", "response_text": "answer"} for i in range(1, 5)
+    ]
+    right = [
+        {"id": "t1", "response_text": "answer"},
+        {"id": "t5", "response_text": "answer"},
+    ]
+
+    paired_left, paired_right = score.paired_comparable(left, right, fixtures)
+
+    assert paired_left == []
+    assert paired_right == []
+    assert score.metric_display(score.aggregate_metrics(left, fixtures)) == "1.000"

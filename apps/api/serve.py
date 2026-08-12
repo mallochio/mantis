@@ -30,17 +30,16 @@ if not (_HERE / "mini.py").exists():
 
 import conductor
 import providers
+import runs
 import serve_config
 import trinity
 import utils
 from conductor import *
 from providers import *
+from runs import *
 from serve_config import *
 from trinity import *
 from utils import *
-
-import runs
-from runs import *
 
 
 class ServeProxy(types.ModuleType):

@@ -116,18 +116,42 @@ def metric_display(
     return f"{metrics[key]:.{digits}f}"
 
 
-def comparable(left: dict[str, Any], right: dict[str, Any]) -> bool:
-    return (
-        left["success_count"] >= MIN_SUCCESSFUL_ROWS
-        and right["success_count"] >= MIN_SUCCESSFUL_ROWS
-        and left["success_count"] == right["success_count"]
-    )
+def paired_scores(
+    left_rows: list[dict[str, Any]],
+    right_rows: list[dict[str, Any]],
+    fx_by_id: dict[str, dict[str, Any]],
+) -> tuple[list[float], list[float]]:
+    left = {r["id"]: r for r in left_rows if not r.get("error")}
+    right = {r["id"]: r for r in right_rows if not r.get("error")}
+    ids = left.keys() & right.keys()
+    left_scores = [
+        score_response(left[i].get("response_text", ""), fx_by_id.get(i, {}).get("expect", []))
+        for i in ids
+    ]
+    right_scores = [
+        score_response(right[i].get("response_text", ""), fx_by_id.get(i, {}).get("expect", []))
+        for i in ids
+    ]
+    return left_scores, right_scores
 
 
-def comparison_display(left: dict[str, Any], right: dict[str, Any]) -> str:
-    if comparable(left, right):
-        return metric_display(left)
-    return f"n/a ({left['success_count']}/{left['count']} successful)"
+def paired_comparable(
+    left_rows: list[dict[str, Any]],
+    right_rows: list[dict[str, Any]],
+    fx_by_id: dict[str, dict[str, Any]],
+) -> tuple[list[float], list[float]]:
+    left_scores, right_scores = paired_scores(left_rows, right_rows, fx_by_id)
+    if len(left_scores) < MIN_SUCCESSFUL_ROWS:
+        return [], []
+    return left_scores, right_scores
+
+
+def paired_success_count(
+    left_rows: list[dict[str, Any]], right_rows: list[dict[str, Any]]
+) -> int:
+    left = {r["id"] for r in left_rows if not r.get("error")}
+    right = {r["id"] for r in right_rows if not r.get("error")}
+    return len(left & right)
 
 
 def main() -> None:
@@ -208,7 +232,7 @@ def main() -> None:
     lines.append("# Comparative Eval: direct vs TRINITY vs Conductor-old vs Conductor-new\n")
     lines.append(
         f"Scoring rule: report a mean only with at least {MIN_SUCCESSFUL_ROWS} "
-        "successful rows; comparisons also require matching successful counts.\n"
+        "successful rows; comparisons use successful-item intersections.\n"
     )
     lines.append(
         "Scoring note: an empty response without an error scores 0.0 under the "
@@ -280,22 +304,30 @@ def main() -> None:
     dl = sum_latency(direct_rows)
     tl = sum_latency(trinity_rows)
     lines.append("### a) trinity vs direct\n")
-    direct_trinity_comparable = comparable(metrics["direct"], metrics["trinity"])
-    lines.append(
-        f"- direct mean auto_score: "
-        f"{comparison_display(metrics['direct'], metrics['trinity'])}"
+    direct_trinity_left, direct_trinity_right = paired_comparable(
+        direct_rows, trinity_rows, fx_by_id
     )
-    lines.append(
-        f"- trinity mean auto_score: "
-        f"{comparison_display(metrics['trinity'], metrics['direct'])}"
-    )
-    if direct_trinity_comparable:
-        lines.append(f"- quality delta: {ts - ds:+.3f}")
-        if ds:
+    lines.append(f"- direct mean auto_score: {metric_display(metrics['direct'])}")
+    lines.append(f"- trinity mean auto_score: {metric_display(metrics['trinity'])}")
+    if direct_trinity_left:
+        paired_ds = statistics.mean(direct_trinity_left)
+        paired_ts = statistics.mean(direct_trinity_right)
+        lines.append(
+            f"- quality delta (paired n={len(direct_trinity_left)}): "
+            f"{paired_ts - paired_ds:+.3f}"
+        )
+        if paired_ds:
             lines.append(
-                f"- quality delta percentage: "
-                f"{'+' if ts >= ds else ''}{((ts - ds) / ds * 100):.1f}% vs direct"
+                f"- quality delta percentage (paired n={len(direct_trinity_left)}): "
+                f"{'+' if paired_ts >= paired_ds else ''}"
+                f"{((paired_ts - paired_ds) / paired_ds * 100):.1f}% vs direct"
             )
+    else:
+        lines.append(
+            f"- paired successful intersection: "
+            f"n={paired_success_count(direct_rows, trinity_rows)} "
+            f"(<{MIN_SUCCESSFUL_ROWS}); quality comparison omitted"
+        )
     lines.append(f"- direct total cost: ${dc:.4f}, latency: {dl:.1f}s")
     lines.append(f"- trinity total cost: ${tc:.4f}, latency: {tl:.1f}s")
     cd_direct = f"- cost delta: ${tc - dc:+.4f} " f"({((tc - dc) / dc * 100):.1f}% vs direct)"
@@ -310,44 +342,58 @@ def main() -> None:
     ol = sum_latency(old_rows)
     nl = sum_latency(new_rows)
     lines.append("### b) conductor-new vs conductor-old\n")
-    old_new_comparable = comparable(metrics["conductor-old"], metrics["conductor-new"])
-    lines.append(
-        f"- conductor-old mean auto_score: "
-        f"{comparison_display(metrics['conductor-old'], metrics['conductor-new'])}"
-    )
-    lines.append(
-        f"- conductor-new mean auto_score: "
-        f"{comparison_display(metrics['conductor-new'], metrics['conductor-old'])}"
-    )
-    if old_new_comparable:
-        lines.append(f"- quality delta: {ns - os:+.3f}")
-        if os:
+    old_new_left, old_new_right = paired_comparable(old_rows, new_rows, fx_by_id)
+    lines.append(f"- conductor-old mean auto_score: {metric_display(metrics['conductor-old'])}")
+    lines.append(f"- conductor-new mean auto_score: {metric_display(metrics['conductor-new'])}")
+    if old_new_left:
+        paired_os = statistics.mean(old_new_left)
+        paired_ns = statistics.mean(old_new_right)
+        lines.append(
+            f"- quality delta (paired n={len(old_new_left)}): "
+            f"{paired_ns - paired_os:+.3f}"
+        )
+        if paired_os:
             lines.append(
-                f"- quality delta percentage: "
-                f"{'+' if ns >= os else ''}{((ns - os) / os * 100):.1f}% vs old"
+                f"- quality delta percentage (paired n={len(old_new_left)}): "
+                f"{'+' if paired_ns >= paired_os else ''}"
+                f"{((paired_ns - paired_os) / paired_os * 100):.1f}% vs old"
             )
+    else:
+        lines.append(
+            f"- paired successful intersection: "
+            f"n={paired_success_count(old_rows, new_rows)} "
+            f"(<{MIN_SUCCESSFUL_ROWS}); quality comparison omitted"
+        )
     lines.append(f"- conductor-old total cost: ${oc:.4f}, latency: {ol:.1f}s")
     lines.append(f"- conductor-new total cost: ${nc:.4f}, latency: {nl:.1f}s")
     lines.append("")
 
     # c) conductor-new vs trinity
     lines.append("### c) conductor-new vs trinity\n")
-    new_trinity_comparable = comparable(metrics["conductor-new"], metrics["trinity"])
-    lines.append(
-        f"- trinity mean auto_score: "
-        f"{comparison_display(metrics['trinity'], metrics['conductor-new'])}"
+    new_trinity_left, new_trinity_right = paired_comparable(
+        new_rows, trinity_rows, fx_by_id
     )
-    lines.append(
-        f"- conductor-new mean auto_score: "
-        f"{comparison_display(metrics['conductor-new'], metrics['trinity'])}"
-    )
-    if new_trinity_comparable:
-        lines.append(f"- quality delta: {ns - ts:+.3f}")
-        if ts:
+    lines.append(f"- trinity mean auto_score: {metric_display(metrics['trinity'])}")
+    lines.append(f"- conductor-new mean auto_score: {metric_display(metrics['conductor-new'])}")
+    if new_trinity_left:
+        paired_ns = statistics.mean(new_trinity_left)
+        paired_ts = statistics.mean(new_trinity_right)
+        lines.append(
+            f"- quality delta (paired n={len(new_trinity_left)}): "
+            f"{paired_ns - paired_ts:+.3f}"
+        )
+        if paired_ts:
             lines.append(
-                f"- quality delta percentage: "
-                f"{'+' if ns >= ts else ''}{((ns - ts) / ts * 100):.1f}% vs trinity"
+                f"- quality delta percentage (paired n={len(new_trinity_left)}): "
+                f"{'+' if paired_ns >= paired_ts else ''}"
+                f"{((paired_ns - paired_ts) / paired_ts * 100):.1f}% vs trinity"
             )
+    else:
+        lines.append(
+            f"- paired successful intersection: "
+            f"n={paired_success_count(new_rows, trinity_rows)} "
+            f"(<{MIN_SUCCESSFUL_ROWS}); quality comparison omitted"
+        )
     lines.append(f"- trinity total cost: ${tc:.4f}, latency: {tl:.1f}s")
     lines.append(f"- conductor-new total cost: ${nc:.4f}, latency: {nl:.1f}s")
     lines.append("")
@@ -375,7 +421,9 @@ def main() -> None:
     new_err = error_rate(new_rows)
 
     # Decision rule from task, plus a guard for the failure case observed here
-    if not new_trinity_comparable or not comparable(metrics["direct"], metrics["conductor-new"]):
+    if not new_trinity_left or not paired_comparable(
+        direct_rows, new_rows, fx_by_id
+    )[0]:
         rec = (
             "Insufficient comparable successful rows for a Conductor quality "
             "comparison. Recommendation: collect at least "

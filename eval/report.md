@@ -1,14 +1,14 @@
 ## Provenance
 - config/arm: `direct,trinity,conductor-old,conductor-new`
-- git SHA: `ab92432004acfcbdfcf2762c80a0985c36065d1d`
+- git SHA: `1bf1909dea0bd5b66e3a3a43cd514fd54c8dd79e`
 - catalog revision: `bifrost-2026-08-12`
 - fixtures: `eval/fixtures.jsonl` (sha256 `3fdd2ae72173ee1f91b1eae60edd223a8e0a433c32d1c1d2d6c81c8afdeee366`)
-- generated at: `2026-08-12T19:03:41.076115+00:00`
+- generated at: `2026-08-12T19:08:07.640742+00:00`
 - cost method: `native estimated prices; 2K prompt + 1K completion assumption`
 
 # Comparative Eval: direct vs TRINITY vs Conductor-old vs Conductor-new
 
-Scoring rule: report a mean only with at least 4 successful rows; comparisons also require matching successful counts.
+Scoring rule: report a mean only with at least 4 successful rows; comparisons use successful-item intersections.
 
 Scoring note: an empty response without an error scores 0.0 under the current keyword scorer; row output does not distinguish an empty answer from a wrong answer.
 
@@ -69,8 +69,8 @@ Scoring note: an empty response without an error scores 0.0 under the current ke
 
 - direct mean auto_score: 0.568
 - trinity mean auto_score: 0.890
-- quality delta: +0.322
-- quality delta percentage: +56.6% vs direct
+- quality delta (paired n=16): +0.322
+- quality delta percentage (paired n=16): +56.6% vs direct
 - direct total cost: $0.0128, latency: 125.5s
 - trinity total cost: $0.4563, latency: 1023.0s
 - cost delta: $+0.4435 (3465.0% vs direct)
@@ -79,13 +79,15 @@ Scoring note: an empty response without an error scores 0.0 under the current ke
 
 - conductor-old mean auto_score: n/a (1/16 successful)
 - conductor-new mean auto_score: n/a (1/16 successful)
+- paired successful intersection: n=0 (<4); quality comparison omitted
 - conductor-old total cost: $0.1183, latency: 56.6s
 - conductor-new total cost: $0.1183, latency: 103.0s
 
 ### c) conductor-new vs trinity
 
-- trinity mean auto_score: n/a (16/16 successful)
+- trinity mean auto_score: 0.890
 - conductor-new mean auto_score: n/a (1/16 successful)
+- paired successful intersection: n=1 (<4); quality comparison omitted
 - trinity total cost: $0.4563, latency: 1023.0s
 - conductor-new total cost: $0.1183, latency: 103.0s
 
