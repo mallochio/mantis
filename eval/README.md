@@ -4,11 +4,12 @@ Evaluation harness and results for Mantis.
 
 ## Router harness (W1/W2)
 
-`router_manifest.json` freezes 40 instances from
-`nebius/SWE-rebench-leaderboard` at dataset revision
-`34d5a58864acf91613740a09ec5d205228dcfa39`. Its `created_at_window` and exact
-instance records are the reproducibility boundary; runs belong in the ignored
-`eval/runs/` directory.
+`router_manifest.json` freezes 40 stratified instances from the `2026_03`
+split of `nebius/SWE-rebench-leaderboard` at dataset revision
+`34d5a58864acf91613740a09ec5d205228dcfa39`. Its split, seed,
+`created_at_window`, repository distribution, and exact instance records are
+the reproducibility boundary; runs belong in the ignored `eval/runs/`
+directory.
 
 `router_eval.py` supports these arms:
 
@@ -16,7 +17,8 @@ instance records are the reproducibility boundary; runs belong in the ignored
   the corresponding catalog `upstream_model`;
 - `mantis-direct`: the routed `model=mantis` endpoint;
 - `heuristic`: client-side prompt complexity selection;
-- `random-matched`: tier sampling from observed `mantis-direct` frequencies;
+- `random-matched`: tier sampling from a frozen distribution measured after
+  the complete `mantis-direct` phase;
 - `trinity`: independently selectable `model=mantis-trinity`.
 
 Every routed request carries `X-Route-Session` and records route decision

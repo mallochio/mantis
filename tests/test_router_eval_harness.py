@@ -1,7 +1,10 @@
 """Hermetic tests for the graded router evaluation harness."""
 
 import importlib.util
+import json
+import threading
 import types
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -151,3 +154,100 @@ def test_agent_stops_on_per_instance_budget(monkeypatch):
     )
     assert row["aborted"] is True
     assert row["resolved"] is False
+
+
+def test_agent_model_reaches_loopback_openai_endpoint(monkeypatch):
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers["Content-Length"])
+            requests.append((self.path, self.headers, json.loads(self.rfile.read(length))))
+            body = {
+                "id": "fake",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": '{"command":"echo ok"}'},
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 3, "cost": 0.12},
+            }
+            payload = json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("x-route-decision", "cheap")
+            self.send_header("x-route-model", "deepseek-v4-flash")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        import minisweagent.agents
+        import minisweagent.config
+        import minisweagent.environments
+
+        class FakeEnvironment:
+            def cleanup(self):
+                pass
+
+        class FakeAgent:
+            def __init__(self, model):
+                self.model = model
+                self.messages = []
+
+            def run(self, task):
+                self.messages.append(self.model.query([]))
+                return {"submission": "diff --git a/a b/a\n"}
+
+            def serialize(self):
+                return {"messages": self.messages}
+
+        monkeypatch.setattr(
+            minisweagent.config, "get_config_from_spec",
+            lambda path: {"model": {}, "agent": {}, "environment": {}},
+        )
+        monkeypatch.setattr(
+            minisweagent.environments, "get_environment",
+            lambda config: FakeEnvironment(),
+        )
+        monkeypatch.setattr(
+            minisweagent.agents, "get_agent",
+            lambda model, env, config, default_type: FakeAgent(model),
+        )
+        monkeypatch.setattr(
+            harness, "grade_patch",
+            lambda instance, patch: {"resolved": True, "grader_output": "PASS"},
+        )
+        row = harness.run_mini_agent(
+            _instance(),
+            arm="cheap-only",
+            endpoint=f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
+            tier_models={"cheap": "cheap", "middle": "middle", "expensive": "expensive"},
+            prices={"cheap": {"input_per_token": 1.0, "output_per_token": 1.0}},
+            ledger=harness.CostLedger(total_limit=2.0, instance_limit=2.0),
+            rng=harness.random.Random(1),
+            step_limit=2,
+            output_token_limit=32,
+            frequencies={"cheap": 1.0, "middle": 0.0, "expensive": 0.0},
+        )
+        assert row["resolved"] is True
+        assert row["cost_usd"] == 0.12
+        assert row["route_trace"][0]["route_headers"]["x-route-decision"] == "cheap"
+        assert requests and requests[0][2]["model"] == "cheap"
+        assert requests[0][1]["X-Route-Session"].startswith("router-eval-")
+    finally:
+        server.shutdown()

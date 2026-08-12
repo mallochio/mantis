@@ -378,6 +378,8 @@ def main() -> None:
         arms.append("trinity")
     if set(arms) - set(ARMS):
         parser.error(f"unknown arms: {sorted(set(arms) - set(ARMS))}")
+    if "random-matched" in arms and "mantis-direct" not in arms:
+        parser.error("random-matched requires mantis-direct for its observed distribution")
     caps = {arm: DEFAULT_CAPS[arm] for arm in arms}
     if args.dry_run:
         print(dry_run(manifest, arms, caps, args.prices))
@@ -399,36 +401,58 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w") as output:
         output.write(json.dumps({"metadata": metadata}) + "\n")
-        for instance in manifest["instances"]:
+        instances = manifest["instances"]
+        direct_rows: dict[str, dict[str, Any]] = {}
+        for instance in instances:
             ledger.begin_instance()
             if ledger.total >= ledger.total_limit:
                 metadata["aborted_on_budget"] = True
                 break
-            rows: list[dict[str, Any]] = []
-            for arm in arms:
-                endpoint = (
-                    args.mantis_endpoint if arm in {"mantis-direct", "trinity"}
-                    else args.bifrost_endpoint
-                )
-                row = run_mini_agent(
-                    instance, arm=arm, endpoint=endpoint, tier_models=tier_models,
-                    prices=prices, ledger=ledger, rng=rng,
-                    step_limit=args.step_limit, output_token_limit=args.output_token_limit,
-                    frequencies=frequencies,
-                )
-                rows.append(row)
-                if row.get("aborted"):
-                    metadata["aborted_on_budget"] = True
-                    break
-            if metadata["aborted_on_budget"]:
+            row = run_mini_agent(
+                instance, arm="mantis-direct", endpoint=args.mantis_endpoint,
+                tier_models=tier_models, prices=prices, ledger=ledger, rng=rng,
+                step_limit=args.step_limit, output_token_limit=args.output_token_limit,
+                frequencies={tier: 1 / len(TIERS) for tier in TIERS},
+            )
+            if row.get("aborted"):
+                metadata["aborted_on_budget"] = True
                 break
-            for row in rows:
-                output.write(json.dumps(row) + "\n")
-            output.flush()
-            direct_rows = [row for row in rows if row["arm"] == "mantis-direct"]
-            observed = [row.get("tier") for row in direct_rows if row.get("tier") in TIERS]
-            if observed:
-                frequencies = {tier: observed.count(tier) / len(observed) for tier in TIERS}
+            direct_rows[instance["instance_id"]] = row
+        if not metadata["aborted_on_budget"]:
+            observed = [
+                row.get("tier") for row in direct_rows.values()
+                if row.get("tier") in TIERS
+            ]
+            frequencies = (
+                {tier: observed.count(tier) / len(observed) for tier in TIERS}
+                if observed else {tier: 1 / len(TIERS) for tier in TIERS}
+            )
+            remaining_arms = [arm for arm in arms if arm != "mantis-direct"]
+            for instance in instances:
+                instance_id = instance["instance_id"]
+                ledger.instance = float(direct_rows[instance_id].get("cost_usd") or 0)
+                rows = [direct_rows[instance_id]]
+                for arm in remaining_arms:
+                    endpoint = (
+                        args.mantis_endpoint if arm == "trinity"
+                        else args.bifrost_endpoint
+                    )
+                    row = run_mini_agent(
+                        instance, arm=arm, endpoint=endpoint,
+                        tier_models=tier_models, prices=prices, ledger=ledger,
+                        rng=rng, step_limit=args.step_limit,
+                        output_token_limit=args.output_token_limit,
+                        frequencies=frequencies,
+                    )
+                    rows.append(row)
+                    if row.get("aborted"):
+                        metadata["aborted_on_budget"] = True
+                        break
+                if metadata["aborted_on_budget"]:
+                    break
+                for row in rows:
+                    output.write(json.dumps(row) + "\n")
+                output.flush()
         output.write(json.dumps({"metadata": {**metadata, "spent_usd": ledger.total}}) + "\n")
     print(json.dumps({**metadata, "spent_usd": ledger.total}, indent=2))
 
