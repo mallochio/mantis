@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from score import provenance, score_response
+from score import MIN_SUCCESSFUL_ROWS, provenance, score_response
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -131,8 +131,13 @@ def summarize(results: list[dict[str, Any]], output: str) -> None:
         mean_score = statistics.mean(scores) if scores else 0.0
         total_cost = sum(costs)
         eff = mean_score / total_cost if total_cost else float("nan")
+        score_display = (
+            f"{mean_score:.2f}"
+            if len(ok) >= MIN_SUCCESSFUL_ROWS
+            else f"n/a ({len(ok)}/{len(rs)} successful)"
+        )
         lines.append(
-            f"| {t} | {len(ok)}/{len(rs)} | {len(rs) - len(ok)} | {mean_score:.2f} | "
+            f"| {t} | {len(ok)}/{len(rs)} | {len(rs) - len(ok)} | {score_display} | "
             f"{total_cost:.4f} | "
             f"{eff:.1f} | {statistics.median(lats) if lats else 0:.1f}/{pct(lats, 0.95):.1f} | "
             f"{int(statistics.median(comps)) if comps else 0} |"
@@ -154,9 +159,14 @@ def summarize(results: list[dict[str, Any]], output: str) -> None:
             scores = [score_response(r["response_text"], _expect(r)) for r in rs]
             costs = [r["cost_usd"] for r in rs if r["cost_usd"] is not None]
             lats = [r["latency_s"] for r in rs]
+            score_display = (
+                f"{statistics.mean(scores):.2f}"
+                if len(rs) >= MIN_SUCCESSFUL_ROWS
+                else f"n/a ({len(rs)}/{len(all_rs)} successful)"
+            )
             lines.append(
                 f"| {t} | {len(rs)}/{len(all_rs)} | {len(all_rs) - len(rs)} | "
-                f"{statistics.mean(scores):.2f} | {sum(costs):.4f} | "
+                f"{score_display} | {sum(costs):.4f} | "
                 f"{statistics.median(lats):.1f} |"
             )
         lines.append("")

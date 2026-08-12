@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 REPO = Path(__file__).resolve().parent.parent
+MIN_SUCCESSFUL_ROWS = 4
 
 
 def provenance(
@@ -105,6 +106,30 @@ def aggregate_metrics(
     }
 
 
+def metric_display(
+    metrics: dict[str, Any], key: str = "auto_score_mean", digits: int = 3
+) -> str:
+    success = metrics["success_count"]
+    total = metrics["count"]
+    if success < MIN_SUCCESSFUL_ROWS:
+        return f"n/a ({success}/{total} successful)"
+    return f"{metrics[key]:.{digits}f}"
+
+
+def comparable(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    return (
+        left["success_count"] >= MIN_SUCCESSFUL_ROWS
+        and right["success_count"] >= MIN_SUCCESSFUL_ROWS
+        and left["success_count"] == right["success_count"]
+    )
+
+
+def comparison_display(left: dict[str, Any], right: dict[str, Any]) -> str:
+    if comparable(left, right):
+        return metric_display(left)
+    return f"n/a ({left['success_count']}/{left['count']} successful)"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Score eval results.")
     parser.add_argument("--fixtures", default=str(REPO / "eval" / "fixtures.jsonl"))
@@ -181,6 +206,10 @@ def main() -> None:
         cost_method="native estimated prices; 2K prompt + 1K completion assumption",
     )
     lines.append("# Comparative Eval: direct vs TRINITY vs Conductor-old vs Conductor-new\n")
+    lines.append(
+        f"Scoring rule: report a mean only with at least {MIN_SUCCESSFUL_ROWS} "
+        "successful rows; comparisons also require matching successful counts.\n"
+    )
     lines.append("## Summary\n")
     lines.append(
         "| config | success | errors | auto_score_mean | latency_mean_s | est_cost_sum_usd |"
@@ -190,7 +219,7 @@ def main() -> None:
         m = metrics[c]
         summary_row = (
             f"| {c} | {m['success_count']}/{m['count']} | {m['error_count']} | "
-            f"{m['auto_score_mean']:.3f} | {m['latency_mean_s']:.1f} | "
+            f"{metric_display(m)} | {metric_display(m, 'latency_mean_s', 1)} | "
             f"${m['cost_sum_usd']:.4f} |"
         )
         lines.append(summary_row)
@@ -229,7 +258,7 @@ def main() -> None:
             )
             tier_row = (
                 f"| {tier} | {c} | {m['success_count']}/{m['count']} | {m['error_count']} | "
-                f"{m['auto_score_mean']:.3f} | {tier_latency:.1f} | "
+                f"{metric_display(m)} | {tier_latency:.1f} | "
                 f"${m['cost_sum_usd']:.4f} |"
             )
             lines.append(tier_row)
@@ -246,19 +275,22 @@ def main() -> None:
     dl = sum_latency(direct_rows)
     tl = sum_latency(trinity_rows)
     lines.append("### a) trinity vs direct\n")
+    direct_trinity_comparable = comparable(metrics["direct"], metrics["trinity"])
     lines.append(
-        f"- direct mean auto_score ({metrics['direct']['success_count']} successful, "
-        f"{metrics['direct']['error_count']} errors): {ds:.3f}"
+        f"- direct mean auto_score: "
+        f"{comparison_display(metrics['direct'], metrics['trinity'])}"
     )
     lines.append(
-        f"- trinity mean auto_score ({metrics['trinity']['success_count']} successful, "
-        f"{metrics['trinity']['error_count']} errors): {ts:.3f}"
+        f"- trinity mean auto_score: "
+        f"{comparison_display(metrics['trinity'], metrics['direct'])}"
     )
-    qd_direct = (
-        f"- quality delta: {ts - ds:+.3f} "
-        f"({'+' if ts >= ds else ''}{((ts - ds) / ds * 100):.1f}% vs direct)"
-    )
-    lines.append(qd_direct if ds else "")
+    if direct_trinity_comparable:
+        lines.append(f"- quality delta: {ts - ds:+.3f}")
+        if ds:
+            lines.append(
+                f"- quality delta percentage: "
+                f"{'+' if ts >= ds else ''}{((ts - ds) / ds * 100):.1f}% vs direct"
+            )
     lines.append(f"- direct total cost: ${dc:.4f}, latency: {dl:.1f}s")
     lines.append(f"- trinity total cost: ${tc:.4f}, latency: {tl:.1f}s")
     cd_direct = f"- cost delta: ${tc - dc:+.4f} " f"({((tc - dc) / dc * 100):.1f}% vs direct)"
@@ -273,38 +305,44 @@ def main() -> None:
     ol = sum_latency(old_rows)
     nl = sum_latency(new_rows)
     lines.append("### b) conductor-new vs conductor-old\n")
+    old_new_comparable = comparable(metrics["conductor-old"], metrics["conductor-new"])
     lines.append(
-        f"- conductor-old mean auto_score ({metrics['conductor-old']['success_count']} successful, "
-        f"{metrics['conductor-old']['error_count']} errors): {os:.3f}"
+        f"- conductor-old mean auto_score: "
+        f"{comparison_display(metrics['conductor-old'], metrics['conductor-new'])}"
     )
     lines.append(
-        f"- conductor-new mean auto_score ({metrics['conductor-new']['success_count']} successful, "
-        f"{metrics['conductor-new']['error_count']} errors): {ns:.3f}"
+        f"- conductor-new mean auto_score: "
+        f"{comparison_display(metrics['conductor-new'], metrics['conductor-old'])}"
     )
-    qd_old = (
-        f"- quality delta: {ns - os:+.3f} "
-        f"({'+' if ns >= os else ''}{((ns - os) / os * 100):.1f}% vs old)"
-    )
-    lines.append(qd_old if os else "")
+    if old_new_comparable:
+        lines.append(f"- quality delta: {ns - os:+.3f}")
+        if os:
+            lines.append(
+                f"- quality delta percentage: "
+                f"{'+' if ns >= os else ''}{((ns - os) / os * 100):.1f}% vs old"
+            )
     lines.append(f"- conductor-old total cost: ${oc:.4f}, latency: {ol:.1f}s")
     lines.append(f"- conductor-new total cost: ${nc:.4f}, latency: {nl:.1f}s")
     lines.append("")
 
     # c) conductor-new vs trinity
     lines.append("### c) conductor-new vs trinity\n")
+    new_trinity_comparable = comparable(metrics["conductor-new"], metrics["trinity"])
     lines.append(
-        f"- trinity mean auto_score ({metrics['trinity']['success_count']} successful, "
-        f"{metrics['trinity']['error_count']} errors): {ts:.3f}"
+        f"- trinity mean auto_score: "
+        f"{comparison_display(metrics['trinity'], metrics['conductor-new'])}"
     )
     lines.append(
-        f"- conductor-new mean auto_score ({metrics['conductor-new']['success_count']} successful, "
-        f"{metrics['conductor-new']['error_count']} errors): {ns:.3f}"
+        f"- conductor-new mean auto_score: "
+        f"{comparison_display(metrics['conductor-new'], metrics['trinity'])}"
     )
-    qd_trinity = (
-        f"- quality delta: {ns - ts:+.3f} "
-        f"({'+' if ns >= ts else ''}{((ns - ts) / ts * 100):.1f}% vs trinity)"
-    )
-    lines.append(qd_trinity if ts else "")
+    if new_trinity_comparable:
+        lines.append(f"- quality delta: {ns - ts:+.3f}")
+        if ts:
+            lines.append(
+                f"- quality delta percentage: "
+                f"{'+' if ns >= ts else ''}{((ns - ts) / ts * 100):.1f}% vs trinity"
+            )
     lines.append(f"- trinity total cost: ${tc:.4f}, latency: {tl:.1f}s")
     lines.append(f"- conductor-new total cost: ${nc:.4f}, latency: {nl:.1f}s")
     lines.append("")
@@ -316,7 +354,7 @@ def main() -> None:
         m = tier_table["hard"][c]
         hard_line = (
             f"- {c}: mean auto_score ({m['success_count']} successful, {m['error_count']} errors) "
-            f"= {mean_score(rows):.3f}, "
+            f"= {metric_display(m)}, "
         )
         hard_line += f"cost = ${sum_cost(rows):.4f}"
         lines.append(hard_line)
@@ -332,7 +370,13 @@ def main() -> None:
     new_err = error_rate(new_rows)
 
     # Decision rule from task, plus a guard for the failure case observed here
-    if ns < ds - 0.05 and new_err > 0.5:
+    if not new_trinity_comparable or not comparable(metrics["direct"], metrics["conductor-new"]):
+        rec = (
+            "Insufficient comparable successful rows for a Conductor quality "
+            "comparison. Recommendation: collect at least "
+            f"{MIN_SUCCESSFUL_ROWS} successful rows per arm with matched counts."
+        )
+    elif ns < ds - 0.05 and new_err > 0.5:
         rec = (
             f"Conductor-new scores well below direct ({ns:.3f} vs {ds:.3f}) "
             f"and fails on {new_err:.0%} of prompts. Recommendation: do not "

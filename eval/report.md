@@ -1,12 +1,14 @@
 ## Provenance
 - config/arm: `direct,trinity,conductor-old,conductor-new`
-- git SHA: `4af8134b85851387c78b18c8a2cb3275b7a2f69e`
+- git SHA: `f3fb9d25ec7995aafef0441a707d17cfcede1d97`
 - catalog revision: `bifrost-2026-08-12`
 - fixtures: `eval/fixtures.jsonl` (sha256 `3fdd2ae72173ee1f91b1eae60edd223a8e0a433c32d1c1d2d6c81c8afdeee366`)
-- generated at: `2026-08-12T18:58:55.591865+00:00`
+- generated at: `2026-08-12T19:02:49.163626+00:00`
 - cost method: `native estimated prices; 2K prompt + 1K completion assumption`
 
 # Comparative Eval: direct vs TRINITY vs Conductor-old vs Conductor-new
+
+Scoring rule: report a mean only with at least 4 successful rows; comparisons also require matching successful counts.
 
 ## Summary
 
@@ -14,8 +16,8 @@
 |---|---:|---:|---:|---:|---:|
 | direct | 16/16 | 0 | 0.568 | 7.8 | $0.0128 |
 | trinity | 16/16 | 0 | 0.890 | 63.9 | $0.4563 |
-| conductor-old | 1/16 | 15 | 0.833 | 56.6 | $0.1183 |
-| conductor-new | 1/16 | 15 | 1.000 | 103.0 | $0.1183 |
+| conductor-old | 1/16 | 15 | n/a (1/16 successful) | n/a (1/16 successful) | $0.1183 |
+| conductor-new | 1/16 | 15 | n/a (1/16 successful) | n/a (1/16 successful) | $0.1183 |
 
 ## Results matrix (auto_score, latency, cost)
 
@@ -44,45 +46,44 @@
 |---|---|---:|---:|---:|---:|---:|
 | simple | direct | 4/4 | 0 | 0.958 | 29.9 | $0.0032 |
 | simple | trinity | 4/4 | 0 | 0.917 | 311.7 | $0.0062 |
-| simple | conductor-old | 0/4 | 4 | 0.000 | 0.0 | $0.0000 |
-| simple | conductor-new | 1/4 | 3 | 1.000 | 103.0 | $0.1183 |
+| simple | conductor-old | 0/4 | 4 | n/a (0/4 successful) | 0.0 | $0.0000 |
+| simple | conductor-new | 1/4 | 3 | n/a (1/4 successful) | 103.0 | $0.1183 |
 | medium | direct | 4/4 | 0 | 0.700 | 27.4 | $0.0032 |
 | medium | trinity | 4/4 | 0 | 1.000 | 230.6 | $0.2063 |
-| medium | conductor-old | 0/4 | 4 | 0.000 | 0.0 | $0.0000 |
-| medium | conductor-new | 0/4 | 4 | 0.000 | 0.0 | $0.0000 |
+| medium | conductor-old | 0/4 | 4 | n/a (0/4 successful) | 0.0 | $0.0000 |
+| medium | conductor-new | 0/4 | 4 | n/a (0/4 successful) | 0.0 | $0.0000 |
 | hard | direct | 4/4 | 0 | 0.000 | 38.7 | $0.0032 |
 | hard | trinity | 4/4 | 0 | 0.714 | 348.2 | $0.0742 |
-| hard | conductor-old | 0/4 | 4 | 0.000 | 0.0 | $0.0000 |
-| hard | conductor-new | 0/4 | 4 | 0.000 | 0.0 | $0.0000 |
+| hard | conductor-old | 0/4 | 4 | n/a (0/4 successful) | 0.0 | $0.0000 |
+| hard | conductor-new | 0/4 | 4 | n/a (0/4 successful) | 0.0 | $0.0000 |
 | debug | direct | 4/4 | 0 | 0.614 | 29.6 | $0.0032 |
 | debug | trinity | 4/4 | 0 | 0.929 | 132.5 | $0.1697 |
-| debug | conductor-old | 1/4 | 3 | 0.833 | 56.6 | $0.1183 |
-| debug | conductor-new | 0/4 | 4 | 0.000 | 0.0 | $0.0000 |
+| debug | conductor-old | 1/4 | 3 | n/a (1/4 successful) | 56.6 | $0.1183 |
+| debug | conductor-new | 0/4 | 4 | n/a (0/4 successful) | 0.0 | $0.0000 |
 
 ## Headline comparisons
 
 ### a) trinity vs direct
 
-- direct mean auto_score (16 successful, 0 errors): 0.568
-- trinity mean auto_score (16 successful, 0 errors): 0.890
-- quality delta: +0.322 (+56.6% vs direct)
+- direct mean auto_score: 0.568
+- trinity mean auto_score: 0.890
+- quality delta: +0.322
+- quality delta percentage: +56.6% vs direct
 - direct total cost: $0.0128, latency: 125.5s
 - trinity total cost: $0.4563, latency: 1023.0s
 - cost delta: $+0.4435 (3465.0% vs direct)
 
 ### b) conductor-new vs conductor-old
 
-- conductor-old mean auto_score (1 successful, 15 errors): 0.833
-- conductor-new mean auto_score (1 successful, 15 errors): 1.000
-- quality delta: +0.167 (+20.0% vs old)
+- conductor-old mean auto_score: n/a (1/16 successful)
+- conductor-new mean auto_score: n/a (1/16 successful)
 - conductor-old total cost: $0.1183, latency: 56.6s
 - conductor-new total cost: $0.1183, latency: 103.0s
 
 ### c) conductor-new vs trinity
 
-- trinity mean auto_score (16 successful, 0 errors): 0.890
-- conductor-new mean auto_score (1 successful, 15 errors): 1.000
-- quality delta: +0.110 (+12.4% vs trinity)
+- trinity mean auto_score: n/a (16/16 successful)
+- conductor-new mean auto_score: n/a (1/16 successful)
 - trinity total cost: $0.4563, latency: 1023.0s
 - conductor-new total cost: $0.1183, latency: 103.0s
 
@@ -90,12 +91,12 @@
 
 - direct: mean auto_score (4 successful, 0 errors) = 0.000, cost = $0.0032
 - trinity: mean auto_score (4 successful, 0 errors) = 0.714, cost = $0.0742
-- conductor-old: mean auto_score (0 successful, 4 errors) = 0.000, cost = $0.0000
-- conductor-new: mean auto_score (0 successful, 4 errors) = 0.000, cost = $0.0000
+- conductor-old: mean auto_score (0 successful, 4 errors) = n/a (0/4 successful), cost = $0.0000
+- conductor-new: mean auto_score (0 successful, 4 errors) = n/a (0/4 successful), cost = $0.0000
 
 ## Recommendation
 
-Results are mixed. Recommendation: run a targeted hard-tier eval with more prompts and human scoring before committing to more Conductor training.
+Insufficient comparable successful rows for a Conductor quality comparison. Recommendation: collect at least 4 successful rows per arm with matched counts.
 
 ## Errors / timeouts
 

@@ -27,3 +27,7 @@ Commit fixtures, code, and canonical reports. Do not commit raw run output or
 derived `-scored` projections; raw runs belong in `runs/` (gitignored) and
 derived projections are regenerated on demand. Reports must be reproducible
 from tracked fixtures and raw results.
+
+Reports display a quality or latency mean only when an arm has at least four
+successful rows. Comparisons additionally require matching successful counts;
+otherwise the report uses `n/a` and omits derived deltas and percentages.

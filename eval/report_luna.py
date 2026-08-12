@@ -11,7 +11,15 @@ import statistics
 from pathlib import Path
 from typing import Any
 
-from score import load_jsonl, provenance, score_response
+from score import (
+    MIN_SUCCESSFUL_ROWS,
+    comparable,
+    comparison_display,
+    load_jsonl,
+    metric_display,
+    provenance,
+    score_response,
+)
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -117,6 +125,10 @@ def main() -> None:
     )
     lines.append("# Comparative Eval: direct vs TRINITY vs Conductor-Luna\n")
     lines.append(
+        f"Scoring rule: report a mean only with at least {MIN_SUCCESSFUL_ROWS} "
+        "successful rows; comparisons also require matching successful counts.\n"
+    )
+    lines.append(
         "Conductor-Luna uses the LiteLLM planner `gpt-5.6-luna-max` "
         "instead of a local 3B checkpoint.\n"
     )
@@ -130,7 +142,7 @@ def main() -> None:
         m = metrics[c]
         lines.append(
             f"| {c} | {m['success_count']}/{m['count']} | {m['error_count']} | "
-            f"{m['auto_score_mean']:.3f} | {m['latency_sum_s']:.1f} | "
+            f"{metric_display(m)} | {m['latency_sum_s']:.1f} | "
             f"${m['cost_sum_usd']:.4f} |"
         )
     lines.append("")
@@ -168,7 +180,7 @@ def main() -> None:
             m = tier_table[tier][c]
             lines.append(
                 f"| {tier} | {c} | {m['success_count']}/{m['count']} | {m['error_count']} | "
-                f"{m['auto_score_mean']:.3f} | {m['latency_sum_s']:.1f} | "
+                f"{metric_display(m)} | {m['latency_sum_s']:.1f} | "
                 f"${m['cost_sum_usd']:.4f} |"
             )
     lines.append("")
@@ -191,31 +203,41 @@ def main() -> None:
     lines.append("## Headline comparisons\n")
 
     lines.append("### a) conductor-luna vs trinity\n")
-    lines.append(
-        f"- trinity overall mean ({metrics['trinity']['success_count']} successful, "
-        f"{metrics['trinity']['error_count']} errors): {trinity_overall:.3f}"
+    overall_comparable = comparable(metrics["conductor-luna"], metrics["trinity"])
+    hard_comparable = comparable(
+        tier_table["hard"]["conductor-luna"], tier_table["hard"]["trinity"]
     )
     lines.append(
-        f"- conductor-luna overall mean ({metrics['conductor-luna']['success_count']} successful, "
-        f"{metrics['conductor-luna']['error_count']} errors): {luna_overall:.3f}"
-    )
-    lines.append(f"- overall quality delta: {luna_overall - trinity_overall:+.3f}")
-    lines.append(
-        f"- hard-tier trinity mean ({tier_table['hard']['trinity']['success_count']} successful, "
-        f"{tier_table['hard']['trinity']['error_count']} errors): {hard_trinity:.3f}"
+        f"- trinity overall mean: "
+        f"{comparison_display(metrics['trinity'], metrics['conductor-luna'])}"
     )
     lines.append(
-        f"- hard-tier conductor-luna mean "
-        f"({tier_table['hard']['conductor-luna']['success_count']} successful, "
-        f"{tier_table['hard']['conductor-luna']['error_count']} errors): {hard_luna:.3f}"
+        f"- conductor-luna overall mean: "
+        f"{comparison_display(metrics['conductor-luna'], metrics['trinity'])}"
     )
-    lines.append(f"- hard-tier quality delta: {hard_luna - hard_trinity:+.3f}")
+    if overall_comparable:
+        lines.append(f"- overall quality delta: {luna_overall - trinity_overall:+.3f}")
+    lines.append(
+        f"- hard-tier trinity mean: "
+        f"{comparison_display(tier_table['hard']['trinity'], tier_table['hard']['conductor-luna'])}"
+    )
+    lines.append(
+        f"- hard-tier conductor-luna mean: "
+        f"{comparison_display(tier_table['hard']['conductor-luna'], tier_table['hard']['trinity'])}"
+    )
+    if hard_comparable:
+        lines.append(f"- hard-tier quality delta: {hard_luna - hard_trinity:+.3f}")
     lines.append("")
 
     lines.append("### b) cost-per-quality-point\n")
     score_delta = luna_overall - trinity_overall
     cost_delta = luna_cost - trinity_cost
-    if score_delta > 0 and cost_delta >= 0:
+    if not overall_comparable:
+        lines.append(
+            f"- overall: insufficient comparable successful rows; "
+            f"each arm requires at least {MIN_SUCCESSFUL_ROWS} with matching counts"
+        )
+    elif score_delta > 0 and cost_delta >= 0:
         cpp = cost_delta / score_delta if score_delta else 0.0
         lines.append(
             wrap(
@@ -242,7 +264,12 @@ def main() -> None:
 
     hard_score_delta = hard_luna - hard_trinity
     hard_cost_delta = hard_luna_cost - hard_trinity_cost
-    if hard_score_delta > 0 and hard_cost_delta >= 0:
+    if not hard_comparable:
+        lines.append(
+            f"- hard tier: insufficient comparable successful rows; "
+            f"each arm requires at least {MIN_SUCCESSFUL_ROWS} with matching counts"
+        )
+    elif hard_score_delta > 0 and hard_cost_delta >= 0:
         hard_cpp = hard_cost_delta / hard_score_delta if hard_score_delta else 0.0
         lines.append(
             wrap(
@@ -276,7 +303,14 @@ def main() -> None:
     lines.append("")
 
     lines.append("## Decision table\n")
-    if hard_luna >= hard_trinity + 0.10:
+    if not hard_comparable:
+        decision = "insufficient comparable successful rows on hard tier"
+        threshold = 6
+        reason = (
+            f"Collect at least {MIN_SUCCESSFUL_ROWS} successful rows per arm "
+            "with matched counts before making a Conductor routing decision."
+        )
+    elif hard_luna >= hard_trinity + 0.10:
         decision = "conductor-luna hard-tier mean >= trinity + 0.10"
         threshold = 4
         reason = (
