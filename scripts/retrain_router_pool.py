@@ -13,7 +13,6 @@ Usage (local):
   google/gemini-3.1-pro-preview|high
 
 Usage (SkyPilot):
-  sky launch launch/sky/retrain_fugu_router.yaml
 
 What it does:
   1. Downloads a task dataset (default TerminalBench 2.1 mirror) and a small
@@ -77,9 +76,9 @@ from huggingface_hub import snapshot_download
 from torch import nn
 from tqdm.auto import tqdm
 
-# Make OpenFugu internals importable when this script lives in mantis/scripts.
+# Make orchestration internals importable when this script lives in mantis/scripts.
 REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT / "openfugu-patch"))
+sys.path.insert(0, str(REPO_ROOT / "orchestrator"))
 
 from mini import (
     HEAD_ROWS,

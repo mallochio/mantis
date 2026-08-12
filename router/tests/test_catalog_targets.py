@@ -96,7 +96,6 @@ def catalog_server(tmp_path, monkeypatch):
 
 
 def test_catalog_exact_mapping_invalid_reason_and_bounded_cycles(catalog_server, monkeypatch):
-    monkeypatch.setattr(catalog_server, "ROUTER_NAME", "supra")
     for level, expected in enumerate(("low", "mid", "work", "responses", "safe"), 1):
         monkeypatch.setattr(catalog_server, "_supra_complexity", lambda _prompt, level=level: (level, 1))
         assert catalog_server._decide_uncached("task")[0] == expected

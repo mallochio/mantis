@@ -16,7 +16,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import retrain_conductor as rc  # noqa: E402
 import retrain_router_pool as rp  # noqa: E402
-from openfugu.ultra import CANNED, MockWorker  # noqa: E402
+from ultra import CANNED, MockWorker  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

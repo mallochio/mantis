@@ -1,4 +1,4 @@
-"""Unit tests for openfugu-patch/serve.py."""
+"""Unit tests for orchestrator/serve.py."""
 
 from __future__ import annotations
 

@@ -50,7 +50,7 @@ This shows the orchestration code and worker calls work fine when the planner is
   ```
 - Docker logs: checkpoint loads successfully, no OOM.
 
-**Root cause for this checkpoint:** the retrained checkpoint emits a plain-text answer instead of the required three Python lists (`model_id`, `subtasks`, `access_list`). `openfugu.ultra.parse_workflow` cannot parse it.
+**Root cause for this checkpoint:** the retrained checkpoint emits a plain-text answer instead of the required three Python lists (`model_id`, `subtasks`, `access_list`). `ultra.parse_workflow` cannot parse it.
 
 ## Memory check
 

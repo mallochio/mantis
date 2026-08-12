@@ -624,7 +624,7 @@ def _router_error(upstream: httpx.Response) -> JSONResponse:
     except ValueError:
         body = {
             "error": {
-                "message": "llm-router returned an invalid response",
+                "message": "router returned an invalid response",
                 "type": "upstream_error",
             }
         }
@@ -703,7 +703,7 @@ def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Respons
                 headers={"X-Request-Id": request_id, **_router_response_headers(upstream)},
             )
         except httpx.HTTPError as error:
-            return _error(502, f"llm-router unavailable: {error}", "upstream_error")
+            return _error(502, f"router unavailable: {error}", "upstream_error")
         finally:
             if not handed_off:
                 _capacity.release()

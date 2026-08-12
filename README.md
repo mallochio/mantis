@@ -239,7 +239,7 @@ Large checkpoints and generated outputs remain outside Git.
 ```bash
 uv run pytest tests -q
 uv run ruff check .
-uv run mypy openfugu-patch scripts --exclude outputs
+uv run mypy orchestrator scripts --exclude outputs
 ./scripts/verify.sh
 uv sync --directory router --locked --all-groups
 uv run --directory router pytest tests -q

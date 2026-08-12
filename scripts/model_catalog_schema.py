@@ -1,7 +1,7 @@
-"""Shared, secret-free catalog schema for the Mantis and llm-router consumers.
+"""Shared, secret-free catalog schema for the Mantis and router consumers.
 
 The identifier grammar and the adapter/protocol table are identical to the
-llm-router (RouteLLM) consumer so one catalog can feed both servers.
+Mantis router consumer so one catalog can feed both servers.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-# Identifier grammar shared with the llm-router consumer.
+# Identifier grammar shared with the router consumer.
 TARGET_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _CONTRACT = re.compile(r"[0-9a-f]{64}\Z")

@@ -1,6 +1,5 @@
 fastapi==0.139.0
 httpx==0.28.1
-routellm==0.2.0
 torch==2.13.0
 transformers==5.13.1
 uvicorn==0.51.0

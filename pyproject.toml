@@ -106,24 +106,21 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"openfugu-patch/serve.py" = ["E402", "F403"]
-"openfugu-patch/conductor.py" = ["E402"]
-"openfugu-patch/providers.py" = ["E402"]
-"openfugu-patch/runs.py" = ["E402"]
-"openfugu-patch/serve_config.py" = ["E402"]
-"openfugu-patch/trinity.py" = ["E402"]
-"openfugu-patch/utils.py" = ["E402"]
+"orchestrator/serve.py" = ["E402", "F403"]
+"orchestrator/conductor.py" = ["E402"]
+"orchestrator/providers.py" = ["E402"]
+"orchestrator/runs.py" = ["E402"]
+"orchestrator/serve_config.py" = ["E402"]
+"orchestrator/trinity.py" = ["E402"]
+"orchestrator/utils.py" = ["E402"]
 "scripts/retrain_router_pool.py" = ["E402"]
 "scripts/learn_router.py" = ["E402"]
 "scripts/retrain_conductor.py" = ["E402", "I001"]
-"openfugu-patch/mini.py" = ["ALL"]
-"openfugu-patch/ultra.py" = ["ALL"]
+"orchestrator/mini.py" = ["ALL"]
+"orchestrator/ultra.py" = ["ALL"]
 "scripts/toolscale_data.py" = ["ALL"]
-"openfugu/mini.py" = ["F403"]
-"openfugu/ultra.py" = ["F403"]
-"scripts/update_pool.py" = ["S310"]
 "tests/test_serve.py" = ["E501", "S310"]
-"openfugu-patch/api.py" = ["E501"]
+"orchestrator/api.py" = ["E501"]
 "tests/test_retrain_router_pool.py" = ["E501"]
 "tests/test_retrain_conductor.py" = ["I001", "S105"]
 
@@ -145,22 +142,21 @@ exclude = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["scripts", "openfugu-patch", "OpenFugu/openfugu", "OpenFugu"]
-addopts = "--cov=scripts --cov=openfugu-patch --cov-report=term-missing --cov-report=xml --cov-fail-under=90"
+pythonpath = ["scripts", "orchestrator", "OpenFugu/openfugu", "OpenFugu"]
+addopts = "--cov=scripts --cov=orchestrator --cov-report=term-missing --cov-report=xml --cov-fail-under=90"
 
 [tool.coverage.run]
-source = ["scripts", "openfugu-patch"]
+source = ["scripts", "orchestrator"]
 omit = [
     "*/tests/*",
     "OpenFugu/*",
     "scripts/make_vec.py",
     "scripts/generate_conductor_requirements.py",
     "scripts/retrain_conductor.py",
-    "scripts/sky_launch_retrain_router.sh",
     "scripts/verify.sh",
     "scripts/toolscale_data.py",
-    "openfugu-patch/mini.py",
-    "openfugu-patch/ultra.py",
+    "orchestrator/mini.py",
+    "orchestrator/ultra.py",
 ]
 
 [tool.coverage.report]

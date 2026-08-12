@@ -1,4 +1,4 @@
-"""Tests for Conductor device/dtype auto-detection in openfugu-patch/serve.py."""
+"""Tests for Conductor device/dtype auto-detection in orchestrator/serve.py."""
 from __future__ import annotations
 
 import importlib.util
@@ -16,13 +16,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 def _load_serve_module() -> ModuleType:
     """Load serve.py as a module despite the hyphen in the directory name."""
     spec = importlib.util.spec_from_file_location(
-        "fugu_serve", REPO_ROOT / "openfugu-patch" / "serve.py"
+        "fugu_serve", REPO_ROOT / "orchestrator" / "serve.py"
     )
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     # serve.py needs to find upstream OpenFugu packages.
     sys.path.insert(0, str(REPO_ROOT / "OpenFugu" / "openfugu"))
-    sys.path.insert(0, str(REPO_ROOT / "openfugu-patch"))
+    sys.path.insert(0, str(REPO_ROOT / "orchestrator"))
     try:
         spec.loader.exec_module(module)
     finally:

@@ -10,14 +10,6 @@ import pytest
 import server
 
 
-class FakeRouter:
-    def __init__(self, score=0.3):
-        self._score = score
-
-    def calculate_strong_win_rate(self, prompt):
-        return self._score
-
-
 @pytest.fixture(autouse=True)
 def isolate_store(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "DECISION_STORE_PATH", tmp_path / "decision-state.jsonl")
@@ -32,8 +24,6 @@ def test_default_maps_level_3_and_4_to_middle_and_5_to_expensive(monkeypatch):
 
     monkeypatch.setattr(server, "MIDDLE_MIN_COMPLEXITY", 3)
     monkeypatch.setattr(server, "EXPENSIVE_MIN_COMPLEXITY", 5)
-    monkeypatch.setattr(server, "ROUTER_NAME", "supra")
-    monkeypatch.setattr(server, "SCORE_WITH_MF", False)
     monkeypatch.setattr(server, "_supra_complexity", lambda prompt: (3, 10))
     assert server._decide_uncached("level three")[0] == "middle"
     monkeypatch.setattr(server, "_supra_complexity", lambda prompt: (4, 10))
@@ -43,8 +33,6 @@ def test_default_maps_level_3_and_4_to_middle_and_5_to_expensive(monkeypatch):
 
 
 def test_supra_mode_decides_on_complexity_alone(monkeypatch):
-    monkeypatch.setattr(server, "ROUTER_NAME", "supra")
-    monkeypatch.setattr(server, "SCORE_WITH_MF", False)
     monkeypatch.setattr(server, "MIDDLE_CONFIGURED", False)
     monkeypatch.setattr(server, "EXPENSIVE_MIN_COMPLEXITY", 3)
     calls = []
@@ -109,7 +97,6 @@ def test_supra_early_stop_waits_for_complexity_digit(monkeypatch):
 
 
 def test_supra_mode_short_prompt_still_uses_supra(monkeypatch):
-    monkeypatch.setattr(server, "ROUTER_NAME", "supra")
     monkeypatch.setattr(server, "MIDDLE_CONFIGURED", True)
     monkeypatch.setattr(server, "MIDDLE_MIN_COMPLEXITY", 3)
     monkeypatch.setattr(server, "EXPENSIVE_MIN_COMPLEXITY", 4)
@@ -124,44 +111,10 @@ def test_supra_mode_short_prompt_still_uses_supra(monkeypatch):
     assert decision == "expensive" and ran
 
 
-def test_supra_mode_score_with_mf_is_observability_only(monkeypatch):
-    monkeypatch.setattr(server, "ROUTER_NAME", "supra")
-    monkeypatch.setattr(server, "SCORE_WITH_MF", True)
-    monkeypatch.setattr(server, "_supra_complexity", lambda p: (2, 90))
-    monkeypatch.setattr(server, "_load_router", lambda: FakeRouter(0.9))
-    decision, score, _, _ = server._decide_uncached("low complexity prompt")
-    # MF score is recorded but never flips a supra-cheap decision to expensive.
-    assert decision == "cheap" and score == 0.9
-
-
-def test_supra_mode_falls_back_to_mf_when_supra_unavailable(monkeypatch):
-    monkeypatch.setattr(server, "ROUTER_NAME", "supra")
-
-    def boom(prompt):
-        raise RuntimeError("no torch")
-
-    monkeypatch.setattr(server, "_supra_complexity", boom)
-    monkeypatch.setattr(server, "_load_router", lambda: FakeRouter(0.3))
-    decision, score, complexity, ms = server._decide_uncached("anything")
-    assert decision == "expensive" and score == 0.3 and complexity is None
-    # and low MF scores stay cheap through the legacy path
-    monkeypatch.setattr(server, "_load_router", lambda: FakeRouter(0.05))
-    decision, _, _, _ = server._decide_uncached("anything")
-    assert decision == "cheap"
-
-
-def test_mf_mode_unchanged(monkeypatch):
-    monkeypatch.setattr(server, "ROUTER_NAME", "mf")
-    monkeypatch.setattr(server, "_supra_complexity", lambda p: (4, 100))
-    monkeypatch.setattr(server, "_load_router", lambda: FakeRouter(0.3))
-    decision, score, complexity, ms = server._decide_uncached("anything")
-    assert decision == "expensive" and score == 0.3 and complexity is None
-    monkeypatch.setattr(server, "_load_router", lambda: FakeRouter(0.1))
-    long_prompt = ("please refactor this parser module for clarity and add unit tests, then document the public API "
-                   "surface and update the changelog with a summary of the behavioral changes for the next release")
-    assert len(long_prompt) > 120
-    decision, _, complexity, _ = server._decide_uncached(long_prompt)
-    assert decision == "expensive" and complexity == 4  # supra gate below threshold
+def test_supra_failure_uses_safe_target(monkeypatch):
+    monkeypatch.setattr(server, "_supra_complexity", lambda prompt: (_ for _ in ()).throw(RuntimeError()))
+    monkeypatch.setattr(server, "_safe_target", lambda: "expensive")
+    assert server._decide_uncached("anything") == ("expensive", None, None, None)
 
 
 def test_cheap_successes_pin_cheap(monkeypatch):
@@ -224,8 +177,6 @@ def test_store_roundtrip(tmp_path, monkeypatch):
 
 
 def test_decide_uses_pinned_decision(monkeypatch):
-    monkeypatch.setattr(server, "ROUTER_NAME", "supra")
-    monkeypatch.setattr(server, "SCORE_WITH_MF", False)
     called = []
     monkeypatch.setattr(server, "_supra_complexity", lambda p: called.append(p) or (1, 50))
     h = server._prompt_hash("pinned-prompt")
@@ -249,7 +200,6 @@ def test_log_and_headers_accept_missing_score(tmp_path, monkeypatch):
 
 
 def test_supra_three_tier_mapping_when_middle_configured(monkeypatch):
-    monkeypatch.setattr(server, "ROUTER_NAME", "supra")
     monkeypatch.setattr(server, "MIDDLE_CONFIGURED", True)
     monkeypatch.setattr(server, "MIDDLE_MIN_COMPLEXITY", 3)
     monkeypatch.setattr(server, "EXPENSIVE_MIN_COMPLEXITY", 4)

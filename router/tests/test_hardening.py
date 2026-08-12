@@ -33,9 +33,7 @@ async def test_production_lifespan_owns_and_closes_client(monkeypatch):
         made.append(value)
         return value
     monkeypatch.setattr(server.httpx, "AsyncClient", factory)
-    monkeypatch.setattr(server, "_load_router", lambda: object())
-    monkeypatch.setattr(server, "SUPRA_ENABLED", False)
-    monkeypatch.setattr(server, "ROUTER_NAME", "mf")
+    monkeypatch.setattr(server, "_load_supra", lambda: (object(), object()))
     async with server.lifespan(server.app):
         assert server._READY
         assert server._client is made[0]

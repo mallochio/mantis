@@ -1,4 +1,4 @@
-"""Failover tests for openfugu-patch/serve.py: transient provider errors fail
+"""Failover tests for orchestrator/serve.py: transient provider errors fail
 over to the next pool worker, switching model/endpoint per spec while
 messages, tools, and controls stay identical across attempts."""
 

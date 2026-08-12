@@ -1,6 +1,6 @@
 # Mantis router
 
-> Part of the Mantis monorepo (`router/`). Full history: `git log 33b0ccd -- router/`. Run with `uv run --directory router ...`; it serves :5500 internally and is exposed to clients as `mantis` through Mantis :8088.
+> Mantis router component. Full history: `git log 33b0ccd -- router/`. Run with `uv run --directory router ...`; it serves :5500 internally and is exposed to clients as `mantis` through Mantis :8088.
 
 The router is Mantis's simplest model path: it scores one request and sends it
 to one cheap, middle, or expensive model through Bifrost. It exposes
@@ -9,21 +9,8 @@ default gateway profile, all tiers use Bifrost's configured Cloudflare gateway
 and its catalog routes to OpenCode Go, Modal, or OpenRouter. Direct deployments
 remain supported. The server uses one lifespan-owned asynchronous HTTP pool.
 
-The active routing mode is selected with the legacy-compatible
-`ROUTELLM_ROUTER` environment variable:
+Supra-Router-51M is the routing signal. Complexity 1–2 goes cheap, 3–4 goes middle when configured, and 5 goes expensive.
 
-- `supra` (default): the Supra-Router-51M complexity gate is the primary signal. With the gateway middle tier enabled, complexity 1–2 goes cheap,
-  complexity 3–4 goes middle (Terra by default), and complexity 5+ goes
-  expensive (Sol by default). Direct two-tier mode retains the legacy
-  `ROUTELLM_SUPRA_THRESHOLD` cutoff. Override the expensive boundary with
-  `ROUTELLM_EXPENSIVE_MIN_COMPLEXITY` when deliberately testing another policy. MF scoring is off by default; set
-  `ROUTELLM_SCORE_WITH_MF=1` for observability (it never influences the
-  decision). This mode was chosen because the legacy MF score had essentially
-  zero separation against the Gemini difficulty labels (AUC 0.52 vs 0.66 for
-  Supra), and the MF gate on top of Supra only added wasted expensive calls.
-- `mf` (legacy): MF score >= `ROUTELLM_THRESHOLD`, with Supra as a secondary
-  gate below the threshold. `bert` also selects the old checkpoint. This path
-  remains only for compatibility; use `supra`.
 
 ## Setup and run
 
@@ -42,7 +29,7 @@ legacy-compatible variable name) that is not the default. The
 launcher refuses to stop a port owner unless its recorded PID, working
 directory, command, and listening socket all identify this checkout.
 
-The launcher defaults to the Cloudflare gateway (`unified-ai-gateway.siddsantham.workers.dev`) and requires `AI_GATEWAY_API_KEY` (or `MANTIS_GATEWAY_API_KEY`). Default models are `deepseek-v4-flash` (cheap), `openai/gpt-5.6-terra` at maximum reasoning (middle), and `openai/gpt-5.6-sol` (expensive). Set `ROUTELLM_ENDPOINT_PROFILE=direct` to retain the direct two-backend contract with `EXPENSIVE_BASE`, `EXPENSIVE_KEY`, `CHEAP_BASE`, `CHEAP_KEY`, and their model variables. A direct middle tier can be enabled with `MIDDLE_BASE`, `MIDDLE_KEY`, and `MIDDLE_MODEL`. `user` is not treated as a session identifier unless `ROUTELLM_SESSION_FROM_USER=1` is set; prefer `X-Route-Session` for conversation affinity. `OPENAI_API_KEY` is required by MF scoring. See `server.py` for optional limits.
+The launcher defaults to the Cloudflare gateway (`unified-ai-gateway.siddsantham.workers.dev`) and requires `AI_GATEWAY_API_KEY` (or `MANTIS_GATEWAY_API_KEY`). Default models are `deepseek-v4-flash` (cheap), `openai/gpt-5.6-terra` at maximum reasoning (middle), and `openai/gpt-5.6-sol` (expensive). Set `ROUTELLM_ENDPOINT_PROFILE=direct` to retain the direct two-backend contract with `EXPENSIVE_BASE`, `EXPENSIVE_KEY`, `CHEAP_BASE`, `CHEAP_KEY`, and their model variables. A direct middle tier can be enabled with `MIDDLE_BASE`, `MIDDLE_KEY`, and `MIDDLE_MODEL`. `user` is not treated as a session identifier unless `ROUTELLM_SESSION_FROM_USER=1` is set; prefer `X-Route-Session` for conversation affinity. See `server.py` for optional limits.
 
 ### Endpoint credential profiles
 
@@ -113,8 +100,7 @@ are disabled initially. Responses carry `x-route-api: responses` and
 
 Every routed response includes `x-request-id`, `x-route-decision`,
 `x-route-model`, `x-route-score`, `x-route-attempts`, and `x-route-fallback`.
-Optional Supra headers are also returned. In supra mode `x-route-score` is
-`n/a` unless `ROUTELLM_SCORE_WITH_MF=1`. Requests may provide `X-Route-Session`,
+Supra headers are returned and `x-route-score` is `n/a`. Requests may provide `X-Route-Session`,
 `metadata.session_id`, or `user`; the router stores only an HMAC digest. Session
 affinity keeps short continuations on the current tier and requires an explicit
 new-task signal to downgrade. It expires after one hour and is not persisted.

@@ -22,7 +22,7 @@ from typing import Any
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
-# When running from the repo's openfugu-patch overlay, also find upstream OpenFugu.
+# When running from the repo's orchestration runtime, also find upstream OpenFugu.
 if not (_HERE / "mini.py").exists():
     _OPENFUGU = _HERE.parent / "OpenFugu" / "openfugu"
     if _OPENFUGU.exists():

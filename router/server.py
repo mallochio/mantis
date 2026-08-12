@@ -2,7 +2,7 @@
 
 Exposes one OpenAI-compatible model ("auto") on explicit Chat Completions
 and Responses endpoints. Requests are routed by the Supra-Router-51M complexity
-gate (default; see ROUTELLM_ROUTER below for the legacy RouteLLM MF mode).
+gate.
 Responses requests are restricted to OpenAI models via OpenRouter;
 Chat Completions behavior remains independent.
 
@@ -14,13 +14,9 @@ Config via env:
   EXPENSIVE_KEY=...
   CHEAP_BASE=https://opencode.ai/zen/go/v1
   CHEAP_KEY=...
-  ROUTELLM_THRESHOLD=0.2
-  ROUTELLM_ROUTER=mf
-  ROUTELLM_USE_SUPRA=1
-  ROUTELLM_SUPRA_THRESHOLD=3
   EXPENSIVE_MODEL=openai/gpt-5.6-sol
   CHEAP_MODEL=deepseek-v4-flash
-  LOG_FILE=~/.config/llm-router/logs/decisions.log
+  LOG_FILE=~/.local/share/mantis/router/decisions.log
 """
 from __future__ import annotations
 
@@ -45,7 +41,7 @@ import httpx
 from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-# Defaults mirror llm-router.sh (canonical source, calibrated there) —
+# Defaults mirror the router launcher (canonical source, calibrated there) —
 # keep in sync so bare `python server.py` behaves identically to the launcher.
 _DEFAULT_AI_ROUTING_CONFIG = Path.home() / ".config" / "ai-routing" / "catalog.toml"
 # A legacy raw environment value must never block an explicit catalog/JSON
@@ -86,16 +82,6 @@ def _env_float(name: str, default: float) -> float:
 HOST = os.environ.get("ROUTELLM_HOST", "127.0.0.1")
 PORT = _env_int("ROUTELLM_PORT", 5500)
 SERVER_KEY = os.environ.get("ROUTELLM_KEY", "sk-route-local")
-THRESHOLD = _env_float("ROUTELLM_THRESHOLD", 0.2)
-ROUTER_NAME = os.environ.get("ROUTELLM_ROUTER", "supra")
-# In supra mode the Supra-Router-51M complexity gate is the primary signal
-# (the MF score has ~zero separation on this workload: AUC 0.52 vs 0.66 for
-# Supra over 428 labeled prompts; the MF gate only adds waste on top of Supra).
-# MF scoring is then optional observability only.
-SCORE_WITH_MF = os.environ.get("ROUTELLM_SCORE_WITH_MF", "0").lower() in {"1", "true", "yes", "on"}
-SUPRA_ENABLED = os.environ.get("ROUTELLM_USE_SUPRA", "1") != "0"
-SUPRA_THRESHOLD = _env_int("ROUTELLM_SUPRA_THRESHOLD", 3)
-SUPRA_MIN_SCORE = _env_float("ROUTELLM_SUPRA_MIN_SCORE", 0.0)
 ROUTELLM_CONTEXT_WINDOW = os.environ.get("ROUTELLM_CONTEXT_WINDOW", "auto")
 # Floor for targets without an explicit catalog max_tokens; the catalog
 # carries exact per-model output caps (models.dev): azure gpt-5.6 = 128000,
@@ -644,7 +630,7 @@ EXPENSIVE_MIN_COMPLEXITY = _env_int(
     # With Terra enabled, reserve Sol for Supra's highest complexity level.
     # Direct two-tier mode retains the historical threshold immediately above
     # the Supra cutoff.
-    5 if MIDDLE_CONFIGURED else SUPRA_THRESHOLD + 1,
+    5 if MIDDLE_CONFIGURED else 3,
 )
 
 
@@ -755,11 +741,6 @@ TRAINING_LOG_PATH = Path(os.environ.get("TRAINING_LOG_FILE", str(DATA_DIR/"route
 OUTCOME_LOG_PATH = Path(os.environ.get("OUTCOME_LOG_FILE", str(DATA_DIR/"router/outcomes.jsonl")))
 # Same prompt re-sent within this window usually means the previous route failed.
 RETRY_WINDOW_S = _env_float("ROUTELLM_RETRY_WINDOW_S", 900.0)
-# Short prompts are mostly trivial/ack traffic; MF embeddings on tiny text are
-# noisy and over-route (27% of <=120-char prompts went expensive in the
-# Aug 5-8 log, labeler called them cheap). Force cheap unless MF is very sure.
-SHORT_PROMPT_MAX_CHARS = int(os.environ.get("ROUTELLM_SHORT_PROMPT_MAX_CHARS", "120"))
-SHORT_PROMPT_FORCE_CHEAP_SCORE = float(os.environ.get("ROUTELLM_SHORT_PROMPT_SCORE", "0.25"))
 LOG_PATH.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
 LOG_PATH.parent.chmod(0o700)
 if TRAINING_LOG_ENABLED:
@@ -816,37 +797,6 @@ async def _get_context_window() -> int:
     valid = [value for value in values if isinstance(value, int) and value > 0]
     _cached_context_window = min(valid) if valid else 1_000_000
     return _cached_context_window
-
-
-_router = None  # lazy global
-
-
-def _load_router():
-    global _router
-    if _router is not None:
-        return _router
-    # mf router calls OpenAI text-embedding-3-small at scoring time; the OpenAI()
-    # client is instantiated at import of routellm.routers.similarity_weighted.utils,
-    # so the key must be in env before this import runs.
-    if not os.environ.get("OPENAI_API_KEY"):
-        import subprocess
-        try:
-            k = subprocess.check_output(
-                ["security", "find-generic-password", "-s", "AI.Playground.openai.apiKey", "-w"],
-                text=True, stderr=subprocess.DEVNULL,
-            ).strip()
-            if k:
-                os.environ["OPENAI_API_KEY"] = k
-        except Exception:
-            pass
-    if not os.environ.get("OPENAI_API_KEY"):
-        raise RuntimeError("OPENAI_API_KEY required for mf router (embeddings)")
-    from routellm.routers.routers import ROUTER_CLS
-    cfg = {"checkpoint_path": "routellm/mf_gpt4_augmented"}
-    if ROUTER_NAME == "bert":
-        cfg = {"checkpoint_path": "routellm/bert_gpt4_augmented"}
-    _router = ROUTER_CLS[ROUTER_NAME](**cfg)
-    return _router
 
 
 def _extract_prompt(body: dict) -> str:
@@ -981,9 +931,6 @@ def _default_target() -> str:
 
 
 def _effective_supra_targets() -> tuple[str, ...]:
-    # Legacy threshold knobs are intentionally still dynamic for direct
-    # two-tier deployments and their compatibility tests. Catalog/JSON/env
-    # target policies are immutable for a process lifetime.
     if not _TARGETS_ARE_EXPLICIT and not _SUPRA_TARGETS_FROM_ENV:
         return _legacy_complexity_targets()
     return SUPRA_TARGETS
@@ -997,9 +944,7 @@ def _target_for_complexity(complexity: int | None) -> tuple[str, str]:
 
 
 def _supra_reason(complexity: int | None) -> str | None:
-    if ROUTER_NAME != "supra" or complexity is None:
-        return None
-    return _target_for_complexity(complexity)[1]
+    return _target_for_complexity(complexity)[1] if complexity is not None else None
 
 
 def _fallback_routes(decision: str) -> tuple[str, ...]:
@@ -1123,52 +1068,14 @@ def _chat_tier(decision: str) -> str | None:
     return routes[0] if routes else None
 
 
-def _decide_mf(trimmed_prompt: str) -> tuple[str, float, int | None, int | None]:
-    """Legacy MF+Supra gate, retained for mf/bert and Supra failure fallback."""
-    r = _load_router()
-    score = float(r.calculate_strong_win_rate(trimmed_prompt))
-    low_target = _default_target()
-    strong_target = _safe_target()
-    if len(trimmed_prompt) <= SHORT_PROMPT_MAX_CHARS and score < SHORT_PROMPT_FORCE_CHEAP_SCORE:
-        return low_target, score, None, None
-    supra_complexity = None
-    supra_ms = None
-    if score >= THRESHOLD:
-        return strong_target, score, supra_complexity, supra_ms
-    if SUPRA_ENABLED and score >= SUPRA_MIN_SCORE:
-        supra_complexity, supra_ms = _supra_complexity(trimmed_prompt)
-        if _TARGETS_ARE_EXPLICIT:
-            return _target_for_complexity(supra_complexity)[0], score, supra_complexity, supra_ms
-        if supra_complexity >= SUPRA_THRESHOLD:
-            return strong_target, score, supra_complexity, supra_ms
-    return low_target, score, supra_complexity, supra_ms
-
-
-def _decide_uncached(trimmed_prompt: str) -> tuple[str, float | None, int | None, int | None]:
+def _decide_uncached(trimmed_prompt: str) -> tuple[str, None, int | None, int | None]:
     try:
-        if ROUTER_NAME == "supra":
-            # Supra-first: a valid 1..5 output maps directly to the declared
-            # target list. MF is observability-only when enabled.
-            supra_complexity = supra_ms = None
-            score = None
-            try:
-                supra_complexity, supra_ms = _supra_complexity(trimmed_prompt)
-            except Exception as err:
-                print(f"Supra scoring failed ({err}); falling back to MF gate", flush=True)
-            if SCORE_WITH_MF:
-                try:
-                    r = _load_router()
-                    score = float(r.calculate_strong_win_rate(trimmed_prompt))
-                except Exception as err:
-                    print(f"MF scoring failed ({err})", flush=True)
-            if supra_complexity is not None:
-                target, _reason = _target_for_complexity(supra_complexity)
-                return target, score, supra_complexity, supra_ms
-            return _decide_mf(trimmed_prompt)
-        return _decide_mf(trimmed_prompt)
+        complexity, elapsed_ms = _supra_complexity(trimmed_prompt)
+        target, _reason = _target_for_complexity(complexity)
+        return target, None, complexity, elapsed_ms
     except Exception as err:
-        print(f"Router decision failed ({err}); defaulting to safe target", flush=True)
-        return _safe_target(), 1.0, None, None
+        print(f"Supra scoring failed ({err}); defaulting to safe target", flush=True)
+        return _safe_target(), None, None, None
 
 
 @lru_cache(maxsize=256)
@@ -1438,7 +1345,7 @@ def _log(
     row = {
         "ts": time.time(), "request_id": request_id,
         "occurrence_id": occurrence_id or uuid.uuid4().hex,
-        "router": ROUTER_NAME, "threshold": THRESHOLD, "api_format": api_format,
+        "router": "supra", "api_format": api_format,
         "score": round(score, 4) if isinstance(score, (int, float)) else None,
         "supra_complexity": supra_complexity, "supra_ms": supra_ms,
         "decision": decision, "model": backend_model, "ttfb_ms": ttfb_ms,
@@ -1562,8 +1469,7 @@ def _session_route(session_id: str | None, prompt: str, proposed: str,
     # highest rank appeared.  Keep the historical strongest-only hysteresis for
     # legacy threshold deployments.
     if (_TARGETS_ARE_EXPLICIT and proposed_rank > current_rank) or (
-            complexity is not None and _target_rank(mapped_target) >= _target_rank(_safe_target())) or (
-            score is not None and score >= THRESHOLD):
+            complexity is not None and _target_rank(mapped_target) >= _target_rank(_safe_target())):
         return proposed, "strong_upgrade"
     return current, "upgrade_hysteresis"
 
@@ -2135,10 +2041,7 @@ async def lifespan(app: FastAPI):
     _client = httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT_S, connect=min(10.0, TIMEOUT_S)))
     try:
         # Model initialization is CPU/blocking work and must not block the loop.
-        if ROUTER_NAME != "supra":
-            await asyncio.to_thread(_load_router)
-        if SUPRA_ENABLED or ROUTER_NAME == "supra":
-            await asyncio.to_thread(_load_supra)
+        await asyncio.to_thread(_load_supra)
         _store_load()
         _READY = True
         yield
@@ -2256,7 +2159,7 @@ def _route_headers(decision, score, backend, request_id, supra_complexity, supra
         "x-route-target-revision": TARGET_CONFIG_REVISION,
         "x-route-score": f"{score:.4f}" if isinstance(score, (int, float)) else "n/a",
         "x-route-model": backend["model"],
-        "x-route-router": ROUTER_NAME, "x-route-fallback": "false",
+        "x-route-router": "supra", "x-route-fallback": "false",
         "x-route-attempts": "1", "x-route-api": api_format,
         "x-route-upstream-path": upstream_path,
     }
@@ -2423,7 +2326,7 @@ def _log_attempts(attempts, prompt: str, score: float, request_id: str, occurren
 @app.get("/healthz")
 async def healthz():
     return {
-        "ok": _READY, "router": ROUTER_NAME, "threshold": THRESHOLD,
+        "ok": _READY, "router": "supra",
         "backend": "direct", "tiers": list(BACKENDS),
         "targets": {
             target: {
@@ -3387,8 +3290,7 @@ if __name__ == "__main__":
     _validate_bind_security()
     print(
         "effective config: "
-        f"router={ROUTER_NAME} threshold={THRESHOLD} supra={SUPRA_ENABLED} "
-        f"supra_threshold={SUPRA_THRESHOLD} supra_min_score={SUPRA_MIN_SCORE} "
+        "router=supra "
         f"expensive={EXPENSIVE['model']} middle={MIDDLE['model']} "
         f"middle_effort={MIDDLE['effort']} cheap={CHEAP['model']} port={PORT}",
         flush=True,

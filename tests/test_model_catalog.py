@@ -67,7 +67,7 @@ def _catalog(contract: str = "") -> str:
 
 
 def _shared_catalog(contract: str) -> str:
-    """Combined fixture for the Mantis and llm-router (RouteLLM) consumers."""
+    """Combined fixture for the Mantis and Mantis router consumers."""
     abi = model_catalog.load_abi_manifest()
     provider_order = [
         "modal.prod", "generic.openai", "code", "router",
@@ -465,10 +465,10 @@ def test_router_provider_ids_and_identifier_grammar_accepted(tmp_path):
 
 
 def test_shared_catalog_fixture_both_consumers_parse(tmp_path, monkeypatch):
-    router_home = Path.home() / ".config" / "llm-router" / "server.py"
+    router_home = Path.home() / ".local" / "share" / "mantis" / "router" / "server.py"
     router_server = Path(os.environ.get("ROUTER_SERVER_PATH", str(router_home)))
     if not router_server.is_file():
-        pytest.skip("llm-router consumer (server.py) is not available on this machine")
+        pytest.skip("router consumer (server.py) is not available on this machine")
     path = _write_catalog(tmp_path, _shared_catalog(model_catalog.abi_contract(
         model_catalog.load_abi_manifest()
     )))

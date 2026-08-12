@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pseudo-label coding-session prompts for the llm-router using a cheap model.
+"""Pseudo-label coding-session prompts for the Mantis router using a cheap model.
 
 Reads the router training log, deduplicates prompts, and uses a small model via
 OpenRouter (Gemini 3.5 Flash Lite by default) to classify each prompt by

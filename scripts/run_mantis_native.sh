@@ -3,7 +3,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SERVE_DIR="$REPO_ROOT/openfugu-patch"
+SERVE_DIR="$REPO_ROOT/orchestrator"
 cd "$REPO_ROOT"
 
 [[ -f "$SERVE_DIR/api.py" ]] || { echo "missing $SERVE_DIR/api.py" >&2; exit 1; }
