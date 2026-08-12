@@ -2,7 +2,7 @@
 
 > **Executor instructions**: Build calibration offline first. Production escalation remains gated and deterministic.
 >
-> **Drift check**: `git diff --stat 3cccee1..HEAD -- extensions/mantis.ts openfugu-patch/serve.py eval scripts tests extensions/tests`. STOP if plans 008-010 have not landed or changed their schemas.
+> **Drift check**: `git diff --stat 3cccee1..HEAD -- extensions/mantis.ts apps/api eval scripts tests extensions/tests`. STOP if plans 008-010 have not landed or changed their schemas.
 
 ## Status
 - **Priority**: P1
@@ -18,8 +18,8 @@ A cheap route should be used only when its predicted success is calibrated. The 
 ## Current state
 - `extensions/mantis.ts:343-369` obtains only a Supra complexity header and converts failures to score 1.
 - `extensions/mantis.ts:372-376` exposes no confidence, margin, entropy, or abstention.
-- `openfugu-patch/serve.py:1936-1948` stops TRINITY only on verifier acceptance or max turns.
-- Actual test/tool observations already exist at `openfugu-patch/serve.py:1693-1714`.
+- `apps/api/runs.py:596-644` stops TRINITY only on verifier acceptance or max turns.
+- Actual test/tool observations already exist at `apps/api/runs.py:453-468`.
 
 ## Scope
 **In scope**: offline calibration/report code, compact calibration artifact, utility routing and direct/TRINITY escalation path, focused tests/docs.

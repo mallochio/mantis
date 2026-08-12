@@ -2,7 +2,7 @@
 
 > **Executor instructions**: Begin as an offline/shadow policy. Do not raise global turn limits.
 >
-> **Drift check**: `git diff --stat 3cccee1..HEAD -- openfugu-patch/serve.py scripts/learn_router.py scripts/retrain_router_pool.py tests eval`. STOP unless plans 008 and 012 are complete.
+> **Drift check**: `git diff --stat 3cccee1..HEAD -- apps/api scripts/learn_router.py scripts/retrain_router_pool.py tests eval`. STOP unless plans 008 and 012 are complete.
 
 ## Status
 - **Priority**: P2
@@ -16,9 +16,9 @@
 Mantis routes worker and role every TRINITY turn, but online learning updates only initial-task worker logits. It cannot learn when verification is worth its cost, when tests justify stopping, or when remaining budget should force a cheaper action.
 
 ## Current state
-- `openfugu-patch/serve.py:1759-1778` routes role and worker each turn, with hand-written cold-role guards.
-- `openfugu-patch/serve.py:1835-1848` handles Thinker suggestions and Verifier accept/reject.
-- `openfugu-patch/serve.py:1936-1948` has only terminal acceptance or max-turn stopping.
+- `apps/api/runs.py:521-585` routes role and worker each turn, with hand-written cold-role guards.
+- `apps/api/runs.py:596-644` handles Thinker suggestions and Verifier accept/reject.
+- `apps/api/runs.py:596-644` has only terminal acceptance or max-turn stopping.
 - `scripts/retrain_router_pool.py:1076-1097` copies role labels from the existing router.
 
 ## Scope

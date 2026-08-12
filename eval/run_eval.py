@@ -6,7 +6,7 @@ Usage:
         --fixtures eval/fixtures.jsonl --output eval/results.jsonl
 
 Cost estimation method:
-- `configs/worker-costs.json` gives a per-call USD estimate for each raw
+- `config/worker-costs.json` gives a per-call USD estimate for each raw
   OpenRouter model id (assumes ~2K prompt + 1K completion tokens). These
   prices were fetched from /api/v1/models by update_pool.py.
 - `config/catalog.toml` maps Bifrost worker slots to upstream model ids.

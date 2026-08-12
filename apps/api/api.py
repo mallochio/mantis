@@ -322,7 +322,7 @@ def _complete(request: ChatRequest, headers: dict[str, str] | None = None) -> di
     )
     if event.get("type") == "final":
         serve.delete_run(run_id)
-    return response
+    return cast(dict[str, Any], response)
 
 
 def _text_chunks(text: str, size: int = 64) -> Iterator[str]:
@@ -530,6 +530,8 @@ def ready(response: Response) -> dict[str, Any]:
     if not os.environ.get("MANTIS_API_KEY"):
         raise HTTPException(503, "MANTIS_API_KEY is not configured")
     profile = os.environ.get("MANTIS_ENDPOINT_PROFILE", "direct")
+    if profile == "direct" and not os.environ.get("ROUTELLM_KEY"):
+        raise HTTPException(503, "ROUTELLM_KEY is not configured")
     if profile == "catalog":
         try:
             bindings = model_catalog.load_runtime_bindings()

@@ -2,7 +2,7 @@
 
 > **Executor instructions**: Run this as two independently reportable experiments sharing the same evaluation gate. Do not change worker model weights.
 >
-> **Drift check**: `git diff --stat 3cccee1..HEAD -- scripts/retrain_router_pool.py openfugu-patch/serve.py configs tests eval`. STOP on worker-pool schema drift.
+> **Drift check**: `git diff --stat 3cccee1..HEAD -- scripts/retrain_router_pool.py apps/api config tests eval`. STOP on worker-pool schema drift.
 
 ## Status
 - **Priority**: P2
@@ -18,8 +18,8 @@ The current head is tied to seven positions and runtime role prompts are mostly 
 ## Current state
 - `scripts/learn_router.py:168-170` requires exactly seven pool entries.
 - `scripts/learn_router.py:55-61` accepts records only when the entire pool exactly matches.
-- `openfugu-patch/serve.py:1756-1757` maps fixed slot IDs to models.
-- `openfugu-patch/serve.py:1780-1821` builds shared role prompts.
+- `apps/api/runs.py:521-542` maps fixed slot IDs to models.
+- `apps/api/runs.py:545-593` builds shared role prompts.
 
 ## Scope
 **In scope**: masked offline training/evaluation, small checked-in prompt adapter data, runtime adapter lookup, focused tests.

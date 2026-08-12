@@ -84,7 +84,7 @@ No errors or timeouts recorded for conductor-luna.
 - conductor-luna estimated API spend: **$0.8628**.
 - direct baseline (for reference): **$0.0128**.
 - trinity baseline (for reference): **$0.4563**.
-Costs are per-call estimates from `configs/worker-costs.json` (2K prompt + 1K completion); actual OpenRouter spend may differ.
+Costs are per-call estimates from `config/worker-costs.json` (2K prompt + 1K completion); actual OpenRouter spend may differ.
 
 ## Fixture list
 

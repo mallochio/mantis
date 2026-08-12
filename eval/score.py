@@ -323,7 +323,7 @@ def main() -> None:
     lines.append("## Total spend\n")
     lines.append(f"Estimated total API spend across all configs: **${total_cost:.4f}**.")
     lines.append(
-        "This is a per-call estimate based on `configs/worker-costs.json`; "
+        "This is a per-call estimate based on `config/worker-costs.json`; "
         "actual OpenRouter spend may differ.\n"
     )
 

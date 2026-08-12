@@ -58,8 +58,6 @@ def _run_conductor_workflow(
     res = ConductorExecutor(worker, slot_labels=slot_labels).execute(
         mids, subs, acc, verbose=verbose
     )
-    # expose a turns attribute for _chat_response
-    res.turns = res.steps
     return res
 
 

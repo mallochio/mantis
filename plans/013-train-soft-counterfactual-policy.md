@@ -2,7 +2,7 @@
 
 > **Executor instructions**: Implement offline candidate generation and evaluation first. Never promote from selected-action accuracy alone.
 >
-> **Drift check**: `git diff --stat 3cccee1..HEAD -- scripts/learn_router.py scripts/retrain_router_pool.py tests/test_learn_router.py tests/test_retrain_router_pool.py configs/worker-costs.json`. STOP unless plan 012's schema is present.
+> **Drift check**: `git diff --stat 3cccee1..HEAD -- scripts/learn_router.py scripts/retrain_router_pool.py tests/test_learn_router.py tests/test_retrain_router_pool.py config/worker-costs.json`. STOP unless plan 012's schema is present.
 
 ## Status
 - **Priority**: P1

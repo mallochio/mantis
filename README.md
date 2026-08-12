@@ -40,7 +40,9 @@ login):
 ```
 
 `config/catalog.toml` is the tracked, versioned source of truth for the
-gateway and API worker pool; `~/.config/ai-routing/catalog.toml` is a symlink to it. `bifrost.json`
+gateway and API worker pool. `config/worker-costs.json` contains offline
+training and evaluation estimates. `~/.config/ai-routing/catalog.toml` is a
+symlink to the catalog. `bifrost.json`
 (contains the gateway encryption key) stays local and untracked.
 
 ## Portable host installation

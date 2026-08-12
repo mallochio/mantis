@@ -31,7 +31,7 @@ FUGU_MODEL / FUGU_VECTOR / FUGU_FIXTURE.
 from __future__ import annotations
 import argparse, json, os, sys
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 
@@ -269,7 +269,7 @@ class Coordinator:
     solver response is a no-op that would end the run at turn 0, so we re-route it
     to Worker. Set False to reproduce raw step_trinity (terminate with no response).
     """
-    def __init__(self, router: FuguRouter, worker: WorkerFn,
+    def __init__(self, router: Any, worker: WorkerFn,
                  max_turns: int = MAX_TURNS, stop_token: str = "ACCEPT",
                  sample: bool = True, suppress_cold_verifier: bool = True,
                  agent_mask=None):

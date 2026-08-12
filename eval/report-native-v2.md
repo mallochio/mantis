@@ -140,4 +140,4 @@ Conductor-new scores well below direct (0.073 vs 0.568) and fails on 81% of prom
 ## Total spend
 
 Estimated total API spend across all configs: **$0.9638**.
-This is a per-call estimate based on `configs/worker-costs.json`; actual OpenRouter spend may differ.
+This is a per-call estimate based on `config/worker-costs.json`; actual OpenRouter spend may differ.

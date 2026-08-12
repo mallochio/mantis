@@ -18,7 +18,7 @@ Fixed slot logits cannot naturally generalize to a newly released model, changed
 ## Current state
 - `scripts/learn_router.py:107-108` scores the first seven fixed head rows.
 - `scripts/retrain_router_pool.py:509-520` trains one fixed 10x1024 head.
-- `configs/worker-costs.json` has cost estimates but no capability or latency representation.
+- `config/worker-costs.json` has cost estimates but no capability or latency representation.
 
 ## Scope
 **In scope**: offline model-card schema, prototype scorer, leave-one-model-out evaluation, report and tests.

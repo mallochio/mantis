@@ -962,7 +962,7 @@ class ConductorRun(NativeRun):
                 for c in calls
                 if isinstance(c.get("_anthropic_tool_id"), str)
             }
-            asst = {
+            asst: dict[str, Any] = {
                 "role": "assistant",
                 "content": text,
                 "tool_calls": [

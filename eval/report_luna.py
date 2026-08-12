@@ -290,7 +290,7 @@ def main() -> None:
         f"**${metrics['trinity']['cost_sum_usd']:.4f}**."
     )
     lines.append(
-        "Costs are per-call estimates from `configs/worker-costs.json` "
+        "Costs are per-call estimates from `config/worker-costs.json` "
         "(2K prompt + 1K completion); actual OpenRouter spend may differ.\n"
     )
 

@@ -2,7 +2,7 @@
 
 > **Executor instructions**: Implement observation only. The selected production route must remain unchanged in this plan.
 >
-> **Drift check**: `git diff --stat 3cccee1..HEAD -- extensions/mantis.ts extensions/tests/stream-test.ts configs/worker-costs.json README.md .env.example`. STOP on material routing-flow drift.
+> **Drift check**: `git diff --stat 3cccee1..HEAD -- extensions/mantis.ts extensions/tests/stream-test.ts config/worker-costs.json README.md .env.example`. STOP on material routing-flow drift.
 
 ## Status
 - **Priority**: P1
@@ -20,10 +20,10 @@ This is the cheapest safe runtime experiment: calculate what a direct/TRINITY/Co
 - `extensions/mantis.ts:128` reads one fixed threshold.
 - `extensions/mantis.ts:136-145` logs score, coordinator, and a task prefix.
 - `extensions/mantis.ts:717-723` applies the binary decision before creating a run.
-- `configs/worker-costs.json` is the existing static cost source; treat missing/stale prices as uncertainty, not zero cost.
+- `config/worker-costs.json` is the existing static cost source; treat missing/stale prices as uncertainty, not zero cost.
 
 ## Scope
-**In scope**: `extensions/mantis.ts`, `extensions/tests/stream-test.ts`, `configs/worker-costs.json` only if its schema needs a documented timestamp, `.env.example`, `README.md`.
+**In scope**: `extensions/mantis.ts`, `extensions/tests/stream-test.ts`, `config/worker-costs.json` only if its schema needs a documented timestamp, `.env.example`, `README.md`.
 
 **Out of scope**: changing the live route, online exploration, executing an extra model, storing full prompts, training a new head.
 

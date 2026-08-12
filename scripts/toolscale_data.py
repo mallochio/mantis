@@ -152,9 +152,11 @@ def make_reward_functions(output_dir=None, include_format_reward=True, **kwargs)
             out.append(1.0 if ok else 0.0)
         return out
 
-    def action_reward(completions: List[str], expected_actions: List[str] = None, **kw):
+    def action_reward(completions: List[str], expected_actions: List[str] | None = None, **kw):
         rewards = []
-        exp = expected_actions or [None] * len(completions)
+        exp: List[str | None] = (
+            list(expected_actions) if expected_actions is not None else [None] * len(completions)
+        )
         for comp, gold_json in zip(completions, exp):
             try:
                 gold = json.loads(gold_json) if gold_json else []

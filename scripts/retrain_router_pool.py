@@ -970,7 +970,7 @@ def _parse_retrain_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--alpha", type=float, default=0.1, help="role-loss weight")
     ap.add_argument("--l2", type=float, default=0.01, help="L2 regularization toward original head")
-    default_cost_table = str(REPO_ROOT / "configs" / "worker-costs.json")
+    default_cost_table = str(REPO_ROOT / "config" / "worker-costs.json")
     ap.add_argument(
         "--label-mode",
         choices=["quality", "cost", "budgeted"],

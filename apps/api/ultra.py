@@ -22,7 +22,7 @@ Provenance, stated honestly:
 from __future__ import annotations
 import ast, json, re
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Any, Callable
 
 N_AGENTS = 7
 MAX_STEPS = 5                      # [DOC] Conductor workflows up to 5 steps
@@ -55,7 +55,7 @@ def _balanced_list(after: str) -> str | None:
     return None
 
 
-def extract_list(text: str, labels: list[str]) -> list:
+def extract_list(text: str, labels: list[str]) -> list[Any]:
     """Find 'label: [ ... ]' then parse via ast -> json -> CSV fallback. [EXEC]"""
     tag = "|".join(re.escape(l) for l in labels)
     m = re.search(rf"({tag})\s*[:=]\s*", text, re.I)
@@ -66,11 +66,11 @@ def extract_list(text: str, labels: list[str]) -> list:
         return []
     raw = raw.translate(_SMART).strip()
     try:
-        return ast.literal_eval(raw)
+        return list(ast.literal_eval(raw))
     except Exception:
         pass
     try:
-        return json.loads(re.sub(r"'", '"', raw))
+        return list(json.loads(re.sub(r"'", '"', raw)))
     except Exception:
         pass
     items = [x.strip(" \"'") for x in raw.strip("[]").split(",") if x.strip()]
@@ -150,6 +150,7 @@ class UltraResult:
     final: str
     steps: list[Step] = field(default_factory=list)
     workflow: dict = field(default_factory=dict)
+    turns: list[Any] = field(default_factory=list)
 
 
 class ConductorExecutor:

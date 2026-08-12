@@ -2,7 +2,7 @@
 
 > **Executor instructions**: Upgrade telemetry without changing the learned policy. Learning remains opt-in and promotion remains disabled for the new schema until plan 013.
 >
-> **Drift check**: `git diff --stat 3cccee1..HEAD -- openfugu-patch/serve.py scripts/learn_router.py tests/test_serve.py tests/test_learn_router.py README.md .env.example`. STOP on telemetry-schema drift.
+> **Drift check**: `git diff --stat 3cccee1..HEAD -- apps/api scripts/learn_router.py tests/test_serve.py tests/test_learn_router.py README.md .env.example`. STOP on telemetry-schema drift.
 
 ## Status
 - **Priority**: P1
@@ -13,13 +13,13 @@
 - **Planned at**: commit `3cccee1`, 2026-08-04
 
 ## Why this matters
-Current telemetry emits one terminal record and labels the final successful worker (`openfugu-patch/serve.py:1607-1635`). It cannot teach per-turn worker/role, stopping, escalation, or budget decisions and excludes failures from training.
+Current telemetry emits one terminal record and labels the final successful worker (`apps/api/runs.py:96-150`). It cannot teach per-turn worker/role, stopping, escalation, or budget decisions and excludes failures from training.
 
 ## Current state
-- Trainability requires TRINITY + verifier acceptance + final recognized passing test at `openfugu-patch/serve.py:1610-1614`.
-- `label_worker` is the final Worker's ID and `label_role` is always zero at `openfugu-patch/serve.py:1631-1635`.
+- Trainability requires TRINITY + verifier acceptance + final recognized passing test at `apps/api/runs.py:96-134`.
+- `label_worker` is the final Worker's ID and `label_role` is always zero at `apps/api/runs.py:131-134`.
 - `scripts/learn_router.py:41-68` discards non-trainable records and only accepts schema version 1 hard labels.
-- Telemetry uses private directories/files and excludes tool output at `openfugu-patch/serve.py:1638-1650`; preserve those protections.
+- Telemetry uses private directories/files and excludes tool output at `apps/api/runs.py:138-150`; preserve those protections.
 
 ## Scope
 **In scope**: telemetry schema v2, emission/load tests, migration/compatibility decision, privacy docs.

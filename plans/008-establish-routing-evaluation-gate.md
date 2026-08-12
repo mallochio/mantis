@@ -2,7 +2,7 @@
 
 > **Executor instructions**: Follow this plan step by step. Run every verification command. Update `plans/README.md` when done. Do not make paid API calls without operator approval.
 >
-> **Drift check**: `git diff --stat 3cccee1..HEAD -- eval configs/worker-costs.json README.md`. If the evaluation formats changed materially, STOP and reconcile this plan first.
+> **Drift check**: `git diff --stat 3cccee1..HEAD -- eval config/worker-costs.json README.md`. If the evaluation formats changed materially, STOP and reconcile this plan first.
 
 ## Status
 - **Priority**: P1
@@ -20,7 +20,7 @@ Every later routing experiment needs the same quality/cost/latency gate. The cur
 - `eval/report-native-v2.md:37-50` shows direct winning the simple cost regime and TRINITY winning hard tasks.
 - `eval/run_eval.py:8-22` estimates cost from fixed 2K-input/1K-output assumptions rather than observed usage.
 - `eval/run_eval.py:235-236` appends results, so rerunning can duplicate task/config rows.
-- Verification conventions are `uv run pytest tests -q`, `uv run ruff check .`, and `uv run mypy openfugu-patch scripts --exclude outputs`.
+- Verification conventions are `uv run pytest tests -q`, `uv run ruff check .`, and `uv run mypy apps/api scripts --exclude outputs`.
 
 ## Scope
 **In scope**: `eval/fixtures*.jsonl`, `eval/run_eval.py`, `eval/score.py`, focused tests under `tests/`, and a generated-report schema/documentation file under `eval/`.

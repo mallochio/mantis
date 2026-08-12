@@ -2,7 +2,7 @@
 
 > **Executor instructions**: This is the final, expensive experiment. Begin with cached/fake workers and require a written spend estimate before live rollouts.
 >
-> **Drift check**: `git diff --stat 3cccee1..HEAD -- scripts/retrain_conductor.py scripts/retrain_router_pool.py eval tests openfugu-patch/serve.py`. STOP unless all dependencies have stable schemas and gates.
+> **Drift check**: `git diff --stat 3cccee1..HEAD -- scripts/retrain_conductor.py scripts/retrain_router_pool.py eval tests apps/api`. STOP unless all dependencies have stable schemas and gates.
 
 ## Status
 - **Priority**: P3
@@ -18,7 +18,7 @@ One-shot natural-language workflow generation is expensive and brittle. Offline 
 ## Current state
 - `scripts/retrain_conductor.py:179-250` already parses, structurally rewards, and executes complete DAG candidates.
 - `scripts/retrain_router_pool.py:586-658` already caches worker responses.
-- Runtime Conductor commits to a complete plan before feedback (`openfugu-patch/serve.py:2023-2050`).
+- Runtime Conductor commits to a complete plan before feedback (`apps/api/runs.py:863-912`).
 
 ## Scope
 **In scope**: offline search simulator, stability-weighted trajectory dataset, compact step-wise policy prototype, reports/tests.

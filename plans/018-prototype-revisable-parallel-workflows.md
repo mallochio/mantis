@@ -2,7 +2,7 @@
 
 > **Executor instructions**: Prototype behind an experimental mode. Never parallelize repository mutations.
 >
-> **Drift check**: `git diff --stat 3cccee1..HEAD -- openfugu-patch/serve.py tests/test_serve.py eval scripts/retrain_conductor.py`. STOP on Conductor state-machine drift.
+> **Drift check**: `git diff --stat 3cccee1..HEAD -- apps/api tests/test_serve.py eval scripts/retrain_conductor.py`. STOP on Conductor state-machine drift.
 
 ## Status
 - **Priority**: P3
@@ -16,9 +16,9 @@
 Current Conductor commits to a complete workflow and executes nodes one at a time. It cannot cancel stale work or revise dependencies after tool feedback, and independent read-only nodes cannot reduce wall-clock time through parallel execution.
 
 ## Current state
-- `openfugu-patch/serve.py:2016-2019` stores one fixed workflow, outputs, and a sequential node pointer.
-- `openfugu-patch/serve.py:2030-2050` builds node context from fixed access lists.
-- `openfugu-patch/serve.py:2161+` advances one pending model action at a time.
+- `apps/api/runs.py:863-865` stores one fixed workflow, outputs, and a sequential node pointer.
+- `apps/api/runs.py:878-912` builds node context from fixed access lists.
+- `apps/api/runs.py:1092-1125` advances one pending model action at a time.
 - Conductor remains empirically weak: `eval/report-native-v2.md:65-90` recommends against deployment.
 
 ## Scope

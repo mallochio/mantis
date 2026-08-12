@@ -15,6 +15,7 @@ from openai import OpenAI
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setenv("MANTIS_API_KEY", "test-key")
+    monkeypatch.setenv("ROUTELLM_KEY", "gateway-key")
     return TestClient(api.app)
 
 
@@ -497,6 +498,7 @@ def test_capacity_returns_429(client, monkeypatch):
 def test_ready_reports_only_sanitized_endpoint_metadata(client, monkeypatch):
     marker = "never-return-this-secret"
     monkeypatch.setenv("MANTIS_ENDPOINT_PROFILE", "direct")
+    monkeypatch.setenv("ROUTELLM_KEY", "gateway-key")
     monkeypatch.setenv("OPENROUTER_BASE_URL", "https://direct.example.test/v1?token=" + marker)
     monkeypatch.setenv("OPENCODE_GO_ENDPOINT_URL", "https://opencode.example.test/private")
     body = client.get("/ready").json()
@@ -514,6 +516,14 @@ def test_ready_reports_only_sanitized_endpoint_metadata(client, monkeypatch):
     changed = client.get("/ready").json()
     assert changed["endpoint_hosts"]["openrouter"] == "direct.example.test"
     assert changed["endpoint_fingerprints"]["openrouter"] != first_fingerprint
+
+
+def test_ready_direct_requires_gateway_key(client, monkeypatch):
+    monkeypatch.setenv("MANTIS_ENDPOINT_PROFILE", "direct")
+    monkeypatch.delenv("ROUTELLM_KEY", raising=False)
+    response = client.get("/ready")
+    assert response.status_code == 503
+    assert response.json()["error"]["message"] == "ROUTELLM_KEY is not configured"
 
 
 # --- catalog readiness: credentials and binding fingerprint -------------------

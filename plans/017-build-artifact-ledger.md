@@ -2,7 +2,7 @@
 
 > **Executor instructions**: Start with deterministic extraction from existing events. Do not add a summarizing model call.
 >
-> **Drift check**: `git diff --stat 3cccee1..HEAD -- openfugu-patch/serve.py tests/test_serve.py eval README.md`. STOP on message-history or tool-observation drift.
+> **Drift check**: `git diff --stat 3cccee1..HEAD -- apps/api tests/test_serve.py eval README.md`. STOP on message-history or tool-observation drift.
 
 ## Status
 - **Priority**: P2
@@ -13,12 +13,12 @@
 - **Planned at**: commit `3cccee1`, 2026-08-04
 
 ## Why this matters
-Agents can repeat file reads, tests, and failed hypotheses across turns. Current tool telemetry retains only tool name/error/test flags (`openfugu-patch/serve.py:1693-1714`), while complete tool content stays in each local model transcript. A bounded artifact ledger can pass forward useful state without replaying every transcript.
+Agents can repeat file reads, tests, and failed hypotheses across turns. Current tool telemetry retains only tool name/error/test flags (`apps/api/runs.py:453-468`), while complete tool content stays in each local model transcript. A bounded artifact ledger can pass forward useful state without replaying every transcript.
 
 ## Current state
-- TRINITY builds each role message from conversation history and role-specific content at `openfugu-patch/serve.py:1802-1821`.
-- Conductor passes selected prior node outputs through access lists at `openfugu-patch/serve.py:2030-2050`.
-- Tool result content is bounded when returned to the same model at `openfugu-patch/serve.py:1903-1909` and `2149-2156`.
+- TRINITY builds each role message from conversation history and role-specific content at `apps/api/runs.py:545-593`.
+- Conductor passes selected prior node outputs through access lists at `apps/api/runs.py:878-912`.
+- Tool result content is bounded when returned to the same model at `apps/api/runs.py:453-468` and `2149-2156`.
 
 ## Scope
 **In scope**: in-memory per-run ledger, deterministic entries, relevance/bounds, tests/evaluation.

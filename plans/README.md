@@ -17,9 +17,6 @@ Routing research plans for the model orchestrator. Execute by dependency, not me
 | 017 | Add a compact artifact ledger for cross-agent memory | P2 | M | 008, 012 | TODO |
 | 018 | Prototype revisable and safely parallel workflows | P3 | L | 008, 012, 017 | TODO |
 | 019 | Search workflows offline and distill a step-wise policy | P3 | L | 008, 013-018 | TODO |
-| 020 | Prune derived eval artifacts and document the eval/ artifact boundary | P2 | S | — | DONE |
-| 021 | Single-source the conductor training dependency manifest | P2 | S | — | DONE |
-| 022 | Decompose router/server.py into cohesive modules without behavior change | P1 | M | — | TODO |
 
 Status: TODO | IN PROGRESS | DONE | BLOCKED (with reason) | REJECTED (with rationale).
 
@@ -32,7 +29,6 @@ Status: TODO | IN PROGRESS | DONE | BLOCKED (with reason) | REJECTED (with ratio
 5. After 013, run **015 worker masks/prompt adapters** and **017 artifact ledger** in parallel; they target different mechanisms but both use the shared evaluation gate.
 6. Run **014 learned stopping** only after calibration and decision-level learning are credible.
 7. Treat **016**, **018**, and **019** as research spikes. Do not put them on the production critical path.
-8. **Repo-slimming lane (020-022, planned 2026-08-12 at `168fedb`)**: 020 then 021 first (S effort, zero risk), then 022 (M effort, the flagship). 022 is independent of 008-019 but its module names (`routing.py`, `scoring.py`, `store.py` under `router/`) should be referenced by 008-019 executors once it lands.
 
 ## Parallel work graph
 
@@ -71,7 +67,7 @@ No routing policy becomes the default unless all apply:
 ```bash
 uv run pytest tests -q
 uv run ruff check .
-uv run mypy openfugu-patch scripts --exclude outputs
+uv run mypy apps/api scripts --exclude outputs
 git diff --check
 ```
 
@@ -97,14 +93,6 @@ Use focused tests during each step, then run the full baseline before marking a 
 - **Production parallel Conductor now**: deferred to plan 018 and blocked on Conductor meeting the evaluation gate.
 - **Unlimited recursive replanning**: rejected. Any replan remains bounded to one experimentally.
 - **Backbone fine-tuning**: deferred. Head/prompt/workspace changes are cheaper and easier to verify.
-
-### Repo-slimming audit (2026-08-12, planned at `168fedb`)
-
-- **Merge `router/` into the root uv project (single lockfile)**: rejected. `router/README.md` states the split is deliberate so the router deploys without torch/transformers/fastapi serving deps; merging would inflate the router's dependency and deploy footprint, directly hurting its cost side of quality-to-cost.
-- **Delete raw `eval/results*.jsonl` snapshots**: deferred. Plan 008's promotion gate requires checked-in results for offline report regeneration; revisit after 008 lands.
-- **Merge `router/server.py` provider-calling code with `openfugu-patch/providers.py`**: rejected after audit. They are not duplicates: the router is a simple forwarder, providers.py does multi-role protocol translation for TRINITY/Conductor; a merge would couple the two deployment footprints. Plan 022 checks for byte-level shared helpers after decomposition and only then considers a tiny shared primitives package.
-- **`scripts/model_catalog*.py` decomposition**: rejected. Already cleanly split (schema/abi/runtime); no action.
-- **Delete `launch/sky/*.yaml` SkyPilot retrain jobs**: deferred to operator decision. Plan 021 records that their setup steps reference a missing `scripts/fetch_openfugu.sh` and the removed OpenFugu submodule (e.g. `retrain_fugu_conductor.yaml:40`); restore the submodule or retire the path.
 
 ## Evidence caveats
 
