@@ -112,8 +112,6 @@ ignore = [
 "scripts/retrain_router_pool.py" = ["E402"]
 "scripts/learn_router.py" = ["E402"]
 "scripts/retrain_conductor.py" = ["E402", "I001"]
-"apps/api/mini.py" = ["ALL"]
-"apps/api/ultra.py" = ["ALL"]
 "scripts/toolscale_data.py" = ["ALL"]
 "tests/test_serve.py" = ["E501", "S310"]
 "apps/api/api.py" = ["E501"]
@@ -151,8 +149,6 @@ omit = [
     "scripts/retrain_conductor.py",
     "scripts/verify.sh",
     "scripts/toolscale_data.py",
-    "apps/api/mini.py",
-    "apps/api/ultra.py",
 ]
 
 [tool.coverage.report]

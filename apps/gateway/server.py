@@ -1069,11 +1069,13 @@ def _chat_tier(decision: str) -> str | None:
 
 
 def _decide_uncached(trimmed_prompt: str) -> tuple[str, None, int | None, int | None]:
+    global SUPRA_FALLBACK_COUNT
     try:
         complexity, elapsed_ms = _supra_complexity(trimmed_prompt)
         target, _reason = _target_for_complexity(complexity)
         return target, None, complexity, elapsed_ms
     except Exception as err:
+        SUPRA_FALLBACK_COUNT += 1
         print(f"Supra scoring failed ({err}); defaulting to safe target", flush=True)
         return _safe_target(), None, None, None
 
@@ -1734,6 +1736,7 @@ PIN_TTL_S = _env_float("ROUTELLM_PIN_TTL_S", float(7 * 86400))
 DECISION_STORE_MAX = _env_int("ROUTELLM_DECISION_STORE_MAX", 4096)
 _decision_store: dict[str, dict] = {}
 _decision_store_lock = threading.Lock()
+SUPRA_FALLBACK_COUNT = 0
 
 
 def _store_load() -> None:
@@ -2347,6 +2350,7 @@ async def healthz():
         "supra_targets": list(SUPRA_TARGETS), "supra_invalid_target": SUPRA_INVALID_TARGET,
         "target_config_source": TARGET_CONFIG_SOURCE, "target_config_revision": TARGET_CONFIG_REVISION,
         "target_config_fingerprint": TARGET_CONFIG_FINGERPRINT,
+        "supra_fallback_count": SUPRA_FALLBACK_COUNT,
         "ready": _READY, "cache": {**_cache_metrics, "entries": len(_resp_cache), "bytes": _cache_bytes},
     }
 
