@@ -112,9 +112,11 @@ def test_supra_mode_short_prompt_still_uses_supra(monkeypatch):
 
 
 def test_supra_failure_uses_safe_target(monkeypatch):
+    before = server.SUPRA_FALLBACK_COUNT
     monkeypatch.setattr(server, "_supra_complexity", lambda prompt: (_ for _ in ()).throw(RuntimeError()))
     monkeypatch.setattr(server, "_safe_target", lambda: "expensive")
     assert server._decide_uncached("anything") == ("expensive", None, None, None)
+    assert server.SUPRA_FALLBACK_COUNT == before + 1
 
 
 def test_cheap_successes_pin_cheap(monkeypatch):

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # OpenFugu — Apache-2.0. Part of an independent, open reimplementation of
 # the Fugu orchestrator. NOT affiliated with Sakana AI. See NOTICE.
-# Reference: Learning to Orchestrate Agents in NL with the Conductor (arXiv:2512.04388, Sakana AI). Independent reimplementation of the workflow-DAG executor from the paper; no Sakana source code is copied.
+# Reference: Learning to Orchestrate Agents in NL with the Conductor
+# (arXiv:2512.04388, Sakana AI). Independent reimplementation of the workflow
+# DAG executor from the paper.
 """
 fugu_ultra.py — a faithful, runnable reconstruction of Sakana Fugu-Ultra's
 Conductor line: instead of routing one worker per turn (that's fugu_mini.py /
@@ -20,58 +22,78 @@ Provenance, stated honestly:
 """
 
 from __future__ import annotations
-import ast, json, re
+
+import ast
+import json
+import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 N_AGENTS = 7
-MAX_STEPS = 5                      # [DOC] Conductor workflows up to 5 steps
+MAX_STEPS = 5  # [DOC] Conductor workflows up to 5 steps
 _SMART = str.maketrans("“”‘’", "\"\"''")
 
-DEFAULT_SLOT_LABELS = [            # [DATA] training metadata; remappable to any provider
-    "gpt-5", "claude-sonnet-4", "gemini-2.5-pro",
-    "deepseek-r1-distill-qwen-32b", "gemma-3-27b-it",
-    "qwen3-32b-reasoning", "qwen3-32b-direct",
+DEFAULT_SLOT_LABELS = [  # [DATA] training metadata; remappable to any provider
+    "gpt-5",
+    "claude-sonnet-4",
+    "gemini-2.5-pro",
+    "deepseek-r1-distill-qwen-32b",
+    "gemma-3-27b-it",
+    "qwen3-32b-reasoning",
+    "qwen3-32b-direct",
 ]
+
 
 # ---- 3-list parsing (faithful to conductor_utils._extract_any) [EXEC] --------
 def _balanced_list(after: str) -> str | None:
     """Extract the first balanced [...] list, respecting quotes/escapes."""
-    depth = 0; start = None; q = None; esc = False
+    depth = 0
+    start = None
+    q = None
+    esc = False
     for i, ch in enumerate(after):
-        if esc: esc = False; continue
-        if ch == "\\": esc = True; continue
-        if q:
-            if ch == q: q = None
+        if esc:
+            esc = False
             continue
-        if ch in "\"'": q = ch; continue
+        if ch == "\\":
+            esc = True
+            continue
+        if q:
+            if ch == q:
+                q = None
+            continue
+        if ch in "\"'":
+            q = ch
+            continue
         if ch == "[":
-            if depth == 0: start = i
+            if depth == 0:
+                start = i
             depth += 1
         elif ch == "]":
             depth -= 1
             if depth == 0 and start is not None:
-                return after[start:i + 1]
+                return after[start : i + 1]
     return None
 
 
 def extract_list(text: str, labels: list[str]) -> list[Any]:
     """Find 'label: [ ... ]' then parse via ast -> json -> CSV fallback. [EXEC]"""
-    tag = "|".join(re.escape(l) for l in labels)
-    m = re.search(rf"({tag})\s*[:=]\s*", text, re.I)
+    tag = "|".join(re.escape(label) for label in labels)
+    m = re.search(rf"({tag})\s*[:=]\s*", text, re.IGNORECASE)
     if not m:
         return []
-    raw = _balanced_list(text[m.end():])
+    raw = _balanced_list(text[m.end() :])
     if not raw:
         return []
     raw = raw.translate(_SMART).strip()
     try:
         return list(ast.literal_eval(raw))
-    except Exception:
+    except (SyntaxError, ValueError):
         pass
     try:
         return list(json.loads(re.sub(r"'", '"', raw)))
-    except Exception:
+    except (TypeError, ValueError, json.JSONDecodeError):
         pass
     items = [x.strip(" \"'") for x in raw.strip("[]").split(",") if x.strip()]
     return [int(x) if x.isdigit() else x for x in items]
@@ -79,15 +101,17 @@ def extract_list(text: str, labels: list[str]) -> list[Any]:
 
 def parse_workflow(text: str) -> tuple[list, list, list]:
     model_ids = extract_list(text, ["model_id", "model id", "model_ids", "model ids"])
-    subtasks  = extract_list(text, ["subtasks", "subtask"])
-    access    = extract_list(text, ["access_list", "access list", "access"])
+    subtasks = extract_list(text, ["subtasks", "subtask"])
+    access = extract_list(text, ["access_list", "access list", "access"])
     return model_ids, subtasks, access
 
 
 def _is_all(x) -> bool:
     return isinstance(x, str) and x.strip().lower() in ("all", "[all]", "'all'")
 
+
 # EXEC_MARKER
+
 
 # ---- access-list visibility (choose_position: indices of earlier steps) [EXEC]
 def visible_indices(access_list: list, step: int) -> list[int]:
@@ -105,7 +129,7 @@ def visible_indices(access_list: list, step: int) -> list[int]:
     for pos in dict.fromkeys(a if isinstance(a, (list, tuple)) else [a]):
         if not isinstance(pos, int):
             continue
-        if pos >= step:                                  # forward reference -> reject [EXEC]
+        if pos >= step:  # forward reference -> reject [EXEC]
             raise ValueError(f"step {step} references future/own step {pos} (not a DAG order)")
         if 0 <= pos < step:
             out.append(pos)
@@ -121,7 +145,7 @@ def conductor_prompt(query: str, slot_labels: list[str]) -> list[dict]:
         "  model_id   = [int, ...]   # which worker (0-indexed) runs each step\n"
         "  subtasks   = [str, ...]   # the natural-language instruction for each step\n"
         "  access_list= [list, ...]  # for each step, the indices of EARLIER steps whose\n"
-        "                            # outputs that step may see ([] = none, may use \"all\")\n"
+        '                            # outputs that step may see ([] = none, may use "all")\n'
         "Rules: lists must be equal length (<=5 steps); access_list may only reference "
         "strictly earlier steps (it is a DAG executed in order); the LAST step's output "
         "is the final answer. Pick workers to match each subtask's demands.\n\n"
@@ -129,11 +153,13 @@ def conductor_prompt(query: str, slot_labels: list[str]) -> list[dict]:
         "Output the three lists explicitly as 'model_id: [...]', 'subtasks: [...]', "
         "'access_list: [...]'. You may reason first, but the three lists must appear."
     )
-    return [{"role": "system", "content": sys},
-            {"role": "user", "content": f"USER QUESTION: {query}"}]
+    return [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": f"USER QUESTION: {query}"},
+    ]
 
 
-WorkerFn = Callable[[str, list, int], str]   # (subtask, messages, agent_id) -> reply
+WorkerFn = Callable[[str, list, int], str]  # (subtask, messages, agent_id) -> reply
 
 
 @dataclass
@@ -159,6 +185,7 @@ class ConductorExecutor:
     Each step prompts its worker with its subtask plus the outputs of the steps
     named in access_list, injected as <Agent N response> blocks (the engine's
     exact context-assembly format)."""
+
     def __init__(self, worker: WorkerFn, slot_labels=None, max_steps=MAX_STEPS):
         self.worker = worker
         self.slot_labels = slot_labels or DEFAULT_SLOT_LABELS
@@ -168,28 +195,38 @@ class ConductorExecutor:
         if not (subtasks and model_ids and access):
             raise ValueError("workflow missing one of model_id/subtasks/access_list")
         if not (len(model_ids) == len(subtasks) == len(access)):
-            raise ValueError(f"lists unequal length: "
-                             f"{len(model_ids)}/{len(subtasks)}/{len(access)}")
+            raise ValueError(
+                f"lists unequal length: {len(model_ids)}/{len(subtasks)}/{len(access)}"
+            )
         if len(subtasks) > self.max_steps:
-            subtasks, model_ids, access = (subtasks[:self.max_steps],
-                                           model_ids[:self.max_steps], access[:self.max_steps])
+            subtasks, model_ids, access = (
+                subtasks[: self.max_steps],
+                model_ids[: self.max_steps],
+                access[: self.max_steps],
+            )
         return model_ids, subtasks, access
 
     def execute(self, model_ids, subtasks, access, verbose=False) -> UltraResult:
         model_ids, subtasks, access = self.validate(model_ids, subtasks, access)
-        res = UltraResult(final="", workflow={"model_id": model_ids,
-                                              "subtasks": subtasks, "access_list": access})
+        res = UltraResult(
+            final="", workflow={"model_id": model_ids, "subtasks": subtasks, "access_list": access}
+        )
         outputs: list[str] = []
-        for t, (mid, sub) in enumerate(zip(model_ids, subtasks)):
+        for t, (mid, sub) in enumerate(zip(model_ids, subtasks, strict=False)):
             sees = visible_indices(access, t)
             ctx = ""
             for j in sees:
-                ctx += (f"\n<Subtask assigned to Agent {model_ids[j]}>{subtasks[j]}"
-                        f"</Subtask assigned to Agent {model_ids[j]}>"
-                        f"\n<Agent {model_ids[j]} response>{outputs[j].strip()}"
-                        f"</Agent {model_ids[j]} response>")
-            user = (f"USER QUESTION context:\n{ctx}\n\nYour subtask: {sub}"
-                    if ctx else f"Your subtask: {sub}")
+                ctx += (
+                    f"\n<Subtask assigned to Agent {model_ids[j]}>{subtasks[j]}"
+                    f"</Subtask assigned to Agent {model_ids[j]}>"
+                    f"\n<Agent {model_ids[j]} response>{outputs[j].strip()}"
+                    f"</Agent {model_ids[j]} response>"
+                )
+            user = (
+                f"USER QUESTION context:\n{ctx}\n\nYour subtask: {sub}"
+                if ctx
+                else f"Your subtask: {sub}"
+            )
             mid = int(mid) % len(self.slot_labels)
             reply = self.worker(sub, [{"role": "user", "content": user}], mid)
             outputs.append(reply)
@@ -198,11 +235,13 @@ class ConductorExecutor:
                 print(f"  step {t}: agent={mid}({self.slot_labels[mid]}) sees={sees}")
                 print(f"    subtask: {sub[:80]}")
                 print(f"    -> {reply.strip()[:90]}")
-        res.final = outputs[-1] if outputs else ""        # last step = answer [EXEC]
+        res.final = outputs[-1] if outputs else ""  # last step = answer [EXEC]
         return res
+
 
 class MockWorker:
     """Offline: deterministic replies so parser+DAG can be tested with no keys."""
+
     def __call__(self, subtask, messages, agent_id):
         return f"[agent {agent_id}] result for: {subtask[:50]}"
 
@@ -223,7 +262,7 @@ def self_test() -> int:
     mids, subs, acc = parse_workflow(CANNED)
     print("parsed workflow:")
     print(f"  model_id   = {mids}")
-    print(f"  subtasks   = {[s[:30]+'...' for s in subs]}")
+    print(f"  subtasks   = {[s[:30] + '...' for s in subs]}")
     print(f"  access_list= {acc}")
     assert mids == [2, 0, 1], mids
     assert acc == [[], [0], [0, 1]], acc
@@ -234,7 +273,8 @@ def self_test() -> int:
     assert visible_indices(acc, 2) == [0, 1]
     # forward-ref rejection
     try:
-        visible_indices([[], [2], []], 1); raise AssertionError("should have rejected")
+        visible_indices([[], [2], []], 1)
+        raise AssertionError("should have rejected")
     except ValueError:
         pass
     res = ConductorExecutor(MockWorker()).execute(mids, subs, acc, verbose=True)

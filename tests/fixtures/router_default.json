@@ -1,0 +1,8 @@
+{
+  "mode": "head-only",
+  "vector_length": 19456,
+  "svf_length": 9216,
+  "head_shape": [10, 1024],
+  "svf_offsets_all_zero": true,
+  "source": "artifacts/router_head.safetensors"
+}
