@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from score import score_response
+from score import MIN_SUCCESSFUL_ROWS, provenance, score_response
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -104,18 +104,28 @@ def summarize(results: list[dict[str, Any]], output: str) -> None:
     for r in results:
         by_target[r["target"]].append(r)
 
-    lines = ["# A/B: mantis vs sakana/fugu-ultra", ""]
+    lines = provenance(
+        config=",".join(targets),
+        fixtures_path=REPO / "eval" / "fixtures.jsonl",
+        cost_method="provider-reported usage.cost (real USD when supplied)",
+    )
+    lines.extend(["# A/B: mantis vs sakana/fugu-ultra", ""])
+    lines.append(
+        "Scoring note: an empty response without an error scores 0.0 under the "
+        "current keyword scorer; row output does not distinguish an empty answer "
+        "from a wrong answer.\n"
+    )
     lines.append(
         f"Fixtures: {len(results) // max(len(targets), 1)} tasks x {len(targets)} targets. "
         "Scoring: keyword hit rate on `expect` terms (eval/score.py)."
     )
     lines.append("")
     header = (
-        "| target | success | score | cost $ | score/$ | latency s (med/p95) | "
+        "| target | success | errors | score | cost_usd | score/$ | latency s (med/p95) | "
         "completion tokens (med) |"
     )
     lines.append(header)
-    lines.append("|---|---|---|---|---|---|---|")
+    lines.append("|---|---:|---:|---:|---:|---:|---|---:|")
     for t in targets:
         rs = by_target[t]
         ok = [r for r in rs if not r["error"]]
@@ -126,8 +136,14 @@ def summarize(results: list[dict[str, Any]], output: str) -> None:
         mean_score = statistics.mean(scores) if scores else 0.0
         total_cost = sum(costs)
         eff = mean_score / total_cost if total_cost else float("nan")
+        score_display = (
+            f"{mean_score:.2f}"
+            if len(ok) >= MIN_SUCCESSFUL_ROWS
+            else f"n/a ({len(ok)}/{len(rs)} successful)"
+        )
         lines.append(
-            f"| {t} | {len(ok)}/{len(rs)} | {mean_score:.2f} | {total_cost:.4f} | "
+            f"| {t} | {len(ok)}/{len(rs)} | {len(rs) - len(ok)} | {score_display} | "
+            f"{total_cost:.4f} | "
             f"{eff:.1f} | {statistics.median(lats) if lats else 0:.1f}/{pct(lats, 0.95):.1f} | "
             f"{int(statistics.median(comps)) if comps else 0} |"
         )
@@ -138,17 +154,24 @@ def summarize(results: list[dict[str, Any]], output: str) -> None:
     for tier in tiers:
         lines.append(f"### {tier}")
         lines.append("")
-        lines.append("| target | score | cost $ | latency med s |")
-        lines.append("|---|---|---|---|")
+        lines.append("| target | success | errors | score | cost_usd | latency med s |")
+        lines.append("|---|---:|---:|---:|---:|---:|")
         for t in targets:
-            rs = [r for r in by_target[t] if r["tier"] == tier and not r["error"]]
-            if not rs:
+            all_rs = [r for r in by_target[t] if r["tier"] == tier]
+            rs = [r for r in all_rs if not r["error"]]
+            if not all_rs:
                 continue
             scores = [score_response(r["response_text"], _expect(r)) for r in rs]
             costs = [r["cost_usd"] for r in rs if r["cost_usd"] is not None]
             lats = [r["latency_s"] for r in rs]
+            score_display = (
+                f"{statistics.mean(scores):.2f}"
+                if len(rs) >= MIN_SUCCESSFUL_ROWS
+                else f"n/a ({len(rs)}/{len(all_rs)} successful)"
+            )
             lines.append(
-                f"| {t} | {statistics.mean(scores):.2f} | {sum(costs):.4f} | "
+                f"| {t} | {len(rs)}/{len(all_rs)} | {len(all_rs) - len(rs)} | "
+                f"{score_display} | {sum(costs):.4f} | "
                 f"{statistics.median(lats):.1f} |"
             )
         lines.append("")

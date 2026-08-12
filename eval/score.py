@@ -6,7 +6,7 @@ Scoring rubric (auto_score only):
   should contain. Keywords are matched case-insensitively as literal
   substrings.
 - `auto_score` = (number of expect terms found in response_text) / (total expect terms).
-- Responses with an error field or empty response_text score 0.
+- Responses with an error field are excluded from aggregate metrics.
 - `human_score` is left null for the user to fill in later.
 """
 
@@ -15,11 +15,52 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import subprocess
+import tomllib
 from collections import defaultdict
+from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
 REPO = Path(__file__).resolve().parent.parent
+MIN_SUCCESSFUL_ROWS = 4
+
+
+def provenance(
+    *,
+    config: str,
+    fixtures_path: Path,
+    cost_method: str,
+    generated_at: datetime | None = None,
+) -> list[str]:
+    try:
+        git_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=REPO, text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        git_sha = "unknown"
+    try:
+        catalog = tomllib.loads((REPO / "config" / "catalog.toml").read_text())
+        revision = catalog["routellm"]["revision"]
+    except (OSError, KeyError, TypeError, tomllib.TOMLDecodeError):
+        revision = "unknown"
+    fixture_sha = sha256(fixtures_path.read_bytes()).hexdigest()
+    try:
+        fixture_display = fixtures_path.relative_to(REPO)
+    except ValueError:
+        fixture_display = fixtures_path
+    timestamp = generated_at or datetime.now(UTC)
+    return [
+        "## Provenance",
+        f"- config/arm: `{config}`",
+        f"- git SHA: `{git_sha}`",
+        f"- catalog revision: `{revision}`",
+        f"- fixtures: `{fixture_display}` (sha256 `{fixture_sha}`)",
+        f"- generated at: `{timestamp.isoformat()}`",
+        f"- cost method: `{cost_method}`",
+        "",
+    ]
 
 
 def score_response(response_text: str, expect: list[str]) -> float:
@@ -44,6 +85,75 @@ def fmt(x: float) -> str:
     return f"{x:.2f}"
 
 
+def aggregate_metrics(
+    rows: list[dict[str, Any]], fx_by_id: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    valid = [r for r in rows if not r.get("error")]
+    scores = [
+        score_response(r.get("response_text", ""), fx_by_id.get(r["id"], {}).get("expect", []))
+        for r in valid
+    ]
+    latencies = [float(r.get("latency_s", 0) or 0) for r in valid]
+    costs = [float(r.get("est_cost_usd", 0) or 0) for r in valid]
+    return {
+        "count": len(rows),
+        "success_count": len(valid),
+        "error_count": len(rows) - len(valid),
+        "auto_score_mean": statistics.mean(scores) if scores else 0.0,
+        "auto_score_median": statistics.median(scores) if scores else 0.0,
+        "latency_mean_s": statistics.mean(latencies) if latencies else 0.0,
+        "cost_sum_usd": sum(costs),
+    }
+
+
+def metric_display(
+    metrics: dict[str, Any], key: str = "auto_score_mean", digits: int = 3
+) -> str:
+    success = metrics["success_count"]
+    total = metrics["count"]
+    if success < MIN_SUCCESSFUL_ROWS:
+        return f"n/a ({success}/{total} successful)"
+    return f"{metrics[key]:.{digits}f}"
+
+
+def paired_scores(
+    left_rows: list[dict[str, Any]],
+    right_rows: list[dict[str, Any]],
+    fx_by_id: dict[str, dict[str, Any]],
+) -> tuple[list[float], list[float]]:
+    left = {r["id"]: r for r in left_rows if not r.get("error")}
+    right = {r["id"]: r for r in right_rows if not r.get("error")}
+    ids = left.keys() & right.keys()
+    left_scores = [
+        score_response(left[i].get("response_text", ""), fx_by_id.get(i, {}).get("expect", []))
+        for i in ids
+    ]
+    right_scores = [
+        score_response(right[i].get("response_text", ""), fx_by_id.get(i, {}).get("expect", []))
+        for i in ids
+    ]
+    return left_scores, right_scores
+
+
+def paired_comparable(
+    left_rows: list[dict[str, Any]],
+    right_rows: list[dict[str, Any]],
+    fx_by_id: dict[str, dict[str, Any]],
+) -> tuple[list[float], list[float]]:
+    left_scores, right_scores = paired_scores(left_rows, right_rows, fx_by_id)
+    if len(left_scores) < MIN_SUCCESSFUL_ROWS:
+        return [], []
+    return left_scores, right_scores
+
+
+def paired_success_count(
+    left_rows: list[dict[str, Any]], right_rows: list[dict[str, Any]]
+) -> int:
+    left = {r["id"] for r in left_rows if not r.get("error")}
+    right = {r["id"] for r in right_rows if not r.get("error")}
+    return len(left & right)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Score eval results.")
     parser.add_argument("--fixtures", default=str(REPO / "eval" / "fixtures.jsonl"))
@@ -62,12 +172,10 @@ def main() -> None:
         for r in results:
             fx = fx_by_id.get(r["id"], {})
             expect = fx.get("expect", [])
-            auto = 0.0
-            if not r.get("error"):
-                auto = score_response(r.get("response_text", ""), expect)
+            auto = None if r.get("error") else score_response(r.get("response_text", ""), expect)
             row = {
                 **r,
-                "auto_score": round(auto, 3),
+                "auto_score": round(auto, 3) if auto is not None else None,
                 "human_score": None,
             }
             out.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -79,25 +187,7 @@ def main() -> None:
         by_config[r["config"]].append(r)
 
     def config_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
-        scores = []
-        latencies = []
-        costs = []
-        for r in rows:
-            fx = fx_by_id.get(r["id"], {})
-            expect = fx.get("expect", [])
-            auto = 0.0
-            if not r.get("error"):
-                auto = score_response(r.get("response_text", ""), expect)
-            scores.append(auto)
-            latencies.append(r.get("latency_s", 0))
-            costs.append(r.get("est_cost_usd", 0))
-        return {
-            "count": len(rows),
-            "auto_score_mean": statistics.mean(scores) if scores else 0.0,
-            "auto_score_median": statistics.median(scores) if scores else 0.0,
-            "latency_mean_s": statistics.mean(latencies) if latencies else 0.0,
-            "cost_sum_usd": sum(costs),
-        }
+        return aggregate_metrics(rows, fx_by_id)
 
     metrics = {c: config_metrics(by_config.get(c, [])) for c in configs}
 
@@ -120,31 +210,45 @@ def main() -> None:
         vals = []
         for r in rows:
             fx = fx_by_id.get(r["id"], {})
-            auto = 0.0
             if not r.get("error"):
-                auto = score_response(r.get("response_text", ""), fx.get("expect", []))
-            vals.append(auto)
+                vals.append(score_response(r.get("response_text", ""), fx.get("expect", [])))
         return statistics.mean(vals) if vals else 0.0
 
     def sum_cost(rows: list[dict[str, Any]]) -> float:
-        return sum(float(r.get("est_cost_usd", 0) or 0) for r in rows)
+        return sum(float(r.get("est_cost_usd", 0) or 0) for r in rows if not r.get("error"))
 
     def sum_latency(rows: list[dict[str, Any]]) -> float:
-        return sum(float(r.get("latency_s", 0) or 0) for r in rows)
+        return sum(float(r.get("latency_s", 0) or 0) for r in rows if not r.get("error"))
 
     def tier_rows(rows: list[dict[str, Any]], tier: str) -> list[dict[str, Any]]:
         return [r for r in rows if r.get("tier") == tier]
 
     # Build report
-    lines: list[str] = []
+    lines: list[str] = provenance(
+        config=",".join(configs),
+        fixtures_path=Path(args.fixtures),
+        cost_method="native estimated prices; 2K prompt + 1K completion assumption",
+    )
     lines.append("# Comparative Eval: direct vs TRINITY vs Conductor-old vs Conductor-new\n")
+    lines.append(
+        f"Scoring rule: report a mean only with at least {MIN_SUCCESSFUL_ROWS} "
+        "successful rows; comparisons use successful-item intersections.\n"
+    )
+    lines.append(
+        "Scoring note: an empty response without an error scores 0.0 under the "
+        "current keyword scorer; row output does not distinguish an empty answer "
+        "from a wrong answer.\n"
+    )
     lines.append("## Summary\n")
-    lines.append("| config | auto_score_mean | latency_mean_s | cost_sum_usd |")
-    lines.append("|---|---|---|---|")
+    lines.append(
+        "| config | success | errors | auto_score_mean | latency_mean_s | est_cost_sum_usd |"
+    )
+    lines.append("|---|---:|---:|---:|---:|---:|")
     for c in configs:
         m = metrics[c]
         summary_row = (
-            f"| {c} | {m['auto_score_mean']:.3f} | {m['latency_mean_s']:.1f} | "
+            f"| {c} | {m['success_count']}/{m['count']} | {m['error_count']} | "
+            f"{metric_display(m)} | {metric_display(m, 'latency_mean_s', 1)} | "
             f"${m['cost_sum_usd']:.4f} |"
         )
         lines.append(summary_row)
@@ -171,8 +275,10 @@ def main() -> None:
 
     # Per-tier averages
     lines.append("## Per-tier averages\n")
-    lines.append("| tier | config | auto_score_mean | latency_sum_s | cost_sum_usd |")
-    lines.append("|---|---|---|---|---|")
+    lines.append(
+        "| tier | config | success | errors | auto_score_mean | latency_sum_s | est_cost_sum_usd |"
+    )
+    lines.append("|---|---|---:|---:|---:|---:|---:|")
     for tier in tiers:
         for c in configs:
             m = tier_table[tier][c]
@@ -180,7 +286,8 @@ def main() -> None:
                 [r for r in by_config.get(c, []) if r.get("tier") == tier]
             )
             tier_row = (
-                f"| {tier} | {c} | {m['auto_score_mean']:.3f} | {tier_latency:.1f} | "
+                f"| {tier} | {c} | {m['success_count']}/{m['count']} | {m['error_count']} | "
+                f"{metric_display(m)} | {tier_latency:.1f} | "
                 f"${m['cost_sum_usd']:.4f} |"
             )
             lines.append(tier_row)
@@ -197,13 +304,30 @@ def main() -> None:
     dl = sum_latency(direct_rows)
     tl = sum_latency(trinity_rows)
     lines.append("### a) trinity vs direct\n")
-    lines.append(f"- direct mean auto_score: {ds:.3f}")
-    lines.append(f"- trinity mean auto_score: {ts:.3f}")
-    qd_direct = (
-        f"- quality delta: {ts - ds:+.3f} "
-        f"({'+' if ts >= ds else ''}{((ts - ds) / ds * 100):.1f}% vs direct)"
+    direct_trinity_left, direct_trinity_right = paired_comparable(
+        direct_rows, trinity_rows, fx_by_id
     )
-    lines.append(qd_direct if ds else "")
+    lines.append(f"- direct mean auto_score: {metric_display(metrics['direct'])}")
+    lines.append(f"- trinity mean auto_score: {metric_display(metrics['trinity'])}")
+    if direct_trinity_left:
+        paired_ds = statistics.mean(direct_trinity_left)
+        paired_ts = statistics.mean(direct_trinity_right)
+        lines.append(
+            f"- quality delta (paired n={len(direct_trinity_left)}): "
+            f"{paired_ts - paired_ds:+.3f}"
+        )
+        if paired_ds:
+            lines.append(
+                f"- quality delta percentage (paired n={len(direct_trinity_left)}): "
+                f"{'+' if paired_ts >= paired_ds else ''}"
+                f"{((paired_ts - paired_ds) / paired_ds * 100):.1f}% vs direct"
+            )
+    else:
+        lines.append(
+            f"- paired successful intersection: "
+            f"n={paired_success_count(direct_rows, trinity_rows)} "
+            f"(<{MIN_SUCCESSFUL_ROWS}); quality comparison omitted"
+        )
     lines.append(f"- direct total cost: ${dc:.4f}, latency: {dl:.1f}s")
     lines.append(f"- trinity total cost: ${tc:.4f}, latency: {tl:.1f}s")
     cd_direct = f"- cost delta: ${tc - dc:+.4f} " f"({((tc - dc) / dc * 100):.1f}% vs direct)"
@@ -218,26 +342,58 @@ def main() -> None:
     ol = sum_latency(old_rows)
     nl = sum_latency(new_rows)
     lines.append("### b) conductor-new vs conductor-old\n")
-    lines.append(f"- conductor-old mean auto_score: {os:.3f}")
-    lines.append(f"- conductor-new mean auto_score: {ns:.3f}")
-    qd_old = (
-        f"- quality delta: {ns - os:+.3f} "
-        f"({'+' if ns >= os else ''}{((ns - os) / os * 100):.1f}% vs old)"
-    )
-    lines.append(qd_old if os else "")
+    old_new_left, old_new_right = paired_comparable(old_rows, new_rows, fx_by_id)
+    lines.append(f"- conductor-old mean auto_score: {metric_display(metrics['conductor-old'])}")
+    lines.append(f"- conductor-new mean auto_score: {metric_display(metrics['conductor-new'])}")
+    if old_new_left:
+        paired_os = statistics.mean(old_new_left)
+        paired_ns = statistics.mean(old_new_right)
+        lines.append(
+            f"- quality delta (paired n={len(old_new_left)}): "
+            f"{paired_ns - paired_os:+.3f}"
+        )
+        if paired_os:
+            lines.append(
+                f"- quality delta percentage (paired n={len(old_new_left)}): "
+                f"{'+' if paired_ns >= paired_os else ''}"
+                f"{((paired_ns - paired_os) / paired_os * 100):.1f}% vs old"
+            )
+    else:
+        lines.append(
+            f"- paired successful intersection: "
+            f"n={paired_success_count(old_rows, new_rows)} "
+            f"(<{MIN_SUCCESSFUL_ROWS}); quality comparison omitted"
+        )
     lines.append(f"- conductor-old total cost: ${oc:.4f}, latency: {ol:.1f}s")
     lines.append(f"- conductor-new total cost: ${nc:.4f}, latency: {nl:.1f}s")
     lines.append("")
 
     # c) conductor-new vs trinity
     lines.append("### c) conductor-new vs trinity\n")
-    lines.append(f"- trinity mean auto_score: {ts:.3f}")
-    lines.append(f"- conductor-new mean auto_score: {ns:.3f}")
-    qd_trinity = (
-        f"- quality delta: {ns - ts:+.3f} "
-        f"({'+' if ns >= ts else ''}{((ns - ts) / ts * 100):.1f}% vs trinity)"
+    new_trinity_left, new_trinity_right = paired_comparable(
+        new_rows, trinity_rows, fx_by_id
     )
-    lines.append(qd_trinity if ts else "")
+    lines.append(f"- trinity mean auto_score: {metric_display(metrics['trinity'])}")
+    lines.append(f"- conductor-new mean auto_score: {metric_display(metrics['conductor-new'])}")
+    if new_trinity_left:
+        paired_ns = statistics.mean(new_trinity_left)
+        paired_ts = statistics.mean(new_trinity_right)
+        lines.append(
+            f"- quality delta (paired n={len(new_trinity_left)}): "
+            f"{paired_ns - paired_ts:+.3f}"
+        )
+        if paired_ts:
+            lines.append(
+                f"- quality delta percentage (paired n={len(new_trinity_left)}): "
+                f"{'+' if paired_ns >= paired_ts else ''}"
+                f"{((paired_ns - paired_ts) / paired_ts * 100):.1f}% vs trinity"
+            )
+    else:
+        lines.append(
+            f"- paired successful intersection: "
+            f"n={paired_success_count(new_rows, trinity_rows)} "
+            f"(<{MIN_SUCCESSFUL_ROWS}); quality comparison omitted"
+        )
     lines.append(f"- trinity total cost: ${tc:.4f}, latency: {tl:.1f}s")
     lines.append(f"- conductor-new total cost: ${nc:.4f}, latency: {nl:.1f}s")
     lines.append("")
@@ -246,7 +402,11 @@ def main() -> None:
     lines.append("### Hard-tier comparison\n")
     for c in configs:
         rows = tier_rows(by_config.get(c, []), "hard")
-        hard_line = f"- {c}: mean auto_score = {mean_score(rows):.3f}, "
+        m = tier_table["hard"][c]
+        hard_line = (
+            f"- {c}: mean auto_score ({m['success_count']} successful, {m['error_count']} errors) "
+            f"= {metric_display(m)}, "
+        )
         hard_line += f"cost = ${sum_cost(rows):.4f}"
         lines.append(hard_line)
     lines.append("")
@@ -261,7 +421,15 @@ def main() -> None:
     new_err = error_rate(new_rows)
 
     # Decision rule from task, plus a guard for the failure case observed here
-    if ns < ds - 0.05 and new_err > 0.5:
+    if not new_trinity_left or not paired_comparable(
+        direct_rows, new_rows, fx_by_id
+    )[0]:
+        rec = (
+            "Insufficient comparable successful rows for a Conductor quality "
+            "comparison. Recommendation: collect at least "
+            f"{MIN_SUCCESSFUL_ROWS} successful rows per arm with matched counts."
+        )
+    elif ns < ds - 0.05 and new_err > 0.5:
         rec = (
             f"Conductor-new scores well below direct ({ns:.3f} vs {ds:.3f}) "
             f"and fails on {new_err:.0%} of prompts. Recommendation: do not "

@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Generate eval/report-luna-conductor.md.
+"""Generate eval/report-luna-conductor.md from tracked raw results.
 
-Merges the existing direct + trinity scored results from
-`eval/results-native-v2-scored.jsonl` with a fresh `eval/results-luna.jsonl`
-run of `conductor-luna` (LiteLLM planner = gpt-5.6-luna-max).
+Combines native-v2 direct/trinity results with a fresh
+`eval/results-luna.jsonl` run of `conductor-luna`.
 """
 from __future__ import annotations
 
@@ -12,21 +11,32 @@ import statistics
 from pathlib import Path
 from typing import Any
 
-from score import load_jsonl, score_response
+from score import (
+    MIN_SUCCESSFUL_ROWS,
+    load_jsonl,
+    metric_display,
+    paired_comparable,
+    paired_success_count,
+    provenance,
+    score_response,
+)
 
 REPO = Path(__file__).resolve().parent.parent
 
 
 def config_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    valid = [r for r in rows if not r.get("error")]
     scores = []
     latencies = []
     costs = []
-    for r in rows:
+    for r in valid:
         scores.append(r.get("auto_score", 0.0) or 0.0)
         latencies.append(r.get("latency_s", 0) or 0)
         costs.append(r.get("est_cost_usd", 0) or 0)
     return {
         "count": len(rows),
+        "success_count": len(valid),
+        "error_count": len(rows) - len(valid),
         "auto_score_mean": statistics.mean(scores) if scores else 0.0,
         "latency_sum_s": sum(latencies),
         "cost_sum_usd": sum(costs),
@@ -54,7 +64,21 @@ def main() -> None:
     fx_by_id = {f["id"]: f for f in fixtures}
     tiers = ["simple", "medium", "hard", "debug"]
 
-    baseline = load_jsonl(REPO / "eval" / "results-native-v2-scored.jsonl")
+    baseline_raw = load_jsonl(REPO / "eval" / "results-native-v2.jsonl")
+    baseline: list[dict[str, Any]] = []
+    for r in baseline_raw:
+        fx = fx_by_id.get(r["id"], {})
+        auto = (
+            None
+            if r.get("error")
+            else score_response(r.get("response_text", ""), fx.get("expect", []))
+        )
+        baseline.append(
+            {
+                **r,
+                "auto_score": round(auto, 3) if auto is not None else None,
+            }
+        )
     direct_rows = [r for r in baseline if r["config"] == "direct"]
     trinity_rows = [r for r in baseline if r["config"] == "trinity"]
 
@@ -64,10 +88,12 @@ def main() -> None:
     for r in luna_raw:
         fx = fx_by_id.get(r["id"], {})
         expect = fx.get("expect", [])
-        auto = 0.0
-        if not r.get("error"):
-            auto = score_response(r.get("response_text", ""), expect)
-        row = {**r, "config": "conductor-luna", "auto_score": round(auto, 3)}
+        auto = None if r.get("error") else score_response(r.get("response_text", ""), expect)
+        row = {
+            **r,
+            "config": "conductor-luna",
+            "auto_score": round(auto, 3) if auto is not None else None,
+        }
         luna_rows.append(row)
 
     # Write scored luna results
@@ -92,21 +118,37 @@ def main() -> None:
             rows = [r for r in by_config[c] if r.get("tier") == tier]
             tier_table[tier][c] = config_metrics(rows)
 
-    lines: list[str] = []
+    lines: list[str] = provenance(
+        config="direct,trinity,conductor-luna",
+        fixtures_path=REPO / "eval" / "fixtures.jsonl",
+        cost_method="native estimated prices; 2K prompt + 1K completion assumption",
+    )
     lines.append("# Comparative Eval: direct vs TRINITY vs Conductor-Luna\n")
+    lines.append(
+        f"Scoring rule: report a mean only with at least {MIN_SUCCESSFUL_ROWS} "
+        "successful rows; comparisons use successful-item intersections.\n"
+    )
+    lines.append(
+        "Scoring note: an empty response without an error scores 0.0 under the "
+        "current keyword scorer; row output does not distinguish an empty answer "
+        "from a wrong answer.\n"
+    )
     lines.append(
         "Conductor-Luna uses the LiteLLM planner `gpt-5.6-luna-max` "
         "instead of a local 3B checkpoint.\n"
     )
 
     lines.append("## Summary\n")
-    lines.append("| config | auto_score_mean | latency_sum_s | cost_sum_usd |")
-    lines.append("|---|---|---|---|")
+    lines.append(
+        "| config | success | errors | auto_score_mean | latency_sum_s | est_cost_sum_usd |"
+    )
+    lines.append("|---|---:|---:|---:|---:|---:|")
     for c in configs:
         m = metrics[c]
         lines.append(
-            f"| {c} | {m['auto_score_mean']:.3f} | "
-            f"{m['latency_sum_s']:.1f} | ${m['cost_sum_usd']:.4f} |"
+            f"| {c} | {m['success_count']}/{m['count']} | {m['error_count']} | "
+            f"{metric_display(m)} | {m['latency_sum_s']:.1f} | "
+            f"${m['cost_sum_usd']:.4f} |"
         )
     lines.append("")
 
@@ -134,20 +176,21 @@ def main() -> None:
     lines.append("")
 
     lines.append("## Per-tier averages\n")
-    lines.append("| tier | config | auto_score_mean | latency_sum_s | cost_sum_usd |")
-    lines.append("|---|---|---|---|---|")
+    lines.append(
+        "| tier | config | success | errors | auto_score_mean | latency_sum_s | est_cost_sum_usd |"
+    )
+    lines.append("|---|---|---:|---:|---:|---:|---:|")
     for tier in tiers:
         for c in configs:
             m = tier_table[tier][c]
             lines.append(
-                f"| {tier} | {c} | {m['auto_score_mean']:.3f} | "
-                f"{m['latency_sum_s']:.1f} | ${m['cost_sum_usd']:.4f} |"
+                f"| {tier} | {c} | {m['success_count']}/{m['count']} | {m['error_count']} | "
+                f"{metric_display(m)} | {m['latency_sum_s']:.1f} | "
+                f"${m['cost_sum_usd']:.4f} |"
             )
     lines.append("")
 
     # Headline comparisons
-    trinity_overall = metrics["trinity"]["auto_score_mean"]
-    luna_overall = metrics["conductor-luna"]["auto_score_mean"]
     trinity_cost = metrics["trinity"]["cost_sum_usd"]
     luna_cost = metrics["conductor-luna"]["cost_sum_usd"]
 
@@ -163,31 +206,75 @@ def main() -> None:
     lines.append("## Headline comparisons\n")
 
     lines.append("### a) conductor-luna vs trinity\n")
-    lines.append(f"- trinity overall mean: {trinity_overall:.3f}")
-    lines.append(f"- conductor-luna overall mean: {luna_overall:.3f}")
-    lines.append(f"- overall quality delta: {luna_overall - trinity_overall:+.3f}")
-    lines.append(f"- hard-tier trinity mean: {hard_trinity:.3f}")
-    lines.append(f"- hard-tier conductor-luna mean: {hard_luna:.3f}")
-    lines.append(f"- hard-tier quality delta: {hard_luna - hard_trinity:+.3f}")
+    overall_left, overall_right = paired_comparable(
+        luna_rows, trinity_rows, fx_by_id
+    )
+    hard_left, hard_right = paired_comparable(
+        [r for r in luna_rows if r.get("tier") == "hard"],
+        [r for r in trinity_rows if r.get("tier") == "hard"],
+        fx_by_id,
+    )
+    hard_luna_rows = [r for r in luna_rows if r.get("tier") == "hard"]
+    hard_trinity_rows = [r for r in trinity_rows if r.get("tier") == "hard"]
+    lines.append(f"- trinity overall mean: {metric_display(metrics['trinity'])}")
+    lines.append(f"- conductor-luna overall mean: {metric_display(metrics['conductor-luna'])}")
+    if overall_left:
+        paired_trinity = statistics.mean(overall_right)
+        paired_luna = statistics.mean(overall_left)
+        lines.append(
+            f"- overall quality delta (paired n={len(overall_left)}): "
+            f"{paired_luna - paired_trinity:+.3f}"
+        )
+    else:
+        lines.append(
+            f"- paired successful intersection: "
+            f"n={paired_success_count(luna_rows, trinity_rows)} "
+            f"(<{MIN_SUCCESSFUL_ROWS}); quality comparison omitted"
+        )
+    lines.append(f"- hard-tier trinity mean: {metric_display(tier_table['hard']['trinity'])}")
+    lines.append(
+        f"- hard-tier conductor-luna mean: "
+        f"{metric_display(tier_table['hard']['conductor-luna'])}"
+    )
+    if hard_left:
+        paired_hard_trinity = statistics.mean(hard_right)
+        paired_hard_luna = statistics.mean(hard_left)
+        lines.append(
+            f"- hard-tier quality delta (paired n={len(hard_left)}): "
+            f"{paired_hard_luna - paired_hard_trinity:+.3f}"
+        )
+    else:
+        lines.append(
+            f"- hard-tier paired successful intersection: "
+            f"n={paired_success_count(hard_luna_rows, hard_trinity_rows)} "
+            f"(<{MIN_SUCCESSFUL_ROWS}); quality comparison omitted"
+        )
     lines.append("")
 
     lines.append("### b) cost-per-quality-point\n")
-    score_delta = luna_overall - trinity_overall
     cost_delta = luna_cost - trinity_cost
-    if score_delta > 0 and cost_delta >= 0:
-        cpp = cost_delta / score_delta if score_delta else 0.0
+    if not overall_left:
+        lines.append(
+            f"- overall: insufficient comparable successful rows; "
+            f"the paired intersection requires at least {MIN_SUCCESSFUL_ROWS} items"
+        )
+    elif (paired_luna - paired_trinity) > 0 and cost_delta >= 0:
+        paired_score_delta = paired_luna - paired_trinity
+        cpp = cost_delta / paired_score_delta if paired_score_delta else 0.0
         lines.append(
             wrap(
                 "- overall: "
-                f"${cost_delta:.4f} extra spend for +{score_delta:.3f} quality "
+                f"${cost_delta:.4f} extra spend for "
+                f"+{paired_luna - paired_trinity:.3f} quality "
                 f"= ${cpp:.4f} per quality point"
             )
         )
-    elif score_delta > 0 and cost_delta < 0:
+    elif (paired_luna - paired_trinity) > 0 and cost_delta < 0:
         lines.append(
             wrap(
                 "- overall: conductor-luna is both cheaper "
-                f"(save ${-cost_delta:.4f}) and better (+{score_delta:.3f}), "
+                f"(save ${-cost_delta:.4f}) and better "
+                f"(+{paired_luna - paired_trinity:.3f}), "
                 "so cost per quality point is negative"
             )
         )
@@ -195,34 +282,45 @@ def main() -> None:
         lines.append(
             wrap(
                 "- overall: conductor-luna is not a quality win "
-                f"(delta {score_delta:+.3f}) despite ${cost_delta:+.4f} cost delta"
+                f"(delta {paired_luna - paired_trinity:+.3f}) "
+                f"despite ${cost_delta:+.4f} cost delta"
             )
         )
 
-    hard_score_delta = hard_luna - hard_trinity
     hard_cost_delta = hard_luna_cost - hard_trinity_cost
-    if hard_score_delta > 0 and hard_cost_delta >= 0:
-        hard_cpp = hard_cost_delta / hard_score_delta if hard_score_delta else 0.0
+    if not hard_left:
+        lines.append(
+            f"- hard tier: insufficient comparable successful rows; "
+            f"the paired intersection requires at least {MIN_SUCCESSFUL_ROWS} items"
+        )
+    elif (paired_hard_luna - paired_hard_trinity) > 0 and hard_cost_delta >= 0:
+        paired_hard_score_delta = paired_hard_luna - paired_hard_trinity
+        hard_cpp = (
+            hard_cost_delta / paired_hard_score_delta
+            if paired_hard_score_delta
+            else 0.0
+        )
         lines.append(
             wrap(
                 "- hard tier: "
-                f"${hard_cost_delta:.4f} extra spend for +{hard_score_delta:.3f} "
+                f"${hard_cost_delta:.4f} extra spend for "
+                f"+{paired_hard_luna - paired_hard_trinity:.3f} "
                 f"quality = ${hard_cpp:.4f} per quality point"
             )
         )
-    elif hard_score_delta > 0 and hard_cost_delta < 0:
+    elif (paired_hard_luna - paired_hard_trinity) > 0 and hard_cost_delta < 0:
         lines.append(
             wrap(
                 "- hard tier: conductor-luna is both cheaper "
                 f"(save ${-hard_cost_delta:.4f}) and better "
-                f"(+{hard_score_delta:.3f})"
+                f"(+{paired_hard_luna - paired_hard_trinity:.3f})"
             )
         )
     else:
         lines.append(
             wrap(
                 "- hard tier: conductor-luna is not a quality win "
-                f"(delta {hard_score_delta:+.3f}) on hard tasks"
+                f"(delta {paired_hard_luna - paired_hard_trinity:+.3f}) on hard tasks"
             )
         )
     lines.append("")
@@ -235,7 +333,14 @@ def main() -> None:
     lines.append("")
 
     lines.append("## Decision table\n")
-    if hard_luna >= hard_trinity + 0.10:
+    if not hard_left:
+        decision = "insufficient comparable successful rows on hard tier"
+        threshold = 6
+        reason = (
+            f"Collect at least {MIN_SUCCESSFUL_ROWS} successful rows per arm "
+            "with matched counts before making a Conductor routing decision."
+        )
+    elif hard_luna >= hard_trinity + 0.10:
         decision = "conductor-luna hard-tier mean >= trinity + 0.10"
         threshold = 4
         reason = (

@@ -1,14 +1,26 @@
+## Provenance
+- config/arm: `direct,trinity,conductor-luna`
+- git SHA: `1bf1909dea0bd5b66e3a3a43cd514fd54c8dd79e`
+- catalog revision: `bifrost-2026-08-12`
+- fixtures: `eval/fixtures.jsonl` (sha256 `3fdd2ae72173ee1f91b1eae60edd223a8e0a433c32d1c1d2d6c81c8afdeee366`)
+- generated at: `2026-08-12T19:08:07.764372+00:00`
+- cost method: `native estimated prices; 2K prompt + 1K completion assumption`
+
 # Comparative Eval: direct vs TRINITY vs Conductor-Luna
+
+Scoring rule: report a mean only with at least 4 successful rows; comparisons use successful-item intersections.
+
+Scoring note: an empty response without an error scores 0.0 under the current keyword scorer; row output does not distinguish an empty answer from a wrong answer.
 
 Conductor-Luna uses the LiteLLM planner `gpt-5.6-luna-max` instead of a local 3B checkpoint.
 
 ## Summary
 
-| config | auto_score_mean | latency_sum_s | cost_sum_usd |
-|---|---|---|---|
-| direct | 0.568 | 125.5 | $0.0128 |
-| trinity | 0.890 | 1023.0 | $0.4563 |
-| conductor-luna | 0.626 | 1331.2 | $0.8628 |
+| config | success | errors | auto_score_mean | latency_sum_s | est_cost_sum_usd |
+|---|---:|---:|---:|---:|---:|
+| direct | 16/16 | 0 | 0.568 | 125.5 | $0.0128 |
+| trinity | 16/16 | 0 | 0.890 | 1023.0 | $0.4563 |
+| conductor-luna | 16/16 | 0 | 0.626 | 1331.2 | $0.8628 |
 
 ## Results matrix (auto_score, latency, cost)
 
@@ -33,20 +45,20 @@ Conductor-Luna uses the LiteLLM planner `gpt-5.6-luna-max` instead of a local 3B
 
 ## Per-tier averages
 
-| tier | config | auto_score_mean | latency_sum_s | cost_sum_usd |
-|---|---|---|---|---|
-| simple | direct | 0.958 | 29.9 | $0.0032 |
-| simple | trinity | 0.917 | 311.7 | $0.0062 |
-| simple | conductor-luna | 0.617 | 175.9 | $0.1699 |
-| medium | direct | 0.700 | 27.4 | $0.0032 |
-| medium | trinity | 1.000 | 230.6 | $0.2063 |
-| medium | conductor-luna | 1.000 | 260.5 | $0.2032 |
-| hard | direct | 0.000 | 38.7 | $0.0032 |
-| hard | trinity | 0.714 | 348.2 | $0.0742 |
-| hard | conductor-luna | 0.250 | 653.0 | $0.2865 |
-| debug | direct | 0.614 | 29.6 | $0.0032 |
-| debug | trinity | 0.928 | 132.5 | $0.1697 |
-| debug | conductor-luna | 0.636 | 241.8 | $0.2032 |
+| tier | config | success | errors | auto_score_mean | latency_sum_s | est_cost_sum_usd |
+|---|---|---:|---:|---:|---:|---:|
+| simple | direct | 4/4 | 0 | 0.958 | 29.9 | $0.0032 |
+| simple | trinity | 4/4 | 0 | 0.917 | 311.7 | $0.0062 |
+| simple | conductor-luna | 4/4 | 0 | 0.617 | 175.9 | $0.1699 |
+| medium | direct | 4/4 | 0 | 0.700 | 27.4 | $0.0032 |
+| medium | trinity | 4/4 | 0 | 1.000 | 230.6 | $0.2063 |
+| medium | conductor-luna | 4/4 | 0 | 1.000 | 260.5 | $0.2032 |
+| hard | direct | 4/4 | 0 | 0.000 | 38.7 | $0.0032 |
+| hard | trinity | 4/4 | 0 | 0.714 | 348.2 | $0.0742 |
+| hard | conductor-luna | 4/4 | 0 | 0.250 | 653.0 | $0.2865 |
+| debug | direct | 4/4 | 0 | 0.614 | 29.6 | $0.0032 |
+| debug | trinity | 4/4 | 0 | 0.928 | 132.5 | $0.1697 |
+| debug | conductor-luna | 4/4 | 0 | 0.636 | 241.8 | $0.2032 |
 
 ## Headline comparisons
 
@@ -54,10 +66,10 @@ Conductor-Luna uses the LiteLLM planner `gpt-5.6-luna-max` instead of a local 3B
 
 - trinity overall mean: 0.890
 - conductor-luna overall mean: 0.626
-- overall quality delta: -0.264
+- overall quality delta (paired n=16): -0.264
 - hard-tier trinity mean: 0.714
 - hard-tier conductor-luna mean: 0.250
-- hard-tier quality delta: -0.464
+- hard-tier quality delta (paired n=4): -0.464
 
 ### b) cost-per-quality-point
 
@@ -72,7 +84,7 @@ Conductor-Luna uses the LiteLLM planner `gpt-5.6-luna-max` instead of a local 3B
 ## Decision table
 
 - Decision branch: conductor-luna hard-tier mean < trinity - 0.10
-- Recommended `FUGU_AUTO_THRESHOLD`: 6
+- Recommended Conductor routing threshold: 6
 - Reasoning: TRINITY remains the better orchestrator for hard tasks; keep Conductor out of auto mode.
 
 ## Errors / timeouts

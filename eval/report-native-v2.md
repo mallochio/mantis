@@ -1,13 +1,25 @@
+## Provenance
+- config/arm: `direct,trinity,conductor-old,conductor-new`
+- git SHA: `1bf1909dea0bd5b66e3a3a43cd514fd54c8dd79e`
+- catalog revision: `bifrost-2026-08-12`
+- fixtures: `eval/fixtures.jsonl` (sha256 `3fdd2ae72173ee1f91b1eae60edd223a8e0a433c32d1c1d2d6c81c8afdeee366`)
+- generated at: `2026-08-12T19:08:07.702584+00:00`
+- cost method: `native estimated prices; 2K prompt + 1K completion assumption`
+
 # Comparative Eval: direct vs TRINITY vs Conductor-old vs Conductor-new
+
+Scoring rule: report a mean only with at least 4 successful rows; comparisons use successful-item intersections.
+
+Scoring note: an empty response without an error scores 0.0 under the current keyword scorer; row output does not distinguish an empty answer from a wrong answer.
 
 ## Summary
 
-| config | auto_score_mean | latency_mean_s | cost_sum_usd |
-|---|---|---|---|
-| direct | 0.568 | 7.8 | $0.0128 |
-| trinity | 0.890 | 63.9 | $0.4563 |
-| conductor-old | 0.188 | 94.0 | $0.2648 |
-| conductor-new | 0.073 | 95.7 | $0.2298 |
+| config | success | errors | auto_score_mean | latency_mean_s | est_cost_sum_usd |
+|---|---:|---:|---:|---:|---:|
+| direct | 16/16 | 0 | 0.568 | 7.8 | $0.0128 |
+| trinity | 16/16 | 0 | 0.890 | 63.9 | $0.4563 |
+| conductor-old | 3/16 | 13 | n/a (3/16 successful) | n/a (3/16 successful) | $0.2648 |
+| conductor-new | 3/16 | 13 | n/a (3/16 successful) | n/a (3/16 successful) | $0.2298 |
 
 ## Results matrix (auto_score, latency, cost)
 
@@ -32,24 +44,24 @@
 
 ## Per-tier averages
 
-| tier | config | auto_score_mean | latency_sum_s | cost_sum_usd |
-|---|---|---|---|---|
-| simple | direct | 0.958 | 29.9 | $0.0032 |
-| simple | trinity | 0.917 | 311.7 | $0.0062 |
-| simple | conductor-old | 0.500 | 320.8 | $0.1765 |
-| simple | conductor-new | 0.167 | 403.6 | $0.1416 |
-| medium | direct | 0.700 | 27.4 | $0.0032 |
-| medium | trinity | 1.000 | 230.6 | $0.2063 |
-| medium | conductor-old | 0.250 | 498.7 | $0.0883 |
-| medium | conductor-new | 0.000 | 370.4 | $0.0000 |
-| hard | direct | 0.000 | 38.7 | $0.0032 |
-| hard | trinity | 0.714 | 348.2 | $0.0742 |
-| hard | conductor-old | 0.000 | 498.5 | $0.0000 |
-| hard | conductor-new | 0.125 | 444.7 | $0.0883 |
-| debug | direct | 0.614 | 29.6 | $0.0032 |
-| debug | trinity | 0.929 | 132.5 | $0.1697 |
-| debug | conductor-old | 0.000 | 185.3 | $0.0000 |
-| debug | conductor-new | 0.000 | 313.0 | $0.0000 |
+| tier | config | success | errors | auto_score_mean | latency_sum_s | est_cost_sum_usd |
+|---|---|---:|---:|---:|---:|---:|
+| simple | direct | 4/4 | 0 | 0.958 | 29.9 | $0.0032 |
+| simple | trinity | 4/4 | 0 | 0.917 | 311.7 | $0.0062 |
+| simple | conductor-old | 2/4 | 2 | n/a (2/4 successful) | 179.6 | $0.1765 |
+| simple | conductor-new | 2/4 | 2 | n/a (2/4 successful) | 208.7 | $0.1416 |
+| medium | direct | 4/4 | 0 | 0.700 | 27.4 | $0.0032 |
+| medium | trinity | 4/4 | 0 | 1.000 | 230.6 | $0.2063 |
+| medium | conductor-old | 1/4 | 3 | n/a (1/4 successful) | 142.6 | $0.0883 |
+| medium | conductor-new | 0/4 | 4 | n/a (0/4 successful) | 0.0 | $0.0000 |
+| hard | direct | 4/4 | 0 | 0.000 | 38.7 | $0.0032 |
+| hard | trinity | 4/4 | 0 | 0.714 | 348.2 | $0.0742 |
+| hard | conductor-old | 0/4 | 4 | n/a (0/4 successful) | 0.0 | $0.0000 |
+| hard | conductor-new | 1/4 | 3 | n/a (1/4 successful) | 121.1 | $0.0883 |
+| debug | direct | 4/4 | 0 | 0.614 | 29.6 | $0.0032 |
+| debug | trinity | 4/4 | 0 | 0.929 | 132.5 | $0.1697 |
+| debug | conductor-old | 0/4 | 4 | n/a (0/4 successful) | 0.0 | $0.0000 |
+| debug | conductor-new | 0/4 | 4 | n/a (0/4 successful) | 0.0 | $0.0000 |
 
 ## Headline comparisons
 
@@ -57,37 +69,38 @@
 
 - direct mean auto_score: 0.568
 - trinity mean auto_score: 0.890
-- quality delta: +0.322 (+56.6% vs direct)
+- quality delta (paired n=16): +0.322
+- quality delta percentage (paired n=16): +56.6% vs direct
 - direct total cost: $0.0128, latency: 125.5s
 - trinity total cost: $0.4563, latency: 1023.0s
 - cost delta: $+0.4435 (3465.0% vs direct)
 
 ### b) conductor-new vs conductor-old
 
-- conductor-old mean auto_score: 0.188
-- conductor-new mean auto_score: 0.073
-- quality delta: -0.115 (-61.1% vs old)
-- conductor-old total cost: $0.2648, latency: 1503.3s
-- conductor-new total cost: $0.2298, latency: 1531.7s
+- conductor-old mean auto_score: n/a (3/16 successful)
+- conductor-new mean auto_score: n/a (3/16 successful)
+- paired successful intersection: n=0 (<4); quality comparison omitted
+- conductor-old total cost: $0.2648, latency: 322.2s
+- conductor-new total cost: $0.2298, latency: 329.7s
 
 ### c) conductor-new vs trinity
 
 - trinity mean auto_score: 0.890
-- conductor-new mean auto_score: 0.073
-- quality delta: -0.817 (-91.8% vs trinity)
+- conductor-new mean auto_score: n/a (3/16 successful)
+- paired successful intersection: n=3 (<4); quality comparison omitted
 - trinity total cost: $0.4563, latency: 1023.0s
-- conductor-new total cost: $0.2298, latency: 1531.7s
+- conductor-new total cost: $0.2298, latency: 329.7s
 
 ### Hard-tier comparison
 
-- direct: mean auto_score = 0.000, cost = $0.0032
-- trinity: mean auto_score = 0.714, cost = $0.0742
-- conductor-old: mean auto_score = 0.000, cost = $0.0000
-- conductor-new: mean auto_score = 0.125, cost = $0.0883
+- direct: mean auto_score (4 successful, 0 errors) = 0.000, cost = $0.0032
+- trinity: mean auto_score (4 successful, 0 errors) = 0.714, cost = $0.0742
+- conductor-old: mean auto_score (0 successful, 4 errors) = n/a (0/4 successful), cost = $0.0000
+- conductor-new: mean auto_score (1 successful, 3 errors) = n/a (1/4 successful), cost = $0.0883
 
 ## Recommendation
 
-Conductor-new scores well below direct (0.073 vs 0.568) and fails on 81% of prompts. Recommendation: do not deploy the local Conductor checkpoints as-is; use TRINITY in `/fugu auto` mode, and do not spend more on Conductor training until the checkpoint reliably emits valid DAGs on CPU/float32 serving.
+Insufficient comparable successful rows for a Conductor quality comparison. Recommendation: collect at least 4 successful rows per arm with matched counts.
 
 ## Errors / timeouts
 

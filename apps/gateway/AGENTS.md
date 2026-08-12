@@ -1,1 +1,0 @@
-/Users/sid/.config/agent-sync/AGENTS.md

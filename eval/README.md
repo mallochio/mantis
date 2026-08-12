@@ -17,7 +17,7 @@ Evaluation harness and results for Mantis.
 uv run python eval/run_eval.py --config direct --fixtures eval/fixtures.jsonl --output eval/results.jsonl
 # score raw results; writes <stem>-scored.jsonl and eval/report.md
 python3 eval/score.py --results eval/results.jsonl
-# luna report; reads results-native-v2-scored.jsonl as baseline
+# luna report; reads tracked native-v2 raw results as baseline
 python3 eval/report_luna.py
 ```
 
@@ -25,8 +25,10 @@ python3 eval/report_luna.py
 
 Commit fixtures, code, and canonical reports. Do not commit raw run output or
 derived `-scored` projections; raw runs belong in `runs/` (gitignored) and
-derived projections are regenerated on demand.
+derived projections are regenerated on demand. Reports must be reproducible
+from tracked fixtures and raw results.
 
-`eval/results-native-v2-scored.jsonl` is a documented exception: `report_luna.py`
-reads it as its direct/trinity baseline, so it stays tracked until a future
-change adds a `--baseline` option that points at raw results instead.
+Reports display a quality or latency mean only when an arm has at least four
+successful rows. Comparisons use the intersection of successful item IDs and
+require that paired intersection to contain at least four items; otherwise the
+report omits derived deltas and percentages.
