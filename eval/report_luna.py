@@ -129,6 +129,11 @@ def main() -> None:
         "successful rows; comparisons also require matching successful counts.\n"
     )
     lines.append(
+        "Scoring note: an empty response without an error scores 0.0 under the "
+        "current keyword scorer; row output does not distinguish an empty answer "
+        "from a wrong answer.\n"
+    )
+    lines.append(
         "Conductor-Luna uses the LiteLLM planner `gpt-5.6-luna-max` "
         "instead of a local 3B checkpoint.\n"
     )

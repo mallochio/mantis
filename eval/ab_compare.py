@@ -111,6 +111,11 @@ def summarize(results: list[dict[str, Any]], output: str) -> None:
     )
     lines.extend(["# A/B: mantis vs sakana/fugu-ultra", ""])
     lines.append(
+        "Scoring note: an empty response without an error scores 0.0 under the "
+        "current keyword scorer; row output does not distinguish an empty answer "
+        "from a wrong answer.\n"
+    )
+    lines.append(
         f"Fixtures: {len(results) // max(len(targets), 1)} tasks x {len(targets)} targets. "
         "Scoring: keyword hit rate on `expect` terms (eval/score.py)."
     )

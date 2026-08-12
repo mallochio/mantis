@@ -1,12 +1,14 @@
 ## Provenance
 - config/arm: `mantis,openrouter-fugu`
-- git SHA: `f3fb9d25ec7995aafef0441a707d17cfcede1d97`
+- git SHA: `ab92432004acfcbdfcf2762c80a0985c36065d1d`
 - catalog revision: `bifrost-2026-08-12`
 - fixtures: `eval/fixtures.jsonl` (sha256 `3fdd2ae72173ee1f91b1eae60edd223a8e0a433c32d1c1d2d6c81c8afdeee366`)
-- generated at: `2026-08-12T19:02:49.404033+00:00`
+- generated at: `2026-08-12T19:03:41.311733+00:00`
 - cost method: `provider-reported usage.cost (real USD when supplied)`
 
 # A/B: mantis vs sakana/fugu-ultra
+
+Scoring note: an empty response without an error scores 0.0 under the current keyword scorer; row output does not distinguish an empty answer from a wrong answer.
 
 Fixtures: 16 tasks x 2 targets. Scoring: keyword hit rate on `expect` terms (eval/score.py).
 

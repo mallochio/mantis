@@ -1,14 +1,16 @@
 ## Provenance
 - config/arm: `direct,trinity,conductor-old,conductor-new`
-- git SHA: `f3fb9d25ec7995aafef0441a707d17cfcede1d97`
+- git SHA: `ab92432004acfcbdfcf2762c80a0985c36065d1d`
 - catalog revision: `bifrost-2026-08-12`
 - fixtures: `eval/fixtures.jsonl` (sha256 `3fdd2ae72173ee1f91b1eae60edd223a8e0a433c32d1c1d2d6c81c8afdeee366`)
-- generated at: `2026-08-12T19:02:49.233517+00:00`
+- generated at: `2026-08-12T19:03:41.132407+00:00`
 - cost method: `native estimated prices; 2K prompt + 1K completion assumption`
 
 # Comparative Eval: direct vs TRINITY vs Conductor-old vs Conductor-new
 
 Scoring rule: report a mean only with at least 4 successful rows; comparisons also require matching successful counts.
+
+Scoring note: an empty response without an error scores 0.0 under the current keyword scorer; row output does not distinguish an empty answer from a wrong answer.
 
 ## Summary
 

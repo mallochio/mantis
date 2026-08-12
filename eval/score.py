@@ -210,6 +210,11 @@ def main() -> None:
         f"Scoring rule: report a mean only with at least {MIN_SUCCESSFUL_ROWS} "
         "successful rows; comparisons also require matching successful counts.\n"
     )
+    lines.append(
+        "Scoring note: an empty response without an error scores 0.0 under the "
+        "current keyword scorer; row output does not distinguish an empty answer "
+        "from a wrong answer.\n"
+    )
     lines.append("## Summary\n")
     lines.append(
         "| config | success | errors | auto_score_mean | latency_mean_s | est_cost_sum_usd |"
