@@ -46,6 +46,7 @@ train = [
 ]
 eval = [
     "requests>=2.25",
+    "mini-swe-agent==2.4.6",
 ]
 redis = [
     "redis>=5,<7",
