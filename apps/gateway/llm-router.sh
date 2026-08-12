@@ -13,7 +13,11 @@ set -euo pipefail
 # script, so cd there explicitly — StartupFolder may invoke us from / and
 # ~/Startup/llm-router.sh is a symlink to this file.
 SELF="$0"
-while [ -L "$SELF" ]; do SELF="$(readlink "$SELF")"; done
+while [ -L "$SELF" ]; do
+  LINK_DIR="$(cd -P "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  [[ "$SELF" = /* ]] || SELF="$LINK_DIR/$SELF"
+done
 REPO_DIR="${LLM_ROUTER_DIR:-$(cd "$(dirname "$SELF")" && pwd)}"
 if [ ! -d "$REPO_DIR" ]; then
   echo "ERROR: Mantis gateway directory not found: $REPO_DIR" >&2
@@ -125,7 +129,7 @@ if lsof -nP -iTCP:"$ROUTELLM_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   echo "gateway stopped"
 fi
 
-nohup python server.py </dev/null > "$ROUTER_LOG_DIR/server.out" 2> "$ROUTER_LOG_DIR/server.err" &
+nohup "$REPO_DIR/.venv/bin/python" server.py </dev/null > "$ROUTER_LOG_DIR/server.out" 2> "$ROUTER_LOG_DIR/server.err" &
 echo $! > "$ROUTER_LOG_DIR/server.pid"
 for _ in $(seq 1 600); do  # 60s — first boot downloads the Supra checkpoint
   if lsof -nP -iTCP:"$ROUTELLM_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
