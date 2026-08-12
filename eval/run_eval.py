@@ -27,11 +27,11 @@ import json
 import os
 import re
 import time
+import tomllib
 from pathlib import Path
 from typing import Any
 
 import requests
-import tomllib
 
 REPO = Path(__file__).resolve().parent.parent
 

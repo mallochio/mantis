@@ -7,15 +7,11 @@ import hashlib
 import json
 import os
 import shlex
+import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python 3.10
-    import tomli as tomllib
 
 from model_catalog_abi import abi_contract, abi_mismatch, load_abi_manifest
 from model_catalog_runtime import (

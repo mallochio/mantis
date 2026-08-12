@@ -7,13 +7,13 @@ import hashlib
 import json
 import os
 import sys
+import tomllib
 from pathlib import Path
 
 import model_catalog
 import model_catalog_runtime
 import pytest
 import serve
-import tomllib
 
 REPO = Path(__file__).resolve().parent.parent
 ABI = model_catalog.load_abi_manifest()
