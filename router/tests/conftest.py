@@ -15,6 +15,8 @@ def _force_legacy_router_default() -> None:
     section) so ``import server`` takes the legacy fallback.  Catalog tests
     reload ``server`` with their own fixtures and are unaffected.
     """
+    os.environ.pop("ROUTELLM_SESSION_FROM_USER", None)
+    os.environ.setdefault("ROUTELLM_KEY", "sk-route-local")
     try:
         import server  # noqa: F401
     except ImportError:
@@ -29,6 +31,12 @@ def _force_legacy_router_default() -> None:
 
 
 _force_legacy_router_default()
+
+
+@pytest.fixture(autouse=True)
+def sanitize_router_env(monkeypatch):
+    monkeypatch.delenv("ROUTELLM_SESSION_FROM_USER", raising=False)
+    monkeypatch.setenv("ROUTELLM_KEY", os.environ.get("ROUTELLM_KEY", "sk-route-local"))
 
 
 @pytest.fixture(autouse=True)

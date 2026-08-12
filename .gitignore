@@ -140,6 +140,10 @@ outputs/
 .scratch/
 *.bak
 
+# Derived eval projections (regenerate with eval/score.py / eval/report_luna.py)
+eval/results-scored.jsonl
+eval/results-luna-scored.jsonl
+
 # Model weights and binary artifacts (baseline head is intentionally tracked)
 *.safetensors
 *.bin

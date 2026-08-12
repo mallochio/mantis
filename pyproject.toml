@@ -28,17 +28,24 @@ dependencies = [
 
 [project.optional-dependencies]
 train = [
+    "torch>=2.4",
+    "transformers>=4.52,<5",
     "trl>=0.19,<0.20",
     "datasets>=3.6",
     "peft>=0.12",
-    "bitsandbytes>=0.43",
-    "math-verify>=0.9",
-    "cma>=4.0",
-    "mergekit>=0.1",
-    "llm-blender>=0.0.2",
+    "accelerate>=0.30",
+    "numpy>=1.24",
+    "litellm",
     "hydra-core>=1.3",
     "omegaconf>=2.3",
+    "math-verify>=0.9",
+    "huggingface_hub>=0.23",
+    "cma>=4.0",
     "boto3>=1.28",
+    "mergekit>=0.1",
+    "llm-blender>=0.0.2",
+    "safetensors>=0.4",
+    "bitsandbytes>=0.43",
 ]
 eval = [
     "requests>=2.25",
@@ -109,11 +116,16 @@ ignore = [
 "scripts/retrain_router_pool.py" = ["E402"]
 "scripts/learn_router.py" = ["E402"]
 "scripts/retrain_conductor.py" = ["E402", "I001"]
+"openfugu-patch/mini.py" = ["ALL"]
+"openfugu-patch/ultra.py" = ["ALL"]
+"scripts/toolscale_data.py" = ["ALL"]
+"openfugu/mini.py" = ["F403"]
+"openfugu/ultra.py" = ["F403"]
 "scripts/update_pool.py" = ["S310"]
 "tests/test_serve.py" = ["E501", "S310"]
 "openfugu-patch/api.py" = ["E501"]
 "tests/test_retrain_router_pool.py" = ["E501"]
-"tests/test_retrain_conductor.py" = ["S105"]
+"tests/test_retrain_conductor.py" = ["I001", "S105"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
@@ -142,9 +154,13 @@ omit = [
     "*/tests/*",
     "OpenFugu/*",
     "scripts/make_vec.py",
+    "scripts/generate_conductor_requirements.py",
     "scripts/retrain_conductor.py",
     "scripts/sky_launch_retrain_router.sh",
     "scripts/verify.sh",
+    "scripts/toolscale_data.py",
+    "openfugu-patch/mini.py",
+    "openfugu-patch/ultra.py",
 ]
 
 [tool.coverage.report]

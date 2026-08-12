@@ -79,9 +79,9 @@ from tqdm.auto import tqdm
 
 # Make OpenFugu internals importable when this script lives in mantis/scripts.
 REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT / "OpenFugu"))
+sys.path.insert(0, str(REPO_ROOT / "openfugu-patch"))
 
-from openfugu.mini import (
+from mini import (
     HEAD_ROWS,
     HIDDEN,
     N_AGENTS,
@@ -90,7 +90,7 @@ from openfugu.mini import (
     VEC_LEN,
     FuguRouter,
 )
-from train.toolscale_data import SYSTEM, _parse_plan, _score
+from toolscale_data import SYSTEM, _parse_plan, _score
 
 # ---------------------------------------------------------------------------
 # OpenRouter worker wrapper (explicit OpenAI-compatible provider)

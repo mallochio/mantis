@@ -53,6 +53,7 @@ def _block_external_provider_calls(monkeypatch: pytest.MonkeyPatch):
     # learning file with test runs (pool=test-worker etc.). Tests that need
     # learning set MANTIS_LEARNING=1 themselves.
     monkeypatch.setenv("MANTIS_LEARNING", "0")
+    monkeypatch.setenv("OPENROUTER_API_KEY", os.environ.get("OPENROUTER_API_KEY", "test-key"))
 
     # Scrub ambient endpoint/catalog overrides exported by an interactive
     # shell (~/.zshrc exports OPENROUTER_BASE_URL/OPENCODE_GO_ENDPOINT_URL

@@ -43,7 +43,7 @@ from retrain_router_pool import (  # noqa: E402
     split_model_spec,
 )
 
-from openfugu.ultra import (  # noqa: E402
+from ultra import (  # noqa: E402
     MAX_STEPS,
     N_AGENTS,
     ConductorExecutor,
@@ -52,7 +52,7 @@ from openfugu.ultra import (  # noqa: E402
     parse_workflow,
     visible_indices,
 )
-from train.toolscale_data import _parse_plan, _score  # noqa: E402
+from toolscale_data import _parse_plan, _score  # noqa: E402
 
 DEFAULT_BASE = "di-zhang-fdu/openfugu-conductor-3b"
 DEFAULT_DATASET = "s3://external-datasets-archive/terminal-bench-2.1/"
