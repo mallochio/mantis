@@ -32,29 +32,39 @@ class BudgetAbort(RuntimeError):
     """Raised before a request that would exceed a budget."""
 
 
+class ArmBudgetExceeded(BudgetAbort):
+    """A single instance/arm reached its configured ceiling."""
+
+
 class CostLedger:
-    def __init__(self, *, total_limit: float, instance_limit: float) -> None:
+    def __init__(self, *, total_limit: float, arm_limit: float) -> None:
         self.total_limit = total_limit
-        self.instance_limit = instance_limit
+        self.arm_limit = arm_limit
         self.total = 0.0
-        self.instance = 0.0
+        self.pair_costs: dict[tuple[str, str], float] = {}
         self.aborted = False
 
-    def before_request(self) -> None:
-        if self.total >= self.total_limit or self.instance >= self.instance_limit:
+    def before_request(self, instance_id: str, arm: str, cap: float) -> None:
+        pair = self.pair_costs.get((instance_id, arm), 0.0)
+        if self.total >= self.total_limit:
             self.aborted = True
             raise BudgetAbort("budget ceiling reached before model request")
+        if pair >= cap:
+            raise ArmBudgetExceeded(f"per-arm cap reached for {instance_id}/{arm}")
 
-    def record(self, cost: float | None) -> None:
+    def record(self, instance_id: str, arm: str, cost: float | None, cap: float) -> None:
         if cost is not None:
             self.total += cost
-            self.instance += cost
-            if self.total >= self.total_limit or self.instance >= self.instance_limit:
+            key = (instance_id, arm)
+            self.pair_costs[key] = self.pair_costs.get(key, 0.0) + cost
+            if self.total >= self.total_limit:
                 self.aborted = True
-                raise BudgetAbort("budget ceiling reached after model request")
+                raise BudgetAbort("global budget reached after model request")
+            if self.pair_costs[key] >= cap:
+                raise ArmBudgetExceeded(f"per-arm cap reached for {instance_id}/{arm}")
 
-    def begin_instance(self) -> None:
-        self.instance = 0.0
+    def pair_cost(self, instance_id: str, arm: str) -> float:
+        return self.pair_costs.get((instance_id, arm), 0.0)
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -121,29 +131,59 @@ def _model_for_arm(
     return ("mantis-trinity" if arm == "trinity" else "mantis"), None
 
 
+def routed_request_tiers(
+    row: dict[str, Any], tier_models: dict[str, str]
+) -> list[str]:
+    model_to_tier = {model: tier for tier, model in tier_models.items()}
+    tiers = []
+    for event in row.get("route_trace", []):
+        headers = event.get("route_headers", {})
+        tier = model_to_tier.get(headers.get("x-route-model"))
+        if tier is None and headers.get("x-route-decision") in TIERS:
+            tier = headers["x-route-decision"]
+        if tier in TIERS:
+            tiers.append(tier)
+    if not tiers:
+        raise ValueError(f"mantis-direct row has no usable route trace: {row.get('instance_id')}")
+    return tiers
+
+
 def _run_test_command(
     image: str,
     patch: str,
     command: str,
     *,
     test_patch: str = "",
+    base_commit: str = "",
+    reset_paths: list[str] | None = None,
     install: str = "",
     timeout: int = 300,
 ) -> tuple[bool, str]:
     if not patch.strip():
         return False, "empty model patch"
     with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as handle:
-        handle.write(f"{test_patch}\n{patch}")
+        handle.write(patch)
         patch_path = Path(handle.name)
+    with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as handle:
+        handle.write(test_patch)
+        test_path = Path(handle.name)
     try:
         setup = f"{install} && " if install else ""
+        reset = ""
+        if base_commit and reset_paths:
+            reset = f"git checkout {shlex.quote(base_commit)} -- " + " ".join(
+                shlex.quote(path) for path in reset_paths
+            ) + " && "
         shell = (
             "source /root/.bashrc && conda activate testbed && "
-            f"cd /testbed && git apply /tmp/model.patch && {setup}{command}"
+            f"cd /testbed && git apply /tmp/model.patch && {reset}"
+            "git apply /tmp/test.patch && " + f"{setup}{command}"
         )
         result = subprocess.run(
             [
-                "docker", "run", "--rm", "-v", f"{patch_path}:/tmp/model.patch:ro",
+                "docker", "run", "--rm",
+                "-v", f"{patch_path}:/tmp/model.patch:ro",
+                "-v", f"{test_path}:/tmp/test.patch:ro",
                 image, "bash", "-lc", shell,
             ],
             capture_output=True, text=True, timeout=timeout, check=False,
@@ -151,27 +191,59 @@ def _run_test_command(
         return result.returncode == 0, result.stdout + result.stderr
     finally:
         patch_path.unlink(missing_ok=True)
+        test_path.unlink(missing_ok=True)
+
+
+def _test_paths(test_patch: str) -> list[str]:
+    return sorted({
+        line[6:].split("\t", 1)[0]
+        for line in test_patch.splitlines()
+        if line.startswith("+++ b/")
+    })
+
+
+def _test_command(instance: dict[str, Any], tests: list[str]) -> str:
+    tokens = shlex.split(instance.get("test_cmd", ""))
+    if not tokens or tokens[0] != "pytest":
+        raise ValueError("test_cmd is not a pytest command")
+    split_at = next(
+        (i for i, token in enumerate(tokens[1:], 1) if token.startswith("tests/")),
+        None,
+    )
+    if split_at is None or not tests:
+        raise ValueError("test_cmd has no test-root token")
+    return " ".join(shlex.quote(token) for token in tokens[:split_at] + tests)
 
 
 def grade_patch(instance: dict[str, Any], patch: str) -> dict[str, Any]:
     """Grade a patch in a fresh prebuilt image."""
     if not patch.strip():
         return {"resolved": False, "grader_output": "empty model patch"}
-    tests = instance.get("FAIL_TO_PASS", []) + instance.get("PASS_TO_PASS", [])
-    test_cmd = instance.get("test_cmd", "")
-    if tests and test_cmd.startswith("pytest"):
-        prefix = test_cmd.split(" tests", 1)[0]
-        command = f"{prefix} " + " ".join(shlex.quote(test) for test in tests)
-    else:
-        command = test_cmd
-    passed, output = _run_test_command(
-        instance["docker_image"],
-        patch,
-        command,
-        test_patch=instance.get("test_patch", ""),
-        install=instance.get("install", ""),
-    )
-    return {"resolved": passed, "grader_output": output}
+    f2p = list(instance.get("FAIL_TO_PASS", []))
+    p2p = list(instance.get("PASS_TO_PASS", []))
+    try:
+        commands = {"fail_to_pass": _test_command(instance, f2p),
+                    "pass_to_pass": _test_command(instance, p2p)}
+    except ValueError as exc:
+        return {"resolved": False, "grader_error": str(exc)}
+    common = {
+        "image": instance["docker_image"], "patch": patch,
+        "test_patch": instance.get("test_patch", ""),
+        "base_commit": instance.get("base_commit", ""),
+        "reset_paths": _test_paths(instance.get("test_patch", "")),
+        "install": instance.get("install", ""),
+    }
+    results = {}
+    for name, command in commands.items():
+        passed, output = _run_test_command(command=command, **common)
+        results[name] = {"passed": passed, "output": output}
+    return {
+        "resolved": all(result["passed"] for result in results.values()),
+        "test_results": results,
+        "grader_output": "\n".join(
+            cast(str, result["output"]) for result in results.values()
+        ),
+    }
 
 
 def _route_headers(response: Any) -> dict[str, str]:
@@ -191,6 +263,7 @@ def run_mini_agent(
     tier_models: dict[str, str],
     prices: dict[str, dict[str, float]],
     ledger: CostLedger,
+    arm_cap: float,
     rng: random.Random,
     step_limit: int,
     output_token_limit: int,
@@ -247,12 +320,12 @@ def run_mini_agent(
             return getattr(self.wrapped, name)
 
         def query(self, messages: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
-            ledger.before_request()
+            ledger.before_request(instance["instance_id"], arm, arm_cap)
             result = cast(dict[str, Any], self.wrapped.query(messages, **kwargs))
             response = result.get("extra", {}).get("response", {})
             usage = response.get("usage", {}) if isinstance(response, dict) else {}
             cost, method = usage_cost(usage, model_name, prices)
-            ledger.record(cost)
+            ledger.record(instance["instance_id"], arm, cost, arm_cap)
             result.setdefault("extra", {}).update(
                 {
                     "measured_cost": cost,
@@ -295,7 +368,8 @@ def run_mini_agent(
         return {
             "instance_id": instance["instance_id"], "arm": arm,
             "tier": selected_tier, "resolved": grade["resolved"],
-            "model_patch": patch, "cost_usd": ledger.instance,
+            "model_patch": patch,
+            "cost_usd": ledger.pair_cost(instance["instance_id"], arm),
             "trajectory": cast(dict[str, Any], agent.serialize()),
             "route_trace": [
                 message.get("extra", {})
@@ -304,11 +378,20 @@ def run_mini_agent(
             ],
             "grader_output": grade["grader_output"],
         }
+    except ArmBudgetExceeded as exc:
+        return {
+            "instance_id": instance["instance_id"], "arm": arm,
+            "tier": selected_tier, "resolved": False, "aborted": True,
+            "abort_scope": "instance_arm", "error": str(exc),
+            "cost_usd": ledger.pair_cost(instance["instance_id"], arm),
+            "trajectory": cast(dict[str, Any], agent.serialize()),
+        }
     except BudgetAbort as exc:
         return {
             "instance_id": instance["instance_id"], "arm": arm,
             "tier": selected_tier, "resolved": False,
-            "aborted": True, "error": str(exc), "cost_usd": ledger.instance,
+            "aborted": True, "abort_scope": "global", "error": str(exc),
+            "cost_usd": ledger.pair_cost(instance["instance_id"], arm),
             "trajectory": cast(dict[str, Any], agent.serialize()),
         }
     finally:
@@ -351,7 +434,14 @@ def main() -> None:
     parser.add_argument("--include-trinity", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--budget-usd", type=float, default=250.0)
-    parser.add_argument("--per-instance-cost", type=float, default=5.0)
+    parser.add_argument(
+        "--per-instance-cost", type=float, default=None,
+        help="override every per-instance/arm cap (legacy alias)",
+    )
+    parser.add_argument(
+        "--arm-cap", action="append", default=[],
+        metavar="ARM=USD", help="override one arm's per-instance cap",
+    )
     parser.add_argument("--step-limit", type=int, default=50)
     parser.add_argument("--output-token-limit", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=7)
@@ -381,22 +471,29 @@ def main() -> None:
     if "random-matched" in arms and "mantis-direct" not in arms:
         parser.error("random-matched requires mantis-direct for its observed distribution")
     caps = {arm: DEFAULT_CAPS[arm] for arm in arms}
+    if args.per_instance_cost is not None:
+        caps = dict.fromkeys(arms, args.per_instance_cost)
+    for override in args.arm_cap:
+        arm, value = override.split("=", 1)
+        if arm not in caps:
+            parser.error(f"cannot cap disabled arm: {arm}")
+        caps[arm] = float(value)
     if args.dry_run:
         print(dry_run(manifest, arms, caps, args.prices))
         return
 
     tier_models = dict(item.split("=", 1) for item in args.tier_models.split(","))
     rng = random.Random(args.seed)
-    ledger = CostLedger(total_limit=args.budget_usd, instance_limit=args.per_instance_cost)
+    ledger = CostLedger(total_limit=args.budget_usd, arm_limit=max(caps.values()))
     frequencies = {tier: 1 / len(TIERS) for tier in TIERS}
     metadata = {
         "manifest": str(args.manifest),
         "manifest_sha256": hashlib.sha256(args.manifest.read_bytes()).hexdigest(),
         "arms": arms, "caps": caps, "budget_usd": args.budget_usd,
-        "per_instance_cost": args.per_instance_cost,
+        "per_arm_caps": caps,
         "step_limit": args.step_limit,
         "output_token_limit": args.output_token_limit, "seed": args.seed,
-        "aborted_on_budget": False,
+        "aborted_on_budget": False, "excluded_instances": [],
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w") as output:
@@ -404,33 +501,39 @@ def main() -> None:
         instances = manifest["instances"]
         direct_rows: dict[str, dict[str, Any]] = {}
         for instance in instances:
-            ledger.begin_instance()
             if ledger.total >= ledger.total_limit:
                 metadata["aborted_on_budget"] = True
                 break
             row = run_mini_agent(
                 instance, arm="mantis-direct", endpoint=args.mantis_endpoint,
-                tier_models=tier_models, prices=prices, ledger=ledger, rng=rng,
+                tier_models=tier_models, prices=prices, ledger=ledger,
+                arm_cap=caps["mantis-direct"], rng=rng,
                 step_limit=args.step_limit, output_token_limit=args.output_token_limit,
                 frequencies={tier: 1 / len(TIERS) for tier in TIERS},
             )
+            output.write(json.dumps(row) + "\n")
+            output.flush()
+            if row.get("abort_scope") == "instance_arm":
+                metadata["excluded_instances"].append(instance["instance_id"])
+                continue
             if row.get("aborted"):
                 metadata["aborted_on_budget"] = True
                 break
             direct_rows[instance["instance_id"]] = row
         if not metadata["aborted_on_budget"]:
             observed = [
-                row.get("tier") for row in direct_rows.values()
-                if row.get("tier") in TIERS
+                tier
+                for row in direct_rows.values()
+                for tier in routed_request_tiers(row, tier_models)
             ]
-            frequencies = (
-                {tier: observed.count(tier) / len(observed) for tier in TIERS}
-                if observed else {tier: 1 / len(TIERS) for tier in TIERS}
-            )
+            if not observed:
+                raise RuntimeError("mantis-direct produced no route decisions")
+            frequencies = {tier: observed.count(tier) / len(observed) for tier in TIERS}
             remaining_arms = [arm for arm in arms if arm != "mantis-direct"]
             for instance in instances:
                 instance_id = instance["instance_id"]
-                ledger.instance = float(direct_rows[instance_id].get("cost_usd") or 0)
+                if instance_id in metadata["excluded_instances"]:
+                    continue
                 rows = [direct_rows[instance_id]]
                 for arm in remaining_arms:
                     endpoint = (
@@ -440,19 +543,22 @@ def main() -> None:
                     row = run_mini_agent(
                         instance, arm=arm, endpoint=endpoint,
                         tier_models=tier_models, prices=prices, ledger=ledger,
+                        arm_cap=caps[arm],
                         rng=rng, step_limit=args.step_limit,
                         output_token_limit=args.output_token_limit,
                         frequencies=frequencies,
                     )
                     rows.append(row)
+                    output.write(json.dumps(row) + "\n")
+                    output.flush()
+                    if row.get("abort_scope") == "instance_arm":
+                        metadata["excluded_instances"].append(instance_id)
+                        break
                     if row.get("aborted"):
                         metadata["aborted_on_budget"] = True
                         break
                 if metadata["aborted_on_budget"]:
                     break
-                for row in rows:
-                    output.write(json.dumps(row) + "\n")
-                output.flush()
         output.write(json.dumps({"metadata": {**metadata, "spent_usd": ledger.total}}) + "\n")
     print(json.dumps({**metadata, "spent_usd": ledger.total}, indent=2))
 

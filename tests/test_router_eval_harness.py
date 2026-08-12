@@ -7,6 +7,8 @@ import types
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -110,13 +112,55 @@ def test_grader_rejects_empty_and_runs_fresh_container(monkeypatch):
     calls = []
     monkeypatch.setattr(
         harness, "_run_test_command",
-        lambda image, patch, command, test_patch="", install="", timeout=300: (
+        lambda image, patch, command, test_patch="", install="", timeout=300, **kwargs: (
             calls.append((image, patch, command)) or (True, "PASS")
         ),
     )
     assert harness.grade_patch(_instance(), "")["resolved"] is False
     assert harness.grade_patch(_instance(), "diff --git a/a b/a\n")["resolved"] is True
-    assert "test_fix" in calls[0][2] and "test_existing" in calls[0][2]
+    assert {call[2].split("::")[-1] for call in calls} == {
+        "test_fix", "test_existing",
+    }
+
+
+def test_grader_rejects_test_tampering(monkeypatch):
+    seen = []
+
+    def run(*, reset_paths, **kwargs):
+        seen.append(reset_paths)
+        return False, "test files reset before official patch"
+
+    monkeypatch.setattr(harness, "_run_test_command", run)
+    instance = {**_instance(), "test_patch": "+++ b/tests/test_demo.py\n"}
+    result = harness.grade_patch(instance, "diff --git a/tests/test_demo.py b/tests/test_demo.py\n")
+    assert result["resolved"] is False
+    assert seen and seen[0] == ["tests/test_demo.py"]
+
+
+def test_cost_ledger_isolates_arm_caps_and_global_budget():
+    ledger = harness.CostLedger(total_limit=2.0, arm_limit=1.0)
+    ledger.record("item", "cheap-only", 0.6, 1.0)
+    ledger.record("item", "expensive-only", 0.8, 1.0)
+    assert ledger.pair_cost("item", "cheap-only") == 0.6
+    assert ledger.pair_cost("item", "expensive-only") == 0.8
+    with pytest.raises(harness.ArmBudgetExceeded):
+        ledger.record("item", "cheap-only", 0.5, 1.0)
+    with pytest.raises(harness.BudgetAbort):
+        ledger.record("item", "middle-only", 0.6, 1.0)
+
+
+def test_direct_route_frequency_uses_request_headers():
+    row = {
+        "instance_id": "item",
+        "route_trace": [
+            {"route_headers": {"x-route-model": "cheap-model"}},
+            {"route_headers": {"x-route-decision": "middle"}},
+        ],
+    }
+    assert harness.routed_request_tiers(
+        row,
+        {"cheap": "cheap-model", "middle": "middle-model", "expensive": "expensive-model"},
+    ) == ["cheap", "middle"]
 
 
 def test_agent_trajectory_patch_and_grading(monkeypatch):
@@ -129,7 +173,8 @@ def test_agent_trajectory_patch_and_grading(monkeypatch):
         _instance(), arm="cheap-only", endpoint="http://fake/v1/chat/completions",
         tier_models={"cheap": "cheap", "middle": "middle", "expensive": "expensive"},
         prices={"cheap": {"input_per_token": 1.0, "output_per_token": 1.0}},
-        ledger=harness.CostLedger(total_limit=2.0, instance_limit=2.0),
+        ledger=harness.CostLedger(total_limit=2.0, arm_limit=2.0),
+        arm_cap=2.0,
         rng=harness.random.Random(1), step_limit=2, output_token_limit=32,
         frequencies={"cheap": 1.0, "middle": 0.0, "expensive": 0.0},
     )
@@ -148,7 +193,8 @@ def test_agent_stops_on_per_instance_budget(monkeypatch):
         _instance(), arm="cheap-only", endpoint="http://fake/v1/chat/completions",
         tier_models={"cheap": "cheap", "middle": "middle", "expensive": "expensive"},
         prices={"cheap": {"input_per_token": 1.0, "output_per_token": 1.0}},
-        ledger=harness.CostLedger(total_limit=5.0, instance_limit=1.0),
+        ledger=harness.CostLedger(total_limit=5.0, arm_limit=1.0),
+        arm_cap=1.0,
         rng=harness.random.Random(1), step_limit=4, output_token_limit=32,
         frequencies={"cheap": 1.0, "middle": 0.0, "expensive": 0.0},
     )
@@ -238,7 +284,8 @@ def test_agent_model_reaches_loopback_openai_endpoint(monkeypatch):
             endpoint=f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
             tier_models={"cheap": "cheap", "middle": "middle", "expensive": "expensive"},
             prices={"cheap": {"input_per_token": 1.0, "output_per_token": 1.0}},
-            ledger=harness.CostLedger(total_limit=2.0, instance_limit=2.0),
+            ledger=harness.CostLedger(total_limit=2.0, arm_limit=2.0),
+            arm_cap=2.0,
             rng=harness.random.Random(1),
             step_limit=2,
             output_token_limit=32,
