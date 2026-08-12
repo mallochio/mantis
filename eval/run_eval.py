@@ -9,9 +9,7 @@ Cost estimation method:
 - `configs/worker-costs.json` gives a per-call USD estimate for each raw
   OpenRouter model id (assumes ~2K prompt + 1K completion tokens). These
   prices were fetched from /api/v1/models by update_pool.py.
-- `configs/litellm.yaml` maps LiteLLM aliases to raw OpenRouter ids.
-  A leading "openai/" is the LiteLLM provider prefix; stripping it yields
-  the OpenRouter id used in worker-costs.json.
+- `config/catalog.toml` maps Bifrost worker slots to upstream model ids.
 - "direct": one call at the requested model's cost.
 - "trinity": parse fugu_trace (e.g. "Worker(3)->Thinker(1)->Verifier(1):...").
   Every "Role(slot)" arrow is one worker call; cost = sum(slot model cost).
@@ -33,21 +31,19 @@ from pathlib import Path
 from typing import Any
 
 import requests
-import yaml
+import tomllib
 
 REPO = Path(__file__).resolve().parent.parent
 
 
-def load_litellm_alias_map(path: Path) -> dict[str, str]:
-    """Map LiteLLM alias -> raw OpenRouter model id."""
-    data = yaml.safe_load(path.read_text())
-    alias_map: dict[str, str] = {}
-    for entry in data.get("model_list", []):
-        alias = entry.get("model_name")
-        raw = entry.get("litellm_params", {}).get("model", "")
-        if alias and raw.startswith("openai/"):
-            alias_map[alias] = raw[len("openai/") :]
-    return alias_map
+def load_catalog_models(path: Path) -> tuple[list[str], str]:
+    """Return Bifrost worker models and the Conductor planner from the catalog."""
+    with path.open("rb") as handle:
+        catalog = tomllib.load(handle)
+    mantis = catalog["mantis"]
+    workers = mantis["workers"]
+    models = [workers[slot]["upstream_model"] for slot in mantis["slot_order"]]
+    return models, mantis["conductor_model"].removeprefix("bifrost/")
 
 
 def load_worker_costs(path: Path) -> dict[str, float]:
@@ -55,26 +51,17 @@ def load_worker_costs(path: Path) -> dict[str, float]:
     return {k: float(v) for k, v in data.items() if not k.startswith("_")}
 
 
-def slot_models_from_env() -> list[str]:
-    raw = os.environ.get("MANTIS_WORKER_MODELS") or os.environ.get("MANTIS_WORKER_MODEL") or ""
-    return [m.strip() for m in raw.split(",") if m.strip()]
+def _cost_key(model: str) -> str:
+    return model.removeprefix("bifrost/")
 
 
-def avg_pool_cost(costs: dict[str, float], aliases: list[str], alias_map: dict[str, str]) -> float:
-    total = 0.0
-    count = 0
-    for alias in aliases:
-        raw = alias_map.get(alias, alias)
-        c = costs.get(raw)
-        if c is not None:
-            total += c
-            count += 1
-    return total / count if count else 0.01
+def avg_pool_cost(costs: dict[str, float], models: list[str]) -> float:
+    values = [costs[model] for model in map(_cost_key, models) if model in costs]
+    return sum(values) / len(values) if values else 0.01
 
 
-def model_cost(model_or_alias: str, costs: dict[str, float], alias_map: dict[str, str]) -> float:
-    raw = alias_map.get(model_or_alias, model_or_alias)
-    return costs.get(raw, 0.01)
+def model_cost(model: str, costs: dict[str, float]) -> float:
+    return costs.get(_cost_key(model), 0.01)
 
 
 def parse_conductor_trace(trace: str) -> int:
@@ -93,8 +80,7 @@ def estimate_cost(
     config: str,
     response: dict[str, Any],
     costs: dict[str, float],
-    alias_map: dict[str, str],
-    slot_aliases: list[str],
+    slot_models: list[str],
 ) -> tuple[float, int]:
     """Return (est_cost_usd, n_worker_calls)."""
     usage = response.get("usage", {}) or {}
@@ -102,10 +88,10 @@ def estimate_cost(
     turns = usage.get("fugu_turns", 0) or 0
 
     if config == "direct":
-        model = os.environ.get("DIRECT_MODEL", "gpt-5.6-luna-max")
-        return model_cost(model, costs, alias_map), 1
+        model = os.environ.get("DIRECT_MODEL", "deepseek-v4-flash")
+        return model_cost(model, costs), 1
 
-    pool_avg = avg_pool_cost(costs, slot_aliases, alias_map)
+    pool_avg = avg_pool_cost(costs, slot_models)
 
     if config == "trinity":
         slots = parse_trinity_trace(trace or "")
@@ -114,16 +100,16 @@ def estimate_cost(
         n = len(slots)
         cost = 0.0
         for sid in slots:
-            alias = slot_aliases[sid % len(slot_aliases)] if slot_aliases else ""
-            cost += model_cost(alias, costs, alias_map)
+            model = slot_models[sid % len(slot_models)] if slot_models else ""
+            cost += model_cost(model, costs)
         return cost, n
 
     # conductor-*
     steps = parse_conductor_trace(trace or "")
     if not steps:
         steps = turns
-    conductor_model = os.environ.get("MANTIS_CONDUCTOR_MODEL", "gpt-5.6-luna-max")
-    plan_cost = model_cost(conductor_model, costs, alias_map)
+    conductor_model = os.environ.get("MANTIS_CONDUCTOR_MODEL", "")
+    plan_cost = model_cost(conductor_model, costs)
     step_cost = steps * pool_avg
     return plan_cost + step_cost, steps + 1
 
@@ -145,8 +131,7 @@ def post_chat(
         "max_tokens": max_tokens,
         "temperature": 0.7,
     }
-    # LiteLLM reasoning models reject temperature!=1 when reasoning_effort set;
-    # drop_params in litellm_settings handles it, but avoid conflict for direct.
+    # Reasoning models reject temperature != 1 when reasoning effort is set.
     if "-luna" in model or "-sol" in model or "claude-" in model or "gemini-" in model:
         payload.pop("temperature", None)
     r = requests.post(url, json=payload, headers=headers, timeout=timeout)
@@ -165,21 +150,19 @@ def main() -> None:
     parser.add_argument("--fixtures", default=str(REPO / "eval" / "fixtures.jsonl"))
     parser.add_argument("--output", default=str(REPO / "eval" / "results.jsonl"))
     parser.add_argument("--timeout", type=float, default=300.0)
-    parser.add_argument("--litellm-url", default="http://localhost:3001/v1/chat/completions")
-    parser.add_argument("--openfugu-url", default="http://localhost:8088/v1/chat/completions")
+    parser.add_argument("--bifrost-url", default="http://127.0.0.1:8080/v1/chat/completions")
+    parser.add_argument("--mantis-url", default="http://localhost:8088/v1/chat/completions")
     parser.add_argument(
         "--api-key",
-        default=os.environ.get("LITELLM_KEY") or os.environ.get("MANTIS_API_KEY"),
+        default=os.environ.get("BIFROST_API_KEY") or os.environ.get("MANTIS_API_KEY"),
     )
     args = parser.parse_args()
     if not args.api_key:
-        parser.error("set LITELLM_KEY or MANTIS_API_KEY in the environment")
+        parser.error("set BIFROST_API_KEY or MANTIS_API_KEY in the environment")
 
     costs = load_worker_costs(REPO / "configs" / "worker-costs.json")
-    alias_map = load_litellm_alias_map(REPO / "configs" / "litellm.yaml")
-    slot_aliases = slot_models_from_env()
-    if not slot_aliases:
-        slot_aliases = list(alias_map.keys())[:7]
+    slot_models, conductor_model = load_catalog_models(REPO / "config" / "catalog.toml")
+    os.environ.setdefault("MANTIS_CONDUCTOR_MODEL", conductor_model)
 
     fixtures: list[dict[str, Any]] = []
     with open(args.fixtures) as f:
@@ -193,11 +176,11 @@ def main() -> None:
 
     # Map config to endpoint/model
     if args.config == "direct":
-        url = args.litellm_url
-        model = os.environ.get("DIRECT_MODEL", "gpt-5.6-luna-max")
+        url = args.bifrost_url
+        model = os.environ.get("DIRECT_MODEL", "deepseek-v4-flash")
     else:
-        url = args.openfugu_url
-        model = "trinity" if args.config == "trinity" else "conductor"
+        url = args.mantis_url
+        model = "mantis-trinity" if args.config == "trinity" else "mantis-ultra"
 
     for fx in fixtures:
         prompt = fx["prompt"]
@@ -223,7 +206,7 @@ def main() -> None:
             usage = resp.get("usage", {}) or {}
             rec["fugu_trace"] = usage.get("fugu_trace")
             rec["est_cost_usd"], rec["n_worker_calls"] = estimate_cost(
-                args.config, resp, costs, alias_map, slot_aliases
+                args.config, resp, costs, slot_models
             )
         except requests.exceptions.Timeout:
             rec["latency_s"] = round(time.time() - start, 3)

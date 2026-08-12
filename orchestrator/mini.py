@@ -233,39 +233,6 @@ class MockWorker:
         return f"[{slot}] concrete work toward the solution."
 
 
-class LiteLLMWorker:
-    """Real worker pool via litellm as the provider-agnostic middle layer.
-    litellm.completion() speaks one API to every backend, so each of the 7
-    agent slots can be a different provider/model with no per-vendor code —
-    which mirrors Fugu's own "swappable heterogeneous pool". [CODE]
-
-    `slot_models` is a list of up to 7 litellm model ids (e.g.
-    'openai/gpt-4o-mini', 'anthropic/claude-3-5-sonnet', 'gemini/gemini-1.5-pro').
-    Credentials/base url are taken from litellm's normal env resolution, or
-    passed through `api_key`/`api_base` (read from FUGU_API_KEY/FUGU_BASE_URL).
-    Default points every slot at FUGU_WORKER_MODEL so the loop runs with one model."""
-    def __init__(self, slot_models: list[str] | None = None,
-                 api_key: str | None = None, api_base: str | None = None,
-                 max_tokens: int = 1024, temperature: float = 0.2):
-        import litellm
-        self.litellm = litellm
-        default_model = os.environ.get("FUGU_WORKER_MODEL", "openai/gpt-4o-mini")
-        self.slot_models = slot_models or [default_model] * N_AGENTS
-        self.api_key = api_key or os.environ.get("FUGU_API_KEY") or os.environ.get("OPENAI_API_KEY")
-        self.api_base = api_base or os.environ.get("FUGU_BASE_URL") or os.environ.get("OPENAI_BASE_URL")
-        self.max_tokens, self.temperature = max_tokens, temperature
-
-    def __call__(self, role_name: str, messages: list, agent_id: int) -> str:
-        model = self.slot_models[agent_id % len(self.slot_models)]
-        msgs = [{"role": m["role"], "content": m["content"]} for m in messages]
-        kw = dict(model=model, messages=msgs,
-                  max_tokens=self.max_tokens, temperature=self.temperature)
-        if self.api_key:  kw["api_key"] = self.api_key
-        if self.api_base: kw["api_base"] = self.api_base
-        r = self.litellm.completion(**kw)
-        return r.choices[0].message.content or ""
-
-
 # ---- the coordination loop (step_trinity, faithful) -------------------------
 @dataclass
 class Turn:
@@ -455,10 +422,6 @@ def main(argv=None):
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--route", metavar="PROMPT", help="one routing decision for PROMPT")
-    ap.add_argument("--live", action="store_true",
-                    help="demo with a real worker pool via litellm (needs FUGU_API_KEY/_BASE_URL)")
-    ap.add_argument("--slot-models", metavar="CSV",
-                    help="comma-separated litellm model ids for the 7 agent slots")
     ap.add_argument("--query", help="override the --demo query")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args(argv)
@@ -485,13 +448,8 @@ def main(argv=None):
         return 0
 
     if args.demo:
-        if args.live:
-            models = args.slot_models.split(",") if args.slot_models else None
-            worker = LiteLLMWorker(slot_models=models)
-            print("worker pool: LiteLLMWorker (live, via litellm)")
-        else:
-            worker = MockWorker()
-            print("worker pool: MockWorker (offline)")
+        worker = MockWorker()
+        print("worker pool: MockWorker (offline)")
         coord = Coordinator(router, worker, sample=True)
         q = args.query or "Implement binary search in Python and prove it terminates."
         print(f"query: {q}\n")

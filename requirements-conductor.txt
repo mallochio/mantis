@@ -9,7 +9,6 @@ cma>=4.0
 datasets>=3.6
 huggingface_hub>=0.23
 hydra-core>=1.3
-litellm
 llm-blender>=0.0.2
 math-verify>=0.9
 mergekit>=0.1

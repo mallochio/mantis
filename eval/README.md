@@ -13,8 +13,8 @@ Evaluation harness and results for Mantis.
 ## Regeneration commands
 
 ```
-# run a config, raw results land in eval/results.jsonl (or --output)
-python3 eval/run_eval.py --config direct --fixtures eval/fixtures.jsonl --output eval/results.jsonl
+# run a config through the local Bifrost or Mantis endpoint
+uv run python eval/run_eval.py --config direct --fixtures eval/fixtures.jsonl --output eval/results.jsonl
 # score raw results; writes <stem>-scored.jsonl and eval/report.md
 python3 eval/score.py --results eval/results.jsonl
 # luna report; reads results-native-v2-scored.jsonl as baseline

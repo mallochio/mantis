@@ -24,7 +24,6 @@ EXPECTED_PACKAGES = {
     "datasets",
     "huggingface-hub",
     "hydra-core",
-    "litellm",
     "llm-blender",
     "math-verify",
     "mergekit",

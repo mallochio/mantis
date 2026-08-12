@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Canonical launch script for the RouteLLM coding-router.
+# Canonical launch script for the Mantis router.
 # Lives in ~/Startup/ so StartupFolder (https://github.com/FuzzyIdeas/StartupFolder)
 # runs it at login. It detaches the router, prints status, then exits.
 #
-# Loads exported env from ~/.zshrc, starts the local LiteLLM proxy if needed,
-# then starts the router. The router is stopped-and-restarted if already running
+# Loads exported env from ~/.zshrc, then starts the router. The router is stopped-and-restarted if already running
 # so config/env changes take effect; if it is down it is just started.
 #
 # Usage: ~/Startup/llm-router.sh          (router backgrounded, prints status)
@@ -17,7 +16,7 @@ SELF="$0"
 while [ -L "$SELF" ]; do SELF="$(readlink "$SELF")"; done
 REPO_DIR="${LLM_ROUTER_DIR:-$(cd "$(dirname "$SELF")" && pwd)}"
 if [ ! -d "$REPO_DIR" ]; then
-  echo "ERROR: llm-router repo dir not found: $REPO_DIR" >&2
+  echo "ERROR: Mantis router directory not found: $REPO_DIR" >&2
   exit 1
 fi
 cd "$REPO_DIR"

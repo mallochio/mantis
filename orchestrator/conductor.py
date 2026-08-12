@@ -293,7 +293,7 @@ class EnvLocalConductor:
 
 class EnvConductorCoordinator(ConductorCoordinator):
     """ConductorCoordinator that can use a local transformers checkpoint
-    (Llama-3.2-3B Conductor) or LiteLLM for the planning call."""
+    (Llama-3.2-3B Conductor) or Bifrost for the planning call."""
 
     def __init__(
         self,

@@ -638,7 +638,7 @@ def test_env_conductor_coordinator_with_local(monkeypatch):
     assert res.final == "solved"
 
 
-def test_env_conductor_coordinator_litellm(monkeypatch):
+def test_env_conductor_coordinator_bifrost(monkeypatch):
     workflow = "model_id: [0]\nsubtasks: ['answer']\naccess_list: ['all']"
 
     class FakeWorker:

@@ -17,16 +17,10 @@ Provenance, stated honestly:
           Conductor is a *prompted off-the-shelf model*. The Conductor paper's
           own claim is that prompting works (just below the RL-optimized model);
           this reproduces the mechanism, not the trained policy.
-
-Workers (and the Conductor) run through litellm, so any provider pool works.
-
-Usage:
-  python fugu_ultra.py --query "..." --conductor novita/deepseek/deepseek-v4-pro \
-      --slot-models <csv of 7 worker model ids>
-  python fugu_ultra.py --self-test     # offline: parser + DAG executor on a canned workflow
 """
+
 from __future__ import annotations
-import argparse, ast, json, os, re, sys
+import ast, json, re
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -206,102 +200,6 @@ class ConductorExecutor:
         res.final = outputs[-1] if outputs else ""        # last step = answer [EXEC]
         return res
 
-# CLI_MARKER
-
-class LiteLLMWorker:
-    """Provider-agnostic worker via litellm (same middle layer as fugu_mini)."""
-    def __init__(self, slot_models=None, api_key=None, api_base=None,
-                 max_tokens=1024, temperature=0.2):
-        import litellm
-        self.litellm = litellm
-        default = os.environ.get("FUGU_WORKER_MODEL", "openai/gpt-4o-mini")
-        self.slot_models = slot_models or [default] * N_AGENTS
-        self.api_key = api_key or os.environ.get("FUGU_API_KEY") or os.environ.get("OPENAI_API_KEY")
-        self.api_base = api_base or os.environ.get("FUGU_BASE_URL") or os.environ.get("OPENAI_BASE_URL")
-        self.max_tokens, self.temperature = max_tokens, temperature
-
-    def _call(self, model, messages):
-        kw = dict(model=model, messages=messages,
-                  max_tokens=self.max_tokens, temperature=self.temperature)
-        if self.api_key:  kw["api_key"] = self.api_key
-        if self.api_base: kw["api_base"] = self.api_base
-        return self.litellm.completion(**kw).choices[0].message.content or ""
-
-    def __call__(self, subtask, messages, agent_id):
-        return self._call(self.slot_models[agent_id % len(self.slot_models)], messages)
-
-    def conduct(self, model, messages):     # the Conductor call (more tokens)
-        old = self.max_tokens; self.max_tokens = 2048
-        try:
-            return self._call(model, messages)
-        finally:
-            self.max_tokens = old
-
-
-class LocalConductor:
-    """Our GRPO-trained Conductor, loaded locally with transformers. Emits the
-    workflow completion (the 3-list DAG) from a chat-formatted prompt. This is
-    the trained policy driving inference — not a prompted off-the-shelf API
-    model. [EXEC: generation; the trained weights are ours]"""
-    def __init__(self, ckpt, device="cuda:0", max_new=512):
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        self.torch, self.max_new, self.device = torch, max_new, device
-        self.tok = AutoTokenizer.from_pretrained(ckpt)
-        if self.tok.pad_token is None:
-            self.tok.pad_token = self.tok.eos_token
-        try:
-            self.model = AutoModelForCausalLM.from_pretrained(ckpt, dtype=torch.bfloat16).to(device).eval()
-        except TypeError:
-            self.model = AutoModelForCausalLM.from_pretrained(ckpt, torch_dtype=torch.bfloat16).to(device).eval()
-
-    def conduct(self, messages):              # mirrors LiteLLMWorker.conduct signature use
-        torch = self.torch
-        try:
-            text = self.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        except Exception:
-            text = "\n".join(m["content"] for m in messages)
-        ids = self.tok(text, return_tensors="pt", truncation=True, max_length=2048).to(self.device)
-        with torch.no_grad():
-            out = self.model.generate(**ids, max_new_tokens=self.max_new, do_sample=False,
-                                      pad_token_id=self.tok.pad_token_id)
-        return self.tok.decode(out[0, ids["input_ids"].shape[1]:], skip_special_tokens=True)
-
-
-class LocalPoolWorker:
-    """Local worker pool for executing the workflow DAG steps — same protocol as
-    the TRINITY serving side: (subtask, messages, agent_id) -> reply, each model
-    resident on its own GPU. No external API."""
-    def __init__(self, specs, max_new=384):
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        self.torch, self.max_new = torch, max_new
-        self.names, self.toks, self.models, self.devs = [], [], [], []
-        for name, path, dev in specs:
-            tk = AutoTokenizer.from_pretrained(path)
-            if tk.pad_token is None:
-                tk.pad_token = tk.eos_token
-            try:
-                m = AutoModelForCausalLM.from_pretrained(path, dtype=torch.bfloat16).to(dev).eval()
-            except TypeError:
-                m = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.bfloat16).to(dev).eval()
-            self.names.append(name); self.toks.append(tk); self.models.append(m); self.devs.append(dev)
-
-    def __call__(self, subtask, messages, agent_id):
-        torch = self.torch
-        wid = agent_id % len(self.models)
-        tk, model, dev = self.toks[wid], self.models[wid], self.devs[wid]
-        try:
-            text = tk.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        except Exception:
-            text = "\n".join(m["content"] for m in messages)
-        ids = tk(text, return_tensors="pt", truncation=True, max_length=2048).to(dev)
-        with torch.no_grad():
-            out = model.generate(**ids, max_new_tokens=self.max_new, do_sample=False,
-                                 pad_token_id=tk.pad_token_id)
-        return tk.decode(out[0, ids["input_ids"].shape[1]:], skip_special_tokens=True)
-
-
 class MockWorker:
     """Offline: deterministic replies so parser+DAG can be tested with no keys."""
     def __call__(self, subtask, messages, agent_id):
@@ -342,74 +240,3 @@ def self_test() -> int:
     assert len(res.steps) == 3 and res.final
     print("\nPASS — parser, equal-length, DAG order, forward-ref ban, execution all OK")
     return 0
-
-
-def _parse_local_specs(csv, n_gpu):
-    specs = []
-    for i, entry in enumerate(csv.split(",")):
-        if "@" in entry:
-            path, dev = entry.rsplit("@", 1)
-        else:
-            path = entry
-            dev = f"cuda:{(i % max(n_gpu - 1, 1)) + 1}" if n_gpu > 1 else "cpu"
-        specs.append((os.path.basename(path.rstrip("/")) or f"w{i}", path, dev))
-    return specs
-
-
-def main(argv=None):
-    ap = argparse.ArgumentParser(description="Faithful Fugu-Ultra (Conductor) workflow executor.")
-    ap.add_argument("--query")
-    ap.add_argument("--conductor", help="litellm model id acting as the Conductor")
-    ap.add_argument("--local-conductor", help="path to a trained local Conductor checkpoint")
-    ap.add_argument("--conductor-device", default="cuda:0")
-    ap.add_argument("--slot-models", metavar="CSV", help="7 litellm worker model ids")
-    ap.add_argument("--local-models", metavar="CSV",
-                    help="local HF worker paths (path or path@device); no API needed")
-    ap.add_argument("--self-test", action="store_true")
-    args = ap.parse_args(argv)
-
-    if args.self_test:
-        return self_test()
-    if not args.query or not (args.conductor or args.local_conductor):
-        ap.error("need --query and (--conductor or --local-conductor), or --self-test")
-
-    # worker pool: local resident models, or litellm
-    if args.local_models:
-        try:
-            import torch
-            n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
-        except Exception:
-            n_gpu = 0
-        specs = _parse_local_specs(args.local_models, n_gpu)
-        worker = LocalPoolWorker(specs)
-        slot_labels = [n for n, _, _ in specs]
-        print(f"workers: LOCAL ({len(specs)}): {slot_labels}")
-    else:
-        slots = args.slot_models.split(",") if args.slot_models else None
-        worker = LiteLLMWorker(slot_models=slots)
-        slot_labels = slots or DEFAULT_SLOT_LABELS
-        print(f"workers: litellm ({len(slot_labels)} slots)")
-
-    # Conductor: trained local checkpoint, or litellm
-    if args.local_conductor:
-        conductor = LocalConductor(args.local_conductor, device=args.conductor_device)
-        print(f"conductor: LOCAL trained {args.local_conductor}")
-        completion = conductor.conduct(conductor_prompt(args.query, slot_labels))
-    else:
-        print(f"conductor: {args.conductor}")
-        completion = worker.conduct(args.conductor, conductor_prompt(args.query, slot_labels))
-
-    print(f"query: {args.query}\n")
-    mids, subs, acc = parse_workflow(completion)
-    if not subs:
-        print("Conductor did not emit a parseable workflow. Raw completion:\n")
-        print(completion[:800]); return 1
-    print(f"workflow: model_id={mids}  access_list={acc}")
-    print(f"  ({len(subs)} steps)\n")
-    res = ConductorExecutor(worker, slot_labels=slot_labels).execute(mids, subs, acc, verbose=True)
-    print(f"\nfinal answer (step {len(res.steps)-1} output):\n{res.final.strip()[:600]}")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
