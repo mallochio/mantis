@@ -25,10 +25,14 @@ def _tool_blocks(message: dict[str, Any]) -> list[dict[str, Any]]:
             input_ = json.loads(raw) if isinstance(raw, str) else raw
         except json.JSONDecodeError:
             input_ = {}
-        blocks.append({
-            "type": "tool_use", "id": str(call.get("id", "")),
-            "name": str(function.get("name", "")), "input": input_ if isinstance(input_, dict) else {},
-        })
+        blocks.append(
+            {
+                "type": "tool_use",
+                "id": str(call.get("id", "")),
+                "name": str(function.get("name", "")),
+                "input": input_ if isinstance(input_, dict) else {},
+            }
+        )
     return blocks
 
 
@@ -36,13 +40,16 @@ def _replayable_content(content: Any) -> list[dict[str, Any]]:
     if not isinstance(content, list):
         return []
     return [
-        block for block in content
+        block
+        for block in content
         if isinstance(block, dict)
         and (block.get("type") != "thinking" or isinstance(block.get("thinking"), str))
     ]
 
 
-def chat_to_anthropic(messages: list[dict[str, Any]]) -> tuple[str | list[dict[str, Any]] | None, list[dict[str, Any]]]:
+def chat_to_anthropic(
+    messages: list[dict[str, Any]],
+) -> tuple[str | list[dict[str, Any]] | None, list[dict[str, Any]]]:
     """Convert canonical Mantis history while preserving native assistant blocks."""
     system: list[dict[str, Any]] = []
     converted: list[dict[str, Any]] = []
@@ -66,10 +73,19 @@ def chat_to_anthropic(messages: list[dict[str, Any]]) -> tuple[str | list[dict[s
             continue
         if role == "tool":
             call_id = str(message.get("tool_call_id", ""))
-            converted.append({"role": "user", "content": [{
-                "type": "tool_result", "tool_use_id": tool_ids.get(call_id, call_id),
-                "content": str(message.get("content", "")), "is_error": bool(message.get("is_error", False)),
-            }]})
+            converted.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_ids.get(call_id, call_id),
+                            "content": str(message.get("content", "")),
+                            "is_error": bool(message.get("is_error", False)),
+                        }
+                    ],
+                }
+            )
             continue
         if role == "user":
             converted.append({"role": "user", "content": _text(message.get("content"))})
@@ -82,17 +98,24 @@ def _tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
         function = tool.get("function") if isinstance(tool, dict) else None
         if not isinstance(function, dict):
             continue
-        converted.append({
-            "name": str(function.get("name", "")),
-            "description": str(function.get("description", "")),
-            "input_schema": function.get("parameters") or {"type": "object", "properties": {}},
-        })
+        converted.append(
+            {
+                "name": str(function.get("name", "")),
+                "description": str(function.get("description", "")),
+                "input_schema": function.get("parameters") or {"type": "object", "properties": {}},
+            }
+        )
     return converted
 
 
-def build_anthropic_body(model: str, messages: list[dict[str, Any]], max_tokens: int,
-                         effort: str | None, tools: list[dict[str, Any]] | None,
-                         tool_choice: Any) -> dict[str, Any]:
+def build_anthropic_body(
+    model: str,
+    messages: list[dict[str, Any]],
+    max_tokens: int,
+    effort: str | None,
+    tools: list[dict[str, Any]] | None,
+    tool_choice: Any,
+) -> dict[str, Any]:
     system, history = chat_to_anthropic(messages)
     body: dict[str, Any] = {"model": model, "max_tokens": max_tokens, "messages": history}
     if system:
@@ -111,25 +134,44 @@ def build_anthropic_body(model: str, messages: list[dict[str, Any]], max_tokens:
 
 def anthropic_to_chat(response: dict[str, Any]) -> dict[str, Any]:
     content = response.get("content") or []
-    text = "".join(str(block.get("text", "")) for block in content if isinstance(block, dict) and block.get("type") == "text")
+    text = "".join(
+        str(block.get("text", ""))
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
     calls = []
     tool_ids: dict[str, str] = {}
     for block in content:
         if isinstance(block, dict) and block.get("type") == "tool_use":
             raw_id = str(block.get("id", ""))
-            calls.append({"id": raw_id, "type": "function", "function": {"name": str(block.get("name", "")), "arguments": json.dumps(block.get("input") or {})}})
+            calls.append(
+                {
+                    "id": raw_id,
+                    "type": "function",
+                    "function": {
+                        "name": str(block.get("name", "")),
+                        "arguments": json.dumps(block.get("input") or {}),
+                    },
+                }
+            )
             tool_ids[raw_id] = raw_id
     message: dict[str, Any] = {
-        "role": "assistant", "content": text, "_anthropic_content": _replayable_content(content),
+        "role": "assistant",
+        "content": text,
+        "_anthropic_content": _replayable_content(content),
     }
     if calls:
         message["tool_calls"] = calls
         message["_anthropic_tool_ids"] = tool_ids
     usage = response.get("usage") or {}
-    return {"choices": [{"message": message}], "usage": {
-        "prompt_tokens": usage.get("input_tokens", 0), "completion_tokens": usage.get("output_tokens", 0),
-        "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
-    }}
+    return {
+        "choices": [{"message": message}],
+        "usage": {
+            "prompt_tokens": usage.get("input_tokens", 0),
+            "completion_tokens": usage.get("output_tokens", 0),
+            "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+        },
+    }
 
 
 def assemble_anthropic_stream(events: Any) -> dict[str, Any]:
@@ -154,17 +196,26 @@ def assemble_anthropic_stream(events: Any) -> dict[str, Any]:
                 key = "text" if delta.get("type") == "text_delta" else "thinking"
                 block[key] = str(block.get(key, "")) + str(delta.get(key, ""))
             elif block is not None and delta.get("type") == "input_json_delta":
-                block["_partial_json"] = str(block.get("_partial_json", "")) + str(delta.get("partial_json", ""))
+                block["_partial_json"] = str(block.get("_partial_json", "")) + str(
+                    delta.get("partial_json", "")
+                )
         elif event.get("type") == "message_delta":
             usage = event.get("usage") or usage
     content = list(dict(sorted(blocks.items())).values())
     for block in content:
         raw = block.pop("_partial_json", "")
         if raw:
-            try: block["input"] = json.loads(raw)
-            except json.JSONDecodeError: block["input"] = {}
+            try:
+                block["input"] = json.loads(raw)
+            except json.JSONDecodeError:
+                block["input"] = {}
     return anthropic_to_chat({"content": content, "usage": usage})
 
 
 def anthropic_headers(key: str) -> dict[str, str]:
-    return {"x-api-key": key, "anthropic-version": _VERSION, "Content-Type": "application/json", "User-Agent": "Mantis"}
+    return {
+        "x-api-key": key,
+        "anthropic-version": _VERSION,
+        "Content-Type": "application/json",
+        "User-Agent": "Mantis",
+    }

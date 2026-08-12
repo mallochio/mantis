@@ -6,9 +6,7 @@ import json
 from typing import Any
 
 
-def uses_responses_api(
-    provider: str, model: str, protocols: tuple[str, ...] | None = None
-) -> bool:
+def uses_responses_api(provider: str, model: str, protocols: tuple[str, ...] | None = None) -> bool:
     """Return whether this binding uses the native Responses API.
 
     Catalog bindings declare their protocol explicitly. Raw legacy model specs

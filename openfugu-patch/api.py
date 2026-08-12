@@ -546,9 +546,7 @@ def ready(response: Response) -> dict[str, Any]:
             raise HTTPException(503, "Mantis catalog bindings are not configured")
         if not keys:
             raise HTTPException(503, "Mantis catalog provider credentials are not configured")
-        endpoint_urls = {
-            name: binding.base_url for name, binding in bindings.providers.items()
-        }
+        endpoint_urls = {name: binding.base_url for name, binding in bindings.providers.items()}
     else:
         contract = ""
         keys = {}
@@ -573,8 +571,12 @@ def ready(response: Response) -> dict[str, Any]:
 _MODEL_CREATED = int(time.time())
 _BASIC_MODEL = "mantis"
 _ROUTER_RESPONSE_HEADERS = (
-    "x-route-decision", "x-route-reason", "x-route-sticky", "x-route-model",
-    "x-route-attempts", "x-route-fallback",
+    "x-route-decision",
+    "x-route-reason",
+    "x-route-sticky",
+    "x-route-model",
+    "x-route-attempts",
+    "x-route-fallback",
 )
 _SUPPORTED_PARAMETERS = [
     "tools",
@@ -609,14 +611,23 @@ def _router_body(request: ChatRequest) -> dict[str, Any]:
 
 
 def _router_response_headers(upstream: httpx.Response) -> dict[str, str]:
-    return {name: upstream.headers[name] for name in _ROUTER_RESPONSE_HEADERS if name in upstream.headers}
+    return {
+        name: upstream.headers[name]
+        for name in _ROUTER_RESPONSE_HEADERS
+        if name in upstream.headers
+    }
 
 
 def _router_error(upstream: httpx.Response) -> JSONResponse:
     try:
         body = upstream.json()
     except ValueError:
-        body = {"error": {"message": "llm-router returned an invalid response", "type": "upstream_error"}}
+        body = {
+            "error": {
+                "message": "llm-router returned an invalid response",
+                "type": "upstream_error",
+            }
+        }
     return JSONResponse(body, status_code=upstream.status_code)
 
 
@@ -661,9 +672,14 @@ def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Respons
         handed_off = False
         try:
             client = _router_client()
-            url = os.environ.get("MANTIS_ROUTER_URL", "http://127.0.0.1:5500/v1") + "/chat/completions"
+            url = (
+                os.environ.get("MANTIS_ROUTER_URL", "http://127.0.0.1:5500/v1")
+                + "/chat/completions"
+            )
             if request.stream:
-                stream = client.stream("POST", url, headers=_router_headers(headers), json=_router_body(request))
+                stream = client.stream(
+                    "POST", url, headers=_router_headers(headers), json=_router_body(request)
+                )
                 upstream = stream.__enter__()
                 if upstream.is_error:
                     error = _router_error(upstream)
@@ -672,14 +688,20 @@ def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Respons
                     return error
                 handed_off = True
                 return StreamingResponse(
-                    _router_stream(client, stream, upstream), media_type="text/event-stream",
+                    _router_stream(client, stream, upstream),
+                    media_type="text/event-stream",
                     headers={"X-Request-Id": request_id, **_router_response_headers(upstream)},
                 )
             with client:
-                upstream = client.post(url, headers=_router_headers(headers), json=_router_body(request))
+                upstream = client.post(
+                    url, headers=_router_headers(headers), json=_router_body(request)
+                )
             if upstream.is_error:
                 return _router_error(upstream)
-            return JSONResponse(upstream.json(), headers={"X-Request-Id": request_id, **_router_response_headers(upstream)})
+            return JSONResponse(
+                upstream.json(),
+                headers={"X-Request-Id": request_id, **_router_response_headers(upstream)},
+            )
         except httpx.HTTPError as error:
             return _error(502, f"llm-router unavailable: {error}", "upstream_error")
         finally:
