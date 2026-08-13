@@ -105,3 +105,10 @@ def test_max_output_tokens_clamped_to_router_default_when_backend_uncapped():
     backend = {"model": "openai/gpt-5.6-sol", "effort": "", "max_tokens": None}
     out = server._build_responses_body({"model": "auto", "max_output_tokens": 131072}, backend)
     assert out["max_output_tokens"] == min(131072, server.ROUTELLM_MAX_TOKENS)
+
+
+def test_catalog_backend_explicit_cap_is_honored_not_clamped():
+    # A catalog backend declaring a 384k output cap (DeepSeek V4 Pro per
+    # models.dev) must not be silently reduced to the router-wide fallback.
+    backend = {"model": "deepseek-v4-pro", "effort": "", "max_tokens": 384000}
+    assert server._completion_token_cap(backend) == 384000

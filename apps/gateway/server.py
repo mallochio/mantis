@@ -83,10 +83,11 @@ HOST = os.environ.get("ROUTELLM_HOST", "127.0.0.1")
 PORT = _env_int("ROUTELLM_PORT", 5500)
 SERVER_KEY = os.environ.get("ROUTELLM_KEY", "sk-route-local")
 ROUTELLM_CONTEXT_WINDOW = os.environ.get("ROUTELLM_CONTEXT_WINDOW", "auto")
-# Floor for targets without an explicit catalog max_tokens; the catalog
-# carries exact per-model output caps (models.dev): azure gpt-5.6 = 128000,
-# deepseek v4 flash = 384000.
-ROUTELLM_MAX_TOKENS = _env_int("ROUTELLM_MAX_TOKENS", 131072)
+# Default/ceiling for targets without an explicit catalog max_tokens. The
+# catalog carries exact per-model output caps (models.dev), so this only
+# matters as a fallback; it must be >= the largest catalog cap (deepseek
+# v4 pro = 384000) so no per-model cap is silently reduced.
+ROUTELLM_MAX_TOKENS = _env_int("ROUTELLM_MAX_TOKENS", 384000)
 MODEL_ID = "auto"
 
 def _base(name: str, direct_default: str) -> str:
