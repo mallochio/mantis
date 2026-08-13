@@ -669,6 +669,65 @@ def test_basic_model_relays_router_response_and_session(client, monkeypatch):
     assert seen["headers"]["x-route-session"] == "pi-session"
 
 
+def test_basic_model_relays_body_session_identity_as_header(client, monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        seen["headers"] = request.headers
+        return __import__("httpx").Response(
+            200,
+            json={"id": "chatcmpl-router", "choices": [{"message": {"content": "ok"}}]},
+            headers={"x-route-decision": "cheap"},
+        )
+
+    monkeypatch.setenv("ROUTELLM_KEY", "router-key")
+    monkeypatch.setattr(api, "_router_client", lambda: _router_client(handler))
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "mantis",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"session_id": "meta-session"},
+            "user": "user-session",
+        },
+    )
+    assert response.status_code == 200
+    # Body session identity must reach the router as X-Route-Session...
+    assert seen["headers"]["x-route-session"] == "meta-session"
+    # ...but must not leak into the upstream body where strict providers
+    # reject unknown top-level fields.
+    assert "metadata" not in seen["body"]
+    assert "user" not in seen["body"]
+
+
+def test_basic_model_relays_body_user_as_header_when_no_metadata(client, monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["headers"] = request.headers
+        return __import__("httpx").Response(
+            200,
+            json={"id": "chatcmpl-router", "choices": [{"message": {"content": "ok"}}]},
+            headers={"x-route-decision": "cheap"},
+        )
+
+    monkeypatch.setenv("ROUTELLM_KEY", "router-key")
+    monkeypatch.setattr(api, "_router_client", lambda: _router_client(handler))
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "mantis",
+            "messages": [{"role": "user", "content": "hi"}],
+            "user": "user-session",
+        },
+    )
+    assert response.status_code == 200
+    assert seen["headers"]["x-route-session"] == "user-session"
+
+
 def test_basic_model_relays_router_stream(client, monkeypatch):
     def handler(_request):
         return __import__("httpx").Response(
@@ -698,9 +757,13 @@ def test_basic_model_reports_router_connection_failure(client, monkeypatch):
     import httpx
 
     monkeypatch.setenv("ROUTELLM_KEY", "router-key")
-    monkeypatch.setattr(api, "_router_client", lambda: _router_client(
-        lambda request: (_ for _ in ()).throw(httpx.ConnectError("down", request=request))
-    ))
+    monkeypatch.setattr(
+        api,
+        "_router_client",
+        lambda: _router_client(
+            lambda request: (_ for _ in ()).throw(httpx.ConnectError("down", request=request))
+        ),
+    )
     response = client.post(
         "/v1/chat/completions",
         headers=_headers(),

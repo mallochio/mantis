@@ -143,6 +143,11 @@ class ChatRequest(BaseModel):
     reasoning: ReasoningOptions | None = None
     reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
     web_search_options: dict[str, Any] | None = None
+    # Session identity accepted from the body so conversations can reach the
+    # router's session ratchet. Never forwarded upstream: unknown top-level
+    # fields can be rejected by strict providers. See _router_body/_router_headers.
+    user: str | None = None
+    metadata: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def validate_tools(self) -> ChatRequest:
@@ -598,18 +603,39 @@ def _router_client() -> httpx.Client:
     return httpx.Client(timeout=float(os.environ.get("MANTIS_ROUTER_TIMEOUT_S", "300")))
 
 
-def _router_headers(headers: dict[str, str]) -> dict[str, str]:
+def _session_from_body(body: ChatRequest) -> str | None:
+    """Session identity carried in the request body (metadata.session_id/user).
+
+    The gateway accepts the same fields directly, but the proxy converts them
+    to the X-Route-Session header instead of forwarding the raw body fields,
+    so unknown top-level keys never reach a strict upstream provider.
+    """
+    if isinstance(body.metadata, dict):
+        for key in ("session_id", "sessionId"):
+            value = body.metadata.get(key)
+            if isinstance(value, str) and value:
+                return value
+    if isinstance(body.user, str) and body.user:
+        return body.user
+    return None
+
+
+def _router_headers(headers: dict[str, str], body: ChatRequest | None = None) -> dict[str, str]:
     key = os.environ.get("ROUTELLM_KEY")
     if not key:
         raise HTTPException(503, "ROUTELLM_KEY is not configured")
     out = {"Authorization": f"Bearer {key}"}
-    if session := headers.get("x-route-session"):
+    session = headers.get("x-route-session")
+    if not session and body is not None:
+        session = _session_from_body(body)
+    if session:
         out["X-Route-Session"] = session
     return out
 
 
 def _router_body(request: ChatRequest) -> dict[str, Any]:
-    return {**request.model_dump(exclude_none=True), "model": "auto"}
+    body = request.model_dump(exclude_none=True, exclude={"user", "metadata"})
+    return {**body, "model": "auto"}
 
 
 def _router_response_headers(upstream: httpx.Response) -> dict[str, str]:
@@ -680,7 +706,10 @@ def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Respons
             )
             if request.stream:
                 stream = client.stream(
-                    "POST", url, headers=_router_headers(headers), json=_router_body(request)
+                    "POST",
+                    url,
+                    headers=_router_headers(headers, request),
+                    json=_router_body(request),
                 )
                 upstream = stream.__enter__()
                 if upstream.is_error:
@@ -696,7 +725,7 @@ def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Respons
                 )
             with client:
                 upstream = client.post(
-                    url, headers=_router_headers(headers), json=_router_body(request)
+                    url, headers=_router_headers(headers, request), json=_router_body(request)
                 )
             if upstream.is_error:
                 return _router_error(upstream)
