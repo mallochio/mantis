@@ -139,26 +139,26 @@ def _make_fake_requests(captured: dict[str, Any] | None = None, side_effect=None
     return fake
 
 
-def test_openrouter_worker_reasoning(monkeypatch):
+def test_bifrost_worker_reasoning(monkeypatch):
     captured: dict[str, Any] = {}
     monkeypatch.setattr(rp, "requests", _make_fake_requests(captured))
-    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setenv("BIFROST_API_KEY", "sk-test")
 
-    worker = rp.OpenRouterWorker(["claude-sonnet-5|medium"])
+    worker = rp.BifrostWorker(["claude-sonnet-5|medium"])
     result = worker("Worker", [{"role": "user", "content": "hi"}], 0)
 
     assert result == "ok"
-    assert captured["model"] == "anthropic/claude-sonnet-5"
+    assert captured["model"] == "claude-sonnet-5"
     assert captured["reasoning_effort"] == "medium"
     assert "temperature" not in captured
 
 
-def test_openrouter_worker_non_reasoning(monkeypatch):
+def test_bifrost_worker_non_reasoning(monkeypatch):
     captured: dict[str, Any] = {}
     monkeypatch.setattr(rp, "requests", _make_fake_requests(captured))
-    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setenv("BIFROST_API_KEY", "sk-test")
 
-    worker = rp.OpenRouterWorker(["deepseek-v4-flash|none"])
+    worker = rp.BifrostWorker(["deepseek-v4-flash|none"])
     result = worker("Worker", [{"role": "user", "content": "hi"}], 0)
 
     assert result == "ok"
@@ -166,11 +166,11 @@ def test_openrouter_worker_non_reasoning(monkeypatch):
     assert "reasoning_effort" not in captured
 
 
-def test_openrouter_worker_failure(monkeypatch):
+def test_bifrost_worker_failure(monkeypatch):
     monkeypatch.setattr(rp, "requests", _make_fake_requests(side_effect=RuntimeError("api down")))
-    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setenv("BIFROST_API_KEY", "sk-test")
 
-    worker = rp.OpenRouterWorker(["glm-5.2"])
+    worker = rp.BifrostWorker(["glm-5.2"])
     assert worker("Worker", [{"role": "user", "content": "hi"}], 0) == ""
 
 
@@ -326,7 +326,7 @@ def test_main_smoke(monkeypatch, tmp_path):
         def route(self, messages, sample=False):
             return {"agent_id": 0, "role_id": 1}
 
-    monkeypatch.setattr(rp, "OpenRouterWorker", FakeWorker)
+    monkeypatch.setattr(rp, "BifrostWorker", FakeWorker)
     monkeypatch.setattr(rp, "FuguRouter", FakeRouter)
     monkeypatch.setattr(rp, "extract_hidden_states", lambda router, tasks, batch_size=8: torch.zeros(len(tasks), rp.HIDDEN))
     monkeypatch.setattr(
@@ -375,7 +375,7 @@ def test_normalize_unsupported_alias():
         rp.normalize_model_id("not-a-real-model")
 
 
-def test_openrouter_worker_api_base(monkeypatch):
+def test_bifrost_worker_api_base(monkeypatch):
     captured_url: list[str] = []
 
     def _post(url, **kwargs):
@@ -390,18 +390,18 @@ def test_openrouter_worker_api_base(monkeypatch):
     fake_requests = MagicMock()
     fake_requests.Session.return_value = session
     monkeypatch.setattr(rp, "requests", fake_requests)
-    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setenv("BIFROST_API_KEY", "sk-test")
 
-    worker = rp.OpenRouterWorker(["claude-sonnet-5|medium"], api_base="http://custom/")
+    worker = rp.BifrostWorker(["claude-sonnet-5|medium"], api_base="http://custom/")
     worker("Worker", [{"role": "user", "content": "hi"}], 0)
     assert captured_url == ["http://custom/chat/completions"]
 
 
-def test_openrouter_worker_missing_key(monkeypatch):
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+def test_bifrost_worker_missing_key(monkeypatch):
+    monkeypatch.delenv("BIFROST_API_KEY", raising=False)
     monkeypatch.setattr(rp, "requests", MagicMock())
     with pytest.raises(ValueError):
-        rp.OpenRouterWorker(["claude-sonnet-5"])
+        rp.BifrostWorker(["claude-sonnet-5"])
 
 
 def test_sync_s3_to_local_invalid_uri(tmp_path):
@@ -504,7 +504,7 @@ def test_main_toolscale(monkeypatch, tmp_path):
         def route(self, messages, sample=False):
             return {"agent_id": 0, "role_id": 1}
 
-    monkeypatch.setattr(rp, "OpenRouterWorker", FakeWorker)
+    monkeypatch.setattr(rp, "BifrostWorker", FakeWorker)
     monkeypatch.setattr(rp, "FuguRouter", FakeRouter)
     monkeypatch.setattr(
         rp, "extract_hidden_states",
@@ -582,7 +582,7 @@ def test_main_uses_cache(monkeypatch, tmp_path):
         def route(self, messages, sample=False):
             return {"agent_id": 0, "role_id": 1}
 
-    monkeypatch.setattr(rp, "OpenRouterWorker", FakeWorker)
+    monkeypatch.setattr(rp, "BifrostWorker", FakeWorker)
     monkeypatch.setattr(rp, "FuguRouter", FakeRouter)
     monkeypatch.setattr(
         rp, "extract_hidden_states",
@@ -661,7 +661,7 @@ def test_main_pad_pool(monkeypatch, tmp_path):
         def route(self, messages, sample=False):
             return {"agent_id": 0, "role_id": 1}
 
-    monkeypatch.setattr(rp, "OpenRouterWorker", FakeWorker)
+    monkeypatch.setattr(rp, "BifrostWorker", FakeWorker)
     monkeypatch.setattr(rp, "FuguRouter", FakeRouter)
     monkeypatch.setattr(
         rp, "extract_hidden_states",
@@ -735,6 +735,10 @@ def test_pick_best_worker_quality_2x_score_wins_despite_price():
     assert rp._pick_best_worker(scores, pool, "quality", costs) == 1
 
 
+def test_model_cost_matches_bifrost_model_to_unique_shadow_price():
+    assert rp._model_cost("gpt-5.6-luna", {"openai/gpt-5.6-luna": 0.0008}) == 0.0008
+
+
 def test_pick_budgeted_worker_equal_scores_cheaper_wins():
     pool = ["openai/gpt-5.6-luna|max", "anthropic/claude-opus-5|medium"]
     scores = [0.9, 0.9]
@@ -794,7 +798,7 @@ def test_pick_budgeted_worker_no_passing_binary():
     assert gold == -1
 
 
-def test_openrouter_worker_retry_success(monkeypatch):
+def test_bifrost_worker_retry_success(monkeypatch):
     """Transient failure on first attempt should be retried and then succeed."""
     calls: list[int] = []
     resp = MagicMock()
@@ -815,9 +819,9 @@ def test_openrouter_worker_retry_success(monkeypatch):
     fake_requests = MagicMock()
     fake_requests.Session.return_value = session
     monkeypatch.setattr(rp, "requests", fake_requests)
-    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setenv("BIFROST_API_KEY", "sk-test")
 
-    worker = rp.OpenRouterWorker(["gpt-5.6-luna|max"], retry_backoff=0.0)
+    worker = rp.BifrostWorker(["gpt-5.6-luna|max"], retry_backoff=0.0)
     completion, event = worker.call_with_retry(
         "Worker", [{"role": "user", "content": "hi"}], 0, task_id=1
     )
@@ -827,7 +831,7 @@ def test_openrouter_worker_retry_success(monkeypatch):
     assert event["task_id"] == 1
 
 
-def test_openrouter_worker_non_transient_no_retry(monkeypatch):
+def test_bifrost_worker_non_transient_no_retry(monkeypatch):
     def _post(*args, **kwargs):
         raise ValueError("bad request")
 
@@ -836,9 +840,9 @@ def test_openrouter_worker_non_transient_no_retry(monkeypatch):
     fake_requests = MagicMock()
     fake_requests.Session.return_value = session
     monkeypatch.setattr(rp, "requests", fake_requests)
-    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setenv("BIFROST_API_KEY", "sk-test")
 
-    worker = rp.OpenRouterWorker(["gpt-5.6-luna|max"], retry_backoff=0.0)
+    worker = rp.BifrostWorker(["gpt-5.6-luna|max"], retry_backoff=0.0)
     completion, event = worker.call_with_retry(
         "Worker", [{"role": "user", "content": "hi"}], 0
     )
@@ -847,31 +851,16 @@ def test_openrouter_worker_non_transient_no_retry(monkeypatch):
     assert event["status"] == "error"
 
 
-def test_resolve_costs_live(monkeypatch, tmp_path):
-    live_costs = {"openai/gpt-5.6-luna": 0.0008}
-    monkeypatch.setattr(rp, "_fetch_live_pricing", lambda pool: (live_costs, live_costs))
+def test_resolve_costs_uses_cost_table(tmp_path):
+    cost_table = tmp_path / "costs.json"
+    cost_table.write_text(json.dumps({"m0": 0.5, "m1": 0.05}))
     out = tmp_path / "out"
     out.mkdir()
-    costs, source = rp._resolve_costs(
-        ["openai/gpt-5.6-luna|max"], str(tmp_path / "fallback.json"), out
-    )
-    assert source == "live"
-    assert costs["openai/gpt-5.6-luna"] == 0.0008
+    costs, source = rp._resolve_costs(["m0", "m1"], cost_table, out)
+    assert source == "cost_table"
+    assert costs["m0"] == 0.5
     snapshot = json.loads((out / "pricing_snapshot.json").read_text())
-    assert snapshot["source"] == "live"
-
-
-def test_resolve_costs_fallback(monkeypatch, tmp_path):
-    fallback = tmp_path / "costs.json"
-    fallback.write_text(json.dumps({"openai/m0": 0.5, "openai/m1": 0.05}))
-    monkeypatch.setattr(rp, "_fetch_live_pricing", lambda pool: (None, None))
-    out = tmp_path / "out"
-    out.mkdir()
-    costs, source = rp._resolve_costs(
-        ["openai/m0", "openai/m1"], str(fallback), out
-    )
-    assert source == "fallback"
-    assert costs["openai/m0"] == 0.5
+    assert snapshot["source"] == "cost_table"
 
 
 def test_label_distribution_computes_three_modes():
@@ -911,7 +900,7 @@ def test_main_cost_mode(monkeypatch, tmp_path):
         def route(self, messages, sample=False):
             return {"agent_id": 0, "role_id": 1}
 
-    monkeypatch.setattr(rp, "OpenRouterWorker", FakeWorker)
+    monkeypatch.setattr(rp, "BifrostWorker", FakeWorker)
     monkeypatch.setattr(rp, "FuguRouter", FakeRouter)
     monkeypatch.setattr(
         rp, "extract_hidden_states",

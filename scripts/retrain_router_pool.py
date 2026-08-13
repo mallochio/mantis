@@ -2,7 +2,7 @@
 """Retrain the OpenFugu TRINITY router head for a new 7-slot worker pool.
 
 Usage (local):
-  export OPENROUTER_API_KEY=sk-or-v1-...
+  export BIFROST_API_KEY=...
   python scripts/retrain_router_pool.py \
     --pool "<7 model specs separated by commas, optional |reasoning_effort>" \
     --output-dir ./outputs/router_retrain
@@ -17,7 +17,7 @@ Usage (SkyPilot):
 What it does:
   1. Downloads a task dataset (default TerminalBench 2.1 mirror) and a small
      validation split.
-  2. Calls each worker in the pool for each task through OpenRouter. Responses
+  2. Calls each worker in the pool for each task through the local Bifrost gateway. Responses
      are scored against the reference solution; the best worker becomes the gold
      worker label for that task.
   3. Runs the Qwen3-0.6B TRINITY backbone to extract penultimate-token hidden
@@ -37,7 +37,8 @@ Label modes:
              skipped.
 
 Environment:
-  OPENROUTER_API_KEY  required for worker calls
+  BIFROST_API_KEY     required for worker calls
+  BIFROST_BASE_URL     OpenAI-compatible endpoint (default http://127.0.0.1:8080/v1)
   HF_TOKEN            optional, avoids HF rate limits / gates Qwen3-0.6B
   MANTIS_MODEL          Qwen3-0.6B dir or HF id (default Qwen/Qwen3-0.6B)
   MANTIS_VECTOR         existing TRINITY vector (default ./artifacts/model_iter_60.npy)
@@ -61,7 +62,6 @@ import re
 import sys
 import threading
 import time
-import urllib.request
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -92,7 +92,7 @@ from mini import (
 from toolscale_data import SYSTEM, _parse_plan, _score
 
 # ---------------------------------------------------------------------------
-# OpenRouter worker wrapper (explicit OpenAI-compatible provider)
+# Bifrost worker wrapper
 # ---------------------------------------------------------------------------
 
 KNOWN_PREFIXES = {
@@ -114,7 +114,7 @@ REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 def split_model_spec(spec: str):
     """Parse 'model_id|reasoning_effort' into (model_id, effort).
 
-    Full OpenRouter ids like 'openai/gpt-5.6-sol|medium' are supported.
+    Bifrost model ids like 'gpt-5.6-sol|medium' are supported.
     Effort is optional; None means no reasoning_effort is sent.
     """
     spec = spec.strip()
@@ -127,7 +127,7 @@ def split_model_spec(spec: str):
 
 
 def normalize_model_id(model: str) -> str:
-    """Turn an alias or openrouter/... id into a full OpenRouter model id."""
+    """Legacy normalizer for existing cost tables and compatibility tests."""
     model = model.strip()
     if model.startswith("openrouter/"):
         return model[len("openrouter/") :]
@@ -137,8 +137,8 @@ def normalize_model_id(model: str) -> str:
         if model.lower().startswith(prefix):
             return provider + model
     raise ValueError(
-        f"Could not infer OpenRouter provider for '{model}'. "
-        f"Pass a full id like 'anthropic/claude-sonnet-5' or 'openrouter/...'."
+        f"Could not infer provider for '{model}'. "
+        f"Pass a full id like 'anthropic/claude-sonnet-5'."
     )
 
 
@@ -203,14 +203,14 @@ def _error_status(exc: Exception) -> str:
     return "error"
 
 
-class OpenRouterWorker:
-    """Call a heterogeneous worker pool through the OpenRouter REST API."""
+class BifrostWorker:
+    """Call a heterogeneous worker pool through Bifrost Chat Completions."""
 
     def __init__(
         self,
         models: list[str],
         api_key: str | None = None,
-        api_base: str = "https://openrouter.ai/api/v1",
+        api_base: str | None = None,
         max_tokens: int = 256,
         temperature: float = 0.2,
         timeout: int = 60,
@@ -220,12 +220,12 @@ class OpenRouterWorker:
         per_model_concurrency: dict[str, int] | str | None = None,
     ):
         specs = [split_model_spec(m) for m in models]
-        self.models = [normalize_model_id(m) for m, _ in specs]
+        self.models = [m.removeprefix("bifrost/") for m, _ in specs]
         self.efforts = [e for _, e in specs]
-        self.api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
+        self.api_key = api_key or os.environ.get("BIFROST_API_KEY")
         if not self.api_key:
-            raise ValueError("OPENROUTER_API_KEY is required")
-        self.api_base = api_base.rstrip("/")
+            raise ValueError("BIFROST_API_KEY is required")
+        self.api_base = (api_base or os.environ.get("BIFROST_BASE_URL", "http://127.0.0.1:8080/v1")).rstrip("/")
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.timeout = timeout
@@ -260,12 +260,7 @@ class OpenRouterWorker:
         else:
             body["reasoning_effort"] = effort
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://fugu.local",
-            "X-Title": "Fugu Retrain",
-        }
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         url = f"{self.api_base}/chat/completions"
         # Enforce a hard per-call ceiling: 10 s connect, then read up to self.timeout.
         resp = self._session.post(url, json=body, headers=headers, timeout=(10, self.timeout))
@@ -457,7 +452,7 @@ def load_toolscale_tasks(limit: int, seed: int = 42, val_frac: float = 0.1):
 
 
 def worker_messages(task: str, system: str | None = None) -> list[dict]:
-    # Anthropic models on OpenRouter do not allow an assistant-message prefill,
+    # Anthropic-compatible models do not allow an assistant-message prefill,
     # so we end with a user message and rely on the system prompt for the format.
     return [
         {"role": "system", "content": system or SYSTEM},
@@ -604,7 +599,7 @@ def _write_events(events_path: Path, events: list[dict]) -> None:
 
 
 def _score_one_worker(
-    worker: OpenRouterWorker,
+    worker: BifrostWorker,
     task_idx: int,
     task: str,
     expected: str | list,
@@ -660,7 +655,10 @@ def _score_one_worker(
 def _model_cost(model: str, costs: dict[str, float] | None) -> float:
     if not costs:
         return float("inf")
-    return costs.get(model, float("inf"))
+    if model in costs:
+        return costs[model]
+    matches = [cost for name, cost in costs.items() if name.rsplit("/", 1)[-1] == model]
+    return matches[0] if len(matches) == 1 else float("inf")
 
 
 def _cheapest_eligible(
@@ -671,8 +669,7 @@ def _cheapest_eligible(
     def sort_key(item: tuple[int, float]) -> tuple[float, float, int]:
         i, score = item
         model, _ = split_model_spec(pool[i])
-        model_id = normalize_model_id(model)
-        return (_model_cost(model_id, costs), -score, i)
+        return (_model_cost(model.removeprefix("bifrost/"), costs), -score, i)
 
     return min(eligible, key=sort_key)[0]
 
@@ -699,8 +696,7 @@ def _pick_best_worker(
     ratios: list[tuple[int, float]] = []
     for i, s in usable:
         model, _ = split_model_spec(pool[i])
-        model_id = normalize_model_id(model)
-        cost = max(_model_cost(model_id, costs), 1e-6)
+        cost = max(_model_cost(model.removeprefix("bifrost/"), costs), 1e-6)
         ratios.append((i, s / cost))
     if not ratios:
         return -1
@@ -774,7 +770,7 @@ def _process_task_scores(
 
 
 def _score_worker_pool(
-    worker: OpenRouterWorker,
+    worker: BifrostWorker,
     pool: list[str],
     train_ds: list[dict],
     out_dir: Path,
@@ -804,7 +800,7 @@ def _score_worker_pool(
             system = row.get("system")
             for agent_id, spec in enumerate(pool):
                 model, _ = split_model_spec(spec)
-                model_id = normalize_model_id(model)
+                model_id = model.removeprefix("bifrost/")
                 fut = executor.submit(
                     _score_one_worker,
                     worker,
@@ -876,63 +872,14 @@ def _label_distribution(
 # ---------------------------------------------------------------------------
 
 
-def _fetch_live_pricing(pool: list[str]) -> tuple[dict[str, float] | None, dict | None]:
-    """Fetch OpenRouter per-token pricing and return (costs, pricing_snapshot_data)."""
-    req = urllib.request.Request(
-        "https://openrouter.ai/api/v1/models",
-        headers={"Accept": "application/json"},
-    )
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if api_key:
-        req.add_header("Authorization", f"Bearer {api_key}")
-    with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310
-        data = json.load(resp)
-    by_id = {m["id"]: m for m in data.get("data", [])}
-    costs: dict[str, float] = {}
-    pricing: dict[str, dict] = {}
-    for spec in pool:
-        model, _ = split_model_spec(spec)
-        model_id = normalize_model_id(model)
-        entry = by_id.get(model_id)
-        if not entry:
-            return None, None
-        pr = entry.get("pricing", {})
-        prompt = float(pr.get("prompt", 0.0))
-        completion_price = float(pr.get("completion", 0.0))
-        per_task = prompt * 2000 + completion_price * 1000
-        costs[model_id] = per_task
-        pricing[model_id] = {
-            "prompt": prompt,
-            "completion": completion_price,
-            "per_task_estimate": per_task,
-        }
-    return costs, pricing
-
-
 def _resolve_costs(
     pool: list[str], fallback_path: str | Path, out_dir: Path
 ) -> tuple[dict[str, float], str]:
-    """Resolve per-task costs from live OpenRouter pricing, with fallback table."""
-    try:
-        costs, pricing = _fetch_live_pricing(pool)
-        if costs and len(costs) == len(pool):
-            snapshot = {"source": "live", "pool": pool, "pricing": pricing}
-            (out_dir / "pricing_snapshot.json").write_text(json.dumps(snapshot, indent=2))
-            print(f"[retrain] live pricing for {len(costs)} models", flush=True)
-            return costs, "live"
-    except Exception as exc:  # noqa: BLE001
-        print(f"[retrain] live pricing fetch failed: {exc}", flush=True)
-
-    print("[retrain] falling back to cost table", flush=True)
+    """Load the explicit shadow-cost table used for Bifrost-routed labels."""
     costs = _load_cost_table(fallback_path)
-    snapshot = {
-        "source": "fallback",
-        "warning": "Live pricing unavailable; using fallback cost table.",
-        "pool": pool,
-        "costs": costs,
-    }
+    snapshot = {"source": "cost_table", "pool": pool, "costs": costs}
     (out_dir / "pricing_snapshot.json").write_text(json.dumps(snapshot, indent=2))
-    return costs, "fallback"
+    return costs, "cost_table"
 
 
 def _load_cost_table(path: str | Path) -> dict[str, float]:
@@ -953,7 +900,7 @@ def _parse_retrain_args(argv=None) -> argparse.Namespace:
         "--pool",
         default=os.environ.get("RETRAIN_WORKER_MODELS"),
         required=False,
-        help="Comma-separated OpenRouter worker model ids. "
+        help="Comma-separated Bifrost model ids. "
         "Append '|reasoning_effort' per model, e.g. openai/gpt-5.6-terra|xhigh",
     )
     ap.add_argument(
@@ -987,7 +934,7 @@ def _parse_retrain_args(argv=None) -> argparse.Namespace:
     ap.add_argument(
         "--cost-table",
         default=os.environ.get("RETRAIN_COST_TABLE", default_cost_table),
-        help="JSON mapping OpenRouter model id -> USD per task call.",
+        help="JSON mapping model id -> shadow USD per task call.",
     )
     ap.add_argument(
         "--max-worker-concurrency",
@@ -1127,7 +1074,7 @@ def _write_trained_vector(
 def _validate_router(
     router_val: FuguRouter,
     val_rows: list[dict],
-    worker: OpenRouterWorker,
+    worker: BifrostWorker,
 ) -> float:
     print("[retrain] running quick validation on held-out tasks...", flush=True)
     val_hits = 0.0
@@ -1200,7 +1147,7 @@ def main(argv=None) -> None:
     if args.per_model_concurrency:
         per_model_concurrency = json.loads(args.per_model_concurrency)
 
-    worker = OpenRouterWorker(
+    worker = BifrostWorker(
         pool,
         max_worker_concurrency=args.max_worker_concurrency,
         per_model_concurrency=per_model_concurrency,
