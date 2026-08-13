@@ -23,9 +23,18 @@ STARTUP_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 LIB_DIR="$STARTUP_DIR/lib"
 
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$HOME/.local/bin:$PATH"
-set +e
-source "$HOME/.zshrc" 2>/dev/null || true
-set -e
+
+# StartupFolder/launchd does not read shell startup files and this script is
+# bash, not zsh. Import exported env from zsh (same pattern as the gateway and
+# Bifrost launchers) instead of sourcing .zshrc directly: bash runs with
+# `set -u`, and .zshrc's zsh-specific blocks reference variables that are
+# unset here (e.g. $OTTY_SHELL_INTEGRATION), which aborts a non-interactive
+# bash shell on expansion.
+if [ -f "$HOME/.zshrc" ]; then
+  while IFS='=' read -r name value; do
+    [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && export "$name=$value"
+  done < <(/bin/zsh -lc 'source "$HOME/.zshrc" >/dev/null && env')
+fi
 
 BIFROST_URL="http://127.0.0.1:8080/health"
 ROUTER_URL="http://127.0.0.1:5500/healthz"
