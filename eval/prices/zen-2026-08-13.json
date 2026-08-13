@@ -1,0 +1,93 @@
+{
+  "snapshot": "zen-swe-rebench shadow prices",
+  "created": "2026-08-13",
+  "currency": "USD per token",
+  "policy": "manufacturer price first; one consistent paid-provider proxy (OpenRouter) where no paid manufacturer listing exists; free-tier $0 is never a shadow price",
+  "retrieved_at": "2026-08-13",
+  "models": {
+    "opencode-zen/deepseek-v4-flash-free": {
+      "served_model": "opencode-zen/deepseek-v4-flash-free",
+      "source_model_version": "unknown (Zen free tier does not disclose)",
+      "input_per_token": 0.00000014,
+      "output_per_token": 0.00000028,
+      "cached_input_per_token": 0.0000000028,
+      "source_url": "https://models.dev/?provider=deepseek",
+      "source_model_id": "deepseek/deepseek-v4-flash",
+      "retrieved_at": "2026-08-13",
+      "method": "manufacturer price (DeepSeek API)",
+      "available": true
+    },
+    "opencode-zen/mimo-v2.5-free": {
+      "served_model": "opencode-zen/mimo-v2.5-free",
+      "source_model_version": "unknown (Zen free tier does not disclose)",
+      "input_per_token": 0.00000014,
+      "output_per_token": 0.00000028,
+      "cached_input_per_token": 0.0000000028,
+      "source_url": "https://models.dev/?provider=xiaomi",
+      "source_model_id": "xiaomi/mimo-v2.5",
+      "retrieved_at": "2026-08-13",
+      "method": "manufacturer price (Xiaomi MiMo API)",
+      "available": true
+    },
+    "opencode-zen/hy3-free": {
+      "served_model": "opencode-zen/hy3-free",
+      "source_model_version": "unknown (Zen free tier does not disclose)",
+      "input_per_token": 0.000000132,
+      "output_per_token": 0.000000528,
+      "cached_input_per_token": 0.000000033,
+      "source_url": "https://openrouter.ai/tencent/hy3",
+      "source_model_id": "tencent/hy3",
+      "retrieved_at": "2026-08-13",
+      "method": "paid-provider proxy (OpenRouter); no paid Tencent listing on models.dev at snapshot time",
+      "available": true
+    },
+    "opencode-zen/nemotron-3-ultra-free": {
+      "served_model": "opencode-zen/nemotron-3-ultra-free",
+      "source_model_version": "unknown (Zen free tier does not disclose)",
+      "input_per_token": 0.0000005,
+      "output_per_token": 0.0000025,
+      "cached_input_per_token": 0.00000015,
+      "source_url": "https://models.dev/?provider=nvidia",
+      "source_model_id": "nvidia/nemotron-3-ultra-550b-a55b",
+      "retrieved_at": "2026-08-13",
+      "method": "manufacturer price (NVIDIA API catalog)",
+      "available": true
+    },
+    "opencode-zen/nemotron-3.5-lightning-free": {
+      "served_model": "opencode-zen/nemotron-3.5-lightning-free",
+      "source_model_version": "unknown (Zen free tier does not disclose)",
+      "input_per_token": 0.0000001,
+      "output_per_token": 0.00000025,
+      "cached_input_per_token": 0.00000005,
+      "source_url": "https://openrouter.ai/nvidia/nemotron-3.5-lightning",
+      "source_model_id": "nvidia/nemotron-3.5-lightning",
+      "retrieved_at": "2026-08-13",
+      "method": "paid-provider proxy (OpenRouter); NVIDIA lists this SKU at $0 on models.dev and $0 is not a valid shadow price",
+      "available": true
+    },
+    "opencode-zen/laguna-s-2.1-free": {
+      "served_model": "opencode-zen/laguna-s-2.1-free",
+      "source_model_version": "unknown (Zen free tier does not disclose)",
+      "input_per_token": 0.00000009,
+      "output_per_token": 0.00000018,
+      "cached_input_per_token": 0.000000009,
+      "source_url": "https://openrouter.ai/poolside/laguna-s-2.1",
+      "source_model_id": "poolside/laguna-s-2.1",
+      "retrieved_at": "2026-08-13",
+      "method": "paid-provider proxy (OpenRouter); Poolside platform lists $0 free tier only",
+      "available": true
+    },
+    "opencode-zen/ling-3.0-tiny-free": {
+      "served_model": "opencode-zen/ling-3.0-tiny-free",
+      "source_model_version": "unknown (Zen free tier does not disclose)",
+      "input_per_token": null,
+      "output_per_token": null,
+      "cached_input_per_token": null,
+      "source_url": null,
+      "source_model_id": null,
+      "retrieved_at": "2026-08-13",
+      "method": "no defensible paid comparator on models.dev or OpenRouter at snapshot time; excluded from all cost frontier/oracle/interpolation analysis",
+      "available": false
+    }
+  }
+}

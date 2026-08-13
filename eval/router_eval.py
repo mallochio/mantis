@@ -44,6 +44,11 @@ DEFAULT_CAPS = {
     "mantis-direct": 0.80, "heuristic": 0.80, "random-matched": 0.80,
     "trinity": 1.50,
 }
+FIXED_ARM_DEFAULT_CAP = DEFAULT_CAPS["expensive-only"]
+DEFAULT_SHADOW_PRICES = REPO / "eval" / "prices" / "zen-2026-08-13.json"
+# Fixed arms name explicit Bifrost model IDs and must never resolve to the
+# paid control provider; the free Zen pool and the paid control stay distinct.
+FIXED_ARM_FORBIDDEN_PREFIXES = ("opencode-go",)
 ROUTE_HEADER_KEYS = (
     "x-route-decision", "x-route-reason", "x-route-model",
     "x-route-sticky", "x-route-fallback",
@@ -134,6 +139,111 @@ def usage_cost(
     )
 
 
+def load_shadow_prices(path: Path) -> dict[str, dict[str, Any]]:
+    data = cast(dict[str, Any], json.loads(path.read_text()))
+    return cast(dict[str, dict[str, Any]], data["models"])
+
+
+def _cached_input_tokens(usage: dict[str, Any]) -> float:
+    cached = usage.get("prompt_cache_hit_tokens")
+    if cached is None:
+        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+    return float(cached or 0)
+
+
+def shadow_cost(
+    usage: dict[str, Any], model: str, shadow: dict[str, dict[str, Any]]
+) -> tuple[float | None, str]:
+    """Analytic cost from returned token counts and the frozen snapshot.
+
+    Never honours ``usage.cost``: a $0 free-tier response still pays shadow
+    prices. Model lookup is exact-key only -- a bare basename (or an alias)
+    never resolves, so ``x-free`` can collapse nothing onto another provider.
+    """
+    entry = shadow.get(model)
+    if entry is None:
+        return None, "shadow.missing_price"
+    if not entry.get("available", True):
+        return None, "shadow.unavailable"
+    prompt = usage.get("prompt_tokens")
+    completion = usage.get("completion_tokens")
+    if prompt is None or completion is None:
+        return None, "shadow.incomplete_usage"
+    cached = usage.get("prompt_cache_hit_tokens")
+    if cached is None:
+        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+    return (
+        float(prompt) * entry["input_per_token"]
+        + float(completion) * entry["output_per_token"]
+        + float(cached or 0) * entry["cached_input_per_token"],
+        "shadow.tokens_x_snapshot",
+    )
+
+
+def eval_costs(
+    usage: dict[str, Any],
+    model: str,
+    prices: dict[str, dict[str, float]],
+    shadow: dict[str, dict[str, Any]],
+    cost_mode: str,
+) -> dict[str, Any]:
+    """Single cost computation for every proxied request.
+
+    ``actual`` keeps observed spend (usage.cost wins), ``shadow`` is the
+    analytic price-table cost. ``cost``/``cost_method`` is the evaluation
+    cost selected by --cost-mode and is what caps, summaries, and
+    route_metrics consume via the row's ``cost_usd``.
+    """
+    actual, actual_method = usage_cost(usage, model, prices)
+    analytic, analytic_method = shadow_cost(usage, model, shadow)
+    if cost_mode == "shadow":
+        cost, method = analytic, analytic_method
+    else:
+        cost, method = actual, actual_method
+    return {
+        "cost": cost, "cost_method": method,
+        "actual_cost_usd": actual, "actual_cost_method": actual_method,
+        "shadow_cost_usd": analytic, "shadow_cost_method": analytic_method,
+    }
+
+
+def _sum_cost(records: list[dict[str, Any]], key: str) -> float | None:
+    values = [record.get(key) for record in records]
+    if not values or any(value is None for value in values):
+        return None
+    return float(sum(float(value) for value in values))
+
+
+def parse_fixed_models(specs: list[str]) -> dict[str, str]:
+    """Parse repeatable --fixed-model NAME=PROVIDER/MODEL declarations.
+
+    Fixed arms must name an exact provider-qualified model. A name colliding
+    with an existing arm, an unqualified model, or a forbidden provider
+    prefix aborts argument parsing rather than running the wrong target.
+    """
+    fixed: dict[str, str] = {}
+    for spec in specs:
+        if "=" not in spec:
+            raise ValueError(f"--fixed-model needs NAME=PROVIDER/MODEL, got {spec!r}")
+        name, _, model = spec.partition("=")
+        name = name.strip()
+        model = model.strip()
+        if not name or not model:
+            raise ValueError(f"--fixed-model needs NAME=PROVIDER/MODEL, got {spec!r}")
+        if name in ARMS or name in fixed:
+            raise ValueError(f"fixed arm name {name!r} collides with an existing arm")
+        if "/" not in model:
+            raise ValueError(
+                f"fixed arm {name!r} model must be provider-qualified, got {model!r}"
+            )
+        if any(model.startswith(prefix + "/") for prefix in FIXED_ARM_FORBIDDEN_PREFIXES):
+            raise ValueError(
+                f"fixed arm {name!r} targets forbidden provider {model.split('/')[0]!r}"
+            )
+        fixed[name] = model
+    return fixed
+
+
 def _tier_for_arm(
     arm: str, prompt: str, rng: random.Random, frequencies: dict[str, float]
 ) -> str:
@@ -152,7 +262,11 @@ def _model_for_arm(
     tier_models: dict[str, str],
     rng: random.Random,
     frequencies: dict[str, float],
+    fixed_models: dict[str, str] | None = None,
 ) -> tuple[str, str | None]:
+    fixed_models = fixed_models or {}
+    if arm in fixed_models:
+        return fixed_models[arm], None
     if arm in TIERS or arm.endswith("-only") or arm in {"heuristic", "random-matched"}:
         tier = _tier_for_arm(arm, prompt, rng, frequencies)
         return tier_models[tier], tier
@@ -397,15 +511,23 @@ class _ProxyHandler(BaseHTTPRequestHandler):
             if resp.headers.get(key)
         }
         usage = _usage_from_response(resp)
-        billed_model = route.get("x-route-model", proxy.model)
-        cost, method = usage_cost(usage, billed_model, proxy.prices)
+        billed_model = route.get("x-route-model") or (
+            resp.json().get("model", proxy.model)
+            if "json" in resp.headers.get("Content-Type", "")
+            else proxy.model
+        )
+        costs = eval_costs(
+            usage, billed_model, proxy.prices, proxy.shadow_prices, proxy.cost_mode
+        )
         with proxy.lock:
             proxy.records.append(
-                {"route_headers": route, "usage": usage, "cost": cost,
-                 "cost_method": method}
+                {"route_headers": route, "usage": usage, "served_model": billed_model,
+                 **costs}
             )
             try:
-                proxy.ledger.record(proxy.instance_id, proxy.arm, cost, proxy.cap)
+                proxy.ledger.record(
+                    proxy.instance_id, proxy.arm, costs["cost"], proxy.cap
+                )
             except ArmBudgetExceeded:
                 proxy.exceeded = True
             except BudgetAbort:
@@ -439,6 +561,8 @@ class _RouteRecordingProxy:
         arm: str,
         cap: float,
         prices: dict[str, dict[str, float]],
+        shadow_prices: dict[str, dict[str, Any]],
+        cost_mode: str,
         model: str,
         session: str,
     ) -> None:
@@ -449,6 +573,8 @@ class _RouteRecordingProxy:
         self.arm = arm
         self.cap = cap
         self.prices = prices
+        self.shadow_prices = shadow_prices
+        self.cost_mode = cost_mode
         self.model = model
         self.session = session
         self.records: list[dict[str, Any]] = []
@@ -551,6 +677,9 @@ def run_pi_agent(
     endpoint: str,
     tier_models: dict[str, str],
     prices: dict[str, dict[str, float]],
+    shadow_prices: dict[str, dict[str, Any]],
+    cost_mode: str,
+    fixed_models: dict[str, str],
     ledger: CostLedger,
     arm_cap: float,
     rng: random.Random,
@@ -570,13 +699,14 @@ def run_pi_agent(
     root = worktrees_root or DEFAULT_WORKTREES
     instance_id = instance["instance_id"]
     model_name, selected_tier = _model_for_arm(
-        arm, instance["problem_statement"], tier_models, rng, frequencies
+        arm, instance["problem_statement"], tier_models, rng, frequencies, fixed_models
     )
     session = f"router-eval-{secrets.token_hex(8)}"
     api_key = os.environ.get("BIFROST_API_KEY") or os.environ.get("MANTIS_API_KEY")
     proxy = _RouteRecordingProxy(
         upstream=endpoint, api_key=api_key, ledger=ledger, instance_id=instance_id,
-        arm=arm, cap=arm_cap, prices=prices, model=model_name, session=session,
+        arm=arm, cap=arm_cap, prices=prices, shadow_prices=shadow_prices,
+        cost_mode=cost_mode, model=model_name, session=session,
     )
     workdir, cache, created = _ensure_worktree(instance, root)
     ext_path = Path(tempfile.mkdtemp(prefix="pi-eval-")) / "eval-provider.ts"
@@ -585,7 +715,10 @@ def run_pi_agent(
     patch = ""
     trajectory: list[dict[str, Any]] = []
     try:
-        models = sorted(set(tier_models.values()) | {"mantis", "mantis-trinity"})
+        models = sorted(
+            set(tier_models.values()) | set(fixed_models.values())
+            | {"mantis", "mantis-trinity"}
+        )
         _render_provider_extension(
             models, proxy.base_url(), api_key or "", session, output_token_limit,
             ext_path,
@@ -630,8 +763,19 @@ def run_pi_agent(
             "tier": selected_tier, "model": model_name,
             "resolved": bool(grade and grade["resolved"]),
             "model_patch": patch,
-            "cost_usd": ledger.pair_cost(instance_id, arm),
+            # Row-level cost is the selected evaluation cost; any unknown
+            # request cost makes the pair unknown (None), never silently $0.
+            "cost_usd": _sum_cost(proxy.records, "cost")
+            if proxy.records
+            else ledger.pair_cost(instance_id, arm),
             "cost_method": proxy.records[-1]["cost_method"] if proxy.records else None,
+            "actual_cost_usd": _sum_cost(proxy.records, "actual_cost_usd"),
+            "shadow_cost_usd": _sum_cost(proxy.records, "shadow_cost_usd"),
+            "served_models": sorted({
+                record["served_model"]
+                for record in proxy.records
+                if record.get("served_model")
+            }),
             "trajectory": trajectory,
             "route_trace": proxy.records,
         }
@@ -736,6 +880,26 @@ def main() -> None:
         default="cheap=deepseek-v4-flash,middle=gpt-5.6-terra,expensive=gpt-5.6-sol",
     )
     parser.add_argument(
+        "--fixed-model", action="append", default=[], dest="fixed_models",
+        metavar="NAME=PROVIDER/MODEL",
+        help="declare a fixed arm pinned to one exact Bifrost provider/model ID; "
+             "repeatable. Fixed arms bypass tier selection entirely.",
+    )
+    parser.add_argument(
+        "--cost-mode", choices=("actual", "shadow"), default="actual",
+        help="evaluation cost basis for caps, summaries, and metrics; "
+             "shadow ignores usage.cost and prices tokens from the frozen snapshot",
+    )
+    parser.add_argument(
+        "--shadow-prices", type=Path, default=DEFAULT_SHADOW_PRICES,
+        help="frozen shadow price snapshot (created per experiment campaign)",
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="skip (instance_id, arm) pairs already present in --output; "
+             "existing rows (including failed ones) are kept, never silently retried",
+    )
+    parser.add_argument(
         "--worktrees-root", type=Path, default=DEFAULT_WORKTREES,
         help="host worktree root for per-instance checkouts (gitignored)",
     )
@@ -744,16 +908,25 @@ def main() -> None:
     args = parser.parse_args()
     manifest = load_manifest(args.manifest)
     prices = load_prices(args.prices)
+    try:
+        fixed_models = parse_fixed_models(args.fixed_models)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.cost_mode == "shadow" and not args.shadow_prices.exists():
+        parser.error(f"--cost-mode shadow requires a snapshot: {args.shadow_prices}")
+    shadow_prices = (
+        load_shadow_prices(args.shadow_prices) if args.shadow_prices.exists() else {}
+    )
     arms = [arm.strip() for arm in args.arms.split(",") if arm.strip()]
     if args.include_trinity and "trinity" not in arms:
         arms.append("trinity")
-    if set(arms) - set(ARMS):
-        parser.error(f"unknown arms: {sorted(set(arms) - set(ARMS))}")
+    if set(arms) - set(ARMS) - set(fixed_models):
+        parser.error(f"unknown arms: {sorted(set(arms) - set(ARMS) - set(fixed_models))}")
     if "random-matched" in arms and "mantis-direct" not in arms:
         parser.error("random-matched requires mantis-direct for its observed distribution")
-    if "mantis-direct" not in arms and "random-matched" not in arms:
-        parser.error("a router evaluation requires mantis-direct")
-    caps = {arm: DEFAULT_CAPS[arm] for arm in arms}
+    if set(arms) - set(fixed_models) and "mantis-direct" not in arms:
+        parser.error("a router evaluation with tier/route arms requires mantis-direct")
+    caps = {arm: DEFAULT_CAPS.get(arm, FIXED_ARM_DEFAULT_CAP) for arm in arms}
     if args.per_instance_cost is not None:
         caps = dict.fromkeys(arms, args.per_instance_cost)
     for override in args.arm_cap:
@@ -770,6 +943,15 @@ def main() -> None:
     ledger = CostLedger(total_limit=args.budget_usd, arm_limit=max(caps.values()))
     frequencies = {tier: 1 / len(TIERS) for tier in TIERS}
     pi_executable = tuple(args.pi_executable.split())
+    done_pairs: set[tuple[str, str]] = set()
+    if args.resume and args.output.exists():
+        for line in args.output.read_text().splitlines():
+            with contextlib.suppress(ValueError):
+                record = json.loads(line)
+                if record.get("record_type") == "result" and "arm" in record:
+                    done_pairs.add((record["instance_id"], record["arm"]))
+        if done_pairs:
+            print(f"resume: skipping {len(done_pairs)} completed (instance, arm) pairs")
     metadata = {
         "manifest": str(args.manifest),
         "manifest_sha256": hashlib.sha256(args.manifest.read_bytes()).hexdigest(),
@@ -779,36 +961,48 @@ def main() -> None:
         "output_token_limit": args.output_token_limit, "seed": args.seed,
         "pi_executable": args.pi_executable,
         "worktrees_root": str(args.worktrees_root),
+        "cost_mode": args.cost_mode,
+        "shadow_prices": str(args.shadow_prices),
+        "shadow_prices_sha256": (
+            hashlib.sha256(args.shadow_prices.read_bytes()).hexdigest()
+            if args.shadow_prices.exists() else None
+        ),
+        "fixed_models": fixed_models,
+        "tier_models": tier_models,
         "aborted_on_budget": False, "excluded_instances": [],
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("w") as output:
+    with args.output.open("a" if args.resume else "w") as output:
         output.write(json.dumps({"record_type": "metadata", "metadata": metadata}) + "\n")
         instances = manifest["instances"]
         direct_rows: dict[str, dict[str, Any]] = {}
-        for instance in instances:
-            if ledger.total >= ledger.total_limit:
-                metadata["aborted_on_budget"] = True
-                break
-            row = run_pi_agent(
-                instance, arm="mantis-direct", endpoint=args.mantis_endpoint,
-                tier_models=tier_models, prices=prices, ledger=ledger,
-                arm_cap=caps["mantis-direct"], rng=rng,
-                timeout=args.timeout, output_token_limit=args.output_token_limit,
-                frequencies={tier: 1 / len(TIERS) for tier in TIERS},
-                worktrees_root=args.worktrees_root, pi_executable=pi_executable,
-                keep_worktrees=args.keep_worktrees,
-            )
-            output.write(json.dumps({"record_type": "result", **row}) + "\n")
-            output.flush()
-            if row.get("abort_scope") == "instance_arm":
-                metadata["excluded_instances"].append(instance["instance_id"])
-                continue
-            if row.get("aborted"):
-                metadata["aborted_on_budget"] = True
-                break
-            direct_rows[instance["instance_id"]] = row
-        if not metadata["aborted_on_budget"]:
+        if "mantis-direct" in arms:
+            for instance in instances:
+                if ledger.total >= ledger.total_limit:
+                    metadata["aborted_on_budget"] = True
+                    break
+                if (instance["instance_id"], "mantis-direct") in done_pairs:
+                    continue
+                row = run_pi_agent(
+                    instance, arm="mantis-direct", endpoint=args.mantis_endpoint,
+                    tier_models=tier_models, prices=prices, shadow_prices=shadow_prices,
+                    cost_mode=args.cost_mode, fixed_models=fixed_models, ledger=ledger,
+                    arm_cap=caps["mantis-direct"], rng=rng,
+                    timeout=args.timeout, output_token_limit=args.output_token_limit,
+                    frequencies={tier: 1 / len(TIERS) for tier in TIERS},
+                    worktrees_root=args.worktrees_root, pi_executable=pi_executable,
+                    keep_worktrees=args.keep_worktrees,
+                )
+                output.write(json.dumps({"record_type": "result", **row}) + "\n")
+                output.flush()
+                if row.get("abort_scope") == "instance_arm":
+                    metadata["excluded_instances"].append(instance["instance_id"])
+                    continue
+                if row.get("aborted"):
+                    metadata["aborted_on_budget"] = True
+                    break
+                direct_rows[instance["instance_id"]] = row
+        if "mantis-direct" in arms and not metadata["aborted_on_budget"]:
             observed = [
                 tier
                 for row in direct_rows.values()
@@ -817,20 +1011,25 @@ def main() -> None:
             if not observed:
                 raise RuntimeError("mantis-direct produced no route decisions")
             frequencies = {tier: observed.count(tier) / len(observed) for tier in TIERS}
-            remaining_arms = [arm for arm in arms if arm != "mantis-direct"]
+        remaining_arms = [arm for arm in arms if arm != "mantis-direct"]
+        if remaining_arms and not metadata["aborted_on_budget"]:
             for instance in instances:
                 instance_id = instance["instance_id"]
                 if instance_id in metadata["excluded_instances"]:
                     continue
-                rows = [direct_rows[instance_id]]
+                rows = [direct_rows[instance_id]] if instance_id in direct_rows else []
                 for arm in remaining_arms:
+                    if (instance_id, arm) in done_pairs:
+                        continue
                     endpoint = (
                         args.mantis_endpoint if arm == "trinity"
                         else args.bifrost_endpoint
                     )
                     row = run_pi_agent(
                         instance, arm=arm, endpoint=endpoint,
-                        tier_models=tier_models, prices=prices, ledger=ledger,
+                        tier_models=tier_models, prices=prices,
+                        shadow_prices=shadow_prices, cost_mode=args.cost_mode,
+                        fixed_models=fixed_models, ledger=ledger,
                         arm_cap=caps[arm],
                         rng=rng, timeout=args.timeout,
                         output_token_limit=args.output_token_limit,

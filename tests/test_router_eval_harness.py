@@ -241,6 +241,7 @@ def test_proxy_forwards_and_records_route_headers():
         api_key="sk-test", ledger=ledger, instance_id="demo-1", arm="cheap-only",
         cap=2.0,
         prices={"cheap": {"input_per_token": 1.0, "output_per_token": 1.0}},
+        shadow_prices={}, cost_mode="actual",
         model="cheap", session="router-eval-test",
     )
     try:
@@ -266,7 +267,8 @@ def test_proxy_aborts_on_arm_cap():
     proxy = harness._RouteRecordingProxy(
         upstream="http://127.0.0.1:1/v1/chat/completions",
         api_key=None, ledger=ledger, instance_id="demo-1", arm="cheap-only",
-        cap=1.0, prices={}, model="cheap", session="router-eval-test",
+        cap=1.0, prices={}, shadow_prices={}, cost_mode="actual",
+        model="cheap", session="router-eval-test",
     )
     try:
         ledger.pair_costs[("demo-1", "cheap-only")] = 1.0
@@ -295,6 +297,7 @@ def test_run_pi_agent_end_to_end(tmp_path, monkeypatch):
             endpoint=f"http://127.0.0.1:{upstream.server_port}/v1/chat/completions",
             tier_models={"cheap": "cheap", "middle": "middle", "expensive": "expensive"},
             prices={"cheap": {"input_per_token": 1.0, "output_per_token": 1.0}},
+            shadow_prices={}, cost_mode="actual", fixed_models={},
             ledger=harness.CostLedger(total_limit=2.0, arm_limit=2.0),
             arm_cap=2.0,
             rng=harness.random.Random(1), timeout=30, output_token_limit=32,
@@ -324,6 +327,7 @@ def test_run_pi_agent_aborts_on_instance_budget(tmp_path):
         endpoint="http://127.0.0.1:1/v1/chat/completions",
         tier_models={"cheap": "cheap", "middle": "middle", "expensive": "expensive"},
         prices={"cheap": {"input_per_token": 1.0, "output_per_token": 1.0}},
+        shadow_prices={}, cost_mode="actual", fixed_models={},
         ledger=ledger, arm_cap=1.0,
         rng=harness.random.Random(1), timeout=30, output_token_limit=32,
         frequencies={"cheap": 1.0, "middle": 0.0, "expensive": 0.0},
