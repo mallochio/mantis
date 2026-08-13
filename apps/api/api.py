@@ -649,7 +649,7 @@ def _router_response_headers(upstream: httpx.Response) -> dict[str, str]:
 def _router_error(upstream: httpx.Response) -> JSONResponse:
     try:
         body = upstream.json()
-    except ValueError:
+    except (ValueError, httpx.ResponseNotRead):
         body = {
             "error": {
                 "message": "router returned an invalid response",
