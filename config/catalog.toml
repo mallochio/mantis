@@ -15,27 +15,30 @@ protocols = ["anthropic_messages"]
 
 [routellm]
 active_policy = "coding"
-revision = "bifrost-2026-08-12"
+revision = "bifrost-2026-08-13-model-swap"
 
 [routellm.targets.cheap]
 provider = "bifrost"
-# deepseek-v4-flash (models.dev opencode/deepseek): ctx 1M, max output 384k
+# deepseek-v4-pro (Bifrost OpenCode Go route): max output 384k.
+# No reasoning_effort is configured, so caller settings are preserved.
 max_tokens = 384000
-upstream_model = "deepseek-v4-flash"
+upstream_model = "deepseek-v4-pro"
 protocols = ["chat_completions", "responses"]
 rank = 0
 
 [routellm.targets.middle]
 provider = "bifrost"
-# gpt-5.6-terra (models.dev azure/openai): ctx 1.05M, max output 128k
+# kimi-k3 (Bifrost Kimi/Modal route): conservative max output 128k.
+# No reasoning_effort is configured, so caller settings are preserved.
 max_tokens = 128000
-upstream_model = "gpt-5.6-terra"
+upstream_model = "kimi-k3"
 protocols = ["chat_completions", "responses"]
 rank = 1
 
 [routellm.targets.expensive]
 provider = "bifrost"
-# claude-opus-5 (models.dev bedrock/anthropic): ctx 1M, max output 128k
+# Claude Opus 5 through Bifrost Bedrock: max output 128k.
+# No reasoning_effort is configured, so caller settings are preserved.
 max_tokens = 128000
 upstream_model = "bedrock/anthropic/claude-opus-5"
 protocols = ["chat_completions", "responses"]
