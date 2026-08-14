@@ -56,13 +56,67 @@ under/over-routing regret, endpoint interpolation, and an injected-decider
 complexity confusion matrix. It never treats an error row as a successful
 resolution.
 
+## Fixed arms and shadow cost (free-model Zen study)
+
+For the free-model studies the harness can run **fixed arms** against explicit
+provider-qualified model IDs and account cost on a frozen **shadow** price
+snapshot instead of the `$0` free-tier price:
+
+```bash
+uv run python eval/router_eval.py   --manifest eval/router_manifest.json   --prices eval/model_prices.json   --shadow-prices eval/prices/zen-2026-08-13.json   --cost-mode shadow   --fixed-model hy3=opencode-zen/hy3-free   --arms hy3   --resume   --timeout 1200 --output-token-limit 4096   --per-instance-cost 5.0
+```
+
+- `--fixed-model NAME=PROVIDER/MODEL` (repeatable) declares a fixed arm pinned
+  to one Bifrost model; `--arms` then lists only those names. Fixed arms never
+  resolve to `opencode-go/*` and never touch the live Mantis router.
+- `--cost-mode shadow` ignores `usage.cost` and prices token usage against the
+  dated snapshot; `actual_cost_usd`, `actual_cost_method`, `shadow_cost_usd`,
+  and `shadow_cost_method` are written per request and per row. Missing token
+  counts or prices stay `unknown`, never `$0`.
+- `--resume` skips `(instance_id, arm)` pairs already present in `--output`, so
+  a spot-preempted worker can continue from the last uploaded JSONL.
+- `--per-instance-cost` / `--arm-cap ARM=USD` bound the shadow spend per
+  episode; only a **global** budget abort stops the whole campaign, while
+  timeouts and per-instance cap hits are recorded as per-episode failures.
+
+The recording proxy retries transient upstream failures (429/5xx and Bifrost's
+`400 FreeUsageLimitError` envelope) with exponential backoff plus jitter,
+honoring `Retry-After`. Tune it with `EVAL_PROXY_RETRIES` (default 8),
+`EVAL_PROXY_RETRY_BASE` (1.0s), `EVAL_PROXY_RETRY_MAX_WAIT` (60s), and
+`EVAL_PROXY_RETRY_ON_STATUS` (comma list; default `429,500,502,503,504`).
+
+`manifests/zen-pilot-12.json` is the frozen 12-task compatibility pilot; the
+40-task `router_manifest.json` is the tier-selection manifest. The shadow
+snapshot is `prices/zen-2026-08-13.json`. `ling-3.0-tiny-free` is not served
+by the Zen gateway (`ModelError`) and is excluded from cost/quality tiers.
+
+## Cloud benchmark runs
+
+`launch/sky/zen-swe-rebench-*.yaml` define the GCP/SkyPilot tasks; the worker
+scripts under `scripts/zen_swe_rebench_*.sh` host a private Zen-only Bifrost on
+`127.0.0.1:8080` on each worker, verify the model allowlist, and upload results
+to `gs://ih-storage-sid/<job-id>/` (upload-only; no GCS bucket is created).
+Phase 2 shards one cluster per fixed arm and fans results in to
+`gs://ih-storage-sid/<run-id>/<arm>/results.jsonl`.
+
+```bash
+sky launch -y -d --cluster zen-phase2-hy3 launch/sky/zen-swe-rebench-phase2.yaml   --env ARM=hy3 --env RUN_ID=job-<8hex>   --env OPENCODE_API_KEY=... --env BIFROST_API_KEY=... --env BIFROST_ENCRYPTION_KEY=...
+```
+
+Secrets are passed via `--env` and are never committed.
+
 ## Files
 
+- `router_eval.py` — the graded SWE-rebench router/fixed-arm harness.
+- `route_metrics.py` — oracle, regret, interpolation, and confusion-matrix metrics.
 - `run_eval.py` — runs a config against fixtures and writes raw results.
 - `score.py` — scores raw results and writes a scored projection plus `report.md`.
 - `ab_compare.py` — compares two result sets for an A/B report.
 - `report_luna.py` — builds the luna-conductor report against the native-v2 baseline.
 - `fixtures.jsonl` — the fixed set of eval prompts/cases used by all configs.
+- `router_manifest.json` — frozen 40-task SWE-rebench tier-selection manifest.
+- `manifests/zen-pilot-12.json` — frozen 12-task compatibility pilot manifest.
+- `prices/zen-2026-08-13.json` — frozen free-model shadow price snapshot.
 
 ## Regeneration commands
 

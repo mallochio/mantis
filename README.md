@@ -23,6 +23,14 @@ internal direct-mode gateway at :5500. They share the routing catalog but keep
 separate dependency locks because the API includes orchestration and training
 dependencies that the gateway does not need.
 
+`eval/` is the offline router-evaluation harness: it drives the `pi` coding
+agent headless against frozen SWE-rebench tasks, grades the resulting patches
+in fresh Docker containers, and records per-request route headers, usage, and
+actual/shadow cost (see `eval/README.md`). `plans/` holds the preregistered
+experiment plans for the free-model Zen SWE-rebench studies. `launch/sky/`
+contains the GCP/SkyPilot task definitions for those benchmark campaigns;
+`launch/host/` is the local host launcher stack.
+
 `mantis` responses carry `x-route-decision`, `x-route-reason`,
 `x-route-sticky`, `x-route-model`, `x-route-attempts`, and
 `x-route-fallback`. Send `X-Route-Session` to retain routing affinity across
@@ -229,6 +237,38 @@ Streaming requests with `stream_options.include_usage` emit a final `mantis`
 SSE frame before `[DONE]` when details are requested.
 
 `/v1/models` descriptors report `context_length` and `max_completion_tokens`, both env-configurable via `MANTIS_CONTEXT_LENGTH` and `MANTIS_MAX_COMPLETION_TOKENS`; downstream cost is reported per request in `usage.cost`.
+
+## SWE-rebench evaluation
+
+The `eval/` harness measures the router as a router on public, revision-pinned
+SWE-rebench tasks. Two things distinguish it from the live API: every model
+call is a **fixed, explicit provider/model arm** (no live routing), and every
+request records route headers, usage, and both **actual cost** and a frozen
+**shadow cost** so free-tier models can sit on a cost frontier without their
+`$0` price collapsing it.
+
+```bash
+# No model calls: print the arm list, caps, and shadow price table.
+uv run python eval/router_eval.py \
+  --manifest eval/manifests/zen-pilot-12.json \
+  --prices eval/model_prices.json \
+  --shadow-prices eval/prices/zen-2026-08-13.json \
+  --cost-mode shadow \
+  --fixed-model deepseek=opencode-zen/deepseek-v4-flash-free \
+  --fixed-model hy3=opencode-zen/hy3-free \
+  --arms deepseek,hy3 \
+  --dry-run
+```
+
+Cloud campaigns run on GCP through SkyPilot, one resumable shard per
+task/model/condition. The workers host a private Zen-only Bifrost on
+`127.0.0.1:8080`, verify the allowlist, and write results to
+`gs://ih-storage-sid/<job-id>/` (upload-only; no bucket is created). Rate-limit
+retries use exponential backoff plus jitter and are tunable with
+`EVAL_PROXY_RETRIES`, `EVAL_PROXY_RETRY_BASE`, `EVAL_PROXY_RETRY_MAX_WAIT`, and
+`EVAL_PROXY_RETRY_ON_STATUS`. See `plans/zen-only-swe-rebench-night-run.md` and
+`plans/batched-queue-zen-swe-rebench-experiment.md` for the preregistered
+protocol, and `eval/README.md` for the harness details.
 
 ## Artifacts
 
