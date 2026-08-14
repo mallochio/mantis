@@ -1,0 +1,48 @@
+# Zen-only SWE-rebench Phase 1 pilot (launch task; reuses the preflight cluster).
+#
+# Same setup as the preflight launch so SkyPilot skips re-running it on the
+# already-provisioned cluster. No `workdir`, no storage mounts: SkyPilot
+# rsyncs local file_mounts straight to the VM, so no GCS bucket is created.
+# Results are written (upload-only) to gs://ih-storage-sid/<JOB_ID>/ under an
+# auto-generated (or env-supplied, for resume) job suffix.
+
+name: zen-swe-rebench-pilot
+
+resources:
+  cloud: gcp
+  region: europe-west4
+  cpus: 4
+  memory: 16+
+  disk_size: 120
+  use_spot: true
+
+file_mounts:
+  /opt/mantis-eval/scripts/zen_swe_rebench_pilot.sh: scripts/zen_swe_rebench_pilot.sh
+  /opt/mantis-eval/scripts/zen_swe_rebench_worker.sh: scripts/zen_swe_rebench_worker.sh
+  /opt/mantis-eval/eval/router_eval.py: eval/router_eval.py
+  /opt/mantis-eval/eval/model_prices.json: eval/model_prices.json
+  /opt/mantis-eval/eval/prices/zen-2026-08-13.json: eval/prices/zen-2026-08-13.json
+  /opt/mantis-eval/eval/manifests/zen-pilot-12.json: eval/manifests/zen-pilot-12.json
+
+setup: |
+  set -euxo pipefail
+  export DEBIAN_FRONTEND=noninteractive
+  sudo apt-get update -y
+  sudo apt-get install -y --no-install-recommends git curl ca-certificates gnupg openssl python3 python3-pip python3-requests
+  # Docker for the SWE-rebench grader (not exercised in preflight, installed now
+  # so the pilot reuses this image). gcpuser is already in the docker group.
+  if ! command -v docker >/dev/null 2>&1; then
+    curl -fsSL https://get.docker.com | sudo sh
+    (sudo systemctl enable --now docker || (sudo nohup dockerd >/var/log/dockerd.log 2>&1 &)) || true
+  fi
+  # Node 22 for the pi coding agent CLI and the Bifrost npx wrapper.
+  if ! command -v node >/dev/null 2>&1 || [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 22 ]; then
+    curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+    sudo apt-get install -y nodejs
+  fi
+  sudo npm install -g @earendil-works/pi-coding-agent@0.84.1
+  echo "node=$(node --version) pi=$(pi --version) docker=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo n/a)"
+
+run: |
+  set -euo pipefail
+  bash /opt/mantis-eval/scripts/zen_swe_rebench_pilot.sh

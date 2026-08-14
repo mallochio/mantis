@@ -336,3 +336,187 @@ def test_run_pi_agent_aborts_on_instance_budget(tmp_path):
     assert row["aborted"] is True
     assert row["abort_scope"] == "instance_arm"
     assert row["resolved"] is False
+
+
+def _status_sequence_server(statuses: list[int]):
+    seen: list[int] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            self.rfile.read(length)
+            status = statuses[min(len(seen), len(statuses) - 1)]
+            seen.append(status)
+            if status >= 400:
+                body = json.dumps({"error": {"message": "upstream", "type": "retry"}}).encode()
+            else:
+                body = json.dumps({
+                    "id": "fake", "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.0},
+                }).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, seen
+
+
+def test_proxy_retries_transient_429_then_succeeds(monkeypatch):
+    monkeypatch.setenv("EVAL_PROXY_RETRIES", "3")
+    monkeypatch.setenv("EVAL_PROXY_RETRY_BASE", "0.0")
+    monkeypatch.setenv("EVAL_PROXY_RETRY_MAX_WAIT", "0.0")
+    upstream, seen = _status_sequence_server([429, 200])
+    ledger = harness.CostLedger(total_limit=2.0, arm_limit=2.0)
+    proxy = harness._RouteRecordingProxy(
+        upstream=f"http://127.0.0.1:{upstream.server_port}/v1/chat/completions",
+        api_key=None, ledger=ledger, instance_id="demo-1", arm="cheap-only",
+        cap=2.0, prices={}, shadow_prices={}, cost_mode="actual",
+        model="cheap", session="router-eval-test",
+    )
+    try:
+        resp = requests.post(f"{proxy.base_url()}/chat/completions", json={}, timeout=30)
+        assert resp.status_code == 200
+        assert seen == [429, 200]
+        assert proxy.records[0]["retries"] == 1
+        assert proxy.records[0]["status"] == 200
+    finally:
+        proxy.close()
+        upstream.shutdown()
+
+
+def test_proxy_retries_persistent_429_then_fails(monkeypatch):
+    monkeypatch.setenv("EVAL_PROXY_RETRIES", "2")
+    monkeypatch.setenv("EVAL_PROXY_RETRY_BASE", "0.0")
+    monkeypatch.setenv("EVAL_PROXY_RETRY_MAX_WAIT", "0.0")
+    upstream, seen = _status_sequence_server([429])
+    ledger = harness.CostLedger(total_limit=2.0, arm_limit=2.0)
+    proxy = harness._RouteRecordingProxy(
+        upstream=f"http://127.0.0.1:{upstream.server_port}/v1/chat/completions",
+        api_key=None, ledger=ledger, instance_id="demo-1", arm="cheap-only",
+        cap=2.0, prices={}, shadow_prices={}, cost_mode="actual",
+        model="cheap", session="router-eval-test",
+    )
+    try:
+        resp = requests.post(f"{proxy.base_url()}/chat/completions", json={}, timeout=30)
+        assert resp.status_code == 429
+        assert seen == [429, 429, 429]
+        assert proxy.records[0]["retries"] == 2
+        assert proxy.records[0]["status"] == 429
+    finally:
+        proxy.close()
+        upstream.shutdown()
+
+
+def _rate_limit_then_success_server():
+    seen: list[int] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            self.rfile.read(length)
+            seen.append(len(seen) + 1)
+            if len(seen) == 1:
+                status = 400
+                body = json.dumps({
+                    "type": "error",
+                    "error": {"type": "FreeUsageLimitError",
+                              "message": "Rate limit exceeded. Please try again later."},
+                }).encode()
+            else:
+                status = 200
+                body = json.dumps({
+                    "id": "fake", "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.0},
+                }).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, seen
+
+
+def test_proxy_retries_bifrost_400_rate_limit_envelope(monkeypatch):
+    monkeypatch.setenv("EVAL_PROXY_RETRIES", "3")
+    monkeypatch.setenv("EVAL_PROXY_RETRY_BASE", "0.0")
+    monkeypatch.setenv("EVAL_PROXY_RETRY_MAX_WAIT", "0.0")
+    upstream, seen = _rate_limit_then_success_server()
+    ledger = harness.CostLedger(total_limit=2.0, arm_limit=2.0)
+    proxy = harness._RouteRecordingProxy(
+        upstream=f"http://127.0.0.1:{upstream.server_port}/v1/chat/completions",
+        api_key=None, ledger=ledger, instance_id="demo-1", arm="cheap-only",
+        cap=2.0, prices={}, shadow_prices={}, cost_mode="actual",
+        model="cheap", session="router-eval-test",
+    )
+    try:
+        resp = requests.post(f"{proxy.base_url()}/chat/completions", json={}, timeout=30)
+        assert resp.status_code == 200
+        assert seen == [1, 2]
+        assert proxy.records[0]["retries"] == 1
+        assert proxy.records[0]["status"] == 200
+    finally:
+        proxy.close()
+        upstream.shutdown()
+
+
+def test_worktree_add_and_remove_use_cwd(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=cache, check=True)
+    subprocess.run(["git", "config", "user.email", "eval@test"], cwd=cache, check=True)
+    subprocess.run(["git", "config", "user.name", "eval"], cwd=cache, check=True)
+    (cache / "f.py").write_text("x\n")
+    subprocess.run(["git", "add", "f.py"], cwd=cache, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=cache, check=True)
+
+    worktree = tmp_path / "wt"
+    harness._git("worktree", "add", "--detach", str(worktree), "HEAD", cwd=cache)
+    assert (worktree / "f.py").exists()
+
+    harness._remove_worktree(worktree, cache)
+    assert not worktree.exists()
+
+
+def test_proxy_retry_config_defaults_and_env(monkeypatch):
+    monkeypatch.delenv("EVAL_PROXY_RETRIES", raising=False)
+    monkeypatch.delenv("EVAL_PROXY_RETRY_BASE", raising=False)
+    monkeypatch.delenv("EVAL_PROXY_RETRY_MAX_WAIT", raising=False)
+    monkeypatch.delenv("EVAL_PROXY_RETRY_ON_STATUS", raising=False)
+    retries, base, max_wait, statuses = harness._proxy_retry_config()
+    assert retries == 8
+    assert base == 1.0
+    assert max_wait == 60.0
+    assert statuses == {429, 500, 502, 503, 504}
+
+    monkeypatch.setenv("EVAL_PROXY_RETRIES", "2")
+    monkeypatch.setenv("EVAL_PROXY_RETRY_BASE", "0.25")
+    monkeypatch.setenv("EVAL_PROXY_RETRY_MAX_WAIT", "10")
+    monkeypatch.setenv("EVAL_PROXY_RETRY_ON_STATUS", "429, 503")
+    retries, base, max_wait, statuses = harness._proxy_retry_config()
+    assert retries == 2
+    assert base == 0.25
+    assert max_wait == 10.0
+    assert statuses == {429, 503}

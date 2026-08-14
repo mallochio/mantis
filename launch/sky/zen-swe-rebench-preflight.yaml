@@ -1,0 +1,53 @@
+# Zen-only SWE-rebench Phase 0 preflight (worker-hosted private Bifrost).
+#
+# Launch from the repo root (secrets come from the shell, never committed):
+#   source ~/.zshrc
+#   sky launch -y launch/sky/zen-swe-rebench-preflight.yaml \
+#     --env OPENCODE_API_KEY="$OPENCODE_API_KEY" \
+#     --env BIFROST_API_KEY="$BIFROST_API_KEY" \
+#     --env BIFROST_ENCRYPTION_KEY="$BIFROST_ENCRYPTION_KEY"
+#
+# No `workdir`, no storage mounts, and no managed-jobs controller: SkyPilot
+# rsyncs the local file_mounts straight to the VM, so no GCS bucket is ever
+# created. Results are written (upload-only) to the pre-existing
+# gs://ih-storage-sid bucket under a fresh job-<suffix>/ prefix.
+
+name: zen-swe-rebench-preflight
+
+resources:
+  cloud: gcp
+  region: europe-west4
+  cpus: 4
+  memory: 16+
+  disk_size: 120
+  use_spot: true
+
+file_mounts:
+  /opt/mantis-eval/scripts/zen_swe_rebench_worker.sh: scripts/zen_swe_rebench_worker.sh
+  /opt/mantis-eval/eval/router_eval.py: eval/router_eval.py
+  /opt/mantis-eval/eval/model_prices.json: eval/model_prices.json
+  /opt/mantis-eval/eval/prices/zen-2026-08-13.json: eval/prices/zen-2026-08-13.json
+  /opt/mantis-eval/eval/manifests/zen-pilot-12.json: eval/manifests/zen-pilot-12.json
+
+setup: |
+  set -euxo pipefail
+  export DEBIAN_FRONTEND=noninteractive
+  sudo apt-get update -y
+  sudo apt-get install -y --no-install-recommends git curl ca-certificates gnupg openssl python3 python3-pip python3-requests
+  # Docker for the SWE-rebench grader (not exercised in preflight, installed now
+  # so the pilot reuses this image). gcpuser is already in the docker group.
+  if ! command -v docker >/dev/null 2>&1; then
+    curl -fsSL https://get.docker.com | sudo sh
+    (sudo systemctl enable --now docker || (sudo nohup dockerd >/var/log/dockerd.log 2>&1 &)) || true
+  fi
+  # Node 22 for the pi coding agent CLI and the Bifrost npx wrapper.
+  if ! command -v node >/dev/null 2>&1 || [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 22 ]; then
+    curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+    sudo apt-get install -y nodejs
+  fi
+  sudo npm install -g @earendil-works/pi-coding-agent@0.84.1
+  echo "node=$(node --version) pi=$(pi --version) docker=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo n/a)"
+
+run: |
+  set -euo pipefail
+  bash /opt/mantis-eval/scripts/zen_swe_rebench_worker.sh

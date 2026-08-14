@@ -24,6 +24,7 @@ import shlex
 import subprocess
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, cast
@@ -367,7 +368,7 @@ def grade_patch(instance: dict[str, Any], patch: str) -> dict[str, Any]:
         commands = {"fail_to_pass": _test_command(instance, f2p),
                     "pass_to_pass": _test_command(instance, p2p)}
     except ValueError as exc:
-        return {"resolved": False, "grader_error": str(exc)}
+        return {"resolved": False, "grader_output": str(exc), "grader_error": str(exc)}
     common = {
         "image": instance["docker_image"], "patch": patch,
         "test_patch": instance.get("test_patch", ""),
@@ -418,15 +419,15 @@ def _ensure_worktree(instance: dict[str, Any], root: Path) -> tuple[Path, Path |
             capture_output=True, text=True, check=True,
         )
     else:
-        _git("-C", str(cache), "fetch", "origin")
+        _git("fetch", "origin", cwd=cache)
     workdir.parent.mkdir(parents=True, exist_ok=True)
-    _git("-C", str(cache), "worktree", "add", "--detach", str(workdir), commit)
+    _git("worktree", "add", "--detach", str(workdir), commit, cwd=cache)
     return workdir, cache, True
 
 
 def _remove_worktree(workdir: Path, cache: Path) -> None:
-    _git("-C", str(cache), "worktree", "remove", "--force", str(workdir))
-    _git("-C", str(cache), "worktree", "prune")
+    _git("worktree", "remove", "--force", str(workdir), cwd=cache)
+    _git("worktree", "prune", cwd=cache)
 
 
 def _worktree_patch(workdir: Path) -> str:
@@ -459,9 +460,81 @@ def _usage_from_response(resp: requests.Response) -> dict[str, Any]:
     return {}
 
 
+_DEFAULT_RETRY_STATUSES = (429, 500, 502, 503, 504)
+
+
+def _proxy_retry_config() -> tuple[int, float, float, frozenset[int]]:
+    """Read proxy retry policy from env; keep Zen free-tier rate limits and
+    transient gateway failures from silently failing a whole rollout."""
+    try:
+        retries = max(0, int(os.environ.get("EVAL_PROXY_RETRIES", "8")))
+    except ValueError:
+        retries = 8
+    try:
+        base = max(0.0, float(os.environ.get("EVAL_PROXY_RETRY_BASE", "1.0")))
+    except ValueError:
+        base = 1.0
+    try:
+        max_wait = max(0.0, float(os.environ.get("EVAL_PROXY_RETRY_MAX_WAIT", "60.0")))
+    except ValueError:
+        max_wait = 60.0
+    raw = os.environ.get("EVAL_PROXY_RETRY_ON_STATUS", "")
+    parts = [part for part in raw.replace(" ", "").split(",") if part]
+    statuses: set[int] = set()
+    for part in parts or [str(status) for status in _DEFAULT_RETRY_STATUSES]:
+        try:
+            statuses.add(int(part))
+        except ValueError:
+            continue
+    return retries, base, max_wait, frozenset(statuses or set(_DEFAULT_RETRY_STATUSES))
+
+
+def _retry_after_seconds(headers: dict[str, str], fallback: float) -> float:
+    raw = headers.get("Retry-After")
+    if raw is None:
+        return fallback
+    try:
+        return float(raw)
+    except ValueError:
+        return fallback
+
+
+def _sleep_with_jitter(seconds: float) -> float:
+    delay = max(0.0, seconds * random.uniform(0.5, 1.5))
+    time.sleep(delay)
+    return delay
+
+
+def _is_retryable_response(resp: requests.Response, statuses: frozenset[int]) -> bool:
+    """Treat gateway rate-limit envelopes as retryable even when the gateway
+    surfaces them as a 400 body (Bifrost returns FreeUsageLimitError with a
+    400 status rather than a 429)."""
+    if resp.status_code in statuses:
+        return True
+    if "json" not in (resp.headers.get("Content-Type") or ""):
+        return False
+    try:
+        body = resp.json()
+    except ValueError:
+        return False
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict):
+        if error.get("type") == "FreeUsageLimitError":
+            return True
+        message = error.get("message")
+        if isinstance(message, str) and "rate limit" in message.lower():
+            return True
+    return False
+
+
 class _ProxyHandler(BaseHTTPRequestHandler):
     """Forward chat completions to the upstream while recording route headers
-    and enforcing the arm/global budget ceiling."""
+    and enforcing the arm/global budget ceiling.
+
+    Retries only transient failures (429/5xx and transport errors) with
+    exponential backoff plus jitter; it never retries budget refusals and
+    never changes the logical request identity across attempts.
+    """
 
     protocol_version = "HTTP/1.1"
 
@@ -499,11 +572,25 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         if session:
             headers["X-Route-Session"] = session
         url = proxy.upstream
-        try:
-            resp = requests.post(url, data=body, headers=headers, timeout=300)
-        except requests.RequestException as exc:
-            self._error(502, f"{type(exc).__name__}: {exc}")
-            return
+        retries, retry_base, retry_max_wait, retry_statuses = _proxy_retry_config()
+        attempt = 0
+        while True:
+            try:
+                resp = requests.post(url, data=body, headers=headers, timeout=300)
+            except requests.RequestException as exc:
+                attempt += 1
+                if attempt > retries:
+                    self._error(502, f"{type(exc).__name__}: {exc}")
+                    return
+                delay = min(retry_max_wait, retry_base * (2 ** (attempt - 1)))
+                _sleep_with_jitter(delay)
+                continue
+            if attempt < retries and _is_retryable_response(resp, retry_statuses):
+                attempt += 1
+                delay = min(retry_max_wait, retry_base * (2 ** (attempt - 1)))
+                _sleep_with_jitter(_retry_after_seconds(dict(resp.headers), delay))
+                continue
+            break
         payload = resp.content
         route = {
             key: resp.headers[key]
@@ -522,7 +609,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         with proxy.lock:
             proxy.records.append(
                 {"route_headers": route, "usage": usage, "served_model": billed_model,
-                 **costs}
+                 "status": resp.status_code, "retries": attempt, **costs}
             )
             try:
                 proxy.ledger.record(
@@ -532,14 +619,19 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 proxy.exceeded = True
             except BudgetAbort:
                 proxy.aborted = True
-        self.send_response(resp.status_code)
-        self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
-        for key in ROUTE_HEADER_KEYS:
-            if resp.headers.get(key):
-                self.send_header(key, resp.headers[key])
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.send_response(resp.status_code)
+            self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
+            for key in ROUTE_HEADER_KEYS:
+                if resp.headers.get(key):
+                    self.send_header(key, resp.headers[key])
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            # The pi client can hang up (for example on its own timeout); the
+            # request was already recorded, so just stop writing.
+            return
 
     def _error(self, code: int, message: str) -> None:
         body = json.dumps({"error": {"message": message, "type": "eval_budget"}}).encode()
@@ -780,7 +872,9 @@ def run_pi_agent(
             "route_trace": proxy.records,
         }
         if grade is not None:
-            row["grader_output"] = grade["grader_output"]
+            row["grader_output"] = grade.get("grader_output", "")
+            if grade.get("grader_error"):
+                row["grader_error"] = grade["grader_error"]
         if abort_scope is not None:
             row["aborted"] = True
             row["abort_scope"] = abort_scope
@@ -998,7 +1092,7 @@ def main() -> None:
                 if row.get("abort_scope") == "instance_arm":
                     metadata["excluded_instances"].append(instance["instance_id"])
                     continue
-                if row.get("aborted"):
+                if row.get("abort_scope") == "global":
                     metadata["aborted_on_budget"] = True
                     break
                 direct_rows[instance["instance_id"]] = row
@@ -1043,7 +1137,7 @@ def main() -> None:
                     if row.get("abort_scope") == "instance_arm":
                         metadata["excluded_instances"].append(instance_id)
                         break
-                    if row.get("aborted"):
+                    if row.get("abort_scope") == "global":
                         metadata["aborted_on_budget"] = True
                         break
                 if metadata["aborted_on_budget"]:
