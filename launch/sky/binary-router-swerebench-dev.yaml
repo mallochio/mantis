@@ -1,0 +1,27 @@
+# Binary direct-router development screen: one fixed arm per GCP Spot worker.
+# No workdir or storage mounts; results upload to the existing ih-storage-sid bucket.
+name: binary-router-swerebench-dev
+resources:
+  cloud: gcp
+  region: europe-west4
+  cpus: 4
+  memory: 16+
+  disk_size: 150
+  use_spot: true
+file_mounts:
+  /opt/mantis-eval/scripts/binary_router_swerebench_arm.sh: scripts/binary_router_swerebench_arm.sh
+  /opt/mantis-eval/eval/router_eval.py: eval/router_eval.py
+  /opt/mantis-eval/eval/model_prices.json: eval/model_prices.json
+  /opt/mantis-eval/eval/prices/binary-hy3-deepseek-2026-08-15.json: eval/prices/binary-hy3-deepseek-2026-08-15.json
+  /opt/mantis-eval/eval/manifests/binary-dev-100.json: eval/manifests/binary-dev-100.json
+setup: |
+  set -euxo pipefail
+  export DEBIAN_FRONTEND=noninteractive
+  sudo apt-get update -y
+  sudo apt-get install -y --no-install-recommends git curl ca-certificates openssl python3 python3-requests
+  if ! command -v docker >/dev/null 2>&1; then curl -fsSL https://get.docker.com | sudo sh; sudo systemctl enable --now docker || true; fi
+  if ! command -v node >/dev/null 2>&1 || [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 22 ]; then curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -; sudo apt-get install -y nodejs; fi
+  sudo npm install -g @earendil-works/pi-coding-agent@0.84.1
+run: |
+  set -euo pipefail
+  bash /opt/mantis-eval/scripts/binary_router_swerebench_arm.sh
