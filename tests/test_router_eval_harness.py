@@ -520,3 +520,45 @@ def test_proxy_retry_config_defaults_and_env(monkeypatch):
     assert base == 0.25
     assert max_wait == 10.0
     assert statuses == {429, 503}
+
+
+def test_run_pi_agent_records_worktree_setup_failure(tmp_path, monkeypatch):
+    def fail_worktree(*_args, **_kwargs):
+        raise subprocess.CalledProcessError(128, ["git", "worktree", "add"])
+
+    monkeypatch.setattr(harness, "_ensure_worktree", fail_worktree)
+    row = harness.run_pi_agent(
+        _instance(), arm="setup-test",
+        endpoint="http://127.0.0.1:1/v1/chat/completions",
+        tier_models={}, prices={}, shadow_prices={}, cost_mode="shadow",
+        fixed_models={"setup-test": "opencode-zen/hy3-free"},
+        ledger=harness.CostLedger(total_limit=2.0, arm_limit=2.0), arm_cap=2.0,
+        rng=harness.random.Random(1), timeout=30, output_token_limit=32,
+        frequencies={}, worktrees_root=tmp_path,
+    )
+    assert row["resolved"] is False
+    assert "CalledProcessError" in row["error"]
+    assert row["shadow_cost_usd"] is None
+
+
+def test_timeout_row_sums_recorded_shadow_cost(tmp_path, monkeypatch):
+    worktrees = tmp_path / "worktrees"
+    _, head = _make_worktree(worktrees)
+    monkeypatch.setattr(
+        harness.subprocess, "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired(args[0], 1)),
+    )
+    # Preserve worktree reset calls by replacing setup with the already-created tree.
+    monkeypatch.setattr(harness, "_ensure_worktree", lambda *_args: (worktrees / "demo-1", None, False))
+    ledger = harness.CostLedger(total_limit=2.0, arm_limit=2.0)
+    row = harness.run_pi_agent(
+        _instance(base_commit=head), arm="timeout-test",
+        endpoint="http://127.0.0.1:1/v1/chat/completions",
+        tier_models={}, prices={}, shadow_prices={}, cost_mode="shadow",
+        fixed_models={"timeout-test": "opencode-zen/hy3-free"}, ledger=ledger,
+        arm_cap=2.0, rng=harness.random.Random(1), timeout=1, output_token_limit=32,
+        frequencies={}, worktrees_root=worktrees,
+    )
+    assert row["abort_scope"] == "timeout"
+    assert row["shadow_cost_usd"] is None
+    assert row["actual_cost_usd"] is None

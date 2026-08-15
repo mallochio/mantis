@@ -803,13 +803,16 @@ def run_pi_agent(
         arm=arm, cap=arm_cap, prices=prices, shadow_prices=shadow_prices,
         cost_mode=cost_mode, model=model_name, session=session,
     )
-    workdir, cache, created = _ensure_worktree(instance, root)
+    workdir: Path | None = None
+    cache: Path | None = None
+    created = False
     ext_path = Path(tempfile.mkdtemp(prefix="pi-eval-")) / "eval-provider.ts"
     error: str | None = None
     abort_scope: str | None = None
     patch = ""
     trajectory: list[dict[str, Any]] = []
     try:
+        workdir, cache, created = _ensure_worktree(instance, root)
         models = sorted(
             set(tier_models.values()) | set(fixed_models.values())
             | {"mantis", "mantis-trinity"}
@@ -888,7 +891,11 @@ def run_pi_agent(
         return {
             "instance_id": instance_id, "arm": arm, "tier": selected_tier,
             "model": model_name, "resolved": False, "model_patch": "",
-            "cost_usd": ledger.pair_cost(instance_id, arm),
+            "cost_usd": _sum_cost(proxy.records, "cost"),
+            "cost_method": proxy.records[-1]["cost_method"] if proxy.records else None,
+            "actual_cost_usd": _sum_cost(proxy.records, "actual_cost_usd"),
+            "shadow_cost_usd": _sum_cost(proxy.records, "shadow_cost_usd"),
+            "served_models": sorted({r["served_model"] for r in proxy.records if r.get("served_model")}),
             "trajectory": trajectory, "route_trace": proxy.records,
             "error": f"pi timed out after {timeout}s", "aborted": True,
             "abort_scope": "timeout",
@@ -897,7 +904,11 @@ def run_pi_agent(
         return {
             "instance_id": instance_id, "arm": arm, "tier": selected_tier,
             "model": model_name, "resolved": False, "model_patch": "",
-            "cost_usd": ledger.pair_cost(instance_id, arm),
+            "cost_usd": _sum_cost(proxy.records, "cost"),
+            "cost_method": proxy.records[-1]["cost_method"] if proxy.records else None,
+            "actual_cost_usd": _sum_cost(proxy.records, "actual_cost_usd"),
+            "shadow_cost_usd": _sum_cost(proxy.records, "shadow_cost_usd"),
+            "served_models": sorted({r["served_model"] for r in proxy.records if r.get("served_model")}),
             "trajectory": trajectory, "route_trace": proxy.records,
             "error": f"{type(exc).__name__}: {exc}",
         }
@@ -906,7 +917,7 @@ def run_pi_agent(
     finally:
         proxy.close()
         ext_path.unlink(missing_ok=True)
-        if created and not keep_worktrees and cache is not None:
+        if created and not keep_worktrees and cache is not None and workdir is not None:
             with contextlib.suppress(subprocess.CalledProcessError):
                 _remove_worktree(workdir, cache)
 
