@@ -18,6 +18,15 @@ OUT_FILE="$RESULT_DIR/results.jsonl"
 BUCKET_PREFIX="gs://ih-storage-sid/${RUN_ID}/${ARM}"
 mkdir -p "$LOG_DIR" "$BIFROST_DIR"
 chmod 700 "$RESULT_DIR" "$BIFROST_DIR"
+# Single-writer guard: refuse to start if another shard is already running.
+# A second concurrent worker would re-download OUT_FILE, replacing the inode
+# while the live worker appends to the old (then-deleted) inode, silently
+# stranding all subsequently written rows.
+exec 9>"$RESULT_DIR/.shard.lock"
+if ! flock -n 9; then
+  echo "another binary-router shard holds $RESULT_DIR/.shard.lock; refusing to start" >&2
+  exit 3
+fi
 export EVAL_PROXY_RETRIES="${EVAL_PROXY_RETRIES:-8}"
 export EVAL_PROXY_RETRY_BASE="${EVAL_PROXY_RETRY_BASE:-1.0}"
 export EVAL_PROXY_RETRY_MAX_WAIT="${EVAL_PROXY_RETRY_MAX_WAIT:-60.0}"
