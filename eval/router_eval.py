@@ -47,9 +47,12 @@ DEFAULT_CAPS = {
 }
 FIXED_ARM_DEFAULT_CAP = DEFAULT_CAPS["expensive-only"]
 DEFAULT_SHADOW_PRICES = REPO / "eval" / "prices" / "zen-2026-08-13.json"
-# Fixed arms name explicit Bifrost model IDs and must never resolve to the
-# paid control provider; the free Zen pool and the paid control stay distinct.
-FIXED_ARM_FORBIDDEN_PREFIXES = ("opencode-go",)
+# Fixed arms must use explicit Bifrost provider-qualified IDs. Provider
+# selection is controlled by each experiment's allowlist rather than a global
+# prefix ban: the Zen discovery study used opencode-zen/* only, while the
+# binary low/high study intentionally pairs Zen hy3 with subscription-backed
+# opencode-go/deepseek-v4-flash.
+FIXED_ARM_FORBIDDEN_PREFIXES: tuple[str, ...] = ()
 ROUTE_HEADER_KEYS = (
     "x-route-decision", "x-route-reason", "x-route-model",
     "x-route-sticky", "x-route-fallback",

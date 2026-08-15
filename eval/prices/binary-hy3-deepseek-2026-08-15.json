@@ -1,0 +1,33 @@
+{
+  "snapshot": "mantis binary router low/high shadow prices",
+  "created": "2026-08-15",
+  "currency": "USD per token",
+  "policy": "Frozen analytic shadow prices; actual subscription/free cost remains separate",
+  "retrieved_at": "2026-08-15",
+  "models": {
+    "opencode-zen/hy3-free": {
+      "served_model": "opencode-zen/hy3-free",
+      "source_model_version": "unknown (Zen free tier does not disclose)",
+      "input_per_token": 1.32e-07,
+      "output_per_token": 5.28e-07,
+      "cached_input_per_token": 3.3e-08,
+      "source_url": "https://openrouter.ai/tencent/hy3",
+      "source_model_id": "tencent/hy3",
+      "retrieved_at": "2026-08-13",
+      "method": "paid-provider proxy (OpenRouter)",
+      "available": true
+    },
+    "opencode-go/deepseek-v4-flash": {
+      "served_model": "opencode-go/deepseek-v4-flash",
+      "source_model_version": "unknown (OpenCode Go endpoint does not disclose)",
+      "input_per_token": 1.4e-07,
+      "output_per_token": 2.8e-07,
+      "cached_input_per_token": 2.8e-08,
+      "source_url": "https://models.dev/?provider=deepseek",
+      "source_model_id": "deepseek/deepseek-v4-flash",
+      "retrieved_at": "2026-08-12",
+      "method": "manufacturer price proxy (DeepSeek API)",
+      "available": true
+    }
+  }
+}

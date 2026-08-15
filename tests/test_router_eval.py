@@ -112,18 +112,24 @@ def test_pair_cost_is_none_when_any_request_cost_unknown():
     assert router_eval._sum_cost([records[0]], "cost") == pytest.approx(0.01)
 
 
-def test_fixed_arms_cannot_call_opencode_go():
-    with pytest.raises(ValueError, match="forbidden provider"):
-        router_eval.parse_fixed_models(["zen-flash=opencode-go/deepseek-v4-flash"])
+def test_fixed_arms_require_provider_qualified_models():
     with pytest.raises(ValueError, match="provider-qualified"):
         router_eval.parse_fixed_models(["zen-flash=deepseek-v4-flash-free"])
     with pytest.raises(ValueError, match="collides"):
         router_eval.parse_fixed_models(["cheap-only=opencode-zen/deepseek-v4-flash-free"])
-    fixed = router_eval.parse_fixed_models(["zen-flash=opencode-zen/deepseek-v4-flash-free"])
+
+    fixed = router_eval.parse_fixed_models([
+        "low=opencode-zen/hy3-free",
+        "high=opencode-go/deepseek-v4-flash",
+    ])
+    assert fixed == {
+        "low": "opencode-zen/hy3-free",
+        "high": "opencode-go/deepseek-v4-flash",
+    }
     model, tier = router_eval._model_for_arm(
-        "zen-flash", "p", {}, router_eval.random.Random(1), {}, fixed
+        "high", "p", {}, router_eval.random.Random(1), {}, fixed
     )
-    assert model == "opencode-zen/deepseek-v4-flash-free"
+    assert model == "opencode-go/deepseek-v4-flash"
     assert tier is None
 
 

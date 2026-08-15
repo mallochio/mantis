@@ -90,6 +90,13 @@ honoring `Retry-After`. Tune it with `EVAL_PROXY_RETRIES` (default 8),
 snapshot is `prices/zen-2026-08-13.json`. `ling-3.0-tiny-free` is not served
 by the Zen gateway (`ModelError`) and is excluded from cost/quality tiers.
 
+The follow-on binary direct-router protocol is
+`plans/direct-binary-router-xroutebench.md`: it pairs Zen `hy3-free` with the
+subscription-backed `opencode-go/deepseek-v4-flash`, sends both explicit IDs
+through Bifrost, and trains a calibrated probability rather than forcing a
+three-tier label. xRouteBench is used to compare offline router algorithms;
+its public test split is not a hyperparameter hill-climbing target.
+
 ## Cloud benchmark runs
 
 `launch/sky/zen-swe-rebench-*.yaml` define the GCP/SkyPilot tasks; the worker
