@@ -17,7 +17,7 @@
 
 ## Why this matters
 
-Mantis currently has three modes: direct routing (`mantis`), multi-agent role cycling (`mantis-trinity`), and planned DAG execution (`mantis-ultra`). The lead/sidekick pattern — a frontier model delegates implementation, test, and lint work to a cheaper sidekick with persistent per-task context and `follow_up` semantics — is a distinct cost/quality contract. A minimal prototype is needed to measure whether it improves the cost/quality frontier before committing to a full production mode.
+Mantis currently has four modes: direct routing (`mantis/base`), multi-agent role cycling (`mantis/trinity`), planned DAG execution (`mantis/ultra`), and lead/sidekick orchestration (`mantis/fusion`). The lead/sidekick pattern — a frontier model delegates implementation, test, and lint work to a cheaper sidekick with persistent per-task context and `follow_up` semantics — is a distinct cost/quality contract. A minimal prototype is needed to measure whether it improves the cost/quality frontier before committing to a full production mode.
 
 ## Research basis
 
@@ -27,7 +27,7 @@ Mantis currently has three modes: direct routing (`mantis`), multi-agent role cy
 
 ## Current state
 
-- `apps/api/serve_config.py:41-45` maps `mantis-trinity` → `trinity` and `mantis-ultra` → `conductor`. No `mantis-fusion` entry exists.
+- `apps/api/serve_config.py:41-45` maps `mantis/trinity` → `trinity` and `mantis/ultra` → `conductor`. No chat-completions `mantis/fusion` entry exists.
 - `apps/api/runs.py:361-527` defines `NativeRun` with `advance`, `advance_idempotent`, `add_usage`, and storage hooks. `get_run`/`advance_run`/`delete_run` are at `apps/api/runs.py:1261-1325`.
 - `apps/api/api.py:692` defines `POST /v1/chat/completions` with `Depends(_authorize)`. No custom `/v1/fusion/*` endpoints exist.
 - `apps/gateway/server.py:1-20` and `:873-918` describe the per-request Supra-Router-51M complexity gate; `apps/gateway/server.py:2977-3084` is the chat-completions handler. Fusion sits above this, routing each individual model call through the gateway.
@@ -137,7 +137,7 @@ Use mock provider responses; do not make billed calls in tests.
 
 ### Step 6: Add a 5-task eval manifest
 
-Create `eval/fusion_manifest.json` with 5 SWE-rebench or synthetic coding tasks. Add an eval command that runs `mantis-fusion` against `mantis` (direct) and `mantis-trinity` on the same tasks, recording:
+Create `eval/fusion_manifest.json` with 5 SWE-rebench or synthetic coding tasks. Add an eval command that runs `mantis/fusion` against `mantis/base` (direct) and `mantis/trinity` on the same tasks, recording:
 
 - `resolved` (pass/fail),
 - `cost_usd`,

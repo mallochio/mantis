@@ -195,7 +195,7 @@ def main() -> None:
         model = os.environ.get("DIRECT_MODEL", "deepseek-v4-flash")
     else:
         url = args.mantis_url
-        model = "mantis-trinity" if args.config == "trinity" else "mantis-ultra"
+        model = "mantis/trinity" if args.config == "trinity" else "mantis/ultra"
 
     for fx in fixtures:
         prompt = fx["prompt"]

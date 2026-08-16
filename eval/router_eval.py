@@ -274,7 +274,7 @@ def _model_for_arm(
     if arm in TIERS or arm.endswith("-only") or arm in {"heuristic", "random-matched"}:
         tier = _tier_for_arm(arm, prompt, rng, frequencies)
         return tier_models[tier], tier
-    return ("mantis-trinity" if arm == "trinity" else "mantis"), None
+    return ("mantis/trinity" if arm == "trinity" else "mantis/base"), None
 
 
 def routed_request_tiers(
@@ -815,7 +815,7 @@ def run_pi_agent(
         workdir, cache, created = _ensure_worktree(instance, root)
         models = sorted(
             set(tier_models.values()) | set(fixed_models.values())
-            | {"mantis", "mantis-trinity"}
+            | {"mantis/base", "mantis/trinity"}
         )
         _render_provider_extension(
             models, proxy.base_url(), api_key or "", session, output_token_limit,

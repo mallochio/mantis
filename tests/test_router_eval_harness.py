@@ -219,14 +219,14 @@ def test_parse_pi_events_extracts_trajectory():
 def test_provider_extension_points_at_proxy(tmp_path):
     ext = tmp_path / "eval-provider.ts"
     harness._render_provider_extension(
-        ["cheap", "mantis", "mantis-trinity"],
+        ["cheap", "mantis/base", "mantis/trinity"],
         "http://127.0.0.1:1234/v1",
         "sk-test", "router-eval-sess", 512, ext,
     )
     text = ext.read_text()
     assert 'baseUrl: "http://127.0.0.1:1234/v1"' in text
-    assert 'id: "mantis"' in text
-    assert 'id: "mantis-trinity"' in text
+    assert 'id: "mantis/base"' in text
+    assert 'id: "mantis/trinity"' in text
     assert "maxTokens: 512" in text
     assert '"X-Route-Session": "router-eval-sess"' in text
 

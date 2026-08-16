@@ -794,7 +794,7 @@ Static check in CI for all three reviewed files.
 
 **Routing and model stickiness**
 
-Fusion does not route each role through the public `model="mantis"` auto-router. It directly calls the configured catalog slots:
+Fusion does not route each role through the public `model="mantis/base"` auto-router. It directly calls the configured catalog slots:
 
 - Main: `gpt-5_6-sol`
 - Sidekick: `gpt-5_6-luna`
@@ -855,13 +855,13 @@ Its operational quality-to-cost ratio is currently poor for repository tasks bec
 
 The increased client timeout from the pre-existing worktree modification reduces premature HTTP timeout risk but does not add server-side progress, retry, or idempotent recovery.
 
-## Pi or another client using `/v1/chat/completions` with `model="mantis"`
+## Pi or another client using `/v1/chat/completions` with `model="mantis/base"`
 
 This is not Fusion. It goes through the router proxy and can use `X-Route-Session`, `metadata.session_id`, or `user` for router affinity. This path is likely cheaper for simple tasks because it can select a single endpoint model and avoid mandatory main planning/review calls.
 
 It also has explicit global concurrency admission control, unlike Fusion.
 
-## `mantis-trinity` / `mantis-ultra`
+## `mantis/trinity` / `mantis/ultra`
 
 These are separate orchestration modes with more mature native run machinery, including bounded tool-result persistence and established response metadata handling. They are not substitutes automatically selected by Fusion and need direct comparative evaluation.
 

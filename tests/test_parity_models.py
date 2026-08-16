@@ -29,7 +29,7 @@ def test_descriptor_fields_and_defaults(client):
         assert isinstance(entry["id"], str)
         assert isinstance(entry["created"], int) and entry["created"] > 0
         assert entry["context_length"] == 262144
-        if entry["id"] == "mantis":
+        if entry["id"] == "mantis/base":
             assert entry["max_completion_tokens"] == 131072
         else:
             assert entry["max_completion_tokens"] == 32768
@@ -42,7 +42,7 @@ def test_env_overrides(client, monkeypatch):
     monkeypatch.setenv("MANTIS_MAX_COMPLETION_TOKENS", "4096")
     for entry in _models(client):
         assert entry["context_length"] == 65536
-        if entry["id"] == "mantis":
+        if entry["id"] == "mantis/base":
             assert entry["max_completion_tokens"] == 131072
         else:
             assert entry["max_completion_tokens"] == 4096

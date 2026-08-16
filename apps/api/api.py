@@ -577,7 +577,7 @@ def ready(response: Response) -> dict[str, Any]:
 
 
 _MODEL_CREATED = int(time.time())
-_BASIC_MODEL = "mantis"
+_BASIC_MODEL = "mantis/base"
 _ROUTER_RESPONSE_HEADERS = (
     "x-route-decision",
     "x-route-reason",
@@ -685,7 +685,9 @@ def models() -> dict[str, Any]:
         "object": "list",
         "data": [
             {"id": _BASIC_MODEL, **basic},
-            *({"id": model, **descriptor} for model in ("mantis-trinity", "mantis-ultra")),
+            {"id": "mantis/trinity", **descriptor},
+            {"id": "mantis/ultra", **descriptor},
+            {"id": "mantis/fusion", **descriptor},
         ],
     }
 
@@ -697,6 +699,13 @@ def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Respons
     headers = dict(http.headers)
     if not _capacity.acquire(blocking=False):
         return _error(429, "Mantis is at capacity", "rate_limit_error")
+    if request.model == "mantis/fusion":
+        _capacity.release()
+        return _error(
+            400,
+            "mantis/fusion is a stateful mode; use /v1/fusion/delegate",
+            "invalid_request_error",
+        )
     if request.model == _BASIC_MODEL:
         handed_off = False
         try:

@@ -15,11 +15,11 @@ directory.
 
 - `cheap-only`, `middle-only`, `expensive-only`: direct Bifrost calls pinned to
   the corresponding catalog `upstream_model`;
-- `mantis-direct`: the routed `model=mantis` endpoint;
+- `mantis-direct`: the routed `model=mantis/base` endpoint;
 - `heuristic`: client-side prompt complexity selection;
 - `random-matched`: tier sampling from a frozen distribution measured after
   the complete `mantis-direct` phase;
-- `trinity`: independently selectable `model=mantis-trinity`.
+- `trinity`: independently selectable `model=mantis/trinity`.
 
 Every routed request carries `X-Route-Session` and records route decision
 headers. `pi` (headless `--mode json`, from the `@earendil-works/pi-coding-agent`

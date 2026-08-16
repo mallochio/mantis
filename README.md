@@ -1,24 +1,24 @@
 # Mantis
 
-Mantis provides three OpenAI-compatible routing modes. Choose the mode
-explicitly.
+Mantis provides four OpenAI-compatible modes. Choose the mode explicitly.
 
 ## Modes
 
 | Model | Mode | Use |
 |---|---|---|
-| `mantis` | Direct | The gateway scores one request with Supra and sends it to a cheap, middle, or expensive model through Bifrost. |
-| `mantis-trinity` | Trinity | Multi-agent coordination over Worker, Thinker, and Verifier roles. |
-| `mantis-ultra` | Ultra | Conductor plans and executes a bounded workflow DAG over the worker pool. |
+| `mantis/base` | Direct | The gateway scores one request with Supra and sends it to a cheap, middle, or expensive model through Bifrost. |
+| `mantis/trinity` | Trinity | Multi-agent coordination over Worker, Thinker, and Verifier roles. |
+| `mantis/ultra` | Ultra | Conductor plans and executes a bounded workflow DAG over the worker pool. |
+| `mantis/fusion` | Fusion | Lead/sidekick orchestration with tool-use follow-ups and a review loop. Use `/v1/fusion/delegate` and `/v1/fusion/follow_up/{run_id}`. |
 
-Only these model IDs are accepted. Select `mantis-trinity` or `mantis-ultra`
-manually; Mantis never selects between modes. All three paths send model calls
-through the local Bifrost gateway. The OpenCode, Pi, and Prime harness catalogs
-advertise a 256k-token context limit for every configured local model.
+Only these model IDs are accepted. Select `mantis/trinity`, `mantis/ultra`, or
+`mantis/fusion` manually; Mantis never selects between modes. All four paths send
+model calls through the local Bifrost gateway. The OpenCode, Pi, and Prime harness
+catalogs advertise a 256k-token context limit for every configured local model.
 
 ## Repository layout
 
-`apps/api/` serves the three public modes at :8088. `apps/gateway/` is the
+`apps/api/` serves the four public modes at :8088. `apps/gateway/` is the
 internal direct-mode gateway at :5500. They share the routing catalog but keep
 separate dependency locks because the API includes orchestration and training
 dependencies that the gateway does not need.
@@ -79,7 +79,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="mantis",
+    model="mantis/base",
     messages=[{"role": "user", "content": "Explain quicksort briefly."}],
 )
 print(response.choices[0].message.content)
@@ -106,7 +106,7 @@ API or client adapter is required.
 
 ```python
 response = client.chat.completions.create(
-    model="mantis",
+    model="mantis/base",
     messages=[{"role": "user", "content": "Read pyproject.toml."}],
     tools=[{
         "type": "function",
@@ -125,6 +125,24 @@ response = client.chat.completions.create(
 
 The calling harness owns tool execution and its filesystem/network permissions.
 Mantis only chooses and orchestrates models.
+
+## Fusion mode
+
+`mantis/fusion` is the lead/sidekick orchestrator. It is not a
+`/v1/chat/completions` model; it runs as a stateful run:
+
+```bash
+curl -s http://127.0.0.1:8088/v1/fusion/delegate \
+  -H "Authorization: Bearer $MANTIS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"brief": "Write a small Python project that prints hello world"}'
+```
+
+The response returns a `run_id`, a `status`, and either a `report` or
+`pending_tool_calls`. Submit tool results to
+`POST /v1/fusion/follow_up/{run_id}`. The run continues until the main model
+accepts the sidekick report or `max_follow_ups` is reached. For local testing
+use `uv run --extra dev python scripts/fusion_headless.py --managed --brief ...`.
 
 ## Images and structured output
 
@@ -170,7 +188,7 @@ reasoning engine or search crawler.
 | `MANTIS_MAX_BODY_BYTES` | Maximum request body size | `52428800` |
 | `MANTIS_UPSTREAM_STREAM` | Stream provider responses upstream (SSE) instead of buffering | `1` |
 | `MANTIS_CACHE_BREAKPOINTS` | Add prompt-cache breakpoints to Claude-family requests | `1` |
-| `MANTIS_ROUTER_URL` | Base URL of the in-repo Mantis router for `mantis` | `http://127.0.0.1:5500/v1` |
+| `MANTIS_ROUTER_URL` | Base URL of the in-repo Mantis router for `mantis/base` | `http://127.0.0.1:5500/v1` |
 | `MANTIS_ROUTER_TIMEOUT_S` | Upstream timeout for `mantis` calls | `300` |
 | `MANTIS_ROUTER_KEY` | Bearer token the API presents to its internal router | required |
 
@@ -199,6 +217,9 @@ Run one replica with the memory backend.
 - `GET /ready` — public configuration readiness check
 - `GET /v1/models` — authenticated model list
 - `POST /v1/chat/completions` — authenticated OpenAI-compatible completion
+- `POST /v1/fusion/delegate` — start a Fusion lead/sidekick run
+- `POST /v1/fusion/follow_up/{run_id}` — submit tool results for a Fusion run
+- `GET /v1/fusion/runs/{run_id}` — get a Fusion run status
 
 By default the response is a plain OpenAI-compatible completion; internal
 routing and worker metadata are not returned. Send the opt-in header

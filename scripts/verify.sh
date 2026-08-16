@@ -25,14 +25,14 @@ echo "  OK"
 
 echo "3/4 models..."
 out=$(curl -fsS "$API/models" -H "Authorization: Bearer $TOKEN")
-grep -q 'mantis-ultra' <<<"$out"
+grep -q 'mantis/ultra' <<<"$out"
 echo "  OK"
 
 echo "4/4 chat completions..."
 out=$(curl -fsS "$API/chat/completions" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"model":"mantis","messages":[{"role":"user","content":"Reply with exactly: 4"}]}')
+  -d '{"model":"mantis/base","messages":[{"role":"user","content":"Reply with exactly: 4"}]}')
 grep -q '"object": "chat.completion"\|"object":"chat.completion"' <<<"$out"
 echo "  OK"
 

@@ -38,10 +38,10 @@ from mini import (
 
 ROUTER: FuguRouter | None = None
 _router_lock = threading.Lock()
-MODEL_NAME = "mantis-trinity"
+MODEL_NAME = "mantis/trinity"
 MODEL_MODES = {
-    "mantis-trinity": "trinity",
-    "mantis-ultra": "conductor",
+    "mantis/trinity": "trinity",
+    "mantis/ultra": "conductor",
 }
 MAX_TURNS = 5
 DEFAULT_MAX_COMPLETION_TOKENS = 32768

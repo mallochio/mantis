@@ -39,7 +39,7 @@ def _stream(client, monkeypatch, event, run, **request):
         "/v1/chat/completions",
         headers=_headers(),
         json={
-            "model": "mantis-trinity",
+            "model": "mantis/trinity",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
             **request,
@@ -154,7 +154,7 @@ def test_verified_final_chunks_are_paced(monkeypatch):
     body = {
         "id": "chatcmpl-test",
         "created": 1,
-        "model": "mantis-trinity",
+        "model": "mantis/trinity",
         "choices": [
             {
                 "message": {"role": "assistant", "content": "word " * 40},

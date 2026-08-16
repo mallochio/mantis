@@ -1637,9 +1637,9 @@ def test_standard_tool_validation_and_model_ids():
         ]
     )
     assert [tool["function"]["name"] for tool in tools] == ["read"]
-    assert serve._mode_for_model("mantis-trinity") == "trinity"
-    assert serve._mode_for_model("mantis-ultra") == "conductor"
-    for model in ("mantis", "trinity", "fugu", "conductor", "ultra", "unknown"):
+    assert serve._mode_for_model("mantis/trinity") == "trinity"
+    assert serve._mode_for_model("mantis/ultra") == "conductor"
+    for model in ("mantis", "mantis-trinity", "mantis-ultra", "trinity", "fugu", "conductor", "ultra", "unknown"):
         with pytest.raises(ValueError):
             serve._mode_for_model(model)
 
