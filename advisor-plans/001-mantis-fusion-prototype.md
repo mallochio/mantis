@@ -79,7 +79,7 @@ Write the lead/sidekick state machine and event types into `apps/api/fusion.py` 
 
 - `state`: `planning | sidekick_pending | sidekick_review | awaiting_tools | completed | cancelled | error`.
 - `event` types: `plan`, `sidekick_turn`, `tool_request`, `tool_result`, `review`, `follow_up`, `complete`, `error`.
-- `lead_model` and `sidekick_model` resolved from env `MANTIS_FUSION_LEAD_MODEL` / `MANTIS_FUSION_SIDEKICK_MODEL`, falling back to catalog workers (`gpt-5_6-sol` for lead, `gemini-3_6-flash` for sidekick) with explicit reasoning-effort and max-tokens from the catalog.
+- `lead_model` and `sidekick_model` resolved from env `MANTIS_FUSION_LEAD_MODEL` / `MANTIS_FUSION_SIDEKICK_MODEL`, falling back to catalog workers (`gpt-5_6-sol` for lead, `gemini-3_7-flash` for sidekick) with explicit reasoning-effort and max-tokens from the catalog.
 
 **Verify**: `uv run ruff check apps/api/fusion.py` exits 0.
 

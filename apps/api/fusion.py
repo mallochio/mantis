@@ -92,7 +92,7 @@ class FusionConfig:
         return (
             self._load().get("sidekick")
             or os.environ.get("MANTIS_FUSION_SIDEKICK_MODEL")
-            or "gemini-3_6-flash"
+            or "gemini-3_7-flash"
         )
 
     def max_follow_ups(self) -> int:

@@ -15,7 +15,7 @@ protocols = ["anthropic_messages"]
 
 [gateway]
 active_policy = "coding"
-revision = "bifrost-2026-08-16-flash-sol-fable"
+revision = "bifrost-2026-08-16-flash-sol-opus"
 
 [gateway.targets.cheap]
 provider = "bifrost"
@@ -41,14 +41,14 @@ rank = 1
 
 [gateway.targets.expensive]
 provider = "bifrost"
-# claude-fable-5 through Bifrost (bedrock-primary; vertex needs a GCP quota
-# grant for the anthropic-claude-fable base model, and bedrock needs
-# `aws bedrock put-account-data-retention --mode provider_data_share`).
-# models.dev anthropic/bedrock: max output 128000, cost $10/$50 per 1M in/out.
+# claude-opus-5 through Bifrost (vertex-primary, bedrock fallback).
+# Fable 5 was the first choice, but Vertex has zero anthropic-claude-fable
+# base-model quota and Bedrock requires a provider_data_share opt-in.
+# models.dev anthropic/bedrock: max output 128000, cost $5/$25 per 1M in/out.
 reasoning_effort = "medium"
 force_reasoning_effort = true
 max_tokens = 128000
-upstream_model = "anthropic/claude-fable-5"
+upstream_model = "anthropic/claude-opus-5"
 protocols = ["chat_completions", "responses"]
 rank = 2
 
@@ -59,7 +59,7 @@ invalid_complexity_target = "expensive"
 
 [mantis]
 slot_order = [
-    "gemini-3_6-flash",
+    "gemini-3_7-flash",
     "gpt-5_6-luna",
     "gpt-5_6-sol",
     "deepseek-v4-flash",
@@ -69,14 +69,14 @@ slot_order = [
 ]
 conductor = "gpt-5_6-luna"
 conductor_model = "bifrost/google/gemini-3.5-flash-lite"
-trained_slot_contract = "52eac89b5e96f1bf64b2bd83af4d8fbc649ddaaf162f4cabf9504aa93b6ae4cf"
+trained_slot_contract = "4af2aed343690a00ab4caeb56c8492152d45e31ba7c5fd16e74146928290aa5b"
 
-[mantis.workers.gemini-3_6-flash]
+[mantis.workers.gemini-3_7-flash]
 provider = "bifrost"
-# gemini-3.6-flash (models.dev google-vertex): max output 65536
+# gemini-3.7-flash (models.dev google-vertex): max output 65536
 max_tokens = 65536
-upstream_model = "google/gemini-3.6-flash"
-model_identity = "gemini-3.6-flash"
+upstream_model = "google/gemini-3.7-flash"
+model_identity = "gemini-3.7-flash"
 reasoning_effort = "high"
 protocols = ["chat_completions"]
 
@@ -136,5 +136,5 @@ protocols = ["chat_completions"]
 # Fusion lead/sidekick configuration. These are worker slot IDs from [mantis.workers].
 [fusion]
 main = "gpt-5_6-sol"
-sidekick = "gemini-3_6-flash"
+sidekick = "gemini-3_7-flash"
 max_follow_ups = 3

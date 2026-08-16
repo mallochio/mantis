@@ -3,7 +3,7 @@
   "training_artifact": "artifacts/router_head.safetensors",
   "training_artifact_sha256": "7ff2db0e6659cac4dd68c5fff47a112768042b31321127aeb1412a6d8e6c09be",
   "slot_order": [
-    "gemini-3_6-flash",
+    "gemini-3_7-flash",
     "gpt-5_6-luna",
     "gpt-5_6-sol",
     "deepseek-v4-flash",
@@ -13,8 +13,8 @@
   ],
   "conductor": "gpt-5_6-luna",
   "workers": {
-    "gemini-3_6-flash": {
-      "model_identity": "gemini-3.6-flash",
+    "gemini-3_7-flash": {
+      "model_identity": "gemini-3.7-flash",
       "reasoning_effort": "high"
     },
     "gpt-5_6-luna": {

@@ -10,6 +10,5 @@
   "z-ai/glm-5.2": 0.003909,
   "google/gemini-3.6-flash": 0.0105,
   "google/gemini-3.7-flash": 0.00525,
-  "anthropic/claude-fable-5": 0.07,
   "deepseek/deepseek-v4-flash-0731": 0.00036,
   "google/gemini-3.1-pro-preview": 0.016}
