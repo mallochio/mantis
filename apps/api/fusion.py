@@ -10,7 +10,7 @@ import tomllib
 import uuid
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import model_catalog
 import providers
@@ -113,6 +113,15 @@ class FusionConfig:
         except (TypeError, ValueError):
             return 262144
 
+    def max_output_tokens(self) -> int:
+        raw = self._load().get("max_output_tokens") or os.environ.get(
+            "MANTIS_FUSION_MAX_OUTPUT_TOKENS", "4096"
+        )
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 4096
+
 
 _FUSION_CONFIG = FusionConfig()
 
@@ -131,6 +140,7 @@ class FusionCoordinator:
         self.sidekick_slot = self.config.sidekick_slot()
         self.max_follow_ups = self.config.max_follow_ups()
         self.context_window = self.config.context_window()
+        self.max_output_tokens = self.config.max_output_tokens()
 
     @staticmethod
     def _estimate_message_tokens(message: dict[str, Any]) -> int:
@@ -155,27 +165,62 @@ class FusionCoordinator:
                 text += str(value)
         return max(1, len(text) // 4)
 
+    def _message_groups(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> list[list[dict[str, Any]]]:
+        """Group assistant tool_calls with all matching tool results.
+
+        Each group is an atomic conversational unit that must be kept or
+        dropped together so providers never receive an orphaned tool result.
+        """
+        groups: list[list[dict[str, Any]]] = []
+        i = 0
+        while i < len(messages):
+            message = messages[i]
+            if message.get("role") == "assistant" and message.get("tool_calls"):
+                group = [message]
+                tool_ids = {str(tc.get("id", "")) for tc in message["tool_calls"]}
+                i += 1
+                while (
+                    i < len(messages)
+                    and messages[i].get("role") == "tool"
+                    and str(messages[i].get("tool_call_id", "")) in tool_ids
+                ):
+                    group.append(messages[i])
+                    i += 1
+                groups.append(group)
+            else:
+                groups.append([message])
+                i += 1
+        return groups
+
     def _trim_messages(
         self,
         messages: list[dict[str, Any]],
         max_input_tokens: int,
     ) -> list[dict[str, Any]]:
-        """Drop oldest non-system messages until the input fits the budget."""
+        """Drop oldest non-system messages until the input fits the budget.
+
+        Tool-call assistant messages and their matching tool results are
+        trimmed as atomic groups so the provider history stays valid.
+        """
         if not messages:
             return messages
         estimates = [self._estimate_message_tokens(m) for m in messages]
         if sum(estimates) <= max_input_tokens:
             return messages
-        # Always preserve the first (system) message, then keep the newest
-        # messages that still fit under the input token budget.
+        # Always preserve the first (system) message, then keep whole
+        # conversational groups from the newest side until the budget is used.
         trimmed = [messages[0]]
         budget = max_input_tokens - estimates[0]
         tail: list[dict[str, Any]] = []
-        for i in range(len(messages) - 1, 0, -1):
-            if estimates[i] > budget:
+        for group in reversed(self._message_groups(messages[1:])):
+            group_tokens = sum(self._estimate_message_tokens(m) for m in group)
+            if group_tokens > budget:
                 break
-            tail.append(messages[i])
-            budget -= estimates[i]
+            tail.extend(reversed(group))
+            budget -= group_tokens
         trimmed.extend(reversed(tail))
         return trimmed
 
@@ -194,7 +239,8 @@ class FusionCoordinator:
         tools: list[dict[str, Any]] | None,
     ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
         """Call a worker slot and return (text, tool_calls, usage)."""
-        output_tokens = self._output_tokens_for(slot)
+        model_cap = self._output_tokens_for(slot)
+        output_tokens = min(self.max_output_tokens, model_cap)
         input_budget = max(0, self.context_window - output_tokens)
         trimmed = self._trim_messages(messages, input_budget)
         data = providers._provider_response(slot, trimmed, output_tokens, 0.7, tools)
@@ -473,8 +519,11 @@ class FusionRun(NativeRun):
         with self.request_lock:
             cached = self.request_events.get(request_id)
             if cached is not None:
-                return cached
-            event = self.advance(tool_results, request_id, message, coordinator)
+                return cast(dict[str, Any], cached)
+            event = cast(
+                dict[str, Any],
+                self.advance(tool_results, request_id, message, coordinator),
+            )
             self.request_events[request_id] = event
             while len(self.request_events) > 64:
                 self.request_events.pop(next(iter(self.request_events)))

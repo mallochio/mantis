@@ -59,7 +59,7 @@ invalid_complexity_target = "expensive"
 
 [mantis]
 slot_order = [
-    "gemini-3_7-flash",
+    "gemini-3_6-flash",
     "gpt-5_6-luna",
     "gpt-5_6-sol",
     "deepseek-v4-flash",
@@ -69,14 +69,14 @@ slot_order = [
 ]
 conductor = "gpt-5_6-luna"
 conductor_model = "bifrost/google/gemini-3.5-flash-lite"
-trained_slot_contract = "4af2aed343690a00ab4caeb56c8492152d45e31ba7c5fd16e74146928290aa5b"
+trained_slot_contract = "52eac89b5e96f1bf64b2bd83af4d8fbc649ddaaf162f4cabf9504aa93b6ae4cf"
 
-[mantis.workers.gemini-3_7-flash]
+[mantis.workers.gemini-3_6-flash]
 provider = "bifrost"
 # gemini-3.7-flash (models.dev google-vertex): max output 65536
 max_tokens = 65536
 upstream_model = "google/gemini-3.7-flash"
-model_identity = "gemini-3.7-flash"
+model_identity = "gemini-3.6-flash"
 reasoning_effort = "high"
 protocols = ["chat_completions"]
 

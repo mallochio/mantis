@@ -336,6 +336,29 @@ def test_fusion_context_window_trims_old_messages():
     assert trimmed[-1]["content"] == "new brief"
 
 
+def test_fusion_trimmer_keeps_tool_call_result_pairs():
+    coordinator = fusion.FusionCoordinator()
+    messages = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "do work"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+    ]
+    trimmed = coordinator._trim_messages(messages, 7)
+    roles = [m["role"] for m in trimmed]
+    assert roles == ["system", "assistant", "tool"]
+
+
 def test_fusion_output_tokens_are_model_specific(monkeypatch):
     resolved = providers.ResolvedModelSpec(
         adapter="openai",
@@ -351,3 +374,4 @@ def test_fusion_output_tokens_are_model_specific(monkeypatch):
     monkeypatch.setattr(providers, "_resolve_model_spec", lambda _slot: resolved)
     coordinator = fusion.FusionCoordinator()
     assert coordinator._output_tokens_for("gpt-5_6-luna") == 128000
+    assert coordinator.max_output_tokens == 4096

@@ -26,6 +26,21 @@ DEFAULT_BRIEF = (
     "Write a small Python project that prints a friendly greeting, "
     "run any tests you write, and lint the code. Report the final state."
 )
+MAX_TOOL_OUTPUT_BYTES = 64 * 1024
+
+
+def _bounded_tool_output(
+    stdout: str | None,
+    stderr: str | None,
+    max_bytes: int = MAX_TOOL_OUTPUT_BYTES,
+) -> str:
+    """Return combined tool output, capping it to avoid runaway context usage."""
+    text = (stdout or "") + (stderr or "")
+    encoded = text.encode()
+    if len(encoded) > max_bytes:
+        prefix = encoded[:max_bytes].decode(errors="ignore")
+        return prefix + "\n\n[fusion] tool output truncated"
+    return text or "<no output>"
 
 
 def _wait_for_server(url: str, token: str, timeout: float = 60.0) -> None:
@@ -40,17 +55,17 @@ def _wait_for_server(url: str, token: str, timeout: float = 60.0) -> None:
             if response.status_code == 200:
                 return
         except httpx.HTTPError:
-            continue
+            pass
         time.sleep(0.5)
     raise RuntimeError("mantis API did not become ready in time")
 
 
-def _start_server(url: str, workdir: Path) -> subprocess.Popen:
+def _start_server(url: str, workdir: Path, token: str) -> subprocess.Popen:
     port = url.rsplit(":", 1)[-1].rstrip("/")
     env = os.environ.copy()
     env["MANTIS_RUN_STORE"] = "file"
     env["MANTIS_RUN_DIR"] = str(workdir / "runs")
-    env["MANTIS_API_KEY"] = env.get("MANTIS_API_KEY", "sk-mantis-headless")
+    env["MANTIS_API_KEY"] = token
     env["PYTHONPATH"] = "scripts:apps/api"
     catalog = model_catalog.load_mantis_catalog()
     if catalog is not None:
@@ -68,10 +83,22 @@ def _start_server(url: str, workdir: Path) -> subprocess.Popen:
 
 
 def _execute_tool_call(workdir: Path, tool_call: dict[str, Any]) -> dict[str, Any]:
-    function = tool_call.get("function", {})
+    tool_call_id = str(tool_call.get("id", ""))
+    function = tool_call.get("function")
+    if not isinstance(function, dict):
+        return {
+            "tool_call_id": tool_call_id,
+            "content": "invalid function field",
+            "is_error": True,
+        }
     name = function.get("name", "")
     arguments = function.get("arguments", "{}")
-    tool_call_id = str(tool_call.get("id", ""))
+    if not isinstance(arguments, str):
+        return {
+            "tool_call_id": tool_call_id,
+            "content": "invalid arguments type",
+            "is_error": True,
+        }
     try:
         args = json.loads(arguments)
     except json.JSONDecodeError as exc:
@@ -80,13 +107,19 @@ def _execute_tool_call(workdir: Path, tool_call: dict[str, Any]) -> dict[str, An
             "content": f"invalid arguments: {exc}",
             "is_error": True,
         }
+    if not isinstance(args, dict):
+        return {
+            "tool_call_id": tool_call_id,
+            "content": "arguments must be an object",
+            "is_error": True,
+        }
 
     if name == "bash":
         command = args.get("command", "")
-        if not command:
+        if not command or not isinstance(command, str):
             return {
                 "tool_call_id": tool_call_id,
-                "content": "empty command",
+                "content": "empty or invalid command",
                 "is_error": True,
             }
         try:
@@ -109,9 +142,7 @@ def _execute_tool_call(workdir: Path, tool_call: dict[str, Any]) -> dict[str, An
                 "content": f"exec failed: {exc}",
                 "is_error": True,
             }
-        output = (result.stdout or "") + (result.stderr or "")
-        if not output:
-            output = "<no output>"
+        output = _bounded_tool_output(result.stdout, result.stderr)
         return {
             "tool_call_id": tool_call_id,
             "content": output,
@@ -154,8 +185,8 @@ def _follow_up(
 
 def _log_tool_call(tc: dict[str, Any], res: dict[str, Any]) -> None:
     function = tc.get("function", {})
-    name = function.get("name", "")
-    args = function.get("arguments", "")[:80]
+    name = function.get("name", "") if isinstance(function, dict) else ""
+    args = function.get("arguments", "")[:80] if isinstance(function, dict) else ""
     error = res.get("is_error", False)
     print(f"[tool] {name}: {args!r} -> error={error}")
 
@@ -192,6 +223,12 @@ def run_session(url: str, token: str, brief: str, max_iterations: int = 10) -> d
             iterations += 1
             print(f"[fusion] status: {event['status']}")
 
+        if event.get("status") == "awaiting_tools":
+            client.close()
+            raise RuntimeError(
+                f"Fusion run {run_id} still awaits tools after {max_iterations} iterations"
+            )
+
     client.close()
     return event
 
@@ -223,7 +260,7 @@ def main() -> None:
     try:
         if args.managed:
             workdir = Path(tempfile.mkdtemp(prefix="fusion-runs-"))
-            server = _start_server(args.url, workdir)
+            server = _start_server(args.url, workdir, args.token)
             _wait_for_server(args.url, args.token)
 
         event = run_session(args.url, args.token, args.brief, args.max_iterations)
