@@ -92,7 +92,7 @@ class FusionConfig:
         return (
             self._load().get("sidekick")
             or os.environ.get("MANTIS_FUSION_SIDEKICK_MODEL")
-            or "gemini-3_7-flash"
+            or "gpt-5_6-luna"
         )
 
     def max_follow_ups(self) -> int:
@@ -103,6 +103,15 @@ class FusionConfig:
             return int(raw)
         except (TypeError, ValueError):
             return 3
+
+    def max_tokens(self) -> int:
+        raw = self._load().get("max_tokens") or os.environ.get(
+            "MANTIS_FUSION_MAX_TOKENS", "262144"
+        )
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 262144
 
 
 _FUSION_CONFIG = FusionConfig()
@@ -121,6 +130,7 @@ class FusionCoordinator:
         self.main_slot = self.config.main_slot()
         self.sidekick_slot = self.config.sidekick_slot()
         self.max_follow_ups = self.config.max_follow_ups()
+        self.max_tokens = self.config.max_tokens()
 
     def _call_worker(
         self,
@@ -129,7 +139,7 @@ class FusionCoordinator:
         tools: list[dict[str, Any]] | None,
     ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
         """Call a worker slot and return (text, tool_calls, usage)."""
-        data = providers._provider_response(slot, messages, 4096, 0.7, tools)
+        data = providers._provider_response(slot, messages, self.max_tokens, 0.7, tools)
         msg = data["choices"][0]["message"]
         text = str(msg.get("content") or "")
         tcs = msg.get("tool_calls") or []
