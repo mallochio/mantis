@@ -50,7 +50,7 @@ MAX_UPSTREAM_OUTPUT_TOKENS = DEFAULT_MAX_COMPLETION_TOKENS
 WORKER_TIMEOUT = float(os.environ.get("MANTIS_WORKER_TIMEOUT", "240"))
 
 # These providers reject temperature != 1 when reasoning is enabled.
-REASONING_MODELS = ("claude-", "gpt-5.6-")
+REASONING_MODELS = ("claude-", "gpt-5.6-", "glm-")
 PROVIDERS = {
     "openrouter": (
         os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),

@@ -98,13 +98,13 @@ def test_max_completion_tokens_clamped_to_router_default_when_backend_uncapped()
     backend = {"model": "openai/gpt-5.6-sol", "effort": "", "max_tokens": None}
     body = {"model": "auto", "max_tokens": 131072}
     out = server._build_outgoing_body(body, backend)
-    assert out["max_completion_tokens"] == min(131072, server.ROUTELLM_MAX_TOKENS)
+    assert out["max_completion_tokens"] == min(131072, server.MANTIS_ROUTER_MAX_TOKENS)
 
 
 def test_max_output_tokens_clamped_to_router_default_when_backend_uncapped():
     backend = {"model": "openai/gpt-5.6-sol", "effort": "", "max_tokens": None}
     out = server._build_responses_body({"model": "auto", "max_output_tokens": 131072}, backend)
-    assert out["max_output_tokens"] == min(131072, server.ROUTELLM_MAX_TOKENS)
+    assert out["max_output_tokens"] == min(131072, server.MANTIS_ROUTER_MAX_TOKENS)
 
 
 def test_catalog_backend_explicit_cap_is_honored_not_clamped():

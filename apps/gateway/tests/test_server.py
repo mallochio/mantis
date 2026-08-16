@@ -133,11 +133,6 @@ def test_usage_cache_metrics_are_normalized(tmp_path, monkeypatch):
 
 @pytest.mark.anyio
 async def test_middle_failover_uses_middle_model(client, monkeypatch):
-    monkeypatch.setattr(server, "MIDDLE_CONFIGURED", True)
-    monkeypatch.setattr(server, "MIDDLE", {**server.MIDDLE, "base": "https://openrouter.ai/v1"})
-    monkeypatch.setattr(server, "BACKENDS", {
-        **server.BACKENDS, "middle": {**server.MIDDLE, "base": "https://openrouter.ai/v1"},
-    })
     monkeypatch.setattr(server, "_decide", lambda *args: ("cheap", None, 1, 10))
     calls = []
     def handler(request):
@@ -151,6 +146,6 @@ async def test_middle_failover_uses_middle_model(client, monkeypatch):
     response = await client.post("/v1/chat/completions", headers=AUTH,
                                  json={"model": "auto", "messages": [{"role": "user", "content": "hello"}]})
     assert response.status_code == 200
-    assert calls[0][1] == server.CHEAP["model"] and calls[1][1] == server.MIDDLE["model"]
+    assert calls[0][1] == server.BACKENDS["cheap"]["model"] and calls[1][1] == server.BACKENDS["middle"]["model"]
     assert response.headers["x-route-decision"] == "middle"
     await mock.aclose()

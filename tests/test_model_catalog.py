@@ -112,35 +112,35 @@ def _shared_catalog(contract: str) -> str:
         'adapter = "openai-compatible"\n'
         'base_url = "https://generic.example.test/v1"\n'
         'credential_env = "GENERIC_KEY"\n\n'
-        "[routellm]\n"
+        "[gateway]\n"
         'active_policy = "coding"\n\n'
-        "[routellm.targets.low]\n"
+        "[gateway.targets.low]\n"
         'provider = "generic.openai"\n'
         'upstream_model = "vendor/low"\n'
         'reasoning_effort = "none"\n'
         'protocols = ["chat_completions"]\n'
         "rank = 0\n\n"
-        "[routellm.targets.mid]\n"
+        "[gateway.targets.mid]\n"
         'provider = "modal.prod"\n'
         'upstream_model = "vendor/mid"\n'
         'protocols = ["chat_completions"]\n'
         "rank = 1\n\n"
-        "[routellm.targets.work]\n"
+        "[gateway.targets.work]\n"
         'provider = "router"\n'
         'upstream_model = "vendor/work"\n'
         'protocols = ["chat_completions"]\n'
         "rank = 2\n\n"
-        "[routellm.targets.responses]\n"
+        "[gateway.targets.responses]\n"
         'provider = "router"\n'
         'upstream_model = "openai/responses"\n'
         'protocols = ["chat_completions", "responses"]\n'
         "rank = 3\n\n"
-        "[routellm.targets.safe]\n"
+        "[gateway.targets.safe]\n"
         'provider = "router"\n'
         'upstream_model = "openai/safe"\n'
         'protocols = ["chat_completions", "responses"]\n'
         "rank = 4\n\n"
-        "[routellm.policies.coding]\n"
+        "[gateway.policies.coding]\n"
         'complexity_targets = ["low", "mid", "work", "responses", "safe"]\n'
         'invalid_complexity_target = "safe"\n'
         "[mantis]\n"
@@ -481,10 +481,10 @@ def test_shared_catalog_fixture_both_consumers_parse(tmp_path, monkeypatch):
         "openai-compatible",
     }
     monkeypatch.setenv("AI_ROUTING_CONFIG", str(path))
-    monkeypatch.delenv("ROUTELLM_TARGETS_JSON", raising=False)
-    monkeypatch.delenv("ROUTELLM_SUPRA_TARGETS", raising=False)
-    monkeypatch.delenv("ROUTELLM_SUPRA_INVALID_TARGET", raising=False)
-    monkeypatch.delenv("ROUTELLM_TRAINING_LOG", raising=False)
+    monkeypatch.delenv("MANTIS_ROUTER_TARGETS_JSON", raising=False)
+    monkeypatch.delenv("MANTIS_ROUTER_SUPRA_TARGETS", raising=False)
+    monkeypatch.delenv("MANTIS_ROUTER_SUPRA_INVALID_TARGET", raising=False)
+    monkeypatch.delenv("MANTIS_ROUTER_TRAINING_LOG", raising=False)
     monkeypatch.setenv("MANTIS_DATA_DIR", str(tmp_path / "router-data"))
     for name in ("ROUTER_KEY", "CODE_KEY", "MODAL_KEY", "GENERIC_KEY"):
         monkeypatch.setenv(name, "fixture-key")

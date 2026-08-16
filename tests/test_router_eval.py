@@ -10,12 +10,18 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
-for name in ("router_eval", "route_metrics"):
+
+
+def _load_module(name: str) -> object:
     spec = importlib.util.spec_from_file_location(name, ROOT / "eval" / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
-    globals()[name] = module
+    return module
+
+
+router_eval = _load_module("router_eval")
+route_metrics = _load_module("route_metrics")
 
 SNAPSHOT = {
     "opencode-zen/deepseek-v4-flash-free": {

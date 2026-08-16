@@ -49,7 +49,7 @@ Use xRouteBench and the LLMRouter paper/library as an **offline methodology benc
 - use one pinned query encoder consistently in training and serving;
 - compare calibrated binary probability prediction against ordinal 1–5 and 1–10 ablations;
 - do not install `llmrouter-lib` into the Mantis runtime or replace Bifrost;
-- deploy only an immutable artifact-backed decider at `apps/gateway/server.py::_decide_uncached` behind `ROUTELLM_DECIDER=xroute`;
+- deploy only an immutable artifact-backed decider at `apps/gateway/server.py::_decide_uncached` behind `MANTIS_ROUTER_DECIDER=xroute`;
 - retain current session affinity, failover, protocol handling, telemetry, and safe fallback;
 - Trinity and Conductor remain unchanged.
 

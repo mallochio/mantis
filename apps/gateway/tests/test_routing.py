@@ -19,11 +19,7 @@ def isolate_store(tmp_path, monkeypatch):
 
 
 def test_default_maps_level_3_and_4_to_middle_and_5_to_expensive(monkeypatch):
-    monkeypatch.setattr(server, "MIDDLE_CONFIGURED", True)
-    monkeypatch.setattr(server, "EXPENSIVE_MIN_COMPLEXITY", 5)
-
-    monkeypatch.setattr(server, "MIDDLE_MIN_COMPLEXITY", 3)
-    monkeypatch.setattr(server, "EXPENSIVE_MIN_COMPLEXITY", 5)
+    # Fixture policy: levels 3 and 4 map to the middle tier, level 5 to expensive.
     monkeypatch.setattr(server, "_supra_complexity", lambda prompt: (3, 10))
     assert server._decide_uncached("level three")[0] == "middle"
     monkeypatch.setattr(server, "_supra_complexity", lambda prompt: (4, 10))
@@ -33,8 +29,8 @@ def test_default_maps_level_3_and_4_to_middle_and_5_to_expensive(monkeypatch):
 
 
 def test_supra_mode_decides_on_complexity_alone(monkeypatch):
-    monkeypatch.setattr(server, "MIDDLE_CONFIGURED", False)
-    monkeypatch.setattr(server, "EXPENSIVE_MIN_COMPLEXITY", 3)
+    monkeypatch.setattr(server, "SUPRA_TARGETS",
+                        ("cheap", "cheap", "expensive", "expensive", "expensive"))
     calls = []
 
     def fake_supra(prompt):
@@ -97,9 +93,8 @@ def test_supra_early_stop_waits_for_complexity_digit(monkeypatch):
 
 
 def test_supra_mode_short_prompt_still_uses_supra(monkeypatch):
-    monkeypatch.setattr(server, "MIDDLE_CONFIGURED", True)
-    monkeypatch.setattr(server, "MIDDLE_MIN_COMPLEXITY", 3)
-    monkeypatch.setattr(server, "EXPENSIVE_MIN_COMPLEXITY", 4)
+    monkeypatch.setattr(server, "SUPRA_TARGETS",
+                        ("cheap", "cheap", "middle", "expensive", "expensive"))
     ran = []
 
     def fake_supra(prompt):
@@ -142,14 +137,14 @@ def test_identical_repeats_do_not_pin_expensive(monkeypatch):
     assert h not in server._decision_store
 
 
-def test_cheap_refusals_pin_expensive(monkeypatch):
+def test_cheap_refusals_pin_next_tier(monkeypatch):
     monkeypatch.setattr(server, "PIN_EXPENSIVE_AFTER", 2)
     h = server._prompt_hash("hardening-case")
     server._store_note(h, "cheap", ok=False)
     assert server._store_pinned(h) is None
     server._store_note(h, "cheap", ok=False)
     entry = server._store_pinned(h)
-    assert entry is not None and entry["decision"] == "expensive"
+    assert entry is not None and entry["decision"] == "middle"
 
 
 def test_pin_expiry_and_streak_reset(monkeypatch):
@@ -195,16 +190,15 @@ def test_log_and_headers_accept_missing_score(tmp_path, monkeypatch):
     server._log("cheap", None, "deepseek-v4-flash", "hello", None)
     row = json.loads(open(tmp_path / "decisions.log").read().strip().splitlines()[-1])
     assert row["score"] is None
-    headers = server._route_headers("cheap", None, server.CHEAP, "req_1", None, None, pinned=True)
+    headers = server._route_headers("cheap", None, server.BACKENDS["cheap"], "req_1", None, None, pinned=True)
     assert headers["x-route-score"] == "n/a"
     assert headers["x-route-pinned"] == "true"
 
 
 
 def test_supra_three_tier_mapping_when_middle_configured(monkeypatch):
-    monkeypatch.setattr(server, "MIDDLE_CONFIGURED", True)
-    monkeypatch.setattr(server, "MIDDLE_MIN_COMPLEXITY", 3)
-    monkeypatch.setattr(server, "EXPENSIVE_MIN_COMPLEXITY", 4)
+    monkeypatch.setattr(server, "SUPRA_TARGETS",
+                        ("cheap", "cheap", "middle", "expensive", "expensive"))
     monkeypatch.setattr(server, "_supra_complexity", lambda p: (3, 10))
     assert server._decide_uncached("middle work")[0] == "middle"
     monkeypatch.setattr(server, "_supra_complexity", lambda p: (4, 10))
@@ -225,7 +219,7 @@ def test_session_ids_are_source_namespaced_and_hmac_opaque(monkeypatch):
     assert source == "header" and metadata_source == "metadata"
     assert header_id != metadata_id and header_id != "same"
     assert server._session_id({"user": "same"}, req({})) == (None, None)
-    monkeypatch.setenv("ROUTELLM_SESSION_FROM_USER", "1")
+    monkeypatch.setenv("MANTIS_ROUTER_SESSION_FROM_USER", "1")
     user_id, user_source = server._session_id({"user": "same"}, req({}))
     assert user_source == "user" and user_id not in {header_id, metadata_id}
 
@@ -241,16 +235,12 @@ def test_continuation_only_sticks_existing_session(monkeypatch):
 
 
 
-def test_failover_and_backend_matrix(monkeypatch):
-    monkeypatch.setattr(server, "MIDDLE_CONFIGURED", False)
-    assert server._failover_routes("cheap") == ("cheap", "expensive")
-    assert server._failover_routes("expensive") == ("expensive", "cheap")
-    assert server._backend_for("middle") is server.EXPENSIVE
-    monkeypatch.setattr(server, "MIDDLE_CONFIGURED", True)
+def test_failover_and_backend_matrix():
+    # Fixture targets declare fallbacks cheap -> middle -> expensive -> middle.
     assert server._failover_routes("cheap") == ("cheap", "middle")
     assert server._failover_routes("middle") == ("middle", "expensive")
     assert server._failover_routes("expensive") == ("expensive", "middle")
-    assert server._backend_for("middle") is server.MIDDLE
+    assert server._backend_for("middle") is server.BACKENDS["middle"]
 
 
 def test_session_get_ttl_and_copy(monkeypatch):
@@ -279,7 +269,7 @@ def test_user_is_opt_in(monkeypatch):
     req = Request({"type": "http", "method": "POST", "path": "/", "headers": [],
                    "query_string": b"", "scheme": "http", "server": ("test", 80),
                    "client": ("test", 1), "root_path": ""})
-    monkeypatch.delenv("ROUTELLM_SESSION_FROM_USER", raising=False)
+    monkeypatch.delenv("MANTIS_ROUTER_SESSION_FROM_USER", raising=False)
     assert server._session_id({"user": "account"}, req) == (None, None)
 
 

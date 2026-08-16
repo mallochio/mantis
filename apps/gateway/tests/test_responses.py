@@ -27,42 +27,33 @@ def upstream(handler):
 
 def configure_three_tiers(monkeypatch):
     base = "https://openrouter.ai/v1"
-    cheap = {**server.CHEAP, "tier": "cheap", "base": base,
+    cheap = {**server.BACKENDS["cheap"], "tier": "cheap", "base": base,
              "model": "deepseek-v4-flash", "key": "test"}
-    middle = {**server.MIDDLE, "tier": "middle", "base": base,
+    middle = {**server.BACKENDS["middle"], "tier": "middle", "base": base,
               "model": "openai/gpt-5.6-terra", "effort": "max", "key": "test"}
-    expensive = {**server.EXPENSIVE, "tier": "expensive", "base": base,
+    expensive = {**server.BACKENDS["expensive"], "tier": "expensive", "base": base,
                  "model": "openai/gpt-5.6-sol", "key": "test"}
-    monkeypatch.setattr(server, "CHEAP", cheap)
-    monkeypatch.setattr(server, "MIDDLE", middle)
-    monkeypatch.setattr(server, "EXPENSIVE", expensive)
     monkeypatch.setattr(server, "BACKENDS", {
         "cheap": cheap, "middle": middle, "expensive": expensive,
     })
-    monkeypatch.setattr(server, "MIDDLE_CONFIGURED", True)
     return cheap, middle, expensive
 
 
-def test_responses_capability_requires_openai_and_supported_host():
-    assert server._supports_responses({
-        "base": "https://openrouter.ai/api/v1", "model": "openai/gpt-5.6-sol",
-    })
-    assert not server._supports_responses({
-        "base": "https://router.example.test/v1", "model": "openai/gpt-5.6-sol",
-    })
-    assert not server._supports_responses({
-        "base": "https://modal.example/v1", "model": "kimi-k3",
-    })
-    assert not server._supports_responses({
-        "base": "https://other.example/v1", "model": "openai/gpt-5.6-sol",
-    })
+def test_responses_capability_requires_adapter_support_and_declared_protocol():
+    backend = {"adapter": "openai-compatible", "protocols": ("chat_completions", "responses")}
+    assert server._supports_api(backend, "responses")
+    assert server._supports_api(backend, "chat")
+    assert not server._supports_api({**backend, "protocols": ("chat_completions",)}, "responses")
+    assert not server._supports_api(
+        {**backend, "adapter": "anthropic", "protocols": ("anthropic_messages",)}, "responses")
+    assert not server._supports_api({"protocols": ("responses",)}, "responses")
 
 
 @pytest.mark.anyio
 async def test_responses_promotes_and_preserves_body(client, monkeypatch):
     _, middle, expensive = configure_three_tiers(monkeypatch)
-    # Use the legacy incompatible middle model for the protocol-promotion test.
-    middle.update(model="kimi-k3")
+    # Make the middle tier chat-only for the protocol-promotion test.
+    middle.update(model="kimi-k3", protocols=("chat_completions",))
     seen = {}
 
     def handler(request):
@@ -114,14 +105,14 @@ async def test_chat_still_uses_chat_completions(client, monkeypatch):
 async def test_responses_fails_when_no_capable_backend(client, monkeypatch):
     base = "https://router.example.test/v1"
     backends = {
-        "cheap": {**server.CHEAP, "tier": "cheap", "base": base, "model": "deepseek-v4-flash"},
-        "middle": {**server.MIDDLE, "tier": "middle", "base": base, "model": "kimi-k3"},
-        "expensive": {**server.EXPENSIVE, "tier": "expensive", "base": base, "model": "kimi-k3"},
+        "cheap": {**server.BACKENDS["cheap"], "tier": "cheap", "base": base,
+                  "model": "deepseek-v4-flash", "protocols": ("chat_completions",)},
+        "middle": {**server.BACKENDS["middle"], "tier": "middle", "base": base,
+                   "model": "kimi-k3", "protocols": ("chat_completions",)},
+        "expensive": {**server.BACKENDS["expensive"], "tier": "expensive", "base": base,
+                      "model": "kimi-k3", "protocols": ("chat_completions",)},
     }
     monkeypatch.setattr(server, "BACKENDS", backends)
-    monkeypatch.setattr(server, "CHEAP", backends["cheap"])
-    monkeypatch.setattr(server, "MIDDLE", backends["middle"])
-    monkeypatch.setattr(server, "EXPENSIVE", backends["expensive"])
     response = await client.post("/v1/responses", headers=AUTH, json=BODY)
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "responses_backend_unavailable"
@@ -130,8 +121,8 @@ async def test_responses_fails_when_no_capable_backend(client, monkeypatch):
 @pytest.mark.anyio
 async def test_responses_failover_skips_incompatible_middle(client, monkeypatch):
     cheap, middle, expensive = configure_three_tiers(monkeypatch)
-    cheap.update(model="openai/gpt-5.6-luna")
-    middle.update(model="kimi-k3")
+    cheap.update(model="openai/gpt-5.6-luna", protocols=("chat_completions", "responses"))
+    middle.update(model="kimi-k3", protocols=("chat_completions",))
     calls = []
 
     def handler(request):
@@ -154,8 +145,8 @@ async def test_responses_failover_skips_incompatible_middle(client, monkeypatch)
 
 @pytest.mark.anyio
 async def test_session_affinity_cannot_force_incompatible_tier(client, monkeypatch):
-    _, middle, _ = configure_three_tiers(monkeypatch)
-    middle.update(model="kimi-k3")
+    _, middle, expensive = configure_three_tiers(monkeypatch)
+    middle.update(model="kimi-k3", protocols=("chat_completions",))
     monkeypatch.setattr(server, "_decide", lambda *args: ("middle", None, 3, 10))
     session = "session-response"
     raw_id, _ = server._session_id({}, type("Request", (), {
@@ -170,7 +161,7 @@ async def test_session_affinity_cannot_force_incompatible_tier(client, monkeypat
     monkeypatch.setattr(server, "_client", mock)
     response = await client.post("/v1/responses", headers={**AUTH, "X-Route-Session": session}, json=BODY)
     assert response.status_code == 200
-    assert seen == [server.EXPENSIVE["model"]]
+    assert seen == [expensive["model"]]
     assert response.headers["x-route-reason"] == "responses_protocol_upgrade"
     await mock.aclose()
 
@@ -261,7 +252,7 @@ def test_responses_validation_and_prompt_extraction():
 
 
 def test_responses_body_clamps_and_preserves_reasoning(monkeypatch):
-    backend = {**server.EXPENSIVE, "model": "openai/gpt-5.6-sol", "max_tokens": 100,
+    backend = {**server.BACKENDS["expensive"], "model": "openai/gpt-5.6-sol", "max_tokens": 100,
                "effort": "medium"}
     body = {"model": "auto", "input": "x", "max_output_tokens": 200,
             "reasoning": {"effort": "high", "summary": "detailed"},
@@ -274,21 +265,21 @@ def test_responses_body_clamps_and_preserves_reasoning(monkeypatch):
 
 
 def test_responses_body_uses_maximum_middle_effort_by_default():
-    backend = {**server.MIDDLE, "model": "openai/gpt-5.6-terra", "effort": "max"}
+    backend = {**server.BACKENDS["middle"], "model": "openai/gpt-5.6-terra", "effort": "max"}
     outgoing = server._build_responses_body({"model": "auto", "input": "x"}, backend)
     assert outgoing["model"] == "openai/gpt-5.6-terra"
     assert outgoing["reasoning"] == {"effort": "max"}
 
 
 def test_responses_body_middle_effort_overrides_prime_default_only_for_middle():
-    middle = {**server.MIDDLE, "tier": "middle", "model": "openai/gpt-5.6-terra",
+    middle = {**server.BACKENDS["middle"], "tier": "middle", "model": "openai/gpt-5.6-terra",
               "effort": "max"}
     body = {"model": "auto", "input": "x",
             "reasoning": {"effort": "medium", "summary": "auto"}}
     outgoing = server._build_responses_body(body, middle)
     assert outgoing["reasoning"] == {"effort": "max", "summary": "auto"}
 
-    expensive = {**server.EXPENSIVE, "tier": "expensive", "effort": "medium"}
+    expensive = {**server.BACKENDS["expensive"], "tier": "expensive", "effort": "medium"}
     preserved = server._build_responses_body(body, expensive)
     assert preserved["reasoning"] == body["reasoning"]
 
@@ -347,7 +338,7 @@ async def test_responses_session_proceed_ignores_global_pin(client, monkeypatch)
 def test_middle_reasoning_body_preserves_model():
     body = {"model": "auto", "messages": [{"role": "user", "content": "refactor"}]}
     outgoing = server._build_outgoing_body(body, {
-        **server.MIDDLE,
+        **server.BACKENDS["middle"],
         "base": "https://router.example.test/v1",
         "model": "openai/gpt-5.6-terra", "effort": "max",
     })

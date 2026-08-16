@@ -51,7 +51,6 @@ def _load_policy_contract():
 
 
 def test_routing_policy_contract_uses_placeholder_labels_and_real_mapping(monkeypatch):
-    monkeypatch.setattr(server, "_TARGETS_ARE_EXPLICIT", True)
     monkeypatch.setattr(
         server, "SUPRA_TARGETS", ("cheap", "cheap", "middle", "middle", "expensive")
     )

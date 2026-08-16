@@ -33,7 +33,6 @@ if not (_HERE / "mini.py").exists():
         sys.path.insert(0, str(_OPENFUGU))
 
 import providers
-import runs
 import serve_config
 from mini import (
     DEFAULT_SLOT_LABELS,
@@ -45,6 +44,8 @@ from serve_config import (
     MODEL_MODES,
     RUN_MAX_MSG_BYTES,
 )
+
+import runs
 
 
 def _split_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:

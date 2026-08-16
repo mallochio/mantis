@@ -28,11 +28,11 @@ base_url = "https://upstream.test/v1"
 credential_env = "ROUTER_CATALOG_TEST_KEY"
 developer_role = "native"
 
-[routellm]
+[gateway]
 active_policy = "coding"
 revision = "{revision}"
 
-[routellm.targets.low]
+[gateway.targets.low]
 provider = "direct"
 upstream_model = "vendor/low"
 reasoning_effort = "none"
@@ -40,7 +40,7 @@ protocols = ["chat_completions"]
 fallbacks = ["mid"]
 rank = 0
 
-[routellm.targets.mid]
+[gateway.targets.mid]
 provider = "direct"
 upstream_model = "vendor/mid"
 reasoning_effort = "medium"
@@ -48,7 +48,7 @@ protocols = ["chat_completions"]
 fallbacks = ["low"]
 rank = 1
 
-[routellm.targets.work]
+[gateway.targets.work]
 provider = "direct"
 upstream_model = "vendor/work"
 reasoning_effort = "high"
@@ -56,7 +56,7 @@ protocols = ["chat_completions"]
 fallbacks = ["safe"]
 rank = 2
 
-[routellm.targets.responses]
+[gateway.targets.responses]
 provider = "direct"
 upstream_model = "openai/responses"
 reasoning_effort = "max"
@@ -65,7 +65,7 @@ protocols = ["chat_completions", "responses"]
 fallbacks = ["safe"]
 rank = 3
 
-[routellm.targets.safe]
+[gateway.targets.safe]
 provider = "direct"
 upstream_model = "openai/safe"
 reasoning_effort = "xhigh"
@@ -73,7 +73,7 @@ protocols = ["chat_completions", "responses"]
 fallbacks = ["responses"]
 rank = 4
 {key}
-[routellm.policies.coding]
+[gateway.policies.coding]
 complexity_targets = ["low", "mid", "work", "responses", "safe"]
 invalid_complexity_target = "safe"
 """
@@ -84,6 +84,7 @@ def import_catalog_server(tmp_path, monkeypatch, *, text=None, revision="catalog
     path.write_text(text or catalog_text(revision=revision))
     monkeypatch.setenv("AI_ROUTING_CONFIG", str(path))
     monkeypatch.setenv("ROUTER_CATALOG_TEST_KEY", "test-only-value")
+    monkeypatch.delenv("MANTIS_ROUTER_TARGETS_JSON", raising=False)
     return importlib.reload(server)
 
 
@@ -166,6 +167,7 @@ def test_catalog_rejects_literal_keys_and_missing_credentials(tmp_path):
     path = tmp_path / "catalog.toml"
     path.write_text(catalog_text(bad_key=True))
     env = os.environ.copy()
+    env.pop("MANTIS_ROUTER_TARGETS_JSON", None)
     env.update({"AI_ROUTING_CONFIG": str(path), "ROUTER_CATALOG_TEST_KEY": "test-only-value"})
     env["PYTHONPATH"] = str(Path(__file__).parents[1])
     bad = subprocess.run([sys.executable, "-c", "import server"], env=env, capture_output=True, text=True)
@@ -199,11 +201,11 @@ def _catalog_subprocess(tmp_path, text, *, json_source=None, raw_json=None, cred
     else:
         env.pop("ROUTER_CATALOG_TEST_KEY", None)
     if raw_json is not None:
-        env["ROUTELLM_TARGETS_JSON"] = raw_json
+        env["MANTIS_ROUTER_TARGETS_JSON"] = raw_json
     elif json_source is None:
-        env.pop("ROUTELLM_TARGETS_JSON", None)
+        env.pop("MANTIS_ROUTER_TARGETS_JSON", None)
     else:
-        env["ROUTELLM_TARGETS_JSON"] = json.dumps(json_source)
+        env["MANTIS_ROUTER_TARGETS_JSON"] = json.dumps(json_source)
     env["PYTHONPATH"] = str(Path(__file__).parents[1])
     return subprocess.run([sys.executable, "-c", "import server"], env=env,
                           capture_output=True, text=True)
@@ -242,11 +244,11 @@ def test_json_source_is_atomic_and_validated(tmp_path):
 
     malformed = {"version": 2, "targets": {}, "complexity_targets": ["only"] * 5}
     result = _catalog_subprocess(tmp_path, catalog_text(), json_source=malformed)
-    assert result.returncode != 0 and "ROUTELLM_TARGETS_JSON.version must be 1" in result.stderr
+    assert result.returncode != 0 and "MANTIS_ROUTER_TARGETS_JSON.version must be 1" in result.stderr
 
     bool_version = {"version": True, "targets": {}, "complexity_targets": ["only"] * 5}
     result = _catalog_subprocess(tmp_path, catalog_text(), json_source=bool_version)
-    assert result.returncode != 0 and "ROUTELLM_TARGETS_JSON.version must be 1" in result.stderr
+    assert result.returncode != 0 and "MANTIS_ROUTER_TARGETS_JSON.version must be 1" in result.stderr
 
     # A valid direct JSON source is independent of an absent catalog file.
     direct = {
@@ -264,7 +266,7 @@ def test_json_source_is_atomic_and_validated(tmp_path):
     assert result.returncode == 0
 
 
-def test_shared_catalog_allows_anthropic_but_routellm_targets_reject_it(tmp_path):
+def test_shared_catalog_allows_anthropic_but_router_targets_reject_it(tmp_path):
     shared_anthropic_provider = """
 [providers.anthropic-shared]
 adapter = "anthropic"
@@ -272,7 +274,7 @@ base_url = "https://anthropic.test"
 credential_env = "ROUTER_CATALOG_TEST_KEY"
 protocols = ["anthropic_messages"]
 """
-    shared_catalog = catalog_text().replace("[routellm]", shared_anthropic_provider + "\n[routellm]")
+    shared_catalog = catalog_text().replace("[gateway]", shared_anthropic_provider + "\n[gateway]")
     assert _catalog_subprocess(tmp_path, shared_catalog).returncode == 0
 
     invalid_target = shared_catalog.replace(
@@ -282,7 +284,7 @@ protocols = ["anthropic_messages"]
     )
     result = _catalog_subprocess(tmp_path, invalid_target)
     assert result.returncode != 0
-    assert "cannot declare anthropic_messages for a RouteLLM target" in result.stderr
+    assert "cannot declare anthropic_messages for a router target" in result.stderr
 
 
 def test_adapter_capabilities_and_fingerprint_cover_adapter_and_policy(catalog_server):
@@ -581,12 +583,12 @@ def test_catalog_malformed_unicode_and_raw_json_sources_are_redacted(tmp_path):
 
     result = _catalog_subprocess(tmp_path, catalog_text(), raw_json="{")
     assert result.returncode != 0
-    assert "ROUTELLM_TARGETS_JSON must be valid JSON" in result.stderr
+    assert "MANTIS_ROUTER_TARGETS_JSON must be valid JSON" in result.stderr
 
     for raw in ("null", "[]", "{}"):
         result = _catalog_subprocess(tmp_path, catalog_text(), raw_json=raw)
         assert result.returncode != 0
-        assert "ROUTELLM_TARGETS_JSON must be a non-empty object" in result.stderr
+        assert "MANTIS_ROUTER_TARGETS_JSON must be a non-empty object" in result.stderr
 
 
 def test_revision_invalidates_cache_and_session_state(catalog_server, monkeypatch):
@@ -975,13 +977,18 @@ async def test_native_responses_preflight_commits_lifecycle_only_stream(catalog_
     assert refusal is False and created in prefix
 
 
-def test_legacy_env_parse_errors_do_not_block_explicit_sources(tmp_path):
+def test_malformed_numeric_env_values_fail_fast(tmp_path):
     path = tmp_path / "catalog.toml"
     path.write_text(catalog_text())
     env = os.environ.copy()
+    env.pop("MANTIS_ROUTER_TARGETS_JSON", None)
     env.update({"AI_ROUTING_CONFIG": str(path), "ROUTER_CATALOG_TEST_KEY": "test-only-value",
-                "CHEAP_MAX_TOKENS": "not-an-int", "ROUTELLM_TIMEOUT_S": "bad",
+                "MANTIS_ROUTER_TIMEOUT_S": "bad",
                 "PYTHONPATH": str(Path(__file__).parents[1])})
+    malformed = subprocess.run([sys.executable, "-c", "import server"], env=env,
+                               capture_output=True, text=True)
+    assert malformed.returncode != 0
+    env["MANTIS_ROUTER_TIMEOUT_S"] = "30"
     ok = subprocess.run([sys.executable, "-c", "import server"], env=env,
                         capture_output=True, text=True)
     assert ok.returncode == 0, ok.stderr[-1000:]
@@ -1101,19 +1108,30 @@ def test_json_duplicate_keys_are_rejected_and_wrapper_version_required(tmp_path)
     result = _catalog_subprocess(tmp_path, "", json_source=None, raw_json=no_version)
     assert result.returncode != 0 and "version must be 1" in result.stderr
 
-    # Reserved wrapper keys are rejected in the plain-map form.
-    reserved = json.dumps({"version": {"adapter": "openai-compatible",
-                                       "base_url": "https://u.test/v1",
-                                       "credential_env": "ROUTER_CATALOG_TEST_KEY",
-                                       "upstream_model": "m", "rank": 0,
-                                       "protocols": ["chat_completions"]}})
-    result = _catalog_subprocess(tmp_path, "", json_source=None, raw_json=reserved)
-    assert result.returncode != 0 and "is reserved" in result.stderr
+    # Unknown wrapper keys are rejected.
+    unknown = json.dumps({"version": 1, "nope": 1,
+                          "targets": {"only": {"adapter": "openai-compatible",
+                                               "base_url": "https://u.test/v1",
+                                               "credential_env": "ROUTER_CATALOG_TEST_KEY",
+                                               "upstream_model": "m", "rank": 0,
+                                               "protocols": ["chat_completions"]}},
+                          "complexity_targets": ["only"] * 5})
+    result = _catalog_subprocess(tmp_path, "", json_source=None, raw_json=unknown)
+    assert result.returncode != 0 and "unexpected field" in result.stderr
+
+    # A plain target map without the wrapper is rejected.
+    plain = json.dumps({"only": {"adapter": "openai-compatible",
+                                 "base_url": "https://u.test/v1",
+                                 "credential_env": "ROUTER_CATALOG_TEST_KEY",
+                                 "upstream_model": "m", "rank": 0,
+                                 "protocols": ["chat_completions"]}})
+    result = _catalog_subprocess(tmp_path, "", json_source=None, raw_json=plain)
+    assert result.returncode != 0 and "unexpected field only" in result.stderr
 
 
 def test_catalog_inactive_policy_is_validated_and_rank_may_be_omitted(tmp_path):
-    policy_block = '[routellm.policies.coding]\ncomplexity_targets = ["low", "mid", "work", "responses", "safe"]\n'
-    dormant = ('[routellm.policies.dormant]\ncomplexity_targets = ["low", "mid", "work", "responses", "safe"]\n'
+    policy_block = '[gateway.policies.coding]\ncomplexity_targets = ["low", "mid", "work", "responses", "safe"]\n'
+    dormant = ('[gateway.policies.dormant]\ncomplexity_targets = ["low", "mid", "work", "responses", "safe"]\n'
                'dormant_typo = 1\n')
     text = catalog_text().replace(policy_block, policy_block + dormant, 1)
     result = _catalog_subprocess(tmp_path, text)
@@ -1291,3 +1309,16 @@ async def test_responses_completed_event_with_non_completed_status_is_not_succes
         catalog_server._store_key(catalog_server._prompt_hash("task"), "responses"))
     assert entry is None or entry.get("ok", 0) == 0
     await mock.aclose()
+
+
+def test_gateway_section_name_accepted(tmp_path, monkeypatch):
+    server_inst = import_catalog_server(tmp_path, monkeypatch)
+    try:
+        assert server_inst.TARGET_CONFIG_SOURCE == "catalog"
+        assert "low" in server_inst.BACKENDS
+        assert "expensive" not in server_inst.BACKENDS or server_inst.BACKENDS["expensive"]
+        assert server_inst.SUPRA_INVALID_TARGET == "safe"
+    finally:
+        monkeypatch.undo()
+        importlib.reload(server)
+

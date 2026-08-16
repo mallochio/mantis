@@ -24,7 +24,7 @@ def test_is_reasoning_model():
     assert serve._is_reasoning_model("claude-sonnet-5")
     assert serve._is_reasoning_model("gpt-5.6-terra")
     assert not serve._is_reasoning_model("deepseek-v4-flash")
-    assert not serve._is_reasoning_model("glm-5.2")
+    assert serve._is_reasoning_model("glm-5.2")
 
 
 def test_build_request_routes_providers(monkeypatch):

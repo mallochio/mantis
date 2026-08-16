@@ -78,7 +78,7 @@ start_one() { # step_no name script url timeout_s [grep]
 cmd_start() {
   printf '\n\033[1mStarting the LLM stack (Bifrost -> direct gateway -> Mantis API)\033[0m\n'
   printf '\033[2mComponents already running are restarted so the latest catalog/config is loaded.\033[0m\n'
-  [ -f "$CATALOG" ] || warn "catalog missing: $CATALOG (gateway and API will fall back to legacy env)"
+  [ -f "$CATALOG" ] || warn "catalog missing: $CATALOG (required by the gateway and API)"
   start_one "1/3" "bifrost" "$LIB_DIR/bifrost-local.sh" "$BIFROST_URL" 90 || return 1
   start_one "2/3" "direct gateway" "$LIB_DIR/llm-router.sh" "$ROUTER_URL" 120 '"ready":true' || return 1
   start_one "3/3" "Mantis API" "$LIB_DIR/mantis-local.sh" "$MANTIS_URL" 180 || return 1

@@ -172,7 +172,7 @@ reasoning engine or search crawler.
 | `MANTIS_CACHE_BREAKPOINTS` | Add prompt-cache breakpoints to Claude-family requests | `1` |
 | `MANTIS_ROUTER_URL` | Base URL of the in-repo Mantis router for `mantis` | `http://127.0.0.1:5500/v1` |
 | `MANTIS_ROUTER_TIMEOUT_S` | Upstream timeout for `mantis` calls | `300` |
-| `ROUTELLM_KEY` | Compatibility name for the router bearer token | required |
+| `MANTIS_ROUTER_KEY` | Bearer token the API presents to its internal router | required |
 
 Supported hosted model prefixes are currently `openrouter/` and `opencode-go/`.
 OpenRouter `openai/*` workers use the stateless Responses API with stable,

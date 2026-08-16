@@ -15,7 +15,7 @@ from openai import OpenAI
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setenv("MANTIS_API_KEY", "test-key")
-    monkeypatch.setenv("ROUTELLM_KEY", "gateway-key")
+    monkeypatch.setenv("MANTIS_ROUTER_KEY", "gateway-key")
     return TestClient(api.app)
 
 
@@ -498,7 +498,7 @@ def test_capacity_returns_429(client, monkeypatch):
 def test_ready_reports_only_sanitized_endpoint_metadata(client, monkeypatch):
     marker = "never-return-this-secret"
     monkeypatch.setenv("MANTIS_ENDPOINT_PROFILE", "direct")
-    monkeypatch.setenv("ROUTELLM_KEY", "gateway-key")
+    monkeypatch.setenv("MANTIS_ROUTER_KEY", "gateway-key")
     monkeypatch.setenv("OPENROUTER_BASE_URL", "https://direct.example.test/v1?token=" + marker)
     monkeypatch.setenv("OPENCODE_GO_ENDPOINT_URL", "https://opencode.example.test/private")
     body = client.get("/ready").json()
@@ -520,10 +520,10 @@ def test_ready_reports_only_sanitized_endpoint_metadata(client, monkeypatch):
 
 def test_ready_direct_requires_gateway_key(client, monkeypatch):
     monkeypatch.setenv("MANTIS_ENDPOINT_PROFILE", "direct")
-    monkeypatch.delenv("ROUTELLM_KEY", raising=False)
+    monkeypatch.delenv("MANTIS_ROUTER_KEY", raising=False)
     response = client.get("/ready")
     assert response.status_code == 503
-    assert response.json()["error"]["message"] == "ROUTELLM_KEY is not configured"
+    assert response.json()["error"]["message"] == "MANTIS_ROUTER_KEY is not configured"
 
 
 # --- catalog readiness: credentials and binding fingerprint -------------------
@@ -653,7 +653,7 @@ def test_basic_model_relays_router_response_and_session(client, monkeypatch):
             headers={"x-route-decision": "middle", "x-route-reason": "strong_upgrade"},
         )
 
-    monkeypatch.setenv("ROUTELLM_KEY", "router-key")
+    monkeypatch.setenv("MANTIS_ROUTER_KEY", "router-key")
     monkeypatch.setattr(api, "_router_client", lambda: _router_client(handler))
     response = client.post(
         "/v1/chat/completions",
@@ -681,7 +681,7 @@ def test_basic_model_relays_body_session_identity_as_header(client, monkeypatch)
             headers={"x-route-decision": "cheap"},
         )
 
-    monkeypatch.setenv("ROUTELLM_KEY", "router-key")
+    monkeypatch.setenv("MANTIS_ROUTER_KEY", "router-key")
     monkeypatch.setattr(api, "_router_client", lambda: _router_client(handler))
     response = client.post(
         "/v1/chat/completions",
@@ -713,7 +713,7 @@ def test_basic_model_relays_body_user_as_header_when_no_metadata(client, monkeyp
             headers={"x-route-decision": "cheap"},
         )
 
-    monkeypatch.setenv("ROUTELLM_KEY", "router-key")
+    monkeypatch.setenv("MANTIS_ROUTER_KEY", "router-key")
     monkeypatch.setattr(api, "_router_client", lambda: _router_client(handler))
     response = client.post(
         "/v1/chat/completions",
@@ -736,7 +736,7 @@ def test_basic_model_relays_router_stream(client, monkeypatch):
             headers={"content-type": "text/event-stream", "x-route-decision": "cheap"},
         )
 
-    monkeypatch.setenv("ROUTELLM_KEY", "router-key")
+    monkeypatch.setenv("MANTIS_ROUTER_KEY", "router-key")
     monkeypatch.setattr(api, "_router_client", lambda: _router_client(handler))
     response = client.post(
         "/v1/chat/completions",
@@ -756,7 +756,7 @@ def test_basic_model_relays_router_stream(client, monkeypatch):
 def test_basic_model_reports_router_connection_failure(client, monkeypatch):
     import httpx
 
-    monkeypatch.setenv("ROUTELLM_KEY", "router-key")
+    monkeypatch.setenv("MANTIS_ROUTER_KEY", "router-key")
     monkeypatch.setattr(
         api,
         "_router_client",

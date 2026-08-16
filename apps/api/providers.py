@@ -361,7 +361,10 @@ def _build_request(
         if _cache_breakpoints_enabled() and model.startswith("anthropic/claude-"):
             body["messages"] = _with_cache_breakpoints(messages)
         if effort:
-            body["reasoning_effort"] = effort
+            if model.rsplit("/", 1)[-1].startswith("glm-") and effort == "medium":
+                body["reasoning_effort"] = "high"
+            else:
+                body["reasoning_effort"] = effort
         if not effort and not _is_reasoning_model(model):
             body["temperature"] = temperature
         if tools:

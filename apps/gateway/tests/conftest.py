@@ -1,42 +1,70 @@
-import importlib
+import json
 import os
 import socket
-import tempfile
 
 import pytest
 
 
-def _force_legacy_router_default() -> None:
-    """Force legacy env-based routing tests to run in legacy mode.
+def _deploy_fixture_targets() -> None:
+    """Boot the router from an explicit fixture instead of the dev-shell catalog.
 
-    A catalog now normally exists at the default path, so a plain
-    ``import server`` loads the catalog instead of the legacy environment.
-    Point ``AI_ROUTING_CONFIG`` at an empty catalog (no ``[routellm]``
-    section) so ``import server`` takes the legacy fallback.  Catalog tests
-    reload ``server`` with their own fixtures and are unaffected.
+    A catalog normally exists at the default path, so a plain ``import server``
+    would load the developer's real targets.  Point the server at a fixture
+    source; catalog tests spawn their own subprocess fixtures and are
+    unaffected.
     """
-    os.environ.pop("ROUTELLM_SESSION_FROM_USER", None)
-    os.environ["ROUTELLM_KEY"] = "sk-route-local"  # force: real key may be exported in dev shells
+    os.environ.pop("MANTIS_ROUTER_SESSION_FROM_USER", None)
+    os.environ.pop("AI_ROUTING_CONFIG", None)
+    os.environ["MANTIS_ROUTER_KEY"] = "sk-route-local"  # force: real key may be exported in dev shells
+    os.environ["MANTIS_ROUTER_TEST_CRED"] = "test-only"
+    os.environ["MANTIS_ROUTER_TARGETS_JSON"] = json.dumps({
+        "version": 1,
+        "providers": {
+            "zen": {
+                "adapter": "openai-compatible",
+                "base_url": "https://opencode.ai/zen/go/v1",
+                "credential_env": "MANTIS_ROUTER_TEST_CRED",
+                "protocols": ["chat_completions"],
+            },
+            "openrouter": {
+                "adapter": "openai-compatible",
+                "base_url": "https://openrouter.ai/api/v1",
+                "credential_env": "MANTIS_ROUTER_TEST_CRED",
+                "protocols": ["chat_completions", "responses"],
+            },
+        },
+        "targets": {
+            "cheap": {
+                "provider": "zen", "upstream_model": "deepseek-v4-flash", "rank": 0,
+                "protocols": ["chat_completions"], "fallbacks": ["middle"],
+            },
+            "middle": {
+                "provider": "openrouter", "upstream_model": "openai/gpt-5.6-terra",
+                "reasoning_effort": "max", "force_reasoning_effort": True, "rank": 1,
+                "protocols": ["chat_completions", "responses"], "fallbacks": ["expensive"],
+            },
+            "expensive": {
+                "provider": "openrouter", "upstream_model": "openai/gpt-5.6-sol",
+                "reasoning_effort": "medium", "rank": 2,
+                "protocols": ["chat_completions", "responses"], "fallbacks": ["middle"],
+            },
+        },
+        "complexity_targets": ["cheap", "cheap", "middle", "middle", "expensive"],
+    })
     try:
         import server  # noqa: F401
     except ImportError:
         return
-    fd, path = tempfile.mkstemp(suffix=".toml")
-    try:
-        os.write(fd, b"version = 1\n")
-    finally:
-        os.close(fd)
-    os.environ["AI_ROUTING_CONFIG"] = path
-    importlib.reload(server)
 
 
-_force_legacy_router_default()
+_deploy_fixture_targets()
 
 
 @pytest.fixture(autouse=True)
 def sanitize_router_env(monkeypatch):
-    monkeypatch.delenv("ROUTELLM_SESSION_FROM_USER", raising=False)
-    monkeypatch.setenv("ROUTELLM_KEY", os.environ.get("ROUTELLM_KEY", "sk-route-local"))
+    monkeypatch.delenv("MANTIS_ROUTER_SESSION_FROM_USER", raising=False)
+    monkeypatch.setenv("MANTIS_ROUTER_KEY", os.environ.get("MANTIS_ROUTER_KEY", "sk-route-local"))
+    monkeypatch.setenv("MANTIS_ROUTER_TEST_CRED", os.environ.get("MANTIS_ROUTER_TEST_CRED", "test-only"))
 
 
 @pytest.fixture(autouse=True)

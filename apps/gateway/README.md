@@ -4,10 +4,9 @@
 
 The gateway implements Mantis's direct mode: it scores one request and sends it
 to one cheap, middle, or expensive model through Bifrost. It exposes
-OpenAI-compatible `/v1/chat/completions` and `/v1/responses` endpoints. In the
-default gateway profile, all tiers use Bifrost's configured Cloudflare gateway
-and its catalog routes to OpenCode Go, Modal, or OpenRouter. Direct deployments
-remain supported. The server uses one lifespan-owned asynchronous HTTP pool.
+OpenAI-compatible `/v1/chat/completions` and `/v1/responses` endpoints. All
+tiers route through the local Bifrost gateway per the shared routing catalog.
+The server uses one lifespan-owned asynchronous HTTP pool.
 
 Supra-Router-51M is the routing signal. Complexity 1–2 goes cheap, 3–4 goes middle when configured, and 5 goes expensive.
 
@@ -24,26 +23,17 @@ uv sync --dev
 The default listener is `http://127.0.0.1:5500/v1`, model `auto`, with the
 loopback-only development credential `sk-route-local`. Clients normally use
 `mantis` at `http://127.0.0.1:8088/v1`; :5500 is the internal gateway endpoint.
-A non-loopback bind requires an externally supplied `ROUTELLM_KEY` (a
-legacy-compatible variable name) that is not the default. The
-launcher refuses to stop a port owner unless its recorded PID, working
-directory, command, and listening socket all identify this checkout.
+A non-loopback bind requires an externally supplied `MANTIS_ROUTER_KEY` that
+is not the default. The launcher refuses to stop a port owner unless its
+recorded PID, working directory, command, and listening socket all identify
+this checkout.
 
-The launcher defaults to the Cloudflare gateway (`unified-ai-gateway.siddsantham.workers.dev`) and requires `AI_GATEWAY_API_KEY` (or `MANTIS_GATEWAY_API_KEY`). Default models are `deepseek-v4-flash` (cheap), `openai/gpt-5.6-terra` at maximum reasoning (middle), and `openai/gpt-5.6-sol` (expensive). Set `ROUTELLM_ENDPOINT_PROFILE=direct` to retain the direct two-backend contract with `EXPENSIVE_BASE`, `EXPENSIVE_KEY`, `CHEAP_BASE`, `CHEAP_KEY`, and their model variables. A direct middle tier can be enabled with `MIDDLE_BASE`, `MIDDLE_KEY`, and `MIDDLE_MODEL`. `user` is not treated as a session identifier unless `ROUTELLM_SESSION_FROM_USER=1` is set; prefer `X-Route-Session` for conversation affinity. See `server.py` for optional limits.
-
-### Endpoint credential profiles
-
-The launcher keeps provider keys for direct provider URLs. If either base URL's
-parsed host is `unified-ai-gateway.siddsantham.workers.dev`, it automatically
-uses `AI_GATEWAY_API_KEY` (or `MANTIS_GATEWAY_API_KEY`) for that backend. It
-fails closed when the gateway token is absent. URL hosts are parsed and
-compared without displaying credentials.
-
-Set `ROUTELLM_ENDPOINT_PROFILE=direct` or `cloudflare` to override base-host
-auto-detection for all tiers. `ROUTELLM_GATEWAY_MODE=1` also selects the
-Cloudflare profile. The legacy `ROUTELLM_GATEWAY_MODE=1` also
-selects the Cloudflare profile when no explicit profile is set. Direct bases
-continue to use `EXPENSIVE_KEY` and `CHEAP_KEY`.
+Targets, provider bindings, and the Supra complexity policy come from one
+explicit source: the shared routing catalog (`[gateway]` section of
+`~/.config/ai-routing/catalog.toml`) or `MANTIS_ROUTER_TARGETS_JSON`. There is
+no environment-variable fallback contract; `user` is not treated as a session
+identifier unless `MANTIS_ROUTER_SESSION_FROM_USER=1` is set; prefer
+`X-Route-Session` for conversation affinity.
 
 ## Behavior
 
@@ -51,16 +41,14 @@ continue to use `EXPENSIVE_KEY` and `CHEAP_KEY`.
 
 Clients that want Responses must call `POST /v1/responses` explicitly. The
 router preserves the Responses request and response shapes and sends the request
-to `/responses` through OpenRouter or the Cloudflare gateway. It never translates
-Chat Completions to Responses or vice versa.
+to `/responses`. It never translates Chat Completions to Responses or vice versa.
 
-Only `openai/*` models on OpenRouter or the configured Cloudflare gateway are
-Responses-capable. If a selected cheap or middle tier is incompatible, the
-request is promoted to the nearest higher compatible tier and returns
+A target is Responses-capable when its configured `protocols` include
+`responses`. If a selected tier is incompatible, the request is promoted to the
+nearest higher compatible tier and returns
 `x-route-reason: responses_protocol_upgrade`. Failover also skips incompatible
-tiers. With the default gateway models, Terra and Sol can serve Responses directly;
-an explicitly configured `openai/gpt-5.6-luna` cheap tier may also serve
-Responses directly. A non-OpenAI middle model such as `kimi-k3` is promoted to
+tiers. In the default deployment the middle and expensive tiers serve Responses
+directly; a chat-only middle model is promoted to
 Sol instead. The Terra middle tier uses maximum reasoning (`max`) for every
 Responses request routed to it, overriding only the native `reasoning.effort`
 field while preserving other reasoning fields such as `summary`. Cheap and
@@ -115,11 +103,11 @@ calls in the Aug 5-10 log), so the router keeps a persistent per-prompt
 decision store (`decision-state.jsonl`, append-only, mode 0600) that survives
 restarts:
 
-- A prompt that completes cleanly on the cheap backend `ROUTELLM_PIN_CHEAP_AFTER`
+- A prompt that completes cleanly on the cheap backend `MANTIS_ROUTER_PIN_CHEAP_AFTER`
   (default 5) times is pinned cheap and skips all scoring (no embedding call,
-  no Supra inference) until `ROUTELLM_PIN_TTL_S` (default 7 days) elapses.
+  no Supra inference) until `MANTIS_ROUTER_PIN_TTL_S` (default 7 days) elapses.
 - A prompt whose cheap attempt explicitly refuses
-  `ROUTELLM_PIN_EXPENSIVE_AFTER` (default 2) times is pinned expensive, so
+  `MANTIS_ROUTER_PIN_EXPENSIVE_AFTER` (default 2) times is pinned expensive, so
   later requests skip the doomed cheap attempt entirely. Repeated identical
   requests are deliberately not escalation signals because agent loops often
   repeat prompts such as `Proceed` and polling instructions.
@@ -132,7 +120,7 @@ restarts:
 ## Logs and training
 
 Operational logs contain prompt hashes and routing metadata, not prompt text.
-Set `ROUTELLM_TRAINING_LOG=1` only when full-prompt training collection is
+Set `MANTIS_ROUTER_TRAINING_LOG=1` only when full-prompt training collection is
 explicitly required. Directories use mode `0700`; private files use `0600`.
 Request and outcome occurrence IDs support exact evaluation joins. Old outcome
 rows without IDs use the legacy prompt-hash join.

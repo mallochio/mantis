@@ -895,7 +895,9 @@ def run_pi_agent(
             "cost_method": proxy.records[-1]["cost_method"] if proxy.records else None,
             "actual_cost_usd": _sum_cost(proxy.records, "actual_cost_usd"),
             "shadow_cost_usd": _sum_cost(proxy.records, "shadow_cost_usd"),
-            "served_models": sorted({r["served_model"] for r in proxy.records if r.get("served_model")}),
+            "served_models": sorted(
+                {r["served_model"] for r in proxy.records if r.get("served_model")}
+            ),
             "trajectory": trajectory, "route_trace": proxy.records,
             "error": f"pi timed out after {timeout}s", "aborted": True,
             "abort_scope": "timeout",
@@ -908,7 +910,9 @@ def run_pi_agent(
             "cost_method": proxy.records[-1]["cost_method"] if proxy.records else None,
             "actual_cost_usd": _sum_cost(proxy.records, "actual_cost_usd"),
             "shadow_cost_usd": _sum_cost(proxy.records, "shadow_cost_usd"),
-            "served_models": sorted({r["served_model"] for r in proxy.records if r.get("served_model")}),
+            "served_models": sorted(
+                {r["served_model"] for r in proxy.records if r.get("served_model")}
+            ),
             "trajectory": trajectory, "route_trace": proxy.records,
             "error": f"{type(exc).__name__}: {exc}",
         }

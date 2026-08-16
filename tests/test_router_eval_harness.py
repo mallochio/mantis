@@ -549,7 +549,10 @@ def test_timeout_row_sums_recorded_shadow_cost(tmp_path, monkeypatch):
         lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired(args[0], 1)),
     )
     # Preserve worktree reset calls by replacing setup with the already-created tree.
-    monkeypatch.setattr(harness, "_ensure_worktree", lambda *_args: (worktrees / "demo-1", None, False))
+    monkeypatch.setattr(
+        harness, "_ensure_worktree",
+        lambda *_args: (worktrees / "demo-1", None, False),
+    )
     ledger = harness.CostLedger(total_limit=2.0, arm_limit=2.0)
     row = harness.run_pi_agent(
         _instance(base_commit=head), arm="timeout-test",

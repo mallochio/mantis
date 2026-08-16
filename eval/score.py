@@ -42,7 +42,7 @@ def provenance(
         git_sha = "unknown"
     try:
         catalog = tomllib.loads((REPO / "config" / "catalog.toml").read_text())
-        revision = catalog["routellm"]["revision"]
+        revision = catalog["gateway"]["revision"]
     except (OSError, KeyError, TypeError, tomllib.TOMLDecodeError):
         revision = "unknown"
     fixture_sha = sha256(fixtures_path.read_bytes()).hexdigest()

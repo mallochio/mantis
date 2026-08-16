@@ -13,38 +13,46 @@ base_url = "http://127.0.0.1:8080/anthropic"
 credential_env = "BIFROST_API_KEY"
 protocols = ["anthropic_messages"]
 
-[routellm]
+[gateway]
 active_policy = "coding"
-revision = "bifrost-2026-08-13-model-swap"
+revision = "bifrost-2026-08-16-flash-sol-fable"
 
-[routellm.targets.cheap]
+[gateway.targets.cheap]
 provider = "bifrost"
-# deepseek-v4-pro (Bifrost OpenCode Go route): models.dev output cap 384000.
-# No reasoning_effort is configured, so caller settings are preserved.
-max_tokens = 384000
-upstream_model = "deepseek-v4-pro"
+# gemini-3.7-flash (models.dev google/google-vertex): max output 65536,
+# cost $0.75/$3.75 per 1M in/out.
+reasoning_effort = "medium"
+force_reasoning_effort = true
+max_tokens = 65536
+upstream_model = "google/gemini-3.7-flash"
 protocols = ["chat_completions", "responses"]
 rank = 0
 
-[routellm.targets.middle]
+[gateway.targets.middle]
 provider = "bifrost"
-# kimi-k3 (Bifrost Kimi/Modal route): models.dev output cap 131072.
-# No reasoning_effort is configured, so caller settings are preserved.
-max_tokens = 131072
-upstream_model = "kimi-k3"
+# gpt-5.6-sol (models.dev azure/openai): max output 128000,
+# cost $5/$30 per 1M in/out.
+reasoning_effort = "medium"
+force_reasoning_effort = true
+max_tokens = 128000
+upstream_model = "gpt-5.6-sol"
 protocols = ["chat_completions", "responses"]
 rank = 1
 
-[routellm.targets.expensive]
+[gateway.targets.expensive]
 provider = "bifrost"
-# Claude Opus 5 through Bifrost Bedrock: max output 128k.
-# No reasoning_effort is configured, so caller settings are preserved.
+# claude-fable-5 through Bifrost (bedrock-primary; vertex needs a GCP quota
+# grant for the anthropic-claude-fable base model, and bedrock needs
+# `aws bedrock put-account-data-retention --mode provider_data_share`).
+# models.dev anthropic/bedrock: max output 128000, cost $10/$50 per 1M in/out.
+reasoning_effort = "medium"
+force_reasoning_effort = true
 max_tokens = 128000
-upstream_model = "bedrock/anthropic/claude-opus-5"
+upstream_model = "anthropic/claude-fable-5"
 protocols = ["chat_completions", "responses"]
 rank = 2
 
-[routellm.policies.coding]
+[gateway.policies.coding]
 complexity_targets = ["cheap", "cheap", "middle", "middle", "expensive"]
 invalid_complexity_target = "expensive"
 
@@ -124,3 +132,9 @@ upstream_model = "google/gemini-3.1-pro-preview"
 model_identity = "gemini-3.1-pro-preview"
 reasoning_effort = "high"
 protocols = ["chat_completions"]
+
+# Fusion lead/sidekick configuration. These are worker slot IDs from [mantis.workers].
+[fusion]
+main = "gpt-5_6-sol"
+sidekick = "gemini-3_6-flash"
+max_follow_ups = 3

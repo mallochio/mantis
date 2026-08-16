@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
+import fusion
 import httpx
 import model_catalog
 import serve
@@ -535,8 +536,8 @@ def ready(response: Response) -> dict[str, Any]:
     if not os.environ.get("MANTIS_API_KEY"):
         raise HTTPException(503, "MANTIS_API_KEY is not configured")
     profile = os.environ.get("MANTIS_ENDPOINT_PROFILE", "direct")
-    if profile == "direct" and not os.environ.get("ROUTELLM_KEY"):
-        raise HTTPException(503, "ROUTELLM_KEY is not configured")
+    if profile == "direct" and not os.environ.get("MANTIS_ROUTER_KEY"):
+        raise HTTPException(503, "MANTIS_ROUTER_KEY is not configured")
     if profile == "catalog":
         try:
             bindings = model_catalog.load_runtime_bindings()
@@ -621,9 +622,9 @@ def _session_from_body(body: ChatRequest) -> str | None:
 
 
 def _router_headers(headers: dict[str, str], body: ChatRequest | None = None) -> dict[str, str]:
-    key = os.environ.get("ROUTELLM_KEY")
+    key = os.environ.get("MANTIS_ROUTER_KEY")
     if not key:
-        raise HTTPException(503, "ROUTELLM_KEY is not configured")
+        raise HTTPException(503, "MANTIS_ROUTER_KEY is not configured")
     out = {"Authorization": f"Bearer {key}"}
     session = headers.get("x-route-session")
     if not session and body is not None:
@@ -679,7 +680,7 @@ def models() -> dict[str, Any]:
         "supported_parameters": _SUPPORTED_PARAMETERS,
         "pricing": {"prompt": "0", "completion": "0"},
     }
-    basic = {**descriptor, "context_length": 1_000_000, "max_completion_tokens": 131072}
+    basic = {**descriptor, "context_length": descriptor["context_length"], "max_completion_tokens": 131072}
     return {
         "object": "list",
         "data": [
@@ -753,3 +754,71 @@ def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Respons
         return JSONResponse(body, headers={"X-Request-Id": request_id, **extra})
     finally:
         _capacity.release()
+
+
+class FusionDelegateRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    brief: str = Field(min_length=1)
+    tools: list[FunctionTool] | None = None
+
+
+class FusionToolResult(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    tool_call_id: str = Field(min_length=1)
+    content: str
+    is_error: bool = False
+
+
+class FusionFollowUpRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    request_id: str = Field(min_length=1, max_length=128)
+    tool_results: list[FusionToolResult] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_tool_results(self) -> FusionFollowUpRequest:
+        seen: set[str] = set()
+        for item in self.tool_results:
+            if item.tool_call_id in seen:
+                raise ValueError("duplicate tool_call_id in tool_results")
+            seen.add(item.tool_call_id)
+        return self
+
+
+class FusionResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    run_id: str
+    status: Literal["main_planning", "sidekick_pending", "awaiting_tools", "main_review", "completed", "error"]
+    report: str | None
+    pending_tool_calls: list[dict[str, Any]] | None
+    usage: dict[str, Any]
+    activity: list[dict[str, Any]]
+    request_id: str | None = None
+
+
+@app.post("/v1/fusion/delegate", dependencies=[Depends(_authorize)])
+def fusion_delegate(request: FusionDelegateRequest) -> JSONResponse:
+    tools = [tool.model_dump() for tool in (request.tools or [])]
+    run = fusion.create_fusion_run(request.brief, tools)
+    event = fusion.advance_fusion_run(run.run_id)
+    return JSONResponse(FusionResponse(**event).model_dump())
+
+
+@app.post("/v1/fusion/follow_up/{run_id}", dependencies=[Depends(_authorize)])
+def fusion_follow_up(run_id: str, request: FusionFollowUpRequest) -> JSONResponse:
+    tool_results = [item.model_dump() for item in request.tool_results]
+    event = fusion.advance_fusion_run(
+        run_id,
+        request_id=request.request_id,
+        tool_results=tool_results,
+    )
+    return JSONResponse(FusionResponse(**event, request_id=request.request_id).model_dump())
+
+
+@app.get("/v1/fusion/runs/{run_id}", dependencies=[Depends(_authorize)])
+def fusion_status(run_id: str) -> JSONResponse:
+    event = fusion.fusion_run_status(run_id)
+    return JSONResponse(FusionResponse(**event).model_dump())

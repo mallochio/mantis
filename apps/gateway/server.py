@@ -7,15 +7,9 @@ Responses requests are restricted to OpenAI models via OpenRouter;
 Chat Completions behavior remains independent.
 
 Config via env:
-  ROUTELLM_HOST=127.0.0.1
-  ROUTELLM_PORT=5500
-  ROUTELLM_KEY=sk-route-local          # bearer token clients must present
-  EXPENSIVE_BASE=https://openrouter.ai/api/v1
-  EXPENSIVE_KEY=...
-  CHEAP_BASE=https://opencode.ai/zen/go/v1
-  CHEAP_KEY=...
-  EXPENSIVE_MODEL=openai/gpt-5.6-sol
-  CHEAP_MODEL=deepseek-v4-flash
+  MANTIS_ROUTER_HOST=127.0.0.1
+  MANTIS_ROUTER_PORT=5500
+  MANTIS_ROUTER_KEY=sk-route-local          # bearer token clients must present
   LOG_FILE=~/.local/share/mantis/router/decisions.log
 """
 from __future__ import annotations
@@ -44,58 +38,30 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 # Defaults mirror the router launcher (canonical source, calibrated there) —
 # keep in sync so bare `python server.py` behaves identically to the launcher.
 _DEFAULT_AI_ROUTING_CONFIG = Path.home() / ".config" / "ai-routing" / "catalog.toml"
-# A legacy raw environment value must never block an explicit catalog/JSON
-# source from becoming authoritative. Detect that condition before any legacy
-# environment parsing so malformed legacy values degrade to defaults instead of
-# failing startup for an independent source deployment.
-_EXPLICIT_SOURCE_PRESENT = (
-    "ROUTELLM_TARGETS_JSON" in os.environ
-    or "AI_ROUTING_CONFIG" in os.environ
-    or _DEFAULT_AI_ROUTING_CONFIG.exists()
-)
-
-
 def _env_int(name: str, default: int) -> int:
     value = os.environ.get(name)
     if value is None or not value:
         return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        if _EXPLICIT_SOURCE_PRESENT:
-            return default
-        raise
+    return int(value)
 
 
 def _env_float(name: str, default: float) -> float:
     value = os.environ.get(name)
     if value is None or not value:
         return default
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        if _EXPLICIT_SOURCE_PRESENT:
-            return default
-        raise
+    return float(value)
 
 
-HOST = os.environ.get("ROUTELLM_HOST", "127.0.0.1")
-PORT = _env_int("ROUTELLM_PORT", 5500)
-SERVER_KEY = os.environ.get("ROUTELLM_KEY", "sk-route-local")
-ROUTELLM_CONTEXT_WINDOW = os.environ.get("ROUTELLM_CONTEXT_WINDOW", "auto")
+HOST = os.environ.get("MANTIS_ROUTER_HOST", "127.0.0.1")
+PORT = _env_int("MANTIS_ROUTER_PORT", 5500)
+SERVER_KEY = os.environ.get("MANTIS_ROUTER_KEY", "sk-route-local")
+MANTIS_ROUTER_CONTEXT_WINDOW = os.environ.get("MANTIS_ROUTER_CONTEXT_WINDOW", "auto")
 # Default/ceiling for targets without an explicit catalog max_tokens. The
 # catalog carries exact per-model output caps (models.dev), so this only
 # matters as a fallback; it must be >= the largest catalog cap (deepseek
 # v4 pro = 384000) so no per-model cap is silently reduced.
-ROUTELLM_MAX_TOKENS = _env_int("ROUTELLM_MAX_TOKENS", 384000)
+MANTIS_ROUTER_MAX_TOKENS = _env_int("MANTIS_ROUTER_MAX_TOKENS", 384000)
 MODEL_ID = "auto"
-
-def _base(name: str, direct_default: str) -> str:
-    return os.environ.get(name) or direct_default
-
-
-def _key(name: str) -> str:
-    return os.environ.get(name, "")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -105,23 +71,11 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
-def _optional_int(name: str) -> int | None:
-    value = os.environ.get(name)
-    if not value:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        if _EXPLICIT_SOURCE_PRESENT:
-            return None
-        raise
-
-
 _TARGET_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # The shared provider catalog includes every protocol supported by a catalog
-# consumer. RouteLLM targets use a smaller subset; see
-# _routellm_target_protocols below.
+# consumer. Router targets use a smaller subset; see
+# _target_protocols below.
 _CATALOG_PROTOCOLS = frozenset({"chat_completions", "responses", "anthropic_messages"})
 # Adapters are part of the transport contract.  They are deliberately explicit
 # rather than inferred from a hostname: a provider endpoint can move without
@@ -131,7 +85,7 @@ _ADAPTER_PROTOCOLS = {
     "opencode-go": frozenset({"chat_completions"}),
     "modal": frozenset({"chat_completions"}),
     "openai-compatible": frozenset({"chat_completions", "responses"}),
-    # Mantis may use Bifrost's native Anthropic endpoint. RouteLLM does not
+    # Mantis may use Bifrost's native Anthropic endpoint. The router does not
     # route this protocol, but must accept its provider in the shared catalog.
     "anthropic": frozenset({"anthropic_messages"}),
 }
@@ -232,11 +186,11 @@ def _catalog_protocols(value, field: str, *, required: bool = True) -> tuple[str
     return tuple(value)
 
 
-def _routellm_target_protocols(value, field: str, *, required: bool = True) -> tuple[str, ...]:
-    """Validate RouteLLM target protocols, excluding Anthropic Messages."""
+def _target_protocols(value, field: str, *, required: bool = True) -> tuple[str, ...]:
+    """Validate router target protocols, excluding Anthropic Messages."""
     protocols = _catalog_protocols(value, field, required=required)
     if "anthropic_messages" in protocols:
-        raise _config_error(f"{field} cannot declare anthropic_messages for a RouteLLM target")
+        raise _config_error(f"{field} cannot declare anthropic_messages for a router target")
     return protocols
 
 
@@ -296,7 +250,7 @@ def _backend(name: str, *, base: str, key: str, model: str, effort: str,
         # Preserve legacy endpoint-derived behavior while no catalog is active.
         default_usage = "openrouter.ai" in base
     usage_name = re.sub(r"[^A-Z0-9]", "_", name.upper())
-    usage_name = f"ROUTELLM_{usage_name}_USAGE_INCLUDE"
+    usage_name = f"MANTIS_ROUTER_{usage_name}_USAGE_INCLUDE"
     return {
         # `tier` remains for old telemetry/tests; target is the stable generic
         # identifier exposed in headers and logs for catalog-backed routing.
@@ -313,15 +267,15 @@ def _backend(name: str, *, base: str, key: str, model: str, effort: str,
 
 # The shared catalog has one root namespace for provider bindings plus its two
 # approved consumers.  Keeping this closed makes an accidental top-level table
-# fail at startup instead of silently falling back to legacy router behavior.
-_CATALOG_ROOT_FIELDS = frozenset({"version", "providers", "routellm", "mantis"})
+# fail at startup instead of silently ignoring it.
+_CATALOG_ROOT_FIELDS = frozenset({"version", "providers", "gateway", "mantis", "fusion"})
 _PROVIDER_FIELDS = frozenset({"adapter", "base_url", "credential_env", "developer_role", "protocols"})
 _TARGET_FIELDS = frozenset({
     "provider", "adapter", "base_url", "credential_env", "developer_role",
     "upstream_model", "reasoning_effort", "max_tokens", "protocols", "fallbacks", "rank",
     "force_reasoning_effort", "usage_include",
 })
-_ROUTELLM_FIELDS = frozenset({"active_policy", "revision", "invalid_complexity_target", "targets", "policies"})
+_GATEWAY_FIELDS = frozenset({"active_policy", "revision", "invalid_complexity_target", "targets", "policies"})
 _POLICY_FIELDS = frozenset({"complexity_targets", "revision", "invalid_complexity_target"})
 
 
@@ -357,7 +311,7 @@ def _parse_provider_specs(value, *, field: str) -> dict[str, dict]:
 
 def _build_target_registry(target_specs, providers: dict[str, dict], *, require_provider: bool,
                            environ: dict[str, str] | None = None,
-                           field: str = "routellm.targets") -> dict[str, dict]:
+                           field: str = "gateway.targets") -> dict[str, dict]:
     """Validate non-secret target specs and resolve credential_env at startup."""
     target_specs = _catalog_mapping(target_specs, field)
     if not target_specs:
@@ -401,7 +355,7 @@ def _build_target_registry(target_specs, providers: dict[str, dict], *, require_
             effort = _valid_text(effort, f"{field}.{target_id}.reasoning_effort")
         max_tokens = _valid_optional_positive_int(
             spec.get("max_tokens"), f"{field}.{target_id}.max_tokens")
-        protocols = _routellm_target_protocols(
+        protocols = _target_protocols(
             spec.get("protocols"), f"{field}.{target_id}.protocols")
         if not set(protocols) <= _ADAPTER_PROTOCOLS[binding["adapter"]]:
             raise _config_error(f"{field}.{target_id}.protocols exceeds adapter capabilities")
@@ -457,33 +411,37 @@ def _read_catalog(path: Path, *, explicit: bool) -> dict:
     return data
 
 
-def _catalog_routellm_spec(catalog: dict) -> dict | None:
-    value = catalog.get("routellm")
+def _catalog_gateway_spec(catalog: dict) -> dict | None:
+    value = catalog.get("gateway")
     if value is None:
         return None
+    section_name = "gateway"
     if not _is_catalog_version_one(catalog.get("version")):
-        raise _config_error("catalog version must be 1 when routellm is configured")
-    routellm = _catalog_mapping(value, "routellm")
-    _ensure_fields(routellm, _ROUTELLM_FIELDS, "routellm")
-    targets = _catalog_mapping(routellm.get("targets"), "routellm.targets")
-    policies = _catalog_mapping(routellm.get("policies"), "routellm.policies")
-    active_policy = routellm.get("active_policy")
+        raise _config_error(f"catalog version must be 1 when {section_name} is configured")
+    section = _catalog_mapping(value, section_name)
+    _ensure_fields(section, _GATEWAY_FIELDS, section_name)
+    targets = _catalog_mapping(section.get("targets"), f"{section_name}.targets")
+    policies = _catalog_mapping(section.get("policies"), f"{section_name}.policies")
+    active_policy = section.get("active_policy")
     if not isinstance(active_policy, str) or active_policy not in policies:
-        raise _config_error("routellm.active_policy must name a configured policy")
+        raise _config_error(f"{section_name}.active_policy must name a configured policy")
     # Every policy table is closed-schema validated, not only the active one,
     # so a dormant policy cannot smuggle typos or invalid revision types.
     for policy_id, raw_policy in policies.items():
-        policy = _catalog_mapping(raw_policy, f"routellm.policies.{policy_id}")
-        _ensure_fields(policy, _POLICY_FIELDS, f"routellm.policies.{policy_id}")
+        policy = _catalog_mapping(raw_policy, f"{section_name}.policies.{policy_id}")
+        _ensure_fields(policy, _POLICY_FIELDS, f"{section_name}.policies.{policy_id}")
         if "revision" in policy:
-            _explicit_revision(policy["revision"], f"routellm.policies.{policy_id}.revision")
-    policy = _catalog_mapping(policies[active_policy], f"routellm.policies.{active_policy}")
+            _explicit_revision(policy["revision"], f"{section_name}.policies.{policy_id}.revision")
+    policy = _catalog_mapping(policies[active_policy], f"{section_name}.policies.{active_policy}")
     return {
         "targets": targets,
         "policy_targets": policy.get("complexity_targets"),
-        "revision": policy.get("revision", routellm.get("revision")),
-        "invalid_target": policy.get("invalid_complexity_target", routellm.get("invalid_complexity_target")),
+        "revision": policy.get("revision", section.get("revision")),
+        "invalid_target": policy.get("invalid_complexity_target", section.get("invalid_complexity_target")),
+        "section_name": section_name,
     }
+
+
 
 
 def _reject_duplicate_json_keys(pairs) -> dict:
@@ -503,34 +461,27 @@ def _read_targets_json(raw: str | None) -> dict | None:
     except (TypeError, ValueError):
         # Covers JSONDecodeError and duplicate-key rejection. Never surface
         # parser detail, which could echo source values.
-        raise _config_error("ROUTELLM_TARGETS_JSON must be valid JSON") from None
+        raise _config_error("MANTIS_ROUTER_TARGETS_JSON must be valid JSON") from None
     if not isinstance(data, dict) or not data:
-        raise _config_error("ROUTELLM_TARGETS_JSON must be a non-empty object")
+        raise _config_error("MANTIS_ROUTER_TARGETS_JSON must be a non-empty object")
     wrapper_fields = {
         "version", "targets", "providers", "complexity_targets", "revision",
         "invalid_complexity_target",
     }
-    if "targets" in data:
-        # The wrapper form is unambiguous and versioned exactly like a catalog.
-        _ensure_fields(data, wrapper_fields, "ROUTELLM_TARGETS_JSON wrapper")
-        if not _is_catalog_version_one(data.get("version")):
-            raise _config_error("ROUTELLM_TARGETS_JSON.version must be 1")
-        return {
-            "targets": data["targets"],
-            "providers": data.get("providers", {}),
-            "policy_targets": data.get("complexity_targets"),
-            "revision": data.get("revision"),
-            "invalid_target": data.get("invalid_complexity_target"),
-        }
-    # A plain target-id -> target-spec mapping is convenient for a renderer
-    # that supplies ROUTELLM_SUPRA_TARGETS separately. It is atomic too: it
-    # cannot inherit provider definitions from an unrelated catalog. Wrapper
-    # keys are reserved so no plain map can be misread as a wrapper.
-    reserved = sorted(wrapper_fields - {"targets"} & set(data))
-    if reserved:
-        raise _config_error(f"ROUTELLM_TARGETS_JSON target id {reserved[0]} is reserved")
-    return {"targets": data, "providers": {}, "policy_targets": None,
-            "revision": None, "invalid_target": None}
+    # The wrapper form is unambiguous and versioned exactly like a catalog.
+    _ensure_fields(data, wrapper_fields, "MANTIS_ROUTER_TARGETS_JSON wrapper")
+    if not _is_catalog_version_one(data.get("version")):
+        raise _config_error("MANTIS_ROUTER_TARGETS_JSON.version must be 1")
+    targets = data.get("targets")
+    if not isinstance(targets, dict) or not targets:
+        raise _config_error("MANTIS_ROUTER_TARGETS_JSON.targets must be a non-empty object")
+    return {
+        "targets": targets,
+        "providers": data.get("providers", {}),
+        "policy_targets": data.get("complexity_targets"),
+        "revision": data.get("revision"),
+        "invalid_target": data.get("invalid_complexity_target"),
+    }
 
 
 def _parse_complexity_targets(value, known: dict[str, dict], field: str) -> tuple[str, ...]:
@@ -601,110 +552,38 @@ def _target_config_revision(source: str, explicit: str | None, fingerprint: str)
     return f"{label}-{fingerprint}"
 
 
-EXPENSIVE_BASE = _base("EXPENSIVE_BASE", "https://openrouter.ai/api/v1")
-CHEAP_BASE = _base("CHEAP_BASE", "https://opencode.ai/zen/go/v1")
-MIDDLE_BASE = _base("MIDDLE_BASE", "")
-EXPENSIVE = _backend(
-    "expensive", base=EXPENSIVE_BASE, key=_key("EXPENSIVE_KEY"),
-    model=os.environ.get("EXPENSIVE_MODEL", "openai/gpt-5.6-sol"),
-    effort=os.environ.get("EXPENSIVE_REASONING_EFFORT", "medium"),
-    max_tokens=_optional_int("EXPENSIVE_MAX_TOKENS"), rank=2,
-)
-CHEAP = _backend(
-    "cheap", base=CHEAP_BASE, key=_key("CHEAP_KEY"),
-    model=os.environ.get("CHEAP_MODEL", "deepseek-v4-flash"),
-    effort=os.environ.get("CHEAP_REASONING_EFFORT", "none"),
-    max_tokens=_env_int("CHEAP_MAX_TOKENS", ROUTELLM_MAX_TOKENS), rank=0,
-)
-MIDDLE = _backend(
-    "middle", base=MIDDLE_BASE, key=_key("MIDDLE_KEY"),
-    model=os.environ.get("MIDDLE_MODEL", "openai/gpt-5.6-terra"),
-    effort=os.environ.get("MIDDLE_REASONING_EFFORT", "max"),
-    max_tokens=_env_int("MIDDLE_MAX_TOKENS", ROUTELLM_MAX_TOKENS), rank=1,
-    force_reasoning_effort=True,
-)
-_LEGACY_BACKENDS = {"cheap": CHEAP, "middle": MIDDLE, "expensive": EXPENSIVE}
-MIDDLE_MIN_COMPLEXITY = _env_int("ROUTELLM_MIDDLE_MIN_COMPLEXITY", 3)
-MIDDLE_CONFIGURED = bool(MIDDLE["base"])
-EXPENSIVE_MIN_COMPLEXITY = _env_int(
-    "ROUTELLM_EXPENSIVE_MIN_COMPLEXITY",
-    # With Terra enabled, reserve Sol for Supra's highest complexity level.
-    # Direct two-tier mode retains the historical threshold immediately above
-    # the Supra cutoff.
-    5 if MIDDLE_CONFIGURED else 3,
-)
-
-
-def _legacy_complexity_targets() -> tuple[str, ...]:
-    """Translate threshold-era config to a stable five-level target map."""
-    return tuple(
-        "expensive" if level >= EXPENSIVE_MIN_COMPLEXITY else
-        "middle" if MIDDLE_CONFIGURED and level >= MIDDLE_MIN_COMPLEXITY else
-        "cheap"
-        for level in range(1, 6)
-    )
-
-
 # JSON is a complete renderer/source override.  Parse it before touching the
 # optional catalog so an independent JSON deployment cannot inherit, depend on,
 # or be rejected by an unrelated catalog binding.
-_json_routellm = _read_targets_json(os.environ.get("ROUTELLM_TARGETS_JSON"))
-if _json_routellm is None:
-    _catalog = _read_catalog(AI_ROUTING_CONFIG, explicit=_AI_ROUTING_CONFIG_EXPLICIT)
-    _catalog_routellm = _catalog_routellm_spec(_catalog)
-else:
+_json_spec = _read_targets_json(os.environ.get("MANTIS_ROUTER_TARGETS_JSON"))
+if _json_spec is not None:
     _catalog = {}
-    _catalog_routellm = None
-_TARGETS_ARE_EXPLICIT = _json_routellm is not None or _catalog_routellm is not None
-if _json_routellm is not None:
-    # JSON is an atomic renderer/source override.  In particular, it must not
-    # silently reuse a catalog provider with a similarly named ID.
     _json_providers = _parse_provider_specs(
-        _json_routellm["providers"], field="ROUTELLM_TARGETS_JSON.providers")
+        _json_spec["providers"], field="MANTIS_ROUTER_TARGETS_JSON.providers")
     BACKENDS = _build_target_registry(
-        _json_routellm["targets"], _json_providers, require_provider=False,
-        field="ROUTELLM_TARGETS_JSON.targets")
-    _policy_targets = _json_routellm["policy_targets"]
-    _config_revision = _json_routellm["revision"]
-    _invalid_target = _json_routellm["invalid_target"]
+        _json_spec["targets"], _json_providers, require_provider=False,
+        field="MANTIS_ROUTER_TARGETS_JSON.targets")
+    _policy_targets = _json_spec["policy_targets"]
+    _config_revision = _json_spec["revision"]
+    _invalid_target = _json_spec["invalid_target"]
     TARGET_CONFIG_SOURCE = "json"
-elif _catalog_routellm is not None:
+else:
+    _catalog = _read_catalog(AI_ROUTING_CONFIG, explicit=_AI_ROUTING_CONFIG_EXPLICIT)
+    _catalog_spec = _catalog_gateway_spec(_catalog)
+    if _catalog_spec is None:
+        raise _config_error(
+            "no router targets configured: set MANTIS_ROUTER_TARGETS_JSON or "
+            "provide a routing catalog with a [gateway] section"
+        )
     _catalog_providers = _parse_provider_specs(_catalog.get("providers"), field="providers")
     BACKENDS = _build_target_registry(
-        _catalog_routellm["targets"], _catalog_providers, require_provider=True,
-        field="routellm.targets")
-    _policy_targets = _catalog_routellm["policy_targets"]
-    _config_revision = _catalog_routellm["revision"]
-    _invalid_target = _catalog_routellm["invalid_target"]
+        _catalog_spec["targets"], _catalog_providers, require_provider=True, field="gateway.targets")
+    _policy_targets = _catalog_spec["policy_targets"]
+    _config_revision = _catalog_spec["revision"]
+    _invalid_target = _catalog_spec["invalid_target"]
     TARGET_CONFIG_SOURCE = "catalog"
-else:
-    BACKENDS = _LEGACY_BACKENDS
-    _policy_targets = _legacy_complexity_targets()
-    _config_revision = "legacy"
-    _invalid_target = None
-    TARGET_CONFIG_SOURCE = "legacy"
 
-# Legacy raw policy overrides remain useful for inactive deployments and a
-# plain JSON target map, but must never silently supersede an active catalog or
-# an explicit JSON policy. A full ROUTELLM_TARGETS_JSON source is itself an
-# intentional source replacement; its declared policy is authoritative too.
-_POLICY_IS_AUTHORITATIVE = (
-    _catalog_routellm is not None
-    or (_json_routellm is not None and _json_routellm["policy_targets"] is not None)
-)
-if "ROUTELLM_SUPRA_TARGETS" in os.environ:
-    if _POLICY_IS_AUTHORITATIVE:
-        raise _config_error("ROUTELLM_SUPRA_TARGETS cannot override an active target policy")
-    SUPRA_TARGETS = _parse_complexity_targets(
-        os.environ["ROUTELLM_SUPRA_TARGETS"], BACKENDS, "ROUTELLM_SUPRA_TARGETS")
-    _SUPRA_TARGETS_FROM_ENV = True
-else:
-    SUPRA_TARGETS = _parse_complexity_targets(_policy_targets, BACKENDS, "complexity_targets")
-    _SUPRA_TARGETS_FROM_ENV = False
-if "ROUTELLM_SUPRA_INVALID_TARGET" in os.environ:
-    if _POLICY_IS_AUTHORITATIVE:
-        raise _config_error("ROUTELLM_SUPRA_INVALID_TARGET cannot override an active target policy")
-    _invalid_target = os.environ["ROUTELLM_SUPRA_INVALID_TARGET"]
+SUPRA_TARGETS = _parse_complexity_targets(_policy_targets, BACKENDS, "complexity_targets")
 if _invalid_target is not None:
     SUPRA_INVALID_TARGET = _valid_target_id(_invalid_target, "invalid complexity target")
     if SUPRA_INVALID_TARGET not in BACKENDS:
@@ -722,26 +601,26 @@ TARGET_CONFIG_FINGERPRINT = _target_config_fingerprint(
     TARGET_CONFIG_SOURCE, BACKENDS, SUPRA_TARGETS, SUPRA_INVALID_TARGET)
 TARGET_CONFIG_REVISION = _target_config_revision(
     TARGET_CONFIG_SOURCE,
-    os.environ.get("ROUTELLM_TARGETS_REVISION", _config_revision),
+    os.environ.get("MANTIS_ROUTER_TARGETS_REVISION", _config_revision),
     TARGET_CONFIG_FINGERPRINT,
 )
 
 
 # One async pool is created and closed by the ASGI lifespan.
-TIMEOUT_S = _env_float("ROUTELLM_TIMEOUT_S", 600.0)
+TIMEOUT_S = _env_float("MANTIS_ROUTER_TIMEOUT_S", 600.0)
 _client: httpx.AsyncClient | None = None
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 # Reject oversized bodies before they are buffered into memory (413).
-MAX_BODY_BYTES = _env_int("ROUTELLM_MAX_BODY_BYTES", 50 * 1024 * 1024)
+MAX_BODY_BYTES = _env_int("MANTIS_ROUTER_MAX_BODY_BYTES", 50 * 1024 * 1024)
 
 DATA_DIR = Path(os.environ.get("MANTIS_DATA_DIR", str(Path.home()/".local/share/mantis")))
 LOG_PATH = Path(os.environ.get("LOG_FILE", str(DATA_DIR/"router/decisions.log")))
-TRAINING_LOG_ENABLED = os.environ.get("ROUTELLM_TRAINING_LOG", "0").lower() in {"1", "true", "yes", "on"}
+TRAINING_LOG_ENABLED = os.environ.get("MANTIS_ROUTER_TRAINING_LOG", "0").lower() in {"1", "true", "yes", "on"}
 TRAINING_LOG_PATH = Path(os.environ.get("TRAINING_LOG_FILE", str(DATA_DIR/"router/training.jsonl")))
 OUTCOME_LOG_PATH = Path(os.environ.get("OUTCOME_LOG_FILE", str(DATA_DIR/"router/outcomes.jsonl")))
 # Same prompt re-sent within this window usually means the previous route failed.
-RETRY_WINDOW_S = _env_float("ROUTELLM_RETRY_WINDOW_S", 900.0)
+RETRY_WINDOW_S = _env_float("MANTIS_ROUTER_RETRY_WINDOW_S", 900.0)
 LOG_PATH.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
 LOG_PATH.parent.chmod(0o700)
 if TRAINING_LOG_ENABLED:
@@ -778,7 +657,7 @@ async def _get_context_window() -> int:
     global _cached_context_window
     if _cached_context_window is not None:
         return _cached_context_window
-    env_val = os.environ.get("ROUTELLM_CONTEXT_WINDOW")
+    env_val = os.environ.get("MANTIS_ROUTER_CONTEXT_WINDOW")
     if env_val and env_val.isdigit() and int(env_val) > 0:
         _cached_context_window = int(env_val)
         return _cached_context_window
@@ -796,7 +675,7 @@ async def _get_context_window() -> int:
         for b in backends
     ))
     valid = [value for value in values if isinstance(value, int) and value > 0]
-    _cached_context_window = min(valid) if valid else 1_000_000
+    _cached_context_window = min(valid) if valid else 262_144
     return _cached_context_window
 
 
@@ -927,20 +806,13 @@ def _safe_target() -> str:
 
 def _default_target() -> str:
     """Use the configured level-one policy for no-text/non-routable prompts."""
-    targets = _effective_supra_targets()
-    return targets[0] if targets else _safe_target()
-
-
-def _effective_supra_targets() -> tuple[str, ...]:
-    if not _TARGETS_ARE_EXPLICIT and not _SUPRA_TARGETS_FROM_ENV:
-        return _legacy_complexity_targets()
-    return SUPRA_TARGETS
+    return SUPRA_TARGETS[0] if SUPRA_TARGETS else _safe_target()
 
 
 def _target_for_complexity(complexity: int | None) -> tuple[str, str]:
     """Map only Supra's valid 1..5 values; malformed output takes safe target."""
     if isinstance(complexity, int) and not isinstance(complexity, bool) and 1 <= complexity <= 5:
-        return _effective_supra_targets()[complexity - 1], "supra_complexity"
+        return SUPRA_TARGETS[complexity - 1], "supra_complexity"
     return SUPRA_INVALID_TARGET, "supra_invalid_complexity"
 
 
@@ -949,18 +821,9 @@ def _supra_reason(complexity: int | None) -> str | None:
 
 
 def _fallback_routes(decision: str) -> tuple[str, ...]:
-    """Return at most two deduplicated graph attempts for legacy callers."""
+    """Return at most two deduplicated graph attempts."""
     if decision not in BACKENDS:
         decision = _safe_target()
-    if not _TARGETS_ARE_EXPLICIT:
-        # Preserve the established adjacent legacy graph exactly.
-        if not MIDDLE_CONFIGURED:
-            return (decision, "cheap" if decision == "expensive" else "expensive")
-        if decision == "cheap":
-            return ("cheap", "middle")
-        if decision == "middle":
-            return ("middle", "expensive")
-        return ("expensive", "middle")
     routes = [decision]
     for fallback in BACKENDS[decision].get("fallbacks") or ():
         if fallback in BACKENDS and fallback not in routes:
@@ -974,8 +837,6 @@ def _declared_fallbacks(target: str) -> tuple[str, ...]:
     """All ordered direct graph edges; actual attempts remain bounded elsewhere."""
     if target not in BACKENDS:
         return ()
-    if not _TARGETS_ARE_EXPLICIT:
-        return _fallback_routes(target)[1:]
     return tuple(
         fallback for fallback in BACKENDS[target].get("fallbacks") or ()
         if fallback in BACKENDS and fallback != target
@@ -984,15 +845,10 @@ def _declared_fallbacks(target: str) -> tuple[str, ...]:
 
 def _supports_api(backend: dict, api_format: str) -> bool:
     required = "responses" if api_format == "responses" else "chat_completions"
-    adapter = backend.get("adapter")
-    if adapter is not None:
-        capabilities = _ADAPTER_PROTOCOLS.get(adapter)
-        if capabilities is None or required not in capabilities:
-            return False
-    protocols = backend.get("protocols")
-    if protocols is not None:
-        return required in protocols
-    return api_format != "responses" or _supports_responses(backend)
+    capabilities = _ADAPTER_PROTOCOLS.get(backend.get("adapter"))
+    if capabilities is None or required not in capabilities:
+        return False
+    return required in (backend.get("protocols") or ())
 
 
 def _ranked_compatible_targets(decision: str, api_format: str) -> tuple[str, ...]:
@@ -1133,23 +989,7 @@ def _decide(prompt: str, session_id: str | None = None, api_format: str = "chat"
 
 
 def _backend_for(decision: str) -> dict:
-    # Preserve the direct two-tier compatibility contract. Explicit target
-    # registries never reinterpret a configured target based on legacy names.
-    if not _TARGETS_ARE_EXPLICIT and decision == "middle" and not MIDDLE_CONFIGURED:
-        return EXPENSIVE if EXPENSIVE["base"] else CHEAP
     return BACKENDS.get(decision, BACKENDS[_safe_target()])
-
-
-def _supports_responses(backend: dict) -> bool:
-    """Legacy Responses capability detection for non-catalog backends."""
-    base = str(backend.get("base", ""))
-    if not base or not str(backend.get("model", "")).lower().startswith("openai/"):
-        return False
-    try:
-        host = (urlsplit(base).hostname or "").lower()
-    except ValueError:
-        return False
-    return host == "openrouter.ai"
 
 
 _REFUSAL_RE = re.compile(
@@ -1234,8 +1074,8 @@ def _is_refusal(status: int, data: dict) -> bool:
 def _completion_token_cap(backend: dict) -> int:
     # Catalog targets omit max_tokens entirely (None = uncapped), so the
     # router-wide default is the only clamp that protects them.
-    cap = backend.get("max_tokens") or ROUTELLM_MAX_TOKENS
-    return min(cap, ROUTELLM_MAX_TOKENS)
+    cap = backend.get("max_tokens") or MANTIS_ROUTER_MAX_TOKENS
+    return min(cap, MANTIS_ROUTER_MAX_TOKENS)
 
 
 def _build_outgoing_body(body: dict, backend: dict) -> dict:
@@ -1250,10 +1090,13 @@ def _build_outgoing_body(body: dict, backend: dict) -> dict:
         out_body["max_completion_tokens"] = min(out_body["max_completion_tokens"],
                                                 _completion_token_cap(backend))
     out_body.pop("stop", None)
-    if backend["model"].rsplit("/", 1)[-1].startswith("gpt-5.6-") and out_body.get("temperature") not in (None, 1):
+    if (backend["effort"] or backend["model"].rsplit("/", 1)[-1].startswith(("gpt-5.6-", "glm-", "claude-"))) and out_body.get("temperature") not in (None, 1):
         out_body.pop("temperature")
-    if backend["effort"]:
-        out_body["reasoning_effort"] = backend["effort"]
+    effort = backend["effort"] or out_body.get("reasoning_effort")
+    if effort:
+        if backend["model"].rsplit("/", 1)[-1].startswith("glm-") and effort == "medium":
+            effort = "high"
+        out_body["reasoning_effort"] = effort
     if backend.get("usage_include") and "usage" not in out_body:
         out_body["usage"] = {"include": True}
     return out_body
@@ -1403,8 +1246,8 @@ _CONTINUATION_RE = re.compile(
 _NEW_TASK_RE = re.compile(
     r"^(?:new task|different task|unrelated|switching topics?|on another topic)\b", re.I,
 )
-SESSION_TTL_S = _env_float("ROUTELLM_SESSION_TTL_S", 3600.0)
-SESSION_STATE_MAX = _env_int("ROUTELLM_SESSION_STATE_MAX", 4096)
+SESSION_TTL_S = _env_float("MANTIS_ROUTER_SESSION_TTL_S", 3600.0)
+SESSION_STATE_MAX = _env_int("MANTIS_ROUTER_SESSION_STATE_MAX", 4096)
 _session_state: OrderedDict[str, dict] = OrderedDict()
 _session_lock = threading.Lock()
 _STICKY_REASONS = frozenset({
@@ -1422,7 +1265,7 @@ def _session_id(body: dict, request: Request) -> tuple[str | None, str | None]:
     raw, source = request.headers.get("x-route-session"), "header"
     if not raw and isinstance(body.get("metadata"), dict):
         raw, source = body["metadata"].get("session_id"), "metadata"
-    if (not raw and os.environ.get("ROUTELLM_SESSION_FROM_USER", "0").lower()
+    if (not raw and os.environ.get("MANTIS_ROUTER_SESSION_FROM_USER", "0").lower()
             in {"1", "true", "yes", "on"} and isinstance(body.get("user"), str)):
         raw, source = body["user"], "user"
     if not isinstance(raw, str) or not raw or len(raw.encode()) > 256:
@@ -1472,14 +1315,9 @@ def _session_route(session_id: str | None, prompt: str, proposed: str,
     current_rank, proposed_rank = _target_rank(current), _target_rank(proposed)
     if proposed_rank < current_rank:
         return current, "downgrade_hysteresis"
-    mapped_target, _ = _target_for_complexity(complexity)
-    # Exact catalog policies deliberately expose intermediate ranks.  A normal
-    # session turn must be able to climb to any higher mapped target; otherwise
-    # a low session would never reach a configured middle target until the
-    # highest rank appeared.  Keep the historical strongest-only hysteresis for
-    # legacy threshold deployments.
-    if (_TARGETS_ARE_EXPLICIT and proposed_rank > current_rank) or (
-            complexity is not None and _target_rank(mapped_target) >= _target_rank(_safe_target())):
+    # Exact catalog policies deliberately expose intermediate ranks, so a
+    # session turn may climb to any higher proposed target.
+    if proposed_rank > current_rank:
         return proposed, "strong_upgrade"
     return current, "upgrade_hysteresis"
 
@@ -1519,8 +1357,8 @@ def _session_note(session_id: str | None, tier: str, complexity: int | None,
 # normal quality routing graph or bounded cross-target failover. The index below
 # keeps only HMAC-derived identifiers and non-secret origin bindings in memory;
 # opaque provider state itself is never logged, persisted, or returned.
-RESPONSES_AFFINITY_TTL_S = _env_float("ROUTELLM_RESPONSES_AFFINITY_TTL_S", 3600.0)
-RESPONSES_AFFINITY_MAX = _env_int("ROUTELLM_RESPONSES_AFFINITY_MAX", 4096)
+RESPONSES_AFFINITY_TTL_S = _env_float("MANTIS_ROUTER_RESPONSES_AFFINITY_TTL_S", 3600.0)
+RESPONSES_AFFINITY_MAX = _env_int("MANTIS_ROUTER_RESPONSES_AFFINITY_MAX", 4096)
 _RESPONSES_AFFINITY_HEADER = "x-route-responses-affinity"
 _responses_affinity: OrderedDict[str, dict] = OrderedDict()
 _responses_affinity_lock = threading.Lock()
@@ -1731,10 +1569,10 @@ def _responses_affinity_backend(body: dict, token: str | None) -> dict | None:
 # calls). Pins are intentionally API-scoped: a Responses result cannot cause a
 # later Chat request to select a Responses-only target, and vice versa.
 DECISION_STORE_PATH = Path(os.environ.get("DECISION_STORE_FILE", str(DATA_DIR / "router/decision-state.jsonl")))
-PIN_CHEAP_AFTER = _env_int("ROUTELLM_PIN_CHEAP_AFTER", 5)
-PIN_EXPENSIVE_AFTER = _env_int("ROUTELLM_PIN_EXPENSIVE_AFTER", 2)
-PIN_TTL_S = _env_float("ROUTELLM_PIN_TTL_S", float(7 * 86400))
-DECISION_STORE_MAX = _env_int("ROUTELLM_DECISION_STORE_MAX", 4096)
+PIN_CHEAP_AFTER = _env_int("MANTIS_ROUTER_PIN_CHEAP_AFTER", 5)
+PIN_EXPENSIVE_AFTER = _env_int("MANTIS_ROUTER_PIN_EXPENSIVE_AFTER", 2)
+PIN_TTL_S = _env_float("MANTIS_ROUTER_PIN_TTL_S", float(7 * 86400))
+DECISION_STORE_MAX = _env_int("MANTIS_ROUTER_DECISION_STORE_MAX", 4096)
 _decision_store: dict[str, dict] = {}
 _decision_store_lock = threading.Lock()
 SUPRA_FALLBACK_COUNT = 0
@@ -1790,12 +1628,6 @@ def _refusal_target(decision: str, *, api_format: str = "chat") -> str:
     """Promote a refused target to a compatible bounded graph/rank route."""
     if decision not in BACKENDS:
         return _safe_target()
-    if not _TARGETS_ARE_EXPLICIT:
-        # Preserve historic cheap -> expensive learned escalation whenever it
-        # can serve this API. If it cannot, select the best compatible route.
-        legacy = "expensive" if "expensive" in BACKENDS else _safe_target()
-        if _supports_api(_backend_for(legacy), api_format):
-            return legacy
     for target in _api_routes(decision, api_format):
         if target != decision:
             return target
@@ -1878,9 +1710,9 @@ def _store_note(prompt_hash: str, decision: str, *, ok: bool = False, score=None
         _secure_append(DECISION_STORE_PATH, entry)
 
 
-RESP_CACHE_TTL_S = _env_float("ROUTELLM_RESP_CACHE_TTL_S", 120.0)
-RESP_CACHE_MAX_ENTRIES = _env_int("ROUTELLM_RESP_CACHE_MAX_ENTRIES", 128)
-RESP_CACHE_MAX_BYTES = _env_int("ROUTELLM_RESP_CACHE_MAX_BYTES", 8 * 1024 * 1024)
+RESP_CACHE_TTL_S = _env_float("MANTIS_ROUTER_RESP_CACHE_TTL_S", 120.0)
+RESP_CACHE_MAX_ENTRIES = _env_int("MANTIS_ROUTER_RESP_CACHE_MAX_ENTRIES", 128)
+RESP_CACHE_MAX_BYTES = _env_int("MANTIS_ROUTER_RESP_CACHE_MAX_BYTES", 8 * 1024 * 1024)
 _resp_cache: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
 _inflight: dict[str, asyncio.Future] = {}
 _inflight_lock = asyncio.Lock()
@@ -2063,7 +1895,7 @@ async def lifespan(app: FastAPI):
         _client = None
 
 
-app = FastAPI(title="RouteLLM coding-router", lifespan=lifespan)
+app = FastAPI(title="Mantis router", lifespan=lifespan)
 
 
 def _openai_error(message: str, status: int, *, error_type: str = "invalid_request_error", param=None, code=None):
@@ -2359,12 +2191,12 @@ async def healthz():
 @app.get("/v1/models")
 async def list_models():
     return {"object": "list", "data": [{
-        "id": MODEL_ID, "object": "model", "owned_by": "routellm",
-        "context_window": await _get_context_window(), "max_tokens": ROUTELLM_MAX_TOKENS,
+        "id": MODEL_ID, "object": "model", "owned_by": "mantis",
+        "context_window": await _get_context_window(), "max_tokens": MANTIS_ROUTER_MAX_TOKENS,
     }]}
 
 
-MAX_SSE_EVENT_BYTES = _env_int("ROUTELLM_MAX_SSE_EVENT_BYTES", 1024 * 1024)
+MAX_SSE_EVENT_BYTES = _env_int("MANTIS_ROUTER_MAX_SSE_EVENT_BYTES", 1024 * 1024)
 
 
 def _sse_boundary(buffer: bytearray) -> int | None:
@@ -3293,8 +3125,8 @@ def _bind_is_loopback(host: str) -> bool:
 
 
 def _validate_bind_security() -> None:
-    if not _bind_is_loopback(HOST) and (not os.environ.get("ROUTELLM_KEY") or SERVER_KEY == "sk-route-local"):
-        raise RuntimeError("non-loopback binding requires an externally supplied, non-default ROUTELLM_KEY")
+    if not _bind_is_loopback(HOST) and (not os.environ.get("MANTIS_ROUTER_KEY") or SERVER_KEY == "sk-route-local"):
+        raise RuntimeError("non-loopback binding requires an externally supplied, non-default MANTIS_ROUTER_KEY")
 
 
 if __name__ == "__main__":
@@ -3303,8 +3135,7 @@ if __name__ == "__main__":
     print(
         "effective config: "
         "router=supra "
-        f"expensive={EXPENSIVE['model']} middle={MIDDLE['model']} "
-        f"middle_effort={MIDDLE['effort']} cheap={CHEAP['model']} port={PORT}",
+        f"targets={','.join(BACKENDS)} source={TARGET_CONFIG_SOURCE} port={PORT}",
         flush=True,
     )
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
