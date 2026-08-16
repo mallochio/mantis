@@ -161,7 +161,7 @@ def _log_tool_call(tc: dict[str, Any], res: dict[str, Any]) -> None:
 
 
 def run_session(url: str, token: str, brief: str, max_iterations: int = 10) -> dict[str, Any]:
-    client = httpx.Client(headers={"Authorization": f"Bearer {token}"}, timeout=120.0)
+    client = httpx.Client(headers={"Authorization": f"Bearer {token}"}, timeout=600.0)
     tools = [
         {
             "type": "function",
@@ -210,6 +210,12 @@ def main() -> None:
         help="start and stop the API server automatically",
     )
     parser.add_argument("--max-iterations", type=int, default=10)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="write the final event JSON to this file",
+    )
     args = parser.parse_args()
 
     server = None
@@ -221,6 +227,10 @@ def main() -> None:
             _wait_for_server(args.url, args.token)
 
         event = run_session(args.url, args.token, args.brief, args.max_iterations)
+        if args.output:
+            with args.output.open("w") as handle:
+                json.dump(event, handle, indent=2)
+            print(f"[fusion] wrote final event to {args.output}")
         print(json.dumps(event, indent=2))
     finally:
         if server is not None:
