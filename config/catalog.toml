@@ -138,4 +138,4 @@ protocols = ["chat_completions"]
 main = "gpt-5_6-sol"
 sidekick = "gpt-5_6-luna"
 max_follow_ups = 3
-max_tokens = 262144
+context_window = 262144

@@ -104,9 +104,9 @@ class FusionConfig:
         except (TypeError, ValueError):
             return 3
 
-    def max_tokens(self) -> int:
-        raw = self._load().get("max_tokens") or os.environ.get(
-            "MANTIS_FUSION_MAX_TOKENS", "262144"
+    def context_window(self) -> int:
+        raw = self._load().get("context_window") or os.environ.get(
+            "MANTIS_FUSION_CONTEXT_WINDOW", "262144"
         )
         try:
             return int(raw)
@@ -130,7 +130,62 @@ class FusionCoordinator:
         self.main_slot = self.config.main_slot()
         self.sidekick_slot = self.config.sidekick_slot()
         self.max_follow_ups = self.config.max_follow_ups()
-        self.max_tokens = self.config.max_tokens()
+        self.context_window = self.config.context_window()
+
+    @staticmethod
+    def _estimate_message_tokens(message: dict[str, Any]) -> int:
+        """Approximate token count for a single chat message.
+
+        This is a fast, dependency-free estimate (roughly 4 characters per
+        token) used for context-window trimming before a provider call.
+        """
+        text = ""
+        content = message.get("content")
+        if isinstance(content, str):
+            text += content
+        elif content is not None:
+            text += json.dumps(content)
+        for tc in message.get("tool_calls", []):
+            fn = tc.get("function", {})
+            text += str(fn.get("name", ""))
+            text += str(fn.get("arguments", ""))
+        for key in ("tool_call_id", "name"):
+            value = message.get(key)
+            if value is not None:
+                text += str(value)
+        return max(1, len(text) // 4)
+
+    def _trim_messages(
+        self,
+        messages: list[dict[str, Any]],
+        max_input_tokens: int,
+    ) -> list[dict[str, Any]]:
+        """Drop oldest non-system messages until the input fits the budget."""
+        if not messages:
+            return messages
+        estimates = [self._estimate_message_tokens(m) for m in messages]
+        if sum(estimates) <= max_input_tokens:
+            return messages
+        # Always preserve the first (system) message, then keep the newest
+        # messages that still fit under the input token budget.
+        trimmed = [messages[0]]
+        budget = max_input_tokens - estimates[0]
+        tail: list[dict[str, Any]] = []
+        for i in range(len(messages) - 1, 0, -1):
+            if estimates[i] > budget:
+                break
+            tail.append(messages[i])
+            budget -= estimates[i]
+        trimmed.extend(reversed(tail))
+        return trimmed
+
+    def _output_tokens_for(self, slot: str) -> int:
+        """Return the model-specific output token cap from the catalog."""
+        try:
+            resolved = providers._resolve_model_spec(slot)
+        except (RuntimeError, ValueError):
+            return 4096
+        return resolved.max_tokens or 4096
 
     def _call_worker(
         self,
@@ -139,7 +194,10 @@ class FusionCoordinator:
         tools: list[dict[str, Any]] | None,
     ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
         """Call a worker slot and return (text, tool_calls, usage)."""
-        data = providers._provider_response(slot, messages, self.max_tokens, 0.7, tools)
+        output_tokens = self._output_tokens_for(slot)
+        input_budget = max(0, self.context_window - output_tokens)
+        trimmed = self._trim_messages(messages, input_budget)
+        data = providers._provider_response(slot, trimmed, output_tokens, 0.7, tools)
         msg = data["choices"][0]["message"]
         text = str(msg.get("content") or "")
         tcs = msg.get("tool_calls") or []

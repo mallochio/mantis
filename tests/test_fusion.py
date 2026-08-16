@@ -7,6 +7,7 @@ from typing import Any
 
 import api
 import fusion
+import providers
 import pytest
 import serve_config
 from fastapi.testclient import TestClient
@@ -318,3 +319,35 @@ def test_fusion_file_persistence_round_trip(file_client, fake_worker, tmp_path):
     body = response.json()
     assert body["status"] == "completed"
     assert "Final report" in (body["report"] or "")
+
+
+def test_fusion_context_window_trims_old_messages():
+    coordinator = fusion.FusionCoordinator()
+    messages = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "old brief"},
+        {"role": "assistant", "content": "old plan"},
+        {"role": "user", "content": "new brief"},
+    ]
+    # Force a tiny budget so only the system and the newest user message fit.
+    trimmed = coordinator._trim_messages(messages, 6)
+    assert trimmed[0]["role"] == "system"
+    assert [m["role"] for m in trimmed[1:]] == ["user"]
+    assert trimmed[-1]["content"] == "new brief"
+
+
+def test_fusion_output_tokens_are_model_specific(monkeypatch):
+    resolved = providers.ResolvedModelSpec(
+        adapter="openai",
+        model="gpt-5.6-luna",
+        effort="medium",
+        base_url="http://test",
+        credential_env="TEST_KEY",
+        binding=None,
+        protocols=("chat_completions",),
+        slot="gpt-5_6-luna",
+        max_tokens=128000,
+    )
+    monkeypatch.setattr(providers, "_resolve_model_spec", lambda _slot: resolved)
+    coordinator = fusion.FusionCoordinator()
+    assert coordinator._output_tokens_for("gpt-5_6-luna") == 128000
