@@ -28,7 +28,7 @@ def _runtime_abi(
 ) -> tuple[tuple[str, ...], str]:
     slots = _slot_order(source.get("MANTIS_WORKER_MODELS", "").split(","))
     conductor = _identifier(
-        source.get("MANTIS_CONDUCTOR_SLOT", source.get("MANTIS_CONDUCTOR_MODEL")),
+        source.get("MANTIS_CONDUCTOR_SLOT"),
         "MANTIS_CONDUCTOR_SLOT",
     )
     if set(bindings.workers) != set(slots):

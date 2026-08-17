@@ -30,6 +30,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import jsonschema
+import model_catalog
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
@@ -911,6 +912,13 @@ class TrinityRun(NativeRun):
         return text.strip().upper().startswith("ACCEPT")
 
 
+def _load_mantis_catalog() -> model_catalog.MantisCatalog | None:
+    try:
+        return model_catalog.load_mantis_catalog(require_contract=False)
+    except Exception:
+        return None
+
+
 class ConductorRun(NativeRun):
     """Resumable Conductor run: planning step then DAG nodes, all tool-capable."""
 
@@ -931,8 +939,10 @@ class ConductorRun(NativeRun):
         self.query = query or ""
         self.query_content = utils._last_user_content(messages)
         self.history = history
+        catalog = _load_mantis_catalog()
+        conductor_model = catalog.conductor_model if catalog is not None else None
         self.conductor_model = conductor._resolve_conductor_model(
-            SimpleNamespace(slot_models=self.slot_models)
+            SimpleNamespace(slot_models=self.slot_models, conductor_model=conductor_model)
         )
         self.steps: list[dict[str, Any]] = []
         self._workflow: tuple[list, list, list] | None = None

@@ -797,7 +797,12 @@ def run_pi_agent(
         arm, instance["problem_statement"], tier_models, rng, frequencies, fixed_models
     )
     session = f"router-eval-{secrets.token_hex(8)}"
-    api_key = os.environ.get("BIFROST_API_KEY") or os.environ.get("MANTIS_API_KEY")
+    # The Mantis API (8088) and Bifrost (8080) use different credentials.
+    # Select the right key based on which endpoint this arm targets.
+    if "mantis" in endpoint or ":8088" in endpoint:
+        api_key = os.environ.get("MANTIS_API_KEY") or os.environ.get("BIFROST_API_KEY")
+    else:
+        api_key = os.environ.get("BIFROST_API_KEY") or os.environ.get("MANTIS_API_KEY")
     proxy = _RouteRecordingProxy(
         upstream=endpoint, api_key=api_key, ledger=ledger, instance_id=instance_id,
         arm=arm, cap=arm_cap, prices=prices, shadow_prices=shadow_prices,

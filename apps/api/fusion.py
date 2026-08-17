@@ -82,23 +82,13 @@ class FusionConfig:
             return self._raw
 
     def main_slot(self) -> str:
-        return (
-            self._load().get("main")
-            or os.environ.get("MANTIS_FUSION_MAIN_MODEL")
-            or "gpt-5_6-sol"
-        )
+        return self._load().get("main") or "gpt-5_6-sol"
 
     def sidekick_slot(self) -> str:
-        return (
-            self._load().get("sidekick")
-            or os.environ.get("MANTIS_FUSION_SIDEKICK_MODEL")
-            or "gpt-5_6-luna"
-        )
+        return self._load().get("sidekick") or "gpt-5_6-luna"
 
     def max_follow_ups(self) -> int:
-        raw = self._load().get("max_follow_ups") or os.environ.get(
-            "MANTIS_FUSION_MAX_FOLLOW_UPS", "3"
-        )
+        raw = self._load().get("max_follow_ups") or "3"
         try:
             return int(raw)
         except (TypeError, ValueError):
@@ -106,7 +96,7 @@ class FusionConfig:
 
     def context_window(self) -> int:
         raw = self._load().get("context_window") or os.environ.get(
-            "MANTIS_FUSION_CONTEXT_WINDOW", "262144"
+            "MANTIS_CONTEXT_LENGTH", "262144"
         )
         try:
             return int(raw)
@@ -114,9 +104,7 @@ class FusionConfig:
             return 262144
 
     def max_output_tokens(self) -> int:
-        raw = self._load().get("max_output_tokens") or os.environ.get(
-            "MANTIS_FUSION_MAX_OUTPUT_TOKENS", "4096"
-        )
+        raw = self._load().get("max_output_tokens") or "4096"
         try:
             return int(raw)
         except (TypeError, ValueError):

@@ -91,6 +91,7 @@ def estimate_cost(
     response: dict[str, Any],
     costs: dict[str, float],
     slot_models: list[str],
+    conductor_model: str = "",
 ) -> tuple[float, int]:
     """Return (est_cost_usd, n_worker_calls)."""
     usage = response.get("usage", {}) or {}
@@ -118,7 +119,6 @@ def estimate_cost(
     steps = parse_conductor_trace(trace or "")
     if not steps:
         steps = turns
-    conductor_model = os.environ.get("MANTIS_CONDUCTOR_MODEL", "")
     plan_cost = model_cost(conductor_model, costs)
     step_cost = steps * pool_avg
     return plan_cost + step_cost, steps + 1
@@ -177,7 +177,6 @@ def main() -> None:
 
     costs = load_worker_costs(default_worker_costs_path())
     slot_models, conductor_model = load_catalog_models(REPO / "config" / "catalog.toml")
-    os.environ.setdefault("MANTIS_CONDUCTOR_MODEL", conductor_model)
 
     fixtures: list[dict[str, Any]] = []
     with open(args.fixtures) as f:
@@ -221,7 +220,7 @@ def main() -> None:
             usage = resp.get("usage", {}) or {}
             rec["fugu_trace"] = usage.get("fugu_trace")
             rec["est_cost_usd"], rec["n_worker_calls"] = estimate_cost(
-                args.config, resp, costs, slot_models
+                args.config, resp, costs, slot_models, conductor_model
             )
         except requests.exceptions.Timeout:
             rec["latency_s"] = round(time.time() - start, 3)

@@ -178,7 +178,6 @@ def render_mantis_environment(catalog: MantisCatalog) -> dict[str, str]:
     return {
         "MANTIS_WORKER_MODELS": ",".join(catalog.slot_order),
         "MANTIS_CONDUCTOR_SLOT": catalog.conductor,
-        "MANTIS_CONDUCTOR_MODEL": catalog.conductor_model or catalog.conductor,
         "MANTIS_PROVIDER_BINDINGS": _json(providers),
         "MANTIS_WORKER_BINDINGS": _json(workers),
         "MANTIS_IDENTITY_CONTRACT": identity_fingerprint(catalog),

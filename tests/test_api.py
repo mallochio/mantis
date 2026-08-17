@@ -561,7 +561,7 @@ def _catalog_runtime_env(monkeypatch, keys: dict | None = None, env_keys: dict |
     monkeypatch.setenv("MANTIS_PROVIDER_BINDINGS", _json.dumps(providers))
     monkeypatch.setenv("MANTIS_WORKER_BINDINGS", _json.dumps(workers))
     monkeypatch.setenv("MANTIS_WORKER_MODELS", ",".join(slots))
-    monkeypatch.setenv("MANTIS_CONDUCTOR_MODEL", conductor)
+    monkeypatch.setenv("MANTIS_CONDUCTOR_SLOT", conductor)
     monkeypatch.setenv("MANTIS_IDENTITY_CONTRACT", contract)
     monkeypatch.setenv("MANTIS_PROVIDER_KEYS", _json.dumps(keys) if keys else "")
     for name, value in (env_keys or {}).items():

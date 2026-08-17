@@ -52,7 +52,7 @@ def _load_policy_contract():
 
 def test_routing_policy_contract_uses_placeholder_labels_and_real_mapping(monkeypatch):
     monkeypatch.setattr(
-        server, "SUPRA_TARGETS", ("cheap", "cheap", "middle", "middle", "expensive")
+        server, "SUPRA_TARGETS", ("cheap", "cheap", "cheap", "middle", "expensive")
     )
     monkeypatch.setattr(
         server,
@@ -69,7 +69,7 @@ def test_routing_policy_contract_uses_placeholder_labels_and_real_mapping(monkey
 
 def test_routing_policy_contract_fails_on_mapping_perturbation(monkeypatch):
     monkeypatch.setattr(
-        server, "SUPRA_TARGETS", ("cheap", "middle", "middle", "middle", "expensive")
+        server, "SUPRA_TARGETS", ("cheap", "cheap", "middle", "middle", "expensive")
     )
     with pytest.raises(AssertionError):
         _load_policy_contract()

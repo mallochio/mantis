@@ -187,8 +187,7 @@ reasoning engine or search crawler.
 | `MANTIS_MODEL` | TRINITY router backbone | `Qwen/Qwen3-0.6B` |
 | `MANTIS_VECTOR` | Trained TRINITY vector | `artifacts/model_iter_60.npy` |
 | `MANTIS_HEAD` | Optional head override | unset |
-| `MANTIS_WORKER_MODELS` | Ordered provider/model[effort] pool | see `.env.example` |
-| `MANTIS_CONDUCTOR_MODEL` | Conductor planner model spec | first worker |
+| `MANTIS_CONTEXT_LENGTH` | Shared context-window limit in tokens | `262144` |
 | `MANTIS_LOCAL_MODELS` | Optional local HF worker pool | unset |
 | `MANTIS_LOCAL_CONDUCTOR` | Optional local Conductor checkpoint | unset |
 | `MANTIS_MAX_TURNS` | TRINITY turn cap | `5` |

@@ -121,19 +121,17 @@ def test_native_run_owns_unique_tool_ids_across_serialization():
     assert restored.own_tool_calls([{}])[0]["id"] == "c2"
 
 
-def test_resolve_conductor_model_env(monkeypatch):
-    monkeypatch.setenv("MANTIS_CONDUCTOR_MODEL", "openai/gpt-5.6-sol")
-    assert serve._resolve_conductor_model(SimpleNamespace()) == "openai/gpt-5.6-sol"
+def test_resolve_conductor_model_from_worker():
+    worker = SimpleNamespace(conductor_model="openai/gpt-5.6-sol")
+    assert serve._resolve_conductor_model(worker) == "openai/gpt-5.6-sol"
 
 
-def test_resolve_conductor_model_from_slot_models(monkeypatch):
-    monkeypatch.delenv("MANTIS_CONDUCTOR_MODEL", raising=False)
+def test_resolve_conductor_model_from_slot_models():
     worker = SimpleNamespace(slot_models=["slot-0", "slot-1"])
     assert serve._resolve_conductor_model(worker) == "slot-0"
 
 
-def test_resolve_conductor_model_default(monkeypatch):
-    monkeypatch.delenv("MANTIS_CONDUCTOR_MODEL", raising=False)
+def test_resolve_conductor_model_default():
     assert serve._resolve_conductor_model(SimpleNamespace()) == "openai/gpt-4o-mini"
 
 
@@ -651,7 +649,6 @@ def test_env_conductor_coordinator_bifrost(monkeypatch):
         def __call__(self, sub, messages, agent_id):
             return "done"
 
-    monkeypatch.setenv("MANTIS_CONDUCTOR_MODEL", "gpt-5.6-luna")
     coord = serve.EnvConductorCoordinator(FakeWorker())
     res = coord.run("query")
     assert res.final == "done"

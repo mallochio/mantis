@@ -15,7 +15,7 @@ protocols = ["anthropic_messages"]
 
 [gateway]
 active_policy = "coding"
-revision = "bifrost-2026-08-16-flash-sol-opus"
+revision = "bifrost-2026-08-16-flash-effort-opus-sol"
 
 [gateway.targets.cheap]
 provider = "bifrost"
@@ -30,30 +30,33 @@ rank = 0
 
 [gateway.targets.middle]
 provider = "bifrost"
-# gpt-5.6-sol (models.dev azure/openai): max output 128000,
-# cost $5/$30 per 1M in/out.
-reasoning_effort = "medium"
-force_reasoning_effort = true
-max_tokens = 128000
-upstream_model = "gpt-5.6-sol"
-protocols = ["chat_completions", "responses"]
-rank = 1
-
-[gateway.targets.expensive]
-provider = "bifrost"
 # claude-opus-5 through Bifrost (vertex-primary, bedrock fallback).
-# Fable 5 was the first choice, but Vertex has zero anthropic-claude-fable
-# base-model quota and Bedrock requires a provider_data_share opt-in.
-# models.dev anthropic/bedrock: max output 128000, cost $5/$25 per 1M in/out.
+# Cost-monotonic: $5/$25 per 1M in/out — cheaper than gpt-5.6-sol ($5/$30).
+# models.dev anthropic/bedrock: max output 128000.
 reasoning_effort = "medium"
 force_reasoning_effort = true
 max_tokens = 128000
 upstream_model = "anthropic/claude-opus-5"
 protocols = ["chat_completions", "responses"]
+rank = 1
+
+[gateway.targets.expensive]
+provider = "bifrost"
+# gpt-5.6-sol (models.dev azure/openai): max output 128000,
+# cost $5/$30 per 1M in/out — the most expensive tier.
+reasoning_effort = "high"
+force_reasoning_effort = true
+max_tokens = 128000
+upstream_model = "gpt-5.6-sol"
+protocols = ["chat_completions", "responses"]
 rank = 2
 
 [gateway.policies.coding]
-complexity_targets = ["cheap", "cheap", "middle", "middle", "expensive"]
+# 5 operating points: 3 on the cheap model with escalating effort, then
+# middle (claude-opus-5) and expensive (gpt-5.6-sol).  Cost-monotonic:
+# gemini-flash@low < gemini-flash@medium < gemini-flash@high < opus-5 < sol.
+complexity_targets = ["cheap", "cheap", "cheap", "middle", "expensive"]
+complexity_efforts = ["low", "medium", "high", "medium", "high"]
 invalid_complexity_target = "expensive"
 
 

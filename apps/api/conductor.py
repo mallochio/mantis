@@ -28,6 +28,7 @@ if not (_HERE / "mini.py").exists():
     if _OPENFUGU.exists():
         sys.path.insert(0, str(_OPENFUGU))
 
+import model_catalog
 import serve_config
 import trinity
 import utils
@@ -38,14 +39,24 @@ from mini import (
 from ultra import ConductorExecutor, conductor_prompt, parse_workflow
 
 
+def _load_mantis_catalog() -> model_catalog.MantisCatalog | None:
+    try:
+        return model_catalog.load_mantis_catalog(require_contract=False)
+    except Exception:
+        return None
+
+
 def _resolve_conductor_model(worker) -> str:
-    """Pick the model used for the Conductor planning call."""
-    conductor_model = os.environ.get("MANTIS_CONDUCTOR_MODEL")
-    if conductor_model is None and getattr(worker, "slot_models", None):
-        conductor_model = worker.slot_models[0]
-    if conductor_model is None:
-        conductor_model = "openai/gpt-4o-mini"
-    return conductor_model
+    """Pick the model used for the Conductor planning call.
+
+    Prefer an explicit conductor_model attached to the worker (set from the
+    shared catalog), then the first configured slot, then a safe default.
+    """
+    if getattr(worker, "conductor_model", None):
+        return worker.conductor_model
+    if getattr(worker, "slot_models", None):
+        return worker.slot_models[0]
+    return "openai/gpt-4o-mini"
 
 
 def _run_conductor_workflow(
@@ -336,6 +347,10 @@ def load_coordinator(mode: str):
         )
     local_ckpt = os.environ.get("MANTIS_LOCAL_CONDUCTOR")
     conductor = EnvLocalConductor(local_ckpt) if local_ckpt else None
+    catalog = _load_mantis_catalog()
+    worker.conductor_model = (
+        catalog.conductor_model if catalog is not None else None
+    )
     return EnvConductorCoordinator(
         worker, conductor=conductor, slot_labels=getattr(worker, "slot_models", None)
     )

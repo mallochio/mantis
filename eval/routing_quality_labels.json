@@ -17,13 +17,20 @@
     "complexity_targets": [
       "cheap",
       "cheap",
-      "middle",
+      "cheap",
       "middle",
       "expensive"
     ],
+    "complexity_efforts": [
+      "low",
+      "medium",
+      "high",
+      "medium",
+      "high"
+    ],
     "invalid_complexity_target": "expensive",
     "complexity_levels": 5,
-    "mapping_fingerprint": "34d1db298e9100ff48897f574406650ef607e763ab947642715006675f50a626"
+    "mapping_fingerprint": "2d113a7256fa366b180ef71d16c86bbdacca2ee44c5d1982e13f3f9b723c1ea2"
   },
   "thresholds": {
     "accuracy_min": 1.0,
@@ -43,7 +50,7 @@
     "p3": {
       "prompt": "synthetic routing prompt complexity 3",
       "complexity": 3,
-      "oracle_tier": "middle"
+      "oracle_tier": "cheap"
     },
     "p4": {
       "prompt": "synthetic routing prompt complexity 4",

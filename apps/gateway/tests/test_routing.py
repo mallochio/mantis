@@ -205,6 +205,30 @@ def test_supra_three_tier_mapping_when_middle_configured(monkeypatch):
     assert server._decide_uncached("hard work")[0] == "expensive"
 
 
+def test_effort_for_complexity_returns_override(monkeypatch):
+    monkeypatch.setattr(server, "SUPRA_EFFORTS", ("low", "medium", "high", None, "max"))
+    assert server._effort_for_complexity(1) == "low"
+    assert server._effort_for_complexity(3) == "high"
+    assert server._effort_for_complexity(4) is None
+    assert server._effort_for_complexity(None) is None
+    assert server._effort_for_complexity(0) is None
+    assert server._effort_for_complexity(6) is None
+
+
+def test_apply_effort_override_returns_copy_with_override():
+    backend = {"effort": "medium", "force_reasoning_effort": False, "model": "test"}
+    result = server._apply_effort_override(backend, "high")
+    assert result["effort"] == "high"
+    assert result["force_reasoning_effort"] is True
+    assert backend["effort"] == "medium"  # original unchanged
+
+
+def test_apply_effort_override_noop_when_none_or_same():
+    backend = {"effort": "medium", "force_reasoning_effort": True}
+    assert server._apply_effort_override(backend, None) is backend
+    assert server._apply_effort_override(backend, "medium") is backend
+
+
 def test_session_ids_are_source_namespaced_and_hmac_opaque(monkeypatch):
     from starlette.requests import Request
 

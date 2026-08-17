@@ -55,7 +55,6 @@ def _env_float(name: str, default: float) -> float:
 HOST = os.environ.get("MANTIS_ROUTER_HOST", "127.0.0.1")
 PORT = _env_int("MANTIS_ROUTER_PORT", 5500)
 SERVER_KEY = os.environ.get("MANTIS_ROUTER_KEY", "sk-route-local")
-MANTIS_ROUTER_CONTEXT_WINDOW = os.environ.get("MANTIS_ROUTER_CONTEXT_WINDOW", "auto")
 # Default/ceiling for targets without an explicit catalog max_tokens. The
 # catalog carries exact per-model output caps (models.dev), so this only
 # matters as a fallback; it must be >= the largest catalog cap (deepseek
@@ -276,7 +275,7 @@ _TARGET_FIELDS = frozenset({
     "force_reasoning_effort", "usage_include",
 })
 _GATEWAY_FIELDS = frozenset({"active_policy", "revision", "invalid_complexity_target", "targets", "policies"})
-_POLICY_FIELDS = frozenset({"complexity_targets", "revision", "invalid_complexity_target"})
+_POLICY_FIELDS = frozenset({"complexity_targets", "complexity_efforts", "revision", "invalid_complexity_target"})
 
 
 def _parse_provider_specs(value, *, field: str) -> dict[str, dict]:
@@ -436,6 +435,7 @@ def _catalog_gateway_spec(catalog: dict) -> dict | None:
     return {
         "targets": targets,
         "policy_targets": policy.get("complexity_targets"),
+        "policy_efforts": policy.get("complexity_efforts"),
         "revision": policy.get("revision", section.get("revision")),
         "invalid_target": policy.get("invalid_complexity_target", section.get("invalid_complexity_target")),
         "section_name": section_name,
@@ -465,8 +465,8 @@ def _read_targets_json(raw: str | None) -> dict | None:
     if not isinstance(data, dict) or not data:
         raise _config_error("MANTIS_ROUTER_TARGETS_JSON must be a non-empty object")
     wrapper_fields = {
-        "version", "targets", "providers", "complexity_targets", "revision",
-        "invalid_complexity_target",
+        "version", "targets", "providers", "complexity_targets", "complexity_efforts",
+        "revision", "invalid_complexity_target",
     }
     # The wrapper form is unambiguous and versioned exactly like a catalog.
     _ensure_fields(data, wrapper_fields, "MANTIS_ROUTER_TARGETS_JSON wrapper")
@@ -479,6 +479,7 @@ def _read_targets_json(raw: str | None) -> dict | None:
         "targets": targets,
         "providers": data.get("providers", {}),
         "policy_targets": data.get("complexity_targets"),
+        "policy_efforts": data.get("complexity_efforts"),
         "revision": data.get("revision"),
         "invalid_target": data.get("invalid_complexity_target"),
     }
@@ -496,6 +497,33 @@ def _parse_complexity_targets(value, known: dict[str, dict], field: str) -> tupl
     if any(not str(known[target].get("base", "")) for target in targets):
         raise _config_error(f"{field} references an unconfigured target")
     return targets
+
+
+_VALID_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+
+
+def _parse_complexity_efforts(value, field: str) -> tuple[str | None, ...]:
+    """Parse an optional per-complexity effort override list.
+
+    Returns a 5-tuple of effort strings or ``None`` entries.  ``None`` means
+    "use the target's configured reasoning_effort" so the field is fully
+    backward-compatible when omitted.
+    """
+    if value is None:
+        return (None,) * 5
+    if isinstance(value, str):
+        value = [item.strip() or None for item in value.split(",")]
+    if not isinstance(value, (list, tuple)) or len(value) != 5:
+        raise _config_error(f"{field} must contain exactly five effort levels")
+    efforts: list[str | None] = []
+    for entry in value:
+        if entry is None:
+            efforts.append(None)
+            continue
+        if not isinstance(entry, str) or entry.lower() not in _VALID_EFFORTS:
+            raise _config_error(f"{field} entry {entry!r} is not a valid reasoning effort")
+        efforts.append(entry.lower())
+    return tuple(efforts)
 
 
 def _explicit_revision(value, field: str) -> str | None:
@@ -522,7 +550,8 @@ def _configured_safe_target(targets: dict[str, dict]) -> str:
 
 
 def _target_config_fingerprint(source: str, targets: dict[str, dict],
-                               complexity_targets: tuple[str, ...], invalid_target: str) -> str:
+                               complexity_targets: tuple[str, ...], invalid_target: str,
+                               complexity_efforts: tuple[str | None, ...] = (None,) * 5) -> str:
     # Never include backend["key"].  Every routing/wire-affecting, non-secret
     # binding and policy field is included so a label cannot conceal a stale
     # session, learned pin, or replay cache entry.
@@ -542,7 +571,8 @@ def _target_config_fingerprint(source: str, targets: dict[str, dict],
     }
     payload = json.dumps({
         "source": source, "target_order": target_order, "targets": safe_targets,
-        "complexity_targets": complexity_targets, "invalid_target": invalid_target,
+        "complexity_targets": complexity_targets, "complexity_efforts": complexity_efforts,
+        "invalid_target": invalid_target,
     }, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
@@ -564,6 +594,7 @@ if _json_spec is not None:
         _json_spec["targets"], _json_providers, require_provider=False,
         field="MANTIS_ROUTER_TARGETS_JSON.targets")
     _policy_targets = _json_spec["policy_targets"]
+    _policy_efforts = _json_spec["policy_efforts"]
     _config_revision = _json_spec["revision"]
     _invalid_target = _json_spec["invalid_target"]
     TARGET_CONFIG_SOURCE = "json"
@@ -579,11 +610,13 @@ else:
     BACKENDS = _build_target_registry(
         _catalog_spec["targets"], _catalog_providers, require_provider=True, field="gateway.targets")
     _policy_targets = _catalog_spec["policy_targets"]
+    _policy_efforts = _catalog_spec["policy_efforts"]
     _config_revision = _catalog_spec["revision"]
     _invalid_target = _catalog_spec["invalid_target"]
     TARGET_CONFIG_SOURCE = "catalog"
 
 SUPRA_TARGETS = _parse_complexity_targets(_policy_targets, BACKENDS, "complexity_targets")
+SUPRA_EFFORTS = _parse_complexity_efforts(_policy_efforts, "complexity_efforts")
 if _invalid_target is not None:
     SUPRA_INVALID_TARGET = _valid_target_id(_invalid_target, "invalid complexity target")
     if SUPRA_INVALID_TARGET not in BACKENDS:
@@ -598,7 +631,7 @@ TIER_ORDER = {
     for index, (target, backend) in enumerate(BACKENDS.items())
 }
 TARGET_CONFIG_FINGERPRINT = _target_config_fingerprint(
-    TARGET_CONFIG_SOURCE, BACKENDS, SUPRA_TARGETS, SUPRA_INVALID_TARGET)
+    TARGET_CONFIG_SOURCE, BACKENDS, SUPRA_TARGETS, SUPRA_INVALID_TARGET, SUPRA_EFFORTS)
 TARGET_CONFIG_REVISION = _target_config_revision(
     TARGET_CONFIG_SOURCE,
     os.environ.get("MANTIS_ROUTER_TARGETS_REVISION", _config_revision),
@@ -657,7 +690,7 @@ async def _get_context_window() -> int:
     global _cached_context_window
     if _cached_context_window is not None:
         return _cached_context_window
-    env_val = os.environ.get("MANTIS_ROUTER_CONTEXT_WINDOW")
+    env_val = os.environ.get("MANTIS_CONTEXT_LENGTH")
     if env_val and env_val.isdigit() and int(env_val) > 0:
         _cached_context_window = int(env_val)
         return _cached_context_window
@@ -814,6 +847,25 @@ def _target_for_complexity(complexity: int | None) -> tuple[str, str]:
     if isinstance(complexity, int) and not isinstance(complexity, bool) and 1 <= complexity <= 5:
         return SUPRA_TARGETS[complexity - 1], "supra_complexity"
     return SUPRA_INVALID_TARGET, "supra_invalid_complexity"
+
+
+def _effort_for_complexity(complexity: int | None) -> str | None:
+    """Return the per-complexity effort override, or None to use the target default."""
+    if complexity is None or not isinstance(complexity, int) or complexity < 1 or complexity > len(SUPRA_EFFORTS):
+        return None
+    return SUPRA_EFFORTS[complexity - 1]
+
+
+def _apply_effort_override(backend: dict, effort: str | None) -> dict:
+    """Return a shallow copy of backend with the effort override applied.
+
+    When ``effort`` is None the backend is returned unchanged.  The override
+    also forces reasoning_effort so the caller's reasoning field is respected
+    for both chat and responses protocols.
+    """
+    if effort is None or effort == backend.get("effort"):
+        return backend
+    return {**backend, "effort": effort, "force_reasoning_effort": True}
 
 
 def _supra_reason(complexity: int | None) -> str | None:
@@ -2071,13 +2123,18 @@ def _failover_routes(decision: str) -> tuple[str, ...]:
 
 
 async def _open_with_failover(body: dict, decision: str, deadline: float, *, stream: bool,
-                              api_format: str = "chat"):
+                              api_format: str = "chat", effort_override: str | None = None):
     attempts = []
     routes = _responses_routes(decision) if api_format == "responses" else _chat_routes(decision)
     if not routes:
-        return decision, _backend_for(decision), None, attempts
+        backend = _backend_for(decision)
+        if effort_override:
+            backend = _apply_effort_override(backend, effort_override)
+        return decision, backend, None, attempts
     for index, current in enumerate(routes):
         backend = _backend_for(current)
+        if index == 0 and effort_override:
+            backend = _apply_effort_override(backend, effort_override)
         try:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -2098,7 +2155,8 @@ async def _open_with_failover(body: dict, decision: str, deadline: float, *, str
     return attempts[-1][0], attempts[-1][1], None, attempts
 
 
-async def _open_responses_stream_with_failover(body: dict, decision: str, deadline: float):
+async def _open_responses_stream_with_failover(body: dict, decision: str, deadline: float,
+                                                effort_override: str | None = None):
     """Buffer a small native Responses prefix before committing its SSE bytes.
 
     Unlike Chat, the Responses endpoint cannot translate a stream.  Before any
@@ -2109,9 +2167,14 @@ async def _open_responses_stream_with_failover(body: dict, decision: str, deadli
     attempts = []
     routes = _responses_routes(decision)
     if not routes:
-        return decision, _backend_for(decision), None, attempts, []
+        backend = _backend_for(decision)
+        if effort_override:
+            backend = _apply_effort_override(backend, effort_override)
+        return decision, backend, None, attempts, []
     for index, current in enumerate(routes):
         backend = _backend_for(current)
+        if index == 0 and effort_override:
+            backend = _apply_effort_override(backend, effort_override)
         response = None
         try:
             remaining = deadline - time.monotonic()
@@ -2205,7 +2268,8 @@ async def healthz():
             }
             for target, backend in BACKENDS.items()
         },
-        "supra_targets": list(SUPRA_TARGETS), "supra_invalid_target": SUPRA_INVALID_TARGET,
+        "supra_targets": list(SUPRA_TARGETS), "supra_efforts": list(SUPRA_EFFORTS),
+        "supra_invalid_target": SUPRA_INVALID_TARGET,
         "target_config_source": TARGET_CONFIG_SOURCE, "target_config_revision": TARGET_CONFIG_REVISION,
         "target_config_fingerprint": TARGET_CONFIG_FINGERPRINT,
         "supra_fallback_count": SUPRA_FALLBACK_COUNT,
@@ -2561,10 +2625,11 @@ async def responses(request: Request, authorization: str | None = Header(default
                 selected = decision
         elif body.get("stream"):
             selected, backend, upstream, attempts, response_stream = await _open_responses_stream_with_failover(
-                body, decision, deadline)
+                body, decision, deadline, effort_override=_effort_for_complexity(supra_complexity))
         else:
             selected, backend, upstream, attempts = await _open_with_failover(
                 body, decision, deadline, stream=False, api_format="responses",
+                effort_override=_effort_for_complexity(supra_complexity),
             )
     except BaseException:
         if upstream is not None:
@@ -2900,7 +2965,8 @@ async def chat_completions(
             headers["x-route-session"] = session_id
         deadline = time.monotonic() + TIMEOUT_S
         selected, backend, upstream, attempts = await _open_with_failover(
-            body, decision, deadline, stream=bool(body.get("stream")), api_format="chat")
+            body, decision, deadline, stream=bool(body.get("stream")), api_format="chat",
+            effort_override=_effort_for_complexity(supra_complexity))
 
         prefix = []
         events = None

@@ -194,7 +194,7 @@ def _set_runtime_env(monkeypatch, providers: dict, workers: dict, contract: str 
     monkeypatch.setenv("MANTIS_PROVIDER_BINDINGS", json.dumps(providers))
     monkeypatch.setenv("MANTIS_WORKER_BINDINGS", json.dumps(workers))
     monkeypatch.setenv("MANTIS_WORKER_MODELS", ",".join(SLOTS))
-    monkeypatch.setenv("MANTIS_CONDUCTOR_MODEL", CONDUCTOR)
+    monkeypatch.setenv("MANTIS_CONDUCTOR_SLOT", CONDUCTOR)
     if contract:
         monkeypatch.setenv("MANTIS_IDENTITY_CONTRACT", contract)
 
@@ -224,7 +224,7 @@ def test_fingerprint_bootstraps_then_validate_and_render(tmp_path):
     assert catalog is not None
     rendered = model_catalog.render_mantis_environment(catalog)
     assert rendered["MANTIS_WORKER_MODELS"] == ",".join(SLOTS)
-    assert rendered["MANTIS_CONDUCTOR_MODEL"] == CONDUCTOR
+    assert rendered["MANTIS_CONDUCTOR_SLOT"] == CONDUCTOR
     assert rendered["MANTIS_IDENTITY_CONTRACT"] == model_catalog.identity_fingerprint(catalog)
 
 
@@ -577,7 +577,7 @@ def test_runtime_bindings_enforce_seven_slots_without_contract(monkeypatch):
     monkeypatch.setenv("MANTIS_PROVIDER_BINDINGS", json.dumps(providers))
     monkeypatch.setenv("MANTIS_WORKER_BINDINGS", json.dumps(workers))
     monkeypatch.setenv("MANTIS_WORKER_MODELS", "slot_worker")
-    monkeypatch.setenv("MANTIS_CONDUCTOR_MODEL", "slot_worker")
+    monkeypatch.setenv("MANTIS_CONDUCTOR_SLOT", "slot_worker")
     with pytest.raises(model_catalog.CatalogError, match="exactly seven"):
         model_catalog.load_runtime_bindings()
 
@@ -612,7 +612,7 @@ def test_runtime_bindings_reject_identity_drift(monkeypatch):
 
 def test_runtime_bindings_require_conductor_slot(monkeypatch):
     _set_runtime_env(monkeypatch, _edge_provider(), _full_workers())
-    monkeypatch.setenv("MANTIS_CONDUCTOR_MODEL", "slot_unknown")
+    monkeypatch.setenv("MANTIS_CONDUCTOR_SLOT", "slot_unknown")
     with pytest.raises(model_catalog.CatalogError, match="conductor must name"):
         model_catalog.load_runtime_bindings()
 
