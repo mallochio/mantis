@@ -375,3 +375,94 @@ def test_fusion_output_tokens_are_model_specific(monkeypatch):
     coordinator = fusion.FusionCoordinator()
     assert coordinator._output_tokens_for("gpt-5_6-luna") == 128000
     assert coordinator.max_output_tokens == 4096
+
+
+def test_fusion_chat_initial_call_returns_tool_calls(client, fake_worker):
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "run a shell command",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+            },
+        }
+    ]
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "mantis/fusion",
+            "messages": [{"role": "user", "content": "write a hello world script"}],
+            "tools": tools,
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["model"] == "mantis/fusion"
+    assert body["choices"][0]["finish_reason"] == "tool_calls"
+    message = body["choices"][0]["message"]
+    assert message["role"] == "assistant"
+    assert message["content"] == ""
+    assert len(message["tool_calls"]) == 1
+    assert message["tool_calls"][0]["function"]["name"] == "bash"
+    tool_call_id = message["tool_calls"][0]["id"]
+    assert tool_call_id.startswith("f")
+    assert "~" in tool_call_id
+    assert fake_worker.main_calls == 1
+    assert fake_worker.sidekick_calls == 1
+
+
+def test_fusion_chat_follow_up_returns_report(client, fake_worker):
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "run a shell command",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+            },
+        }
+    ]
+    # First call to get tool calls.
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "mantis/fusion",
+            "messages": [{"role": "user", "content": "write a hello world script"}],
+            "tools": tools,
+        },
+    )
+    first = response.json()
+    tool_call = first["choices"][0]["message"]["tool_calls"][0]
+    tool_call_id = tool_call["id"]
+
+    # Second call with the tool result.
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "mantis/fusion",
+            "messages": [
+                {"role": "user", "content": "write a hello world script"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [tool_call],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": "hello",
+                },
+            ],
+            "tools": tools,
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["choices"][0]["finish_reason"] == "stop"
+    assert "Final report" in body["choices"][0]["message"]["content"]
+    assert fake_worker.sidekick_calls == 2
+    assert fake_worker.main_calls >= 2

@@ -9,7 +9,7 @@ Mantis provides four OpenAI-compatible modes. Choose the mode explicitly.
 | `mantis/base` | Direct | The gateway scores one request with Supra and sends it to a cheap, middle, or expensive model through Bifrost. |
 | `mantis/trinity` | Trinity | Multi-agent coordination over Worker, Thinker, and Verifier roles. |
 | `mantis/ultra` | Ultra | Conductor plans and executes a bounded workflow DAG over the worker pool. |
-| `mantis/fusion` | Fusion | Lead/sidekick orchestration with tool-use follow-ups and a review loop. Use `/v1/fusion/delegate` and `/v1/fusion/follow_up/{run_id}`. |
+| `mantis/fusion` | Fusion | Lead/sidekick orchestration with tool-use follow-ups and a review loop. Works as `model: mantis/fusion` in chat or via `/v1/fusion/delegate`. |
 
 Only these model IDs are accepted. Select `mantis/trinity`, `mantis/ultra`, or
 `mantis/fusion` manually; Mantis never selects between modes. All four paths send
@@ -128,8 +128,8 @@ Mantis only chooses and orchestrates models.
 
 ## Fusion mode
 
-`mantis/fusion` is the lead/sidekick orchestrator. It is not a
-`/v1/chat/completions` model; it runs as a stateful run:
+`mantis/fusion` is the lead/sidekick orchestrator. It is exposed both as a
+`/v1/chat/completions` model and as a stateful `/v1/fusion/*` API:
 
 ```bash
 curl -s http://127.0.0.1:8088/v1/fusion/delegate \

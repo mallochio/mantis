@@ -680,6 +680,187 @@ def _router_stream(client: httpx.Client, stream: Any, upstream: httpx.Response) 
         _capacity.release()
 
 
+_FUSION_TOOL_ID_PREFIX = "f"
+_FUSION_TOOL_ID_SEP = "~"
+
+
+def _encode_fusion_tool_call_id(run_id: str, call_id: str) -> str:
+    return f"{_FUSION_TOOL_ID_PREFIX}{run_id}{_FUSION_TOOL_ID_SEP}{call_id}"
+
+
+def _decode_fusion_tool_call_id(encoded: str) -> tuple[str, str]:
+    if not encoded.startswith(_FUSION_TOOL_ID_PREFIX) or _FUSION_TOOL_ID_SEP not in encoded:
+        raise ValueError("invalid fusion tool_call_id")
+    parts = encoded[1:].split(_FUSION_TOOL_ID_SEP, 1)
+    if len(parts) != 2:
+        raise ValueError("invalid fusion tool_call_id")
+    return parts[0], parts[1]
+
+
+def _content_to_str(content: str | list[TextPart | ImagePart] | None) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            part.text if isinstance(part, TextPart) else str(part)
+            for part in content
+        )
+    return str(content)
+
+
+def _build_fusion_chat_response(
+    request_id: str,
+    model: str,
+    event: dict[str, Any],
+) -> JSONResponse:
+    status = event.get("status")
+    if status == "completed":
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": event.get("report") or "",
+        }
+        finish = "stop"
+    elif status == "awaiting_tools":
+        run_id = event["run_id"]
+        pending = event.get("pending_tool_calls") or []
+        tool_calls = [
+            {
+                "id": _encode_fusion_tool_call_id(run_id, call.get("id", "")),
+                "type": call.get("type", "function"),
+                "function": call.get("function", {}),
+            }
+            for call in pending
+        ]
+        message = {"role": "assistant", "content": "", "tool_calls": tool_calls}
+        finish = "tool_calls"
+    else:
+        return _error(
+            500,
+            event.get("report") or f"fusion run failed with status {status}",
+            "upstream_error",
+        )
+    return JSONResponse(
+        {
+            "id": request_id,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": finish,
+                }
+            ],
+            "usage": event.get("usage") or {},
+        },
+        headers={"X-Request-Id": request_id},
+    )
+
+
+def _stream_fusion_chat(
+    request: ChatRequest,
+    request_id: str,
+) -> Iterator[bytes]:
+    """Yield SSE chunks for a Fusion chat completion."""
+    base = {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": _MODEL_CREATED,
+        "model": "mantis/fusion",
+    }
+    try:
+        event = _run_fusion_chat(request)
+        status = event.get("status")
+
+        def _chunk(delta: dict[str, Any], finish: str | None) -> bytes:
+            return (
+                "data: "
+                + json.dumps(
+                    {
+                        **base,
+                        "choices": [
+                            {"index": 0, "delta": delta, "finish_reason": finish}
+                        ],
+                    }
+                )
+                + "\n\n"
+            ).encode()
+
+        if status == "completed":
+            report = event.get("report") or ""
+            yield _chunk({"role": "assistant"}, None)
+            yield _chunk({"content": report}, "stop")
+        elif status == "awaiting_tools":
+            run_id = event["run_id"]
+            pending = event.get("pending_tool_calls") or []
+            tool_calls = [
+                {
+                    "index": i,
+                    "id": _encode_fusion_tool_call_id(run_id, call.get("id", "")),
+                    "type": call.get("type", "function"),
+                    "function": call.get("function", {}),
+                }
+                for i, call in enumerate(pending)
+            ]
+            yield _chunk({"role": "assistant"}, None)
+            yield _chunk({"tool_calls": tool_calls}, "tool_calls")
+        else:
+            msg = event.get("report") or f"fusion run failed with status {status}"
+            yield _chunk({"role": "assistant"}, None)
+            yield _chunk({"content": msg}, "stop")
+    finally:
+        _capacity.release()
+    yield b"data: [DONE]\n\n"
+
+
+def _run_fusion_chat(request: ChatRequest) -> dict[str, Any]:
+    """Resume or start a Fusion run from an OpenAI-style chat request."""
+    # Find a trailing block of tool messages; if present, this is a follow-up.
+    tool_results: list[dict[str, Any]] = []
+    run_id: str | None = None
+    i = len(request.messages) - 1
+    while i >= 0 and request.messages[i].role == "tool":
+        tool_msg = request.messages[i]
+        try:
+            rid, original_id = _decode_fusion_tool_call_id(tool_msg.tool_call_id or "")
+        except ValueError:
+            break
+        if run_id is None:
+            run_id = rid
+        elif run_id != rid:
+            break
+        tool_results.insert(
+            0,
+            {
+                "tool_call_id": original_id,
+                "content": _content_to_str(tool_msg.content),
+                "is_error": False,
+            },
+        )
+        i -= 1
+
+    if run_id is not None and tool_results:
+        return fusion.advance_fusion_run(
+            run_id,
+            tool_results=tool_results,
+        )
+
+    # Initial call: the brief is the last user message.
+    brief = ""
+    for msg in reversed(request.messages):
+        if msg.role == "user":
+            brief = _content_to_str(msg.content)
+            break
+    if not brief:
+        raise ValueError("mantis/fusion requires at least one user message")
+    tools = [tool.model_dump() for tool in (request.tools or [])]
+    run = fusion.create_fusion_run(brief, tools)
+    return fusion.advance_fusion_run(run.run_id)
+
+
 @app.get("/v1/models", dependencies=[Depends(_authorize)])
 def models() -> dict[str, Any]:
     descriptor = {
@@ -713,12 +894,19 @@ def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Respons
     if request.model in _MODEL_ALIASES:
         request = request.model_copy(update={"model": _MODEL_ALIASES[request.model]})
     if request.model == "mantis/fusion":
-        _capacity.release()
-        return _error(
-            400,
-            "mantis/fusion is a stateful mode; use /v1/fusion/delegate",
-            "invalid_request_error",
-        )
+        if request.stream:
+            return StreamingResponse(
+                _stream_fusion_chat(request, request_id),
+                media_type="text/event-stream",
+                headers={"X-Request-Id": request_id},
+            )
+        try:
+            event = _run_fusion_chat(request)
+            return _build_fusion_chat_response(request_id, "mantis/fusion", event)
+        except Exception as exc:  # noqa: BLE001 - chat adapter error boundary
+            return _error(500, f"fusion chat failed: {exc}", "upstream_error")
+        finally:
+            _capacity.release()
     if request.model == _BASIC_MODEL:
         handed_off = False
         try:
