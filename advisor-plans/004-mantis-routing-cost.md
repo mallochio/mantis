@@ -10,8 +10,10 @@ downgrade by default. This is good for prompt-cache hit rates and bad for cost
 when the user sends a mix of hard and easy turns, or when an early hard turn
 pushes the session onto an expensive tier it never leaves.
 
-Phase 1 (idle-time downgrade and N-turn rescoring) has been implemented. Both
-are opt-in via `MANTIS_ROUTER_DOWNGRADE_IDLE_S` and `MANTIS_ROUTER_RESCORE_EVERY_N`.
+Phase 1 (idle-time downgrade and N-turn rescoring) has been implemented.
+`MANTIS_ROUTER_DOWNGRADE_IDLE_S` is opt-in and defaults to `0`.
+`MANTIS_ROUTER_RESCORE_EVERY_N` defaults to `4`, which re-evaluates after a
+typical "hard task + a few follow-up turns" block without churning the cache.
 
 This plan records the next two cost-control ideas without implementing them.
 

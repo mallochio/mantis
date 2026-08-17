@@ -210,7 +210,7 @@ reasoning engine or search crawler.
 | `MANTIS_CACHE_RETENTION` | OpenRouter cache stickiness: `short`, `long`, or `none` | `short` |
 | `MANTIS_ROUTER_URL` | Base URL of the in-repo Mantis router for `mantis/base` | `http://127.0.0.1:5500/v1` |
 | `MANTIS_ROUTER_DOWNGRADE_IDLE_S` | Allow a routed session to downgrade after N seconds idle (cache ratchet) | `0` |
-| `MANTIS_ROUTER_RESCORE_EVERY_N` | Release the cache ratchet and re-select tier every N completed turns | `0` |
+| `MANTIS_ROUTER_RESCORE_EVERY_N` | Release the cache ratchet and re-select tier every N completed turns | `4` |
 | `MANTIS_ROUTER_TIMEOUT_S` | Upstream timeout for `mantis` calls | `300` |
 | `MANTIS_ROUTER_KEY` | Bearer token the API presents to its internal router | required |
 

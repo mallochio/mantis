@@ -1254,7 +1254,9 @@ SESSION_STATE_MAX = _env_int("MANTIS_ROUTER_SESSION_STATE_MAX", 4096)
 DOWNGRADE_IDLE_S = _env_float("MANTIS_ROUTER_DOWNGRADE_IDLE_S", 0.0)
 # Every N completed turns the session ratchet is released and the freshly
 # scored tier can win, including downgrades. 0 disables rescoring.
-RESCORE_EVERY_N = _env_int("MANTIS_ROUTER_RESCORE_EVERY_N", 0)
+# 4 is a reasonable default: it re-evaluates after a typical "hard task +
+# a few follow-up turns" block without churning the cache inside a tight loop.
+RESCORE_EVERY_N = _env_int("MANTIS_ROUTER_RESCORE_EVERY_N", 4)
 _session_state: OrderedDict[str, dict] = OrderedDict()
 _session_lock = threading.Lock()
 _STICKY_REASONS = frozenset({
