@@ -136,7 +136,21 @@ def build_anthropic_body(
         body["system"] = system
     if effort and effort != "none":
         # Bifrost maps an enabled thinking request to the selected Bedrock model.
-        body["thinking"] = {"type": "enabled", "budget_tokens": min(max_tokens - 1, 16384)}
+        # Budget by effort level so low/medium do not always pay for the full
+        # 16k reasoning allowance.
+        budgets = {
+            "minimal": 1024,
+            "low": 2048,
+            "medium": 8192,
+            "high": 16384,
+            "xhigh": 16384,
+            "max": 16384,
+        }
+        budget = budgets.get(effort, 8192)
+        body["thinking"] = {
+            "type": "enabled",
+            "budget_tokens": min(budget, max_tokens - 1, 16384),
+        }
     native_tools = _tools(tools)
     if native_tools:
         body["tools"] = native_tools

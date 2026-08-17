@@ -195,6 +195,12 @@ def _is_reasoning_model(model: str) -> bool:
     return any(name.startswith(p) for p in REASONING_MODELS)
 
 
+def _is_openai_caching_model(model: str) -> bool:
+    """Models that accept OpenAI's explicit prompt_cache_options / breakpoints."""
+    name = model.rsplit("/", 1)[-1].lower()
+    return name.startswith("gpt-5.6-") or name.startswith("o3") or name.startswith("o4")
+
+
 def _coerce_reasoning_effort(model: str, effort: str | None) -> str | None:
     """Map catalog reasoning_effort to a value the upstream model accepts.
 
@@ -245,6 +251,45 @@ def _coerce_reasoning_effort(model: str, effort: str | None) -> str | None:
 def _cache_breakpoints_enabled() -> bool:
     value = os.environ.get("MANTIS_CACHE_BREAKPOINTS", "1").lower()
     return value not in {"0", "false", "no", "off"}
+
+
+def _cache_retention() -> str:
+    return os.environ.get("MANTIS_CACHE_RETENTION", "short").lower()
+
+
+def _cache_retention_long() -> bool:
+    return _cache_retention() == "long"
+
+
+def _cache_retention_enabled() -> bool:
+    return _cache_retention() != "none"
+
+
+def _openai_cache_breakpoints_enabled() -> bool:
+    value = os.environ.get("MANTIS_OPENAI_CACHE_BREAKPOINTS", "0").lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _with_openai_cache_breakpoints(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Mark stable layers for OpenAI GPT-5.6+ explicit prompt caching.
+
+    Places explicit breakpoints on the last system message and on the message
+    just before the latest user/tool turn so the volatile tail is billed fresh
+    while the stable prefix is reused. This matches the GPT-5.6 caching guide.
+    """
+    out: list[dict[str, Any]] = []
+    last_system_index = -1
+    for i, message in enumerate(messages):
+        if message.get("role") == "system":
+            last_system_index = i
+    for i, message in enumerate(messages):
+        msg = dict(message)
+        if i == last_system_index:
+            msg["prompt_cache_breakpoint"] = {"mode": "explicit"}
+        if i == len(messages) - 2 and len(messages) >= 2:
+            msg["prompt_cache_breakpoint"] = {"mode": "explicit"}
+        out.append(msg)
+    return out
 
 
 def _with_cache_breakpoints(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -470,6 +515,9 @@ def _build_request(
         body = {"model": model, "messages": sanitized_messages, "max_tokens": max_tokens}
         if _cache_breakpoints_enabled() and model.startswith("anthropic/claude-"):
             body["messages"] = _with_cache_breakpoints(sanitized_messages)
+        elif _openai_cache_breakpoints_enabled() and _is_openai_caching_model(model):
+            body["prompt_cache_options"] = {"mode": "explicit", "ttl": "30m"}
+            body["messages"] = _with_openai_cache_breakpoints(sanitized_messages)
         if coerced_effort:
             body["reasoning_effort"] = coerced_effort
         if not effort and not _is_reasoning_model(model):
@@ -666,13 +714,15 @@ def _provider_response(
         # conversation to maximize prompt-cache hits. Apply it to all OpenRouter
         # backends (native Responses for "openai/*" and Chat Completions for
         # every other OpenRouter model), not just the Responses path.
-        if provider == "openrouter":
+        if provider == "openrouter" and _cache_retention_enabled():
             namespace = getattr(run, "cache_namespace", None) or _prompt_cache_namespace(
                 messages, tools
             )
             body["session_id"] = f"mantis-{namespace}"
             cache_key = hashlib.sha256(f"{model}:{namespace}".encode()).hexdigest()[:32]
             body["prompt_cache_key"] = cache_key
+            if _cache_retention_long():
+                body["prompt_cache_retention"] = "24h"
             if responses_api and _cache_breakpoints_enabled():
                 body["cache_control"] = {"type": "ephemeral"}
         _emit_progress(

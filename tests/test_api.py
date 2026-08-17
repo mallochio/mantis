@@ -879,3 +879,27 @@ def test_sanitize_messages_keeps_reasoning_for_responses():
     out = providers._sanitize_messages(messages, "openai/gpt-5.6-sol", is_responses=True)
     assert out[0]["reasoning"] == "long chain"
     assert out[0]["reasoning_details"][0]["type"] == "reasoning"
+
+
+def test_openai_cache_breakpoints_mark_system_and_penultimate():
+    messages = [
+        {"role": "system", "content": "instructions"},
+        {"role": "user", "content": "hello"},
+    ]
+    out = providers._with_openai_cache_breakpoints(messages)
+    assert out[0].get("prompt_cache_breakpoint") == {"mode": "explicit"}
+    assert "prompt_cache_breakpoint" not in out[1]
+
+    messages.append({"role": "assistant", "content": "hi"})
+    messages.append({"role": "user", "content": "again"})
+    out = providers._with_openai_cache_breakpoints(messages)
+    assert out[0].get("prompt_cache_breakpoint") == {"mode": "explicit"}
+    assert out[-2].get("prompt_cache_breakpoint") == {"mode": "explicit"}
+    assert "prompt_cache_breakpoint" not in out[-1]
+
+
+def test_cache_retention_can_disable_openrouter_stickiness(monkeypatch):
+    monkeypatch.setenv("MANTIS_CACHE_RETENTION", "none")
+    assert not providers._cache_retention_enabled()
+    monkeypatch.setenv("MANTIS_CACHE_RETENTION", "long")
+    assert providers._cache_retention_long()
