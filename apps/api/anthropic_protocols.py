@@ -134,7 +134,7 @@ def build_anthropic_body(
     body: dict[str, Any] = {"model": model, "max_tokens": max_tokens, "messages": history}
     if system:
         body["system"] = system
-    if effort:
+    if effort and effort != "none":
         # Bifrost maps an enabled thinking request to the selected Bedrock model.
         body["thinking"] = {"type": "enabled", "budget_tokens": min(max_tokens - 1, 16384)}
     native_tools = _tools(tools)

@@ -806,6 +806,13 @@ def test_coerce_reasoning_effort_maps_deepseek_levels():
     assert providers._coerce_reasoning_effort("deepseek-v4-pro", "max") == "max"
 
 
+def test_coerce_reasoning_effort_defaults_gpt56_to_none():
+    assert providers._coerce_reasoning_effort("gpt-5.6-luna", None) == "none"
+    assert providers._coerce_reasoning_effort("gpt-5.6-luna", "none") == "none"
+    assert providers._coerce_reasoning_effort("gpt-5.6-luna", "xhigh") == "xhigh"
+    assert providers._coerce_reasoning_effort("gpt-5.6-luna", "max") == "xhigh"
+
+
 def test_coerce_reasoning_effort_preserves_unknown_models():
     assert providers._coerce_reasoning_effort("vendor/custom", "xhigh") == "xhigh"
 
@@ -821,7 +828,7 @@ def test_sanitize_messages_strips_cross_model_reasoning():
         },
         {"role": "tool", "tool_call_id": "1", "content": "ok", "reasoning": "..."},
     ]
-    out = providers._sanitize_messages(messages, "openai/gpt-4o", is_anthropic=False)
+    out = providers._sanitize_messages(messages, "openai/gpt-4o")
     assert out[0]["content"] == "answer"
     assert "reasoning" not in out[0]
     assert "reasoning_details" not in out[0]
@@ -858,3 +865,17 @@ def test_sanitize_messages_keeps_anthropic_blocks_for_anthropic_target():
     out = providers._sanitize_messages(messages, "anthropic/claude-opus-5", is_anthropic=True)
     assert out[0]["_anthropic_content"]
     assert "reasoning" not in out[0]
+
+
+def test_sanitize_messages_keeps_reasoning_for_responses():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning": "long chain",
+            "reasoning_details": [{"type": "reasoning", "text": "..."}],
+        }
+    ]
+    out = providers._sanitize_messages(messages, "openai/gpt-5.6-sol", is_responses=True)
+    assert out[0]["reasoning"] == "long chain"
+    assert out[0]["reasoning_details"][0]["type"] == "reasoning"

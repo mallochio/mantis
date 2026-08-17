@@ -142,7 +142,7 @@ class ChatRequest(BaseModel):
     max_tokens: int | None = Field(default=None, ge=1)
     max_completion_tokens: int | None = Field(default=None, ge=1)
     reasoning: ReasoningOptions | None = None
-    reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+    reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] | None = None
     web_search_options: dict[str, Any] | None = None
     # Session identity accepted from the body so conversations can reach the
     # router's session ratchet. Never forwarded upstream: unknown top-level
