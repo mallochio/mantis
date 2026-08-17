@@ -306,3 +306,22 @@ def test_session_ratchet_downgrades_after_idle_threshold():
         assert server._session_route("s", prompt, "cheap", 1) == ("expensive", "downgrade_hysteresis")
     finally:
         server.DOWNGRADE_IDLE_S = previous
+
+
+def test_session_ratchet_rescores_every_n_turns():
+    server._session_state.clear()
+    previous = server.RESCORE_EVERY_N
+    try:
+        server.RESCORE_EVERY_N = 4
+        prompt = "Explain the page-fault handling path in this kernel"
+        # At 3 completed turns the ratchet still blocks downgrades.
+        server._session_state["s"] = {"tier": "expensive", "last_seen": time.time(), "turns": 3}
+        assert server._session_route("s", prompt, "cheap", 1) == ("expensive", "downgrade_hysteresis")
+        # At 4 completed turns the fresh score is allowed to win.
+        server._session_state["s"] = {"tier": "expensive", "last_seen": time.time(), "turns": 4}
+        assert server._session_route("s", prompt, "cheap", 1) == ("cheap", "rescore_downgrade")
+        # Continuation prompts stay sticky even on a rescore turn.
+        server._session_state["s"] = {"tier": "expensive", "last_seen": time.time(), "turns": 4}
+        assert server._session_route("s", "Proceed", "cheap", 1) == ("expensive", "continuation_sticky")
+    finally:
+        server.RESCORE_EVERY_N = previous

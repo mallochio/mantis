@@ -16,6 +16,24 @@ Only these model IDs are accepted. Select `mantis/trinity`, `mantis/ultra`, or
 model calls through the local Bifrost gateway. The OpenCode, Pi, and Prime harness
 catalogs advertise a 256k-token context limit for every configured local model.
 
+## Routing ratchet and cost control
+
+`mantis/base` uses a small classifier (Supra) to pick a worker tier per request
+and then a session ratchet to keep the warm prompt-cache prefix on one tier. The
+ratchet climbs freely but does not downgrade by default, which is good for cache
+hits and bad for cost when a session once needed an expensive model.
+
+Two knobs relax this without breaking multi-turn tool loops:
+
+- `MANTIS_ROUTER_DOWNGRADE_IDLE_S=N`: after `N` seconds of silence the next turn
+  is allowed to drop to the freshly scored, cheaper tier.
+- `MANTIS_ROUTER_RESCORE_EVERY_N=N`: every `N` completed turns the ratchet is
+  released and the classifier's current tier wins, including downgrades.
+
+Both default to `0` (disabled), so the legacy climb-only ratchet is unchanged
+unless the operator opts in. Additional cost-control ideas under consideration
+are in `advisor-plans/004-mantis-routing-cost.md`.
+
 ## Repository layout
 
 `apps/api/` serves the four public modes at :8088. `apps/gateway/` is the
@@ -188,7 +206,11 @@ reasoning engine or search crawler.
 | `MANTIS_MAX_BODY_BYTES` | Maximum request body size | `52428800` |
 | `MANTIS_UPSTREAM_STREAM` | Stream provider responses upstream (SSE) instead of buffering | `1` |
 | `MANTIS_CACHE_BREAKPOINTS` | Add prompt-cache breakpoints to Claude-family requests | `1` |
+| `MANTIS_OPENAI_CACHE_BREAKPOINTS` | Add explicit `prompt_cache_options` breakpoints for `gpt-5.6-*` / `o3*` / `o4*` chat | `0` |
+| `MANTIS_CACHE_RETENTION` | OpenRouter cache stickiness: `short`, `long`, or `none` | `short` |
 | `MANTIS_ROUTER_URL` | Base URL of the in-repo Mantis router for `mantis/base` | `http://127.0.0.1:5500/v1` |
+| `MANTIS_ROUTER_DOWNGRADE_IDLE_S` | Allow a routed session to downgrade after N seconds idle (cache ratchet) | `0` |
+| `MANTIS_ROUTER_RESCORE_EVERY_N` | Release the cache ratchet and re-select tier every N completed turns | `0` |
 | `MANTIS_ROUTER_TIMEOUT_S` | Upstream timeout for `mantis` calls | `300` |
 | `MANTIS_ROUTER_KEY` | Bearer token the API presents to its internal router | required |
 
@@ -203,7 +225,10 @@ matching API key to the gateway secret. An OpenRouter proxy must forward both
 generations alive through such proxies. Cached prompt tokens are accounted per
 model in the `mantis` details and billed at the model's cache-read price when known.
 Reasoning effort is appended with `|`, for example
-`openrouter/openai/gpt-5.6-luna|max`.
+`openrouter/openai/gpt-5.6-luna|max`. Accepted values include `none` for fully
+off; `xhigh` is preserved for GPT-5.6, while `max` is mapped to `xhigh` because
+OpenAI rejects `max` on Sol/Terra. `none` is also supported for Anthropic
+thinking and DeepSeek.
 
 Tool runs use bounded process memory by default until completion or TTL expiry.
 For multi-replica deployment, set `MANTIS_RUN_STORE=redis` and configure
