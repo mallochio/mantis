@@ -578,6 +578,17 @@ def ready(response: Response) -> dict[str, Any]:
 
 _MODEL_CREATED = int(time.time())
 _BASIC_MODEL = "mantis/base"
+# Short aliases clients may send when a provider namespace is already "mantis".
+_MODEL_ALIASES = {
+    "mantis": "mantis/base",
+    "base": "mantis/base",
+    "mantis-trinity": "mantis/trinity",
+    "trinity": "mantis/trinity",
+    "mantis-ultra": "mantis/ultra",
+    "ultra": "mantis/ultra",
+    "mantis-fusion": "mantis/fusion",
+    "fusion": "mantis/fusion",
+}
 _ROUTER_RESPONSE_HEADERS = (
     "x-route-decision",
     "x-route-reason",
@@ -699,6 +710,8 @@ def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Respons
     headers = dict(http.headers)
     if not _capacity.acquire(blocking=False):
         return _error(429, "Mantis is at capacity", "rate_limit_error")
+    if request.model in _MODEL_ALIASES:
+        request = request.model_copy(update={"model": _MODEL_ALIASES[request.model]})
     if request.model == "mantis/fusion":
         _capacity.release()
         return _error(

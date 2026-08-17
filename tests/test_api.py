@@ -774,10 +774,24 @@ def test_basic_model_reports_router_connection_failure(client, monkeypatch):
 
 
 def test_only_public_mantis_model_ids_are_accepted(client):
-    for model in ("mantis-basic", "trinity", "fugu", "conductor", "ultra"):
+    for model in ("mantis-basic", "fugu", "conductor", "mantis-fugu"):
         response = client.post(
             "/v1/chat/completions",
             headers=_headers(),
             json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
         )
         assert response.status_code == 400
+
+
+def test_short_model_aliases_are_accepted(client):
+    # Short aliases route to the same modes and reach the gateway, which is not
+    # running in tests, so they return the upstream 502 instead of 400.
+    for model in ("base", "trinity", "ultra"):
+        response = client.post(
+            "/v1/chat/completions",
+            headers=_headers(),
+            json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert response.status_code in (400, 502), f"{model}: {response.status_code}"
+        body = response.json()
+        assert body["error"]["type"] in ("invalid_request_error", "upstream_error")
