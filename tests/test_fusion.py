@@ -706,3 +706,178 @@ def test_fusion_file_persistence_retains_reasoning_metadata(file_client, fake_wo
     assert isinstance(run, fusion.FusionRun)
     assistant_msgs = [m for m in run.sidekick_messages if m.get("role") == "assistant"]
     assert any("reasoning" in m or "reasoning_details" in m for m in assistant_msgs)
+
+
+def test_fusion_main_driver_can_call_tools_during_planning(client, monkeypatch):
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+            },
+        }
+    ]
+    calls = []
+
+    def mock_worker(slot, messages, max_tokens=4096, temperature=0.7, worker_tools=None):
+        calls.append((slot, messages, worker_tools))
+        first_content = messages[0].get("content", "")
+        if first_content == fusion.MAIN_PREAMBLE:
+            has_tool_result = any(m.get("role") == "tool" for m in messages)
+            if not has_tool_result:
+                # Main calls a tool during planning
+                return {
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [{
+                                "id": "call_read_1",
+                                "type": "function",
+                                "function": {"name": "read_file", "arguments": '{"path": "config.py"}'},
+                            }],
+                        }
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+                }
+            # After tool result, emit plan and brief
+            return {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "PLAN: inspected config, now edit\nBRIEF: edit config.py",
+                    }
+                }],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
+            }
+        # Sidekick completes task
+        return {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Done editing config.py.",
+                }
+            }],
+            "usage": {"prompt_tokens": 15, "completion_tokens": 10, "total_tokens": 25},
+        }
+
+    monkeypatch.setattr(providers, "_provider_response", mock_worker)
+
+    # Initial call triggers main tool call
+    res1 = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "mantis/fusion",
+            "messages": [
+                {"role": "system", "content": "Harness system rules"},
+                {"role": "user", "content": "Update the config file"},
+            ],
+            "tools": tools,
+        },
+    )
+    assert res1.status_code == 200
+    body1 = res1.json()
+    assert body1["choices"][0]["finish_reason"] == "tool_calls"
+    t_call = body1["choices"][0]["message"]["tool_calls"][0]
+    assert t_call["function"]["name"] == "read_file"
+
+    # Follow up with tool result
+    res2 = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "mantis/fusion",
+            "messages": [
+                {"role": "system", "content": "Harness system rules"},
+                {"role": "user", "content": "Update the config file"},
+                body1["choices"][0]["message"],
+                {
+                    "role": "tool",
+                    "tool_call_id": t_call["id"],
+                    "content": "PORT = 8080",
+                },
+            ],
+            "tools": tools,
+        },
+    )
+    assert res2.status_code == 200
+    body2 = res2.json()
+    assert body2["choices"][0]["finish_reason"] == "stop"
+    assert "Done editing config.py." in body2["choices"][0]["message"]["content"]
+
+
+def test_fusion_review_receives_sidekick_tool_activity(client, monkeypatch):
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "run_test", "parameters": {"type": "object"}},
+        }
+    ]
+    review_prompts = []
+
+    def mock_worker(slot, messages, max_tokens=4096, temperature=0.7, worker_tools=None):
+        first_content = messages[0].get("content", "")
+        if first_content == fusion.MAIN_PREAMBLE:
+            is_review = any(fusion.REVIEW_PROMPT in m.get("content", "") for m in messages)
+            if not is_review:
+                return {
+                    "choices": [{"message": {"role": "assistant", "content": "PLAN: test\nBRIEF: run tests"}}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+                }
+            # Record the review prompt
+            for m in messages:
+                if fusion.REVIEW_PROMPT in m.get("content", ""):
+                    review_prompts.append(m["content"])
+            return {
+                "choices": [{"message": {"role": "assistant", "content": "ACCEPT"}}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 2, "total_tokens": 22},
+            }
+        # Sidekick calls run_test then finishes
+        has_tool_res = any(m.get("role") == "tool" for m in messages)
+        if not has_tool_res:
+            return {
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{"id": "call_t1", "type": "function", "function": {"name": "run_test", "arguments": "{}"}}],
+                    }
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+            }
+        return {
+            "choices": [{"message": {"role": "assistant", "content": "All 5 tests passed."}}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
+        }
+
+    monkeypatch.setattr(providers, "_provider_response", mock_worker)
+
+    res1 = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={"model": "mantis/fusion", "messages": [{"role": "user", "content": "Run test suite"}], "tools": tools},
+    )
+    assert res1.status_code == 200
+    t_call = res1.json()["choices"][0]["message"]["tool_calls"][0]
+
+    res2 = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "mantis/fusion",
+            "messages": [
+                {"role": "user", "content": "Run test suite"},
+                res1.json()["choices"][0]["message"],
+                {"role": "tool", "tool_call_id": t_call["id"], "content": "OK: 5 passed"},
+            ],
+            "tools": tools,
+        },
+    )
+    assert res2.status_code == 200
+    assert len(review_prompts) == 1
+    assert "Tool Activity by Sidekick:" in review_prompts[0]
+    assert "run_test" in review_prompts[0]
+    assert "OK: 5 passed" in review_prompts[0]
+

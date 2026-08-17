@@ -38,10 +38,10 @@ FUSION_STATUS = frozenset(
 )
 
 MAIN_PREAMBLE = (
-    "You are the lead engineer on a software task. Your job is to plan work and "
-    "review a sidekick's output. When given a brief, respond with exactly two "
-    "sections: 'PLAN:' containing the high-level plan, and 'BRIEF:' containing a "
-    "self-contained brief for the sidekick. "
+    "You are the lead engineer on a software task. You may use tools to inspect the "
+    "codebase, then plan work and review a sidekick's output. When given a brief or "
+    "conversation, respond with exactly two sections: 'PLAN:' containing the high-level "
+    "plan, and 'BRIEF:' containing a self-contained brief for the sidekick. "
     "When reviewing a sidekick report, reply exactly 'ACCEPT' if the report is "
     "satisfactory. Otherwise reply 'FOLLOW_UP:' followed by concise feedback."
 )
@@ -335,18 +335,31 @@ class FusionCoordinator:
 class FusionRun(NativeRun):
     """A resumable lead/sidekick run whose roles are bound by the catalog."""
 
-    def __init__(self, run_id: str, brief: str, tools: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        run_id: str,
+        brief: str = "",
+        tools: list[dict[str, Any]] | None = None,
+        messages: list[dict[str, Any]] | None = None,
+    ) -> None:
         super().__init__(run_id)
         self.kind = "fusion"
         self.brief = brief
         self.tools = tools or []
-        self.main_messages: list[dict[str, Any]] = [
-            {"role": "system", "content": MAIN_PREAMBLE},
-            {"role": "user", "content": brief},
-        ]
+        if messages:
+            self.main_messages: list[dict[str, Any]] = [
+                {"role": "system", "content": MAIN_PREAMBLE},
+                *messages,
+            ]
+        else:
+            self.main_messages = [
+                {"role": "system", "content": MAIN_PREAMBLE},
+                {"role": "user", "content": brief},
+            ]
         self.sidekick_messages: list[dict[str, Any]] = [
             {"role": "system", "content": SIDEKICK_PREAMBLE},
         ]
+        self.active_role: str = "main"
         self.pending_tool_calls: list[dict[str, Any]] = []
         self.report: str | None = None
         self.plan: str = ""
@@ -362,13 +375,15 @@ class FusionRun(NativeRun):
             "plan": "",
             "sidekick_brief": "",
             "follow_up_count": 0,
+            "active_role": "main",
         }.items():
             if not hasattr(self, key):
                 setattr(self, key, default)
 
     def _append_tool_results(self, tool_results: list[dict[str, Any]]) -> None:
+        target = self.main_messages if self.active_role == "main" else self.sidekick_messages
         for result in tool_results:
-            self.sidekick_messages.append(
+            target.append(
                 {
                     "role": "tool",
                     "tool_call_id": result["tool_call_id"],
@@ -381,11 +396,12 @@ class FusionRun(NativeRun):
         self,
         coordinator: FusionCoordinator,
         prompt: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
         if prompt is not None:
             self.main_messages.append({"role": "user", "content": prompt})
         message, usage = coordinator._call_worker(
-            coordinator.main_slot, self.main_messages, None
+            coordinator.main_slot, self.main_messages, tools
         )
         self.main_messages.append(message)
         text = str(message.get("content") or "")
@@ -506,6 +522,21 @@ class FusionRun(NativeRun):
         except Exception as exc:  # noqa: BLE001 - catch-all guard for worker/state errors
             return self._error_event(exc, request_id)
 
+    def _summarize_sidekick_tool_history(self) -> str:
+        lines: list[str] = []
+        for msg in self.sidekick_messages:
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for call in msg["tool_calls"]:
+                    fn = call.get("function", {})
+                    name = fn.get("name", "")
+                    args = fn.get("arguments", "")
+                    lines.append(f"- Tool call: {name}({args[:120]})")
+            elif msg.get("role") == "tool":
+                content = str(msg.get("content", ""))
+                status = "ERROR" if msg.get("is_error") else "OK"
+                lines.append(f"  Result [{status}]: {content[:200]}")
+        return "\n".join(lines) if lines else "None"
+
     def _advance(
         self,
         tool_results: list[dict[str, Any]],
@@ -521,13 +552,23 @@ class FusionRun(NativeRun):
             self._validate_tool_results(tool_results)
             self._append_tool_results(tool_results)
             self.pending_tool_calls = []
-            self.status = "sidekick_pending"
+            if self.active_role == "main":
+                self.status = "main_planning" if not self.plan else "main_review"
+            else:
+                self.status = "sidekick_pending"
         elif tool_results:
             raise ValueError("tool_results are only valid when status is awaiting_tools")
 
-        # Main planning on a fresh run.
+        # Main planning on a fresh run or resumed planning.
         if self.status == "main_planning":
-            main_text, _, _ = self._call_main(coordinator)
+            self.active_role = "main"
+            main_text, main_calls, _ = self._call_main(
+                coordinator, tools=self.tools if self.tools else None
+            )
+            if main_calls:
+                self.pending_tool_calls = main_calls
+                self.status = "awaiting_tools"
+                return self._ok_event(request_id)
             self.plan, self.sidekick_brief = self._parse_main_plan(main_text)
             self.sidekick_messages.append(
                 {"role": "user", "content": self.sidekick_brief}
@@ -538,6 +579,7 @@ class FusionRun(NativeRun):
         max_iterations = max(1, coordinator.max_follow_ups + 1)
         for _ in range(max_iterations * 4):  # generous step ceiling
             if self.status == "sidekick_pending":
+                self.active_role = "sidekick"
                 sidekick_text, sidekick_calls, _ = self._call_sidekick(coordinator)
                 if sidekick_calls:
                     self.pending_tool_calls = sidekick_calls
@@ -545,8 +587,20 @@ class FusionRun(NativeRun):
                     break
                 # Sidekick produced a report; ask the main to review.
                 self.status = "main_review"
-                review_prompt = REVIEW_PROMPT + sidekick_text
-                review_text, _, _ = self._call_main(coordinator, review_prompt)
+                self.active_role = "main"
+                tool_summary = self._summarize_sidekick_tool_history()
+                review_prompt = (
+                    f"{REVIEW_PROMPT}"
+                    f"Tool Activity by Sidekick:\n{tool_summary}\n\n"
+                    f"Report:\n{sidekick_text}"
+                )
+                review_text, review_calls, _ = self._call_main(
+                    coordinator, review_prompt, tools=self.tools if self.tools else None
+                )
+                if review_calls:
+                    self.pending_tool_calls = review_calls
+                    self.status = "awaiting_tools"
+                    break
                 accepted, feedback = self._parse_main_review(review_text)
                 if accepted:
                     self.report = sidekick_text
@@ -566,6 +620,30 @@ class FusionRun(NativeRun):
                     status="completed",
                     summary=feedback[:200],
                 )
+                self.status = "sidekick_pending"
+                continue
+            if self.status == "main_review":
+                self.active_role = "main"
+                review_text, review_calls, _ = self._call_main(
+                    coordinator, tools=self.tools if self.tools else None
+                )
+                if review_calls:
+                    self.pending_tool_calls = review_calls
+                    self.status = "awaiting_tools"
+                    break
+                accepted, feedback = self._parse_main_review(review_text)
+                if accepted:
+                    last_sidekick_text = self.sidekick_messages[-1].get("content", "")
+                    self.report = self.report or last_sidekick_text
+                    self.status = "completed"
+                    break
+                self.follow_up_count += 1
+                if self.follow_up_count > coordinator.max_follow_ups:
+                    last_sidekick_text = self.sidekick_messages[-1].get("content", "")
+                    self.report = self.report or last_sidekick_text
+                    self.status = "completed"
+                    break
+                self.sidekick_messages.append({"role": "user", "content": feedback})
                 self.status = "sidekick_pending"
                 continue
             if self.status in ("completed", "awaiting_tools", "error"):
@@ -643,9 +721,13 @@ def advance_fusion_run(
             _put_run(run)
 
 
-def create_fusion_run(brief: str, tools: list[dict[str, Any]] | None = None) -> FusionRun:
+def create_fusion_run(
+    brief: str,
+    tools: list[dict[str, Any]] | None = None,
+    messages: list[dict[str, Any]] | None = None,
+) -> FusionRun:
     run_id = uuid.uuid4().hex
-    run = FusionRun(run_id, brief, tools)
+    run = FusionRun(run_id, brief, tools, messages=messages)
     _put_run(run)
     return run
 

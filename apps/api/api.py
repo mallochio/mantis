@@ -880,7 +880,8 @@ def _run_fusion_chat(
         if not brief:
             raise ValueError("mantis/fusion requires at least one user message")
         tools = [tool.model_dump() for tool in (request.tools or [])]
-        run = fusion.create_fusion_run(brief, tools)
+        messages = [msg.model_dump(exclude_none=True) for msg in request.messages]
+        run = fusion.create_fusion_run(brief, tools, messages=messages)
         event = fusion.advance_fusion_run(run.run_id)
 
     if return_reasoning and event.get("run_id"):

@@ -140,5 +140,5 @@ protocols = ["chat_completions"]
 [fusion]
 main = "gpt-5_6-sol"
 sidekick = "gpt-5_6-luna"
-max_follow_ups = 3
+max_follow_ups = 10
 context_window = 262144
