@@ -6,6 +6,7 @@ import time
 from types import SimpleNamespace
 
 import api
+import providers
 import pytest
 import serve
 from fastapi.testclient import TestClient
@@ -795,3 +796,65 @@ def test_short_model_aliases_are_accepted(client):
         assert response.status_code in (400, 502), f"{model}: {response.status_code}"
         body = response.json()
         assert body["error"]["type"] in ("invalid_request_error", "upstream_error")
+
+
+def test_coerce_reasoning_effort_maps_deepseek_levels():
+    assert providers._coerce_reasoning_effort("deepseek-v4-flash", "medium") is None
+    assert providers._coerce_reasoning_effort("deepseek-v4-flash", "low") is None
+    assert providers._coerce_reasoning_effort("deepseek-v4-pro", "high") == "high"
+    assert providers._coerce_reasoning_effort("deepseek-v4-pro", "xhigh") == "max"
+    assert providers._coerce_reasoning_effort("deepseek-v4-pro", "max") == "max"
+
+
+def test_coerce_reasoning_effort_preserves_unknown_models():
+    assert providers._coerce_reasoning_effort("vendor/custom", "xhigh") == "xhigh"
+
+
+def test_sanitize_messages_strips_cross_model_reasoning():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning": "long chain",
+            "reasoning_details": [{"type": "reasoning"}],
+            "_anthropic_content": [{"type": "thinking", "thinking": "..."}],
+        },
+        {"role": "tool", "tool_call_id": "1", "content": "ok", "reasoning": "..."},
+    ]
+    out = providers._sanitize_messages(messages, "openai/gpt-4o", is_anthropic=False)
+    assert out[0]["content"] == "answer"
+    assert "reasoning" not in out[0]
+    assert "reasoning_details" not in out[0]
+    assert "_anthropic_content" not in out[0]
+    assert "reasoning" not in out[1]
+
+
+def test_sanitize_messages_keeps_deepseek_reasoning_for_tool_calls_only():
+    with_tools = {
+        "role": "assistant",
+        "content": "plan",
+        "reasoning": "long chain",
+        "tool_calls": [{"id": "1", "function": {"name": "bash"}}],
+    }
+    without_tools = {
+        "role": "assistant",
+        "content": "answer",
+        "reasoning": "long chain",
+    }
+    out = providers._sanitize_messages([with_tools, without_tools], "deepseek-v4-flash")
+    assert out[0].get("reasoning") == "long chain"
+    assert "reasoning" not in out[1]
+
+
+def test_sanitize_messages_keeps_anthropic_blocks_for_anthropic_target():
+    messages = [
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "answer"}],
+            "_anthropic_content": [{"type": "thinking", "thinking": "..."}],
+            "reasoning": "long chain",
+        }
+    ]
+    out = providers._sanitize_messages(messages, "anthropic/claude-opus-5", is_anthropic=True)
+    assert out[0]["_anthropic_content"]
+    assert "reasoning" not in out[0]
