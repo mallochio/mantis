@@ -25,12 +25,31 @@ class FakeWorker:
         self.accept_after = 0
         self.reviews = 0
 
+    @staticmethod
+    def _message(
+        content: str,
+        tool_calls: list[dict[str, Any]] | None = None,
+        reasoning: str | None = None,
+        reasoning_details: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": content,
+        }
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        if reasoning:
+            message["reasoning"] = reasoning
+        if reasoning_details:
+            message["reasoning_details"] = reasoning_details
+        return message
+
     def __call__(
         self,
         slot: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
-    ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         self.calls.append((slot, messages, tools))
         first_content = messages[0].get("content", "")
         if first_content == fusion.MAIN_PREAMBLE:
@@ -40,7 +59,7 @@ class FakeWorker:
     def _main_response(
         self,
         messages: list[dict[str, Any]],
-    ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         self.main_calls += 1
         # Planning call: the user brief is the last user message before an assistant response.
         # Review call: the user message contains REVIEW_PROMPT.
@@ -50,20 +69,19 @@ class FakeWorker:
         )
         if not is_review:
             return (
-                "PLAN: implement and test the brief\nBRIEF: implement, run tests, and lint",
-                [],
+                self._message(
+                    "PLAN: implement and test the brief\nBRIEF: implement, run tests, and lint"
+                ),
                 {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
             )
         self.reviews += 1
         if self.reviews > self.accept_after:
             return (
-                "ACCEPT",
-                [],
+                self._message("ACCEPT"),
                 {"prompt_tokens": 50, "completion_tokens": 2, "total_tokens": 52},
             )
         return (
-            "FOLLOW_UP: add more tests before reporting",
-            [],
+            self._message("FOLLOW_UP: add more tests before reporting"),
             {"prompt_tokens": 50, "completion_tokens": 8, "total_tokens": 58},
         )
 
@@ -71,27 +89,32 @@ class FakeWorker:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
-    ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         self.sidekick_calls += 1
         # First call: request a tool. Subsequent calls: return a final report.
         if self.sidekick_calls == 1:
             return (
-                "",
-                [
-                    {
-                        "id": "call_bash_1",
-                        "type": "function",
-                        "function": {
-                            "name": "bash",
-                            "arguments": '{"command": "echo hello"}',
-                        },
-                    }
-                ],
+                self._message(
+                    "",
+                    [
+                        {
+                            "id": "call_bash_1",
+                            "type": "function",
+                            "function": {
+                                "name": "bash",
+                                "arguments": '{"command": "echo hello"}',
+                            },
+                        }
+                    ],
+                    reasoning="I will call bash to verify the environment.",
+                ),
                 {"prompt_tokens": 15, "completion_tokens": 10, "total_tokens": 25},
             )
         return (
-            "Final report: implemented and tested successfully.",
-            [],
+            self._message(
+                "Final report: implemented and tested successfully.",
+                reasoning="The shell output confirms the implementation works.",
+            ),
             {"prompt_tokens": 15, "completion_tokens": 20, "total_tokens": 35},
         )
 
@@ -466,3 +489,220 @@ def test_fusion_chat_follow_up_returns_report(client, fake_worker):
     assert "Final report" in body["choices"][0]["message"]["content"]
     assert fake_worker.sidekick_calls == 2
     assert fake_worker.main_calls >= 2
+
+
+def test_extract_reasoning_trace():
+    messages = [
+        {"role": "assistant", "content": "hi", "reasoning": "Plain reasoning."},
+        {
+            "role": "assistant",
+            "content": "",
+            "_anthropic_content": [
+                {"type": "thinking", "thinking": "Anthropic thought."},
+                {"type": "redacted_thinking", "data": "secret"},
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_details": [
+                {
+                    "type": "reasoning",
+                    "id": "r1",
+                    "summary": [{"type": "summary_text", "text": "Responses summary."}],
+                }
+            ],
+        },
+    ]
+    trace = fusion._extract_reasoning_trace(messages)
+    assert "Plain reasoning." in trace
+    assert "Anthropic thought." in trace
+    assert "Responses summary." in trace
+    assert "secret" not in trace
+
+
+def test_extract_reasoning_trace_truncation():
+    long_text = "x" * 10000
+    messages = [{"role": "assistant", "content": "", "reasoning": long_text}]
+    trace = fusion._extract_reasoning_trace(messages, max_chars=100)
+    assert trace.endswith("\n...")
+    assert len(trace) <= 105
+
+
+def test_fusion_preserves_reasoning_metadata(monkeypatch):
+    reasoning_details = [
+        {
+            "type": "reasoning",
+            "id": "r1",
+            "summary": [{"type": "summary_text", "text": "I need to run bash."}],
+        }
+    ]
+    usage = {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}
+
+    class MetadataFakeWorker:
+        def __init__(self) -> None:
+            self.sidekick_calls: list[list[dict[str, Any]]] = []
+
+        def __call__(
+            self,
+            slot: str,
+            messages: list[dict[str, Any]],
+            tools: list[dict[str, Any]] | None,
+        ) -> tuple[dict[str, Any], dict[str, Any]]:
+            first_content = messages[0].get("content", "")
+            if first_content == fusion.MAIN_PREAMBLE:
+                return (
+                    {"role": "assistant", "content": "PLAN: p\nBRIEF: b"},
+                    usage,
+                )
+            self.sidekick_calls.append([dict(m) for m in messages])
+            if len(self.sidekick_calls) == 1:
+                return (
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_bash_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": '{"command": "echo hello"}',
+                                },
+                            }
+                        ],
+                        "reasoning_details": reasoning_details,
+                    },
+                    usage,
+                )
+            return (
+                {"role": "assistant", "content": "Final report: done."},
+                usage,
+            )
+
+    worker = MetadataFakeWorker()
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    run = fusion.FusionRun("metadata-run", "write a test")
+    event = run.advance(coordinator=fusion.FusionCoordinator())
+    assert event["status"] == "awaiting_tools"
+    assert len(worker.sidekick_calls) == 1
+
+    event = run.advance(
+        tool_results=[{"tool_call_id": "call_bash_1", "content": "hello"}],
+        request_id="req-1",
+        coordinator=fusion.FusionCoordinator(),
+    )
+    assert event["status"] == "completed"
+    # The second sidekick call must have received the first sidekick's
+    # reasoning_details so it can be replayed by the upstream provider.
+    second_call_messages = worker.sidekick_calls[1]
+    assistant_msgs = [m for m in second_call_messages if m.get("role") == "assistant"]
+    assert any(m.get("reasoning_details") == reasoning_details for m in assistant_msgs)
+
+
+def test_fusion_chat_returns_reasoning_when_requested(client, fake_worker):
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "run a shell command",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+            },
+        }
+    ]
+    headers = _headers()
+    headers["X-Mantis-Return-Reasoning"] = "true"
+    response = client.post(
+        "/v1/chat/completions",
+        headers=headers,
+        json={
+            "model": "mantis/fusion",
+            "messages": [{"role": "user", "content": "write a hello world script"}],
+            "tools": tools,
+        },
+    )
+    assert response.status_code == 200
+    message = response.json()["choices"][0]["message"]
+    assert message.get("finish_reason") == "tool_calls" or "tool_calls" in message
+    assert "reasoning" in message
+    assert "I will call bash" in message["reasoning"]
+
+
+def test_fusion_chat_no_reasoning_by_default(client, fake_worker):
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "run a shell command",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+            },
+        }
+    ]
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "mantis/fusion",
+            "messages": [{"role": "user", "content": "write a hello world script"}],
+            "tools": tools,
+        },
+    )
+    assert response.status_code == 200
+    message = response.json()["choices"][0]["message"]
+    assert "reasoning" not in message
+
+
+def test_fusion_reasoning_not_exposed_to_other_providers():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "text",
+            "reasoning": "hidden",
+            "reasoning_details": [{"id": "r"}],
+            "_anthropic_content": [{"type": "thinking", "thinking": "hidden"}],
+            "_anthropic_tool_ids": {"a": "b"},
+        }
+    ]
+    sanitized = providers._sanitize_messages(
+        messages,
+        model="gpt-5.6-sol",
+        is_anthropic=False,
+        is_responses=False,
+    )
+    msg = sanitized[0]
+    assert "reasoning" not in msg
+    assert "reasoning_content" not in msg
+    assert "reasoning_details" not in msg
+    assert "_anthropic_content" not in msg
+    assert "_anthropic_tool_ids" not in msg
+
+
+def test_fusion_file_persistence_retains_reasoning_metadata(file_client, fake_worker, tmp_path):
+    response = file_client.post(
+        "/v1/fusion/delegate",
+        headers=_headers(),
+        json=SAMPLE_DELEGATE,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    run_id = body["run_id"]
+    assert (tmp_path / f"{run_id}.pkl").exists()
+
+    response = file_client.post(
+        f"/v1/fusion/follow_up/{run_id}",
+        headers=_headers(),
+        json={
+            "request_id": uuid.uuid4().hex,
+            "tool_results": [{"tool_call_id": "call_bash_1", "content": "hello"}],
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "completed"
+
+    run = fusion.get_run(run_id)
+    assert isinstance(run, fusion.FusionRun)
+    assistant_msgs = [m for m in run.sidekick_messages if m.get("role") == "assistant"]
+    assert any("reasoning" in m or "reasoning_details" in m for m in assistant_msgs)

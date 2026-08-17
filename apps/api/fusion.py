@@ -119,6 +119,77 @@ def _fusion_config() -> FusionConfig:
     return _FUSION_CONFIG
 
 
+def _return_reasoning_by_default() -> bool:
+    return os.environ.get("MANTIS_FUSION_RETURN_REASONING", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _extract_reasoning_trace(
+    messages: list[dict[str, Any]],
+    max_chars: int = 8192,
+) -> str:
+    """Build a sanitized, human-readable reasoning trace from stored assistant messages.
+
+    Only text-like reasoning is included. Signed or encrypted thinking blocks and
+    provider-internal identifiers are intentionally omitted.
+    """
+    pieces: list[str] = []
+    length = 0
+
+    def add(piece: str) -> bool:
+        nonlocal length
+        piece = piece.strip()
+        if not piece:
+            return True
+        if length + len(piece) + 2 > max_chars:
+            remaining = max_chars - length
+            if remaining > 0:
+                pieces.append(piece[:remaining] + "\n...")
+            return False
+        pieces.append(piece)
+        length += len(piece) + 2
+        return True
+
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        for key in ("reasoning", "reasoning_content", "thinking"):
+            value = msg.get(key)
+            if isinstance(value, str) and value.strip() and not add(value):
+                break
+        details = msg.get("reasoning_details")
+        if isinstance(details, list):
+            for item in details:
+                if not isinstance(item, dict):
+                    continue
+                summary = item.get("summary")
+                if isinstance(summary, list):
+                    for part in summary:
+                        if (
+                            isinstance(part, dict)
+                            and isinstance(part.get("text"), str)
+                            and not add(part["text"])
+                        ):
+                            break
+                if isinstance(item.get("text"), str) and not add(item["text"]):
+                    break
+        anthropic_content = msg.get("_anthropic_content")
+        if isinstance(anthropic_content, list):
+            for block in anthropic_content:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "thinking"
+                    and isinstance(block.get("thinking"), str)
+                    and not add(block["thinking"])
+                ):
+                    break
+
+    return "\n\n".join(pieces)
+
+
 class FusionCoordinator:
     """Thin wrapper that calls catalog-bound worker slots."""
 
@@ -225,15 +296,21 @@ class FusionCoordinator:
         slot: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
-    ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
-        """Call a worker slot and return (text, tool_calls, usage)."""
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Call a worker slot and return (assistant_message, usage).
+
+        The returned assistant message preserves provider-specific metadata such
+        as ``reasoning``, ``reasoning_details``, ``_anthropic_content`` and
+        ``_anthropic_tool_ids`` so that later turns can replay required state.
+        """
         model_cap = self._output_tokens_for(slot)
         output_tokens = min(self.max_output_tokens, model_cap)
         input_budget = max(0, self.context_window - output_tokens)
         trimmed = self._trim_messages(messages, input_budget)
         data = providers._provider_response(slot, trimmed, output_tokens, 0.7, tools)
-        msg = data["choices"][0]["message"]
-        text = str(msg.get("content") or "")
+        msg = dict(data["choices"][0]["message"])
+        msg.setdefault("role", "assistant")
+        msg["content"] = str(msg.get("content") or "")
         tcs = msg.get("tool_calls") or []
         calls: list[dict[str, Any]] = []
         for tc in tcs:
@@ -247,8 +324,12 @@ class FusionCoordinator:
                 "function": {"name": str(fn.get("name", "")), "arguments": raw_args},
             }
             calls.append(call)
+        if calls:
+            msg["tool_calls"] = calls
+        else:
+            msg.pop("tool_calls", None)
         usage = data.get("usage") or {}
-        return text, calls, usage
+        return msg, usage
 
 
 class FusionRun(NativeRun):
@@ -285,11 +366,6 @@ class FusionRun(NativeRun):
             if not hasattr(self, key):
                 setattr(self, key, default)
 
-    def _append_sidekick_tool_call(self, text: str, tool_calls: list[dict[str, Any]]) -> None:
-        self.sidekick_messages.append(
-            {"role": "assistant", "content": text, "tool_calls": tool_calls}
-        )
-
     def _append_tool_results(self, tool_results: list[dict[str, Any]]) -> None:
         for result in tool_results:
             self.sidekick_messages.append(
@@ -308,10 +384,12 @@ class FusionRun(NativeRun):
     ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
         if prompt is not None:
             self.main_messages.append({"role": "user", "content": prompt})
-        text, calls, usage = coordinator._call_worker(
+        message, usage = coordinator._call_worker(
             coordinator.main_slot, self.main_messages, None
         )
-        self.main_messages.append({"role": "assistant", "content": text, "tool_calls": calls})
+        self.main_messages.append(message)
+        text = str(message.get("content") or "")
+        calls = message.get("tool_calls") or []
         self.add_usage(usage, model=coordinator.main_slot)
         self.record_activity(
             "main_turn",
@@ -326,9 +404,12 @@ class FusionRun(NativeRun):
         self,
         coordinator: FusionCoordinator,
     ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
-        text, calls, usage = coordinator._call_worker(
+        message, usage = coordinator._call_worker(
             coordinator.sidekick_slot, self.sidekick_messages, self.tools
         )
+        self.sidekick_messages.append(message)
+        text = str(message.get("content") or "")
+        calls = message.get("tool_calls") or []
         self.add_usage(usage, model=coordinator.sidekick_slot)
         self.record_activity(
             "sidekick_turn",
@@ -459,7 +540,6 @@ class FusionRun(NativeRun):
             if self.status == "sidekick_pending":
                 sidekick_text, sidekick_calls, _ = self._call_sidekick(coordinator)
                 if sidekick_calls:
-                    self._append_sidekick_tool_call(sidekick_text, sidekick_calls)
                     self.pending_tool_calls = sidekick_calls
                     self.status = "awaiting_tools"
                     break

@@ -279,6 +279,16 @@ def _detail_level(headers: dict[str, str] | None) -> str:
     return value if value in _DETAIL_LEVELS else "none"
 
 
+def _fusion_return_reasoning(headers: dict[str, str] | None) -> bool:
+    """Return True if the client has opted in to receiving Fusion reasoning traces."""
+    value = (headers or {}).get("x-mantis-return-reasoning", "").strip().lower()
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    return fusion._return_reasoning_by_default()
+
+
 def _mantis_headers(mantis: dict[str, Any], body: dict[str, Any]) -> dict[str, str]:
     headers = {
         "X-Mantis-Run-Id": str(mantis.get("run_id", "")),
@@ -741,6 +751,9 @@ def _build_fusion_chat_response(
             event.get("report") or f"fusion run failed with status {status}",
             "upstream_error",
         )
+    reasoning_trace = event.get("reasoning_trace")
+    if reasoning_trace:
+        message["reasoning"] = reasoning_trace
     return JSONResponse(
         {
             "id": request_id,
@@ -763,6 +776,7 @@ def _build_fusion_chat_response(
 def _stream_fusion_chat(
     request: ChatRequest,
     request_id: str,
+    return_reasoning: bool = False,
 ) -> Iterator[bytes]:
     """Yield SSE chunks for a Fusion chat completion."""
     base = {
@@ -772,7 +786,7 @@ def _stream_fusion_chat(
         "model": "mantis/fusion",
     }
     try:
-        event = _run_fusion_chat(request)
+        event = _run_fusion_chat(request, return_reasoning=return_reasoning)
         status = event.get("status")
 
         def _chunk(delta: dict[str, Any], finish: str | None) -> bytes:
@@ -791,7 +805,10 @@ def _stream_fusion_chat(
 
         if status == "completed":
             report = event.get("report") or ""
+            reasoning_trace = event.get("reasoning_trace")
             yield _chunk({"role": "assistant"}, None)
+            if reasoning_trace:
+                yield _chunk({"reasoning": reasoning_trace}, None)
             yield _chunk({"content": report}, "stop")
         elif status == "awaiting_tools":
             run_id = event["run_id"]
@@ -805,7 +822,10 @@ def _stream_fusion_chat(
                 }
                 for i, call in enumerate(pending)
             ]
+            reasoning_trace = event.get("reasoning_trace")
             yield _chunk({"role": "assistant"}, None)
+            if reasoning_trace:
+                yield _chunk({"reasoning": reasoning_trace}, None)
             yield _chunk({"tool_calls": tool_calls}, "tool_calls")
         else:
             msg = event.get("report") or f"fusion run failed with status {status}"
@@ -816,7 +836,10 @@ def _stream_fusion_chat(
     yield b"data: [DONE]\n\n"
 
 
-def _run_fusion_chat(request: ChatRequest) -> dict[str, Any]:
+def _run_fusion_chat(
+    request: ChatRequest,
+    return_reasoning: bool = False,
+) -> dict[str, Any]:
     """Resume or start a Fusion run from an OpenAI-style chat request."""
     # Find a trailing block of tool messages; if present, this is a follow-up.
     tool_results: list[dict[str, Any]] = []
@@ -843,22 +866,30 @@ def _run_fusion_chat(request: ChatRequest) -> dict[str, Any]:
         i -= 1
 
     if run_id is not None and tool_results:
-        return fusion.advance_fusion_run(
+        event = fusion.advance_fusion_run(
             run_id,
             tool_results=tool_results,
         )
+    else:
+        # Initial call: the brief is the last user message.
+        brief = ""
+        for msg in reversed(request.messages):
+            if msg.role == "user":
+                brief = _content_to_str(msg.content)
+                break
+        if not brief:
+            raise ValueError("mantis/fusion requires at least one user message")
+        tools = [tool.model_dump() for tool in (request.tools or [])]
+        run = fusion.create_fusion_run(brief, tools)
+        event = fusion.advance_fusion_run(run.run_id)
 
-    # Initial call: the brief is the last user message.
-    brief = ""
-    for msg in reversed(request.messages):
-        if msg.role == "user":
-            brief = _content_to_str(msg.content)
-            break
-    if not brief:
-        raise ValueError("mantis/fusion requires at least one user message")
-    tools = [tool.model_dump() for tool in (request.tools or [])]
-    run = fusion.create_fusion_run(brief, tools)
-    return fusion.advance_fusion_run(run.run_id)
+    if return_reasoning and event.get("run_id"):
+        run = fusion.get_run(event["run_id"])
+        if isinstance(run, fusion.FusionRun):
+            event["reasoning_trace"] = fusion._extract_reasoning_trace(
+                run.sidekick_messages + run.main_messages
+            )
+    return event
 
 
 @app.get("/v1/models", dependencies=[Depends(_authorize)])
@@ -894,14 +925,15 @@ def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Respons
     if request.model in _MODEL_ALIASES:
         request = request.model_copy(update={"model": _MODEL_ALIASES[request.model]})
     if request.model == "mantis/fusion":
+        return_reasoning = _fusion_return_reasoning(headers)
         if request.stream:
             return StreamingResponse(
-                _stream_fusion_chat(request, request_id),
+                _stream_fusion_chat(request, request_id, return_reasoning=return_reasoning),
                 media_type="text/event-stream",
                 headers={"X-Request-Id": request_id},
             )
         try:
-            event = _run_fusion_chat(request)
+            event = _run_fusion_chat(request, return_reasoning=return_reasoning)
             return _build_fusion_chat_response(request_id, "mantis/fusion", event)
         except Exception as exc:  # noqa: BLE001 - chat adapter error boundary
             return _error(500, f"fusion chat failed: {exc}", "upstream_error")
