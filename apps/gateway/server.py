@@ -1248,6 +1248,10 @@ _NEW_TASK_RE = re.compile(
 )
 SESSION_TTL_S = _env_float("MANTIS_ROUTER_SESSION_TTL_S", 3600.0)
 SESSION_STATE_MAX = _env_int("MANTIS_ROUTER_SESSION_STATE_MAX", 4096)
+# If a session is idle longer than this, a new user turn is allowed to downgrade
+# to a cheaper proposed tier instead of being pinned by the cache ratchet.
+# 0 disables idle downgrades.
+DOWNGRADE_IDLE_S = _env_float("MANTIS_ROUTER_DOWNGRADE_IDLE_S", 0.0)
 _session_state: OrderedDict[str, dict] = OrderedDict()
 _session_lock = threading.Lock()
 _STICKY_REASONS = frozenset({
@@ -1314,6 +1318,13 @@ def _session_route(session_id: str | None, prompt: str, proposed: str,
         return current, "same_tier"
     current_rank, proposed_rank = _target_rank(current), _target_rank(proposed)
     if proposed_rank < current_rank:
+        # Idle-time downgrade: if enough wall-clock time has passed since the
+        # last turn, treat this as a fresh routing decision. The cacheable
+        # prefix may still be warm, but the user task is likely different, so
+        # paying for the old expensive tier is wasteful. Default is disabled.
+        if (DOWNGRADE_IDLE_S > 0
+                and time.time() - state.get("last_seen", 0) > DOWNGRADE_IDLE_S):
+            return proposed, "downgrade_idle"
         return current, "downgrade_hysteresis"
     # Exact catalog policies deliberately expose intermediate ranks, so a
     # session turn may climb to any higher proposed target.

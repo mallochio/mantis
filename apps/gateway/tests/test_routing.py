@@ -292,3 +292,17 @@ def test_session_ratchet_never_slides_down_but_can_climb():
     assert server._session_route("s", prompt, "cheap", 1) == ("expensive", "downgrade_hysteresis")
     server._session_state["s"] = {"tier": "cheap", "last_seen": time.time(), "turns": 1}
     assert server._session_route("s", prompt, "expensive", 5) == ("expensive", "strong_upgrade")
+
+
+def test_session_ratchet_downgrades_after_idle_threshold():
+    server._session_state.clear()
+    previous = server.DOWNGRADE_IDLE_S
+    try:
+        server.DOWNGRADE_IDLE_S = 1.0
+        prompt = "Explain the page-fault handling path in this kernel"
+        server._session_state["s"] = {"tier": "expensive", "last_seen": time.time() - 2, "turns": 1}
+        assert server._session_route("s", prompt, "cheap", 1) == ("cheap", "downgrade_idle")
+        server._session_state["s"] = {"tier": "expensive", "last_seen": time.time(), "turns": 1}
+        assert server._session_route("s", prompt, "cheap", 1) == ("expensive", "downgrade_hysteresis")
+    finally:
+        server.DOWNGRADE_IDLE_S = previous
