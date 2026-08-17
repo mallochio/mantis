@@ -60,6 +60,10 @@ export MANTIS_ROUTER_RESP_CACHE_TTL_S="${MANTIS_ROUTER_RESP_CACHE_TTL_S:-120}"
 export MANTIS_ROUTER_KEY="${MANTIS_ROUTER_KEY:-sk-route-local}"
 export MANTIS_ROUTER_HOST="${MANTIS_ROUTER_HOST:-127.0.0.1}"
 export MANTIS_ROUTER_PORT="${MANTIS_ROUTER_PORT:-5500}"
+# Re-evaluate the session tier every N completed turns so a session does not
+# stay on an expensive tier forever. 0 disables rescoring; 4 is a reasonable
+# starting value for coding-agent sessions.
+export MANTIS_ROUTER_RESCORE_EVERY_N="${MANTIS_ROUTER_RESCORE_EVERY_N:-4}"
 if [ "$MANTIS_ROUTER_HOST" != "127.0.0.1" ] && [ "$MANTIS_ROUTER_HOST" != "::1" ] && [ "$MANTIS_ROUTER_HOST" != "localhost" ]; then
   if [ -z "${MANTIS_ROUTER_KEY:-}" ] || [ "$MANTIS_ROUTER_KEY" = "sk-route-local" ]; then
     echo 'ERROR: non-loopback binding requires an externally supplied, non-default MANTIS_ROUTER_KEY.' >&2

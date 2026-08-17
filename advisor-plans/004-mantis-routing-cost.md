@@ -12,8 +12,10 @@ pushes the session onto an expensive tier it never leaves.
 
 Phase 1 (idle-time downgrade and N-turn rescoring) has been implemented.
 `MANTIS_ROUTER_DOWNGRADE_IDLE_S` is opt-in and defaults to `0`.
-`MANTIS_ROUTER_RESCORE_EVERY_N` defaults to `4`, which re-evaluates after a
-typical "hard task + a few follow-up turns" block without churning the cache.
+`MANTIS_ROUTER_RESCORE_EVERY_N` defaults to `0` in the code but is set to `4`
+in `launch/host/lib/llm-router.sh` (and the underlying
+`apps/gateway/llm-router.sh`), which re-evaluates after a typical
+"hard task + a few follow-up turns" block without churning the cache.
 
 This plan records the next two cost-control ideas without implementing them.
 
