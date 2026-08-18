@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Any
 
@@ -629,6 +630,74 @@ def test_fusion_chat_returns_reasoning_when_requested(client, fake_worker):
     assert "I will call bash" in message["reasoning"]
 
 
+def test_fusion_plan_and_brief_match_streaming_and_non_streaming(client, fake_worker):
+    payload = {
+        "model": "mantis/fusion",
+        "messages": [{"role": "user", "content": "write a hello world script"}],
+        "tools": [{"type": "function", "function": {"name": "bash", "parameters": {}}}],
+    }
+    regular = client.post("/v1/chat/completions", headers=_headers(), json=payload)
+    fake_worker.sidekick_calls = 0
+    fake_worker.main_calls = 0
+    fake_worker.reviews = 0
+    stream = client.post(
+        "/v1/chat/completions", headers=_headers(), json={**payload, "stream": True}
+    )
+    trace = regular.json()["choices"][0]["message"]["reasoning"]
+    streamed = "".join(
+        json.loads(line[6:])["choices"][0]["delta"].get("reasoning", "")
+        for line in stream.text.splitlines()
+        if line.startswith("data: {")
+    )
+    assert "implement and test the brief" in trace
+    assert "implement, run tests, and lint" in trace
+    assert trace == streamed
+
+
+def test_fusion_trace_excludes_opaque_metadata(client, fake_worker, monkeypatch):
+    opaque_values = {
+        "signature": "signed-provider-signature-123",
+        "encrypted": "encrypted-thinking-payload-456",
+        "provider_id": "provider-internal-id-789",
+    }
+
+    def worker_with_opaque_metadata(slot, messages, tools):
+        message, usage = fake_worker(slot, messages, tools)
+        message["reasoning_details"] = [{
+            "type": "reasoning",
+            "id": opaque_values["provider_id"],
+            "summary": [{"type": "summary_text", "text": "Safe summary."}],
+            "signature": opaque_values["signature"],
+            "encrypted_content": opaque_values["encrypted"],
+        }]
+        message["_anthropic_content"] = [{
+            "type": "thinking",
+            "thinking": "Safe textual thinking.",
+            "signature": opaque_values["signature"],
+        }]
+        message["_anthropic_tool_ids"] = {"call": opaque_values["provider_id"]}
+        return message, usage
+
+    # Metadata is stored for provider replay, but only safe textual summaries
+    # may enter the explicit opt-in provider section.
+    message, _usage = worker_with_opaque_metadata(
+        "gpt-5_6-sol", [{"role": "system", "content": fusion.MAIN_PREAMBLE}], None
+    )
+    trace = fusion._extract_reasoning_trace([message])
+    assert "Safe summary." in trace
+    assert "Safe textual thinking." in trace
+    for value in opaque_values.values():
+        assert value not in trace
+
+    run = fusion.FusionRun("opaque-trace", "x")
+    run.plan = "safe plan"
+    run.sidekick_brief = "safe brief"
+    run.main_messages.append(message)
+    public_trace = fusion._orchestration_trace(run, include_reasoning=True)
+    for value in opaque_values.values():
+        assert value not in public_trace
+
+
 def test_fusion_chat_no_reasoning_by_default(client, fake_worker):
     tools = [
         {
@@ -651,7 +720,10 @@ def test_fusion_chat_no_reasoning_by_default(client, fake_worker):
     )
     assert response.status_code == 200
     message = response.json()["choices"][0]["message"]
-    assert "reasoning" not in message
+    assert "reasoning" in message
+    assert "implement and test the brief" in message["reasoning"]
+    assert "implement, run tests, and lint" in message["reasoning"]
+    assert "I will call bash" not in message["reasoning"]
 
 
 def test_fusion_reasoning_not_exposed_to_other_providers():
@@ -735,7 +807,10 @@ def test_fusion_main_driver_can_call_tools_during_planning(client, monkeypatch):
                             "tool_calls": [{
                                 "id": "call_read_1",
                                 "type": "function",
-                                "function": {"name": "read_file", "arguments": '{"path": "config.py"}'},
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": '{"path": "config.py"}',
+                                },
                             }],
                         }
                     }],
@@ -823,13 +898,20 @@ def test_fusion_review_receives_sidekick_tool_activity(client, monkeypatch):
             is_review = any(fusion.REVIEW_PROMPT in m.get("content", "") for m in messages)
             if not is_review:
                 return {
-                    "choices": [{"message": {"role": "assistant", "content": "PLAN: test\nBRIEF: run tests"}}],
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "PLAN: test\nBRIEF: run tests",
+                        }
+                    }],
                     "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
                 }
             # Record the review prompt
-            for m in messages:
-                if fusion.REVIEW_PROMPT in m.get("content", ""):
-                    review_prompts.append(m["content"])
+            review_prompts.extend(
+                m["content"]
+                for m in messages
+                if fusion.REVIEW_PROMPT in m.get("content", "")
+            )
             return {
                 "choices": [{"message": {"role": "assistant", "content": "ACCEPT"}}],
                 "usage": {"prompt_tokens": 20, "completion_tokens": 2, "total_tokens": 22},
@@ -842,7 +924,14 @@ def test_fusion_review_receives_sidekick_tool_activity(client, monkeypatch):
                     "message": {
                         "role": "assistant",
                         "content": "",
-                        "tool_calls": [{"id": "call_t1", "type": "function", "function": {"name": "run_test", "arguments": "{}"}}],
+                        "tool_calls": [{
+                            "id": "call_t1",
+                            "type": "function",
+                            "function": {
+                                "name": "run_test",
+                                "arguments": "{}",
+                            },
+                        }],
                     }
                 }],
                 "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
@@ -857,7 +946,11 @@ def test_fusion_review_receives_sidekick_tool_activity(client, monkeypatch):
     res1 = client.post(
         "/v1/chat/completions",
         headers=_headers(),
-        json={"model": "mantis/fusion", "messages": [{"role": "user", "content": "Run test suite"}], "tools": tools},
+        json={
+            "model": "mantis/fusion",
+            "messages": [{"role": "user", "content": "Run test suite"}],
+            "tools": tools,
+        },
     )
     assert res1.status_code == 200
     t_call = res1.json()["choices"][0]["message"]["tool_calls"][0]

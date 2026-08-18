@@ -376,6 +376,85 @@ def _openai_tool_call(name: str, _id: str, arguments: dict) -> dict[str, Any]:
     }
 
 
+def prune_tool_result(
+    content: str,
+    max_chars: int = 16000,
+    head_chars: int = 8000,
+    tail_chars: int = 2000,
+) -> str:
+    """Replay-safe head/tail pruning for large tool results.
+
+    Follows DeepSeek Harness compaction-tool-result-pruner pattern: preserves
+    the initial output context (head) and final status/summary (tail) while
+    collapsing middle bytes with an explicit omitted-length marker.
+    """
+    if not isinstance(content, str) or len(content) <= max_chars:
+        return content
+    omitted = len(content) - head_chars - tail_chars
+    if omitted <= 0:
+        return content
+    head = content[:head_chars]
+    tail = content[-tail_chars:] if tail_chars > 0 else ""
+    marker = f"\n\n[... Omitted {omitted} characters of tool output for context efficiency ...]\n\n"
+    return head + marker + tail
+
+
+class RepeatToolGuard:
+    """Advisory loop-breaker for repetitive tool invocations.
+
+    Inspired by DeepSeek Harness dsh-repeat-tool-reminder. Tracks consecutive
+    identical tool calls using canonicalized JSON arguments and returns
+    escalating non-blocking system reminders at specified thresholds.
+    """
+
+    def __init__(self, thresholds: tuple[int, ...] = (3, 5)) -> None:
+        self.thresholds = thresholds
+        self.last_tool: str | None = None
+        self.last_canonical_args: str | None = None
+        self.consecutive_count: int = 0
+
+    @staticmethod
+    def canonicalize_args(args: Any) -> str:
+        if isinstance(args, str):
+            try:
+                parsed = json.loads(args)
+                return json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+            except (json.JSONDecodeError, TypeError):
+                return args.strip()
+        if isinstance(args, dict):
+            try:
+                return json.dumps(args, sort_keys=True, separators=(",", ":"))
+            except TypeError:
+                return str(args)
+        return str(args)
+
+    def observe(self, tool_name: str, args: Any) -> str | None:
+        """Record a tool invocation and return an advisory reminder if a threshold is hit."""
+        canonical = self.canonicalize_args(args)
+        if tool_name == self.last_tool and canonical == self.last_canonical_args:
+            self.consecutive_count += 1
+        else:
+            self.last_tool = tool_name
+            self.last_canonical_args = canonical
+            self.consecutive_count = 1
+
+        for thresh in self.thresholds:
+            if self.consecutive_count == thresh:
+                preview = canonical[:120]
+                return (
+                    f"[Advisory Notice: Tool '{tool_name}' has been called {self.consecutive_count} "
+                    f"times consecutively with identical arguments ({preview}). "
+                    f"If the tool result is unchanged or not making progress, adjust parameters, "
+                    f"try an alternate approach, or conclude your response.]"
+                )
+        return None
+
+    def reset(self) -> None:
+        self.last_tool = None
+        self.last_canonical_args = None
+        self.consecutive_count = 0
+
+
 def _validate_tool_results(tool_results: Any, expected_ids: set[str]) -> list[dict[str, Any]]:
     if not isinstance(tool_results, list):
         raise TypeError("tool_results must be a list")

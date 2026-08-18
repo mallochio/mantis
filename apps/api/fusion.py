@@ -131,11 +131,7 @@ def _extract_reasoning_trace(
     messages: list[dict[str, Any]],
     max_chars: int = 8192,
 ) -> str:
-    """Build a sanitized, human-readable reasoning trace from stored assistant messages.
-
-    Only text-like reasoning is included. Signed or encrypted thinking blocks and
-    provider-internal identifiers are intentionally omitted.
-    """
+    """Return safe textual provider summaries, excluding replay-only metadata."""
     pieces: list[str] = []
     length = 0
 
@@ -186,8 +182,51 @@ def _extract_reasoning_trace(
                     and not add(block["thinking"])
                 ):
                     break
-
     return "\n\n".join(pieces)
+
+
+def _model_label(slot: str) -> str:
+    """Use a readable catalog label without exposing provider internals."""
+    return slot.replace("_", ".", 1)
+
+
+def _orchestration_trace(run: FusionRun, include_reasoning: bool = False) -> str:
+    """Build Fusion's public, chronological orchestration trace."""
+    main_slot = getattr(run, "main_slot", "gpt-5_6-sol")
+    sidekick_slot = getattr(run, "sidekick_slot", "gpt-5_6-luna")
+    lines = [f"Fusion · Planning · {_model_label(main_slot)}"]
+    if run.plan:
+        lines.extend(["", "Plan:", run.plan])
+    if run.sidekick_brief:
+        lines.extend([
+            "",
+            f"Delegated to sidekick · {_model_label(sidekick_slot)}",
+            "",
+            "Brief:",
+            run.sidekick_brief,
+        ])
+    tool_count = sum(
+        len(msg.get("tool_calls") or [])
+        for msg in run.sidekick_messages
+        if msg.get("role") == "assistant"
+    )
+    if tool_count:
+        lines.extend(["", f"Fusion · Sidekick requested {tool_count} tools"])
+        lines.extend(
+            "Fusion · Tool result received"
+            for msg in run.sidekick_messages
+            if msg.get("role") == "tool"
+        )
+    lines.extend(["", "Fusion · Reviewing sidekick report"])
+    if run.status == "completed":
+        lines.append("Fusion · Accepted")
+    elif run.status == "error":
+        lines.append("Fusion · Orchestration failed")
+    if include_reasoning:
+        provider = _extract_reasoning_trace(run.main_messages + run.sidekick_messages)
+        if provider:
+            lines.extend(["", "Provider summary:", provider])
+    return "\n".join(lines)
 
 
 class FusionCoordinator:
@@ -345,6 +384,11 @@ class FusionRun(NativeRun):
         super().__init__(run_id)
         self.kind = "fusion"
         self.brief = brief
+        coordinator = FusionCoordinator()
+        # Keep the slots with the run so status/trace responses remain stable
+        # if the catalog is changed while a run is in progress.
+        self.main_slot = coordinator.main_slot
+        self.sidekick_slot = coordinator.sidekick_slot
         self.tools = tools or []
         if messages:
             self.main_messages: list[dict[str, Any]] = [
@@ -376,6 +420,8 @@ class FusionRun(NativeRun):
             "sidekick_brief": "",
             "follow_up_count": 0,
             "active_role": "main",
+            "main_slot": "gpt-5_6-sol",
+            "sidekick_slot": "gpt-5_6-luna",
         }.items():
             if not hasattr(self, key):
                 setattr(self, key, default)
@@ -563,7 +609,7 @@ class FusionRun(NativeRun):
         if self.status == "main_planning":
             self.active_role = "main"
             main_text, main_calls, _ = self._call_main(
-                coordinator, tools=self.tools if self.tools else None
+                coordinator, tools=self.tools or None
             )
             if main_calls:
                 self.pending_tool_calls = main_calls
@@ -595,7 +641,7 @@ class FusionRun(NativeRun):
                     f"Report:\n{sidekick_text}"
                 )
                 review_text, review_calls, _ = self._call_main(
-                    coordinator, review_prompt, tools=self.tools if self.tools else None
+                    coordinator, review_prompt, tools=self.tools or None
                 )
                 if review_calls:
                     self.pending_tool_calls = review_calls
@@ -625,7 +671,7 @@ class FusionRun(NativeRun):
             if self.status == "main_review":
                 self.active_role = "main"
                 review_text, review_calls, _ = self._call_main(
-                    coordinator, tools=self.tools if self.tools else None
+                    coordinator, tools=self.tools or None
                 )
                 if review_calls:
                     self.pending_tool_calls = review_calls

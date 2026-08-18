@@ -471,8 +471,19 @@ def _stream(
             _capacity.release()
 
     threading.Thread(target=complete, daemon=True).start()
-    show_events = _stream_events_enabled(headers)
+    requested_events = (headers or {}).get("x-mantis-events")
+    if requested_events is None:
+        event_mode = "summary" if _STREAM_EVENTS_DEFAULT else "none"
+    else:
+        event_mode = requested_events.strip().lower()
+        if event_mode in {"0", "false", "off", "none"}:
+            event_mode = "none"
+        elif event_mode != "debug":
+            event_mode = "summary"
+    show_events = event_mode != "none"
     first_event = True
+    last_summary_line = ""
+    last_role = ""
     try:
         while True:
             try:
@@ -482,7 +493,41 @@ def _stream(
                 continue
             if kind == "event":
                 if show_events:
-                    yield _progress_sse(base, value, first_event)
+                    output = value
+                    if event_mode == "summary":
+                        # Provider activity is intentionally reduced at the
+                        # streaming boundary; debug retains the original event.
+                        activity_type = str(value.get("type", ""))
+                        status = str(value.get("status", ""))
+                        role = str(value.get("role", ""))
+                        if activity_type in {"provider", "run"} or (
+                            activity_type == "step" and status != "started"
+                        ):
+                            continue
+                        if activity_type == "complete":
+                            summary = "Answer ready"
+                        elif activity_type == "tool_call":
+                            summary = "Worker requested a tool"
+                        elif activity_type == "tool_result":
+                            summary = "Tool result received"
+                        elif activity_type == "verify_accept":
+                            summary = "Answer ready"
+                        elif activity_type == "verify_reject":
+                            summary = "Worker revising"
+                        else:
+                            summary = {
+                                "Worker": "Worker drafting",
+                                "Verifier": "Verifier reviewing",
+                                "Planner": "Planner planning",
+                            }.get(role, str(value.get("summary") or "Mantis is working"))
+                        model = value.get("model") if role != last_role else None
+                        line = f"Mantis · {summary}" + (f" · {model}" if model else "")
+                        if line == last_summary_line:
+                            continue
+                        output = {**value, "summary": summary, "model": model}
+                        last_summary_line = line
+                        last_role = role or last_role
+                    yield _progress_sse(base, output, first_event)
                     first_event = False
                 continue
             if kind == "error":
@@ -884,11 +929,13 @@ def _run_fusion_chat(
         run = fusion.create_fusion_run(brief, tools, messages=messages)
         event = fusion.advance_fusion_run(run.run_id)
 
-    if return_reasoning and event.get("run_id"):
+    if event.get("run_id"):
         run = fusion.get_run(event["run_id"])
         if isinstance(run, fusion.FusionRun):
-            event["reasoning_trace"] = fusion._extract_reasoning_trace(
-                run.sidekick_messages + run.main_messages
+            # Plans and delegation briefs are public orchestration output.
+            # Only provider summaries are gated by the existing opt-in.
+            event["reasoning_trace"] = fusion._orchestration_trace(
+                run, include_reasoning=return_reasoning
             )
     return event
 
