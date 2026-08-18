@@ -148,7 +148,9 @@ def conductor_prompt(query: str, slot_labels: list[str]) -> list[dict]:
         '                            # outputs that step may see ([] = none, may use "all")\n'
         "Rules: lists must be equal length (<=5 steps); access_list may only reference "
         "strictly earlier steps (it is a DAG executed in order); the LAST step's output "
-        "is the final answer. Pick workers to match each subtask's demands.\n\n"
+        "is the final answer. Pick workers to match each subtask's demands: prefer cheaper "
+        "workers for search, inspection, or reading; reserve frontier reasoning models for "
+        "synthesis, complex debugging, and final code generation.\n\n"
         f"AVAILABLE LANGUAGE MODELS:\n{pool}\n\n"
         "Output the three lists explicitly as 'model_id: [...]', 'subtasks: [...]', "
         "'access_list: [...]'. You may reason first, but the three lists must appear."

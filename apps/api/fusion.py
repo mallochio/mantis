@@ -15,6 +15,7 @@ from typing import Any, cast
 import model_catalog
 import providers
 import serve_config
+import utils
 
 from runs import (
     RUN_STORE,
@@ -298,22 +299,33 @@ class FusionCoordinator:
         messages: list[dict[str, Any]],
         max_input_tokens: int,
     ) -> list[dict[str, Any]]:
-        """Drop oldest non-system messages until the input fits the budget.
-
-        Tool-call assistant messages and their matching tool results are
-        trimmed as atomic groups so the provider history stays valid.
-        """
+        """Prune large tool results and drop oldest non-system groups until fitting budget."""
         if not messages:
             return messages
-        estimates = [self._estimate_message_tokens(m) for m in messages]
+        # Step 1: Replay-safe pruning on oversized tool outputs
+        pruned_messages: list[dict[str, Any]] = []
+        for msg in messages:
+            if msg.get("role") == "tool" and isinstance(msg.get("content"), str):
+                pruned_messages.append(
+                    {
+                        **msg,
+                        "content": utils.prune_tool_result(
+                            msg["content"], max_chars=8192, head_chars=4096, tail_chars=1024
+                        ),
+                    }
+                )
+            else:
+                pruned_messages.append(msg)
+
+        estimates = [self._estimate_message_tokens(m) for m in pruned_messages]
         if sum(estimates) <= max_input_tokens:
-            return messages
-        # Always preserve the first (system) message, then keep whole
-        # conversational groups from the newest side until the budget is used.
-        trimmed = [messages[0]]
+            return pruned_messages
+
+        # Step 2: Preserve system message and keep newest whole conversational groups
+        trimmed = [pruned_messages[0]]
         budget = max_input_tokens - estimates[0]
         tail: list[dict[str, Any]] = []
-        for group in reversed(self._message_groups(messages[1:])):
+        for group in reversed(self._message_groups(pruned_messages[1:])):
             group_tokens = sum(self._estimate_message_tokens(m) for m in group)
             if group_tokens > budget:
                 break
@@ -405,6 +417,8 @@ class FusionRun(NativeRun):
         ]
         self.active_role: str = "main"
         self.pending_tool_calls: list[dict[str, Any]] = []
+        self.planning_tool_rounds = 0
+        self.repeat_guard = utils.RepeatToolGuard()
         self.report: str | None = None
         self.plan: str = ""
         self.sidekick_brief: str = ""
@@ -419,24 +433,38 @@ class FusionRun(NativeRun):
             "plan": "",
             "sidekick_brief": "",
             "follow_up_count": 0,
+            "planning_tool_rounds": 0,
             "active_role": "main",
             "main_slot": "gpt-5_6-sol",
             "sidekick_slot": "gpt-5_6-luna",
         }.items():
             if not hasattr(self, key):
                 setattr(self, key, default)
+        if not hasattr(self, "repeat_guard"):
+            self.repeat_guard = utils.RepeatToolGuard()
 
     def _append_tool_results(self, tool_results: list[dict[str, Any]]) -> None:
         target = self.main_messages if self.active_role == "main" else self.sidekick_messages
         for result in tool_results:
+            raw_content = str(result.get("content", ""))
             target.append(
                 {
                     "role": "tool",
                     "tool_call_id": result["tool_call_id"],
-                    "content": result.get("content", ""),
+                    "content": raw_content[:utils.RUN_MAX_MSG_BYTES],
                     "is_error": bool(result.get("is_error", False)),
                 }
             )
+            # Advisory repeat-tool check
+            call_info = next(
+                (tc for tc in self.pending_tool_calls if tc.get("id") == result.get("tool_call_id")),
+                None,
+            )
+            if call_info and isinstance(call_info.get("function"), dict):
+                fn = call_info["function"]
+                reminder = self.repeat_guard.observe(fn.get("name", ""), fn.get("arguments", "{}"))
+                if reminder:
+                    target.append({"role": "system", "content": reminder})
 
     def _call_main(
         self,
@@ -452,7 +480,8 @@ class FusionRun(NativeRun):
         self.main_messages.append(message)
         text = str(message.get("content") or "")
         calls = message.get("tool_calls") or []
-        self.add_usage(usage, model=coordinator.main_slot)
+        if getattr(serve_config._history_context, "active_run", None) is not self:
+            self.add_usage(usage, model=coordinator.main_slot)
         self.record_activity(
             "main_turn",
             role="main",
@@ -472,7 +501,8 @@ class FusionRun(NativeRun):
         self.sidekick_messages.append(message)
         text = str(message.get("content") or "")
         calls = message.get("tool_calls") or []
-        self.add_usage(usage, model=coordinator.sidekick_slot)
+        if getattr(serve_config._history_context, "active_run", None) is not self:
+            self.add_usage(usage, model=coordinator.sidekick_slot)
         self.record_activity(
             "sidekick_turn",
             role="sidekick",
@@ -495,26 +525,28 @@ class FusionRun(NativeRun):
 
     def _parse_main_review(self, text: str) -> tuple[bool, str]:
         stripped = text.strip()
-        if re.search(r"\bACCEPT\b", stripped):
+        if stripped.upper().startswith("ACCEPT") or re.search(r"^\s*ACCEPT\b", stripped, re.IGNORECASE):
             return True, ""
-        follow_match = re.match(r"FOLLOW_UP:\s*(.*)", stripped, re.DOTALL)
+        follow_match = re.search(r"\bFOLLOW_UP:\s*(.*)", stripped, re.DOTALL | re.IGNORECASE)
         if follow_match:
-            return False, follow_match.group(1).strip()
-        # Default to acceptance when the main model does not issue a clear follow-up.
-        return True, ""
+            feedback = follow_match.group(1).strip()
+            if feedback:
+                return False, feedback
+        if stripped.upper().startswith("REJECT"):
+            return False, stripped
+        raise ValueError(
+            f"main review did not output a valid decision ('ACCEPT' or 'FOLLOW_UP: <feedback>'), got: {stripped[:120]!r}"
+        )
 
-    def _validate_tool_results(self, tool_results: list[dict[str, Any]]) -> None:
-        if not isinstance(tool_results, list):
-            raise TypeError("tool_results must be a list")
-        pending_ids = {str(tc.get("id")) for tc in self.pending_tool_calls if tc.get("id")}
-        seen: set[str] = set()
-        for item in tool_results:
-            tid = str(item.get("tool_call_id"))
-            if tid in pending_ids and tid not in seen:
-                seen.add(tid)
-        missing = pending_ids - seen
-        if missing:
-            raise ValueError(f"missing tool results for {sorted(missing)}")
+    def _validate_tool_results(self, tool_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        expected_ids = {str(tc.get("id")) for tc in self.pending_tool_calls if tc.get("id")}
+        validated = utils._validate_tool_results(tool_results, expected_ids)
+        id_order = {
+            tc_id: idx
+            for idx, tc_id in enumerate(str(tc.get("id")) for tc in self.pending_tool_calls if tc.get("id"))
+        }
+        validated.sort(key=lambda r: id_order.get(str(r.get("tool_call_id")), 999))
+        return validated
 
     def _error_event(self, exc: Exception, request_id: str | None) -> dict[str, Any]:
         self.status = "error"
@@ -570,18 +602,27 @@ class FusionRun(NativeRun):
 
     def _summarize_sidekick_tool_history(self) -> str:
         lines: list[str] = []
+        total_calls = 0
+        error_count = 0
         for msg in self.sidekick_messages:
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
                 for call in msg["tool_calls"]:
+                    total_calls += 1
                     fn = call.get("function", {})
                     name = fn.get("name", "")
                     args = fn.get("arguments", "")
                     lines.append(f"- Tool call: {name}({args[:120]})")
             elif msg.get("role") == "tool":
                 content = str(msg.get("content", ""))
-                status = "ERROR" if msg.get("is_error") else "OK"
+                is_err = bool(msg.get("is_error"))
+                if is_err:
+                    error_count += 1
+                status = "ERROR" if is_err else "OK"
                 lines.append(f"  Result [{status}]: {content[:200]}")
-        return "\n".join(lines) if lines else "None"
+        if not lines:
+            return "None (sidekick used no tools)"
+        summary_header = f"Total tool invocations: {total_calls} (Errors: {error_count})\n"
+        return summary_header + "\n".join(lines)
 
     def _advance(
         self,
@@ -595,8 +636,8 @@ class FusionRun(NativeRun):
 
         # Apply client tool results only when awaiting tools.
         if self.status == "awaiting_tools":
-            self._validate_tool_results(tool_results)
-            self._append_tool_results(tool_results)
+            validated = self._validate_tool_results(tool_results)
+            self._append_tool_results(validated)
             self.pending_tool_calls = []
             if self.active_role == "main":
                 self.status = "main_planning" if not self.plan else "main_review"
@@ -608,10 +649,12 @@ class FusionRun(NativeRun):
         # Main planning on a fresh run or resumed planning.
         if self.status == "main_planning":
             self.active_role = "main"
+            available_tools = self.tools if (self.planning_tool_rounds < 2 and self.tools) else None
             main_text, main_calls, _ = self._call_main(
-                coordinator, tools=self.tools or None
+                coordinator, tools=available_tools
             )
             if main_calls:
+                self.planning_tool_rounds += 1
                 self.pending_tool_calls = main_calls
                 self.status = "awaiting_tools"
                 return self._ok_event(request_id)

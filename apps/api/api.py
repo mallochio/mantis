@@ -1091,21 +1091,31 @@ class FusionResponse(BaseModel):
 
 @app.post("/v1/fusion/delegate", dependencies=[Depends(_authorize)])
 def fusion_delegate(request: FusionDelegateRequest) -> JSONResponse:
-    tools = [tool.model_dump() for tool in (request.tools or [])]
-    run = fusion.create_fusion_run(request.brief, tools)
-    event = fusion.advance_fusion_run(run.run_id)
-    return JSONResponse(FusionResponse(**event).model_dump())
+    if not _capacity.acquire(blocking=False):
+        return _error(429, "Mantis is at capacity", "rate_limit_error")
+    try:
+        tools = [tool.model_dump() for tool in (request.tools or [])]
+        run = fusion.create_fusion_run(request.brief, tools)
+        event = fusion.advance_fusion_run(run.run_id)
+        return JSONResponse(FusionResponse(**event).model_dump())
+    finally:
+        _capacity.release()
 
 
 @app.post("/v1/fusion/follow_up/{run_id}", dependencies=[Depends(_authorize)])
 def fusion_follow_up(run_id: str, request: FusionFollowUpRequest) -> JSONResponse:
-    tool_results = [item.model_dump() for item in request.tool_results]
-    event = fusion.advance_fusion_run(
-        run_id,
-        request_id=request.request_id,
-        tool_results=tool_results,
-    )
-    return JSONResponse(FusionResponse(**event, request_id=request.request_id).model_dump())
+    if not _capacity.acquire(blocking=False):
+        return _error(429, "Mantis is at capacity", "rate_limit_error")
+    try:
+        tool_results = [item.model_dump() for item in request.tool_results]
+        event = fusion.advance_fusion_run(
+            run_id,
+            request_id=request.request_id,
+            tool_results=tool_results,
+        )
+        return JSONResponse(FusionResponse(**event, request_id=request.request_id).model_dump())
+    finally:
+        _capacity.release()
 
 
 @app.get("/v1/fusion/runs/{run_id}", dependencies=[Depends(_authorize)])

@@ -592,6 +592,7 @@ class TrinityRun(NativeRun):
         self._pending: dict[str, Any] | None = None
         self._expected_ids: set[str] = set()
         self._tool_rounds = 0
+        self.repeat_guard = utils.RepeatToolGuard()
 
     def _model_name(self, agent_id: int) -> str:
         return str(self.slot_models[agent_id % len(self.slot_models)])
@@ -621,10 +622,16 @@ class TrinityRun(NativeRun):
         if role == "Thinker":
             info = self.query
             if self.last_response:
-                info += f"\n\nCurrent response:\n{self.last_response}"
+                compact_last = utils.prune_tool_result(
+                    self.last_response, max_chars=8192, head_chars=4096, tail_chars=1024
+                )
+                info += f"\n\nCurrent response:\n{compact_last}"
             return cast(str, THINKER_PROMPT.format(info=info))
         if role == "Verifier":
-            vp = VERIFICATION_PROMPT.format(query=self.query, response=self.last_response or "")
+            compact_resp = utils.prune_tool_result(
+                self.last_response or "", max_chars=8192, head_chars=4096, tail_chars=1024
+            )
+            vp = VERIFICATION_PROMPT.format(query=self.query, response=compact_resp)
             if self.suggestion:
                 vp += (
                     f"These are useful suggestions when drafting your response:\n"
@@ -822,6 +829,21 @@ class TrinityRun(NativeRun):
                     "content": str(r.get("content", ""))[:RUN_MAX_MSG_BYTES],
                 }
             )
+            call_info = next(
+                (
+                    tc
+                    for tc in pending.get("asst", {}).get("tool_calls", [])
+                    if tc.get("id") == r.get("tool_call_id")
+                ),
+                None,
+            )
+            if call_info and isinstance(call_info.get("function"), dict):
+                fn = call_info["function"]
+                reminder = self.repeat_guard.observe(
+                    fn.get("name", ""), fn.get("arguments", "{}")
+                )
+                if reminder:
+                    pending["messages"].append({"role": "system", "content": reminder})
         self._expected_ids = set()
         self._pending = pending
 
@@ -951,6 +973,7 @@ class ConductorRun(NativeRun):
         self._pending: dict[str, Any] | None = None
         self._expected_ids: set[str] = set()
         self._tool_rounds = 0
+        self.repeat_guard = utils.RepeatToolGuard()
 
     def _planner_messages(self) -> list[dict[str, Any]]:
         prior = [m for m in self.history if isinstance(m, dict) and m.get("role") != "system"]
@@ -968,10 +991,13 @@ class ConductorRun(NativeRun):
         ctx = ""
         for j in sees:
             prev_mid = mids[j]
+            prev_out = utils.prune_tool_result(
+                self._outputs[j].strip(), max_chars=8192, head_chars=4096, tail_chars=1024
+            )
             ctx += (
                 f"\n<Subtask assigned to Agent {prev_mid}>{subs[j]}"
                 f"</Subtask assigned to Agent {prev_mid}>"
-                f"\n<Agent {prev_mid} response>{self._outputs[j].strip()}"
+                f"\n<Agent {prev_mid} response>{prev_out}"
                 f"</Agent {prev_mid} response>"
             )
         user = (
@@ -1160,6 +1186,21 @@ class ConductorRun(NativeRun):
                     "content": str(r.get("content", ""))[:RUN_MAX_MSG_BYTES],
                 }
             )
+            call_info = next(
+                (
+                    tc
+                    for tc in pending.get("asst", {}).get("tool_calls", [])
+                    if tc.get("id") == r.get("tool_call_id")
+                ),
+                None,
+            )
+            if call_info and isinstance(call_info.get("function"), dict):
+                fn = call_info["function"]
+                reminder = self.repeat_guard.observe(
+                    fn.get("name", ""), fn.get("arguments", "{}")
+                )
+                if reminder:
+                    pending["messages"].append({"role": "system", "content": reminder})
         self._expected_ids = set()
         self._pending = pending
 

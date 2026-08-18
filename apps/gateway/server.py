@@ -1391,6 +1391,10 @@ def _session_route(session_id: str | None, prompt: str, proposed: str,
                 and turns > 0
                 and turns % RESCORE_EVERY_N == 0):
             return proposed, "rescore_downgrade"
+        # Consecutive low complexity: if the user has had 2+ consecutive low-complexity
+        # turns, allow downgrading to the cheaper proposed tier.
+        if int(state.get("consecutive_low_turns", 0)) >= 2:
+            return proposed, "downgrade_consecutive_low"
         return current, "downgrade_hysteresis"
     # Exact catalog policies deliberately expose intermediate ranks, so a
     # session turn may climb to any higher proposed target.
@@ -1412,10 +1416,17 @@ def _session_note(session_id: str | None, tier: str, complexity: int | None,
         # `tier` preserves the old in-memory shape for existing observability
         # and tests. New readers use routes so no protocol can inherit another
         # protocol's affinity.
+        low_count = int(prior.get("consecutive_low_turns", 0))
+        if complexity is not None and complexity <= 2:
+            low_count += 1
+        else:
+            low_count = 0
+
         state = {
             "tier": routes.get("chat", tier), "routes": routes,
             "target_revision": TARGET_CONFIG_REVISION,
             "last_seen": now, "last_complexity": complexity,
+            "consecutive_low_turns": low_count,
             "turns": int(prior.get("turns", 0)) + 1,
         }
         if isinstance(usage, dict) and usage:

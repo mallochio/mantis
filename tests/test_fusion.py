@@ -552,6 +552,12 @@ def test_fusion_preserves_reasoning_metadata(monkeypatch):
         ) -> tuple[dict[str, Any], dict[str, Any]]:
             first_content = messages[0].get("content", "")
             if first_content == fusion.MAIN_PREAMBLE:
+                is_review = any(
+                    msg.get("role") == "user" and fusion.REVIEW_PROMPT in msg.get("content", "")
+                    for msg in messages
+                )
+                if is_review:
+                    return ({"role": "assistant", "content": "ACCEPT"}, usage)
                 return (
                     {"role": "assistant", "content": "PLAN: p\nBRIEF: b"},
                     usage,
@@ -796,6 +802,15 @@ def test_fusion_main_driver_can_call_tools_during_planning(client, monkeypatch):
         calls.append((slot, messages, worker_tools))
         first_content = messages[0].get("content", "")
         if first_content == fusion.MAIN_PREAMBLE:
+            is_review = any(
+                m.get("role") == "user" and fusion.REVIEW_PROMPT in m.get("content", "")
+                for m in messages
+            )
+            if is_review:
+                return {
+                    "choices": [{"message": {"role": "assistant", "content": "ACCEPT"}}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+                }
             has_tool_result = any(m.get("role") == "tool" for m in messages)
             if not has_tool_result:
                 # Main calls a tool during planning
