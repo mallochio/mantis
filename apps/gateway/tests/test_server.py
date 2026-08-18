@@ -178,3 +178,18 @@ async def test_stream_done_without_explicit_finish_reason_completes_cleanly(clie
     assert "data: [DONE]" in response.text
     await mock.aclose()
 
+
+@pytest.mark.anyio
+async def test_stream_finish_reason_without_done_completes_cleanly(client, monkeypatch):
+    """Providers that emit a finish_reason but omit the terminal [DONE] are still complete."""
+    payload = (b'data: {"choices":[{"delta":{"content":"completed"},"finish_reason":"stop"}]}\n\n')
+    mock = upstream(lambda request: httpx.Response(200, content=payload, headers={"content-type": "text/event-stream"}))
+    monkeypatch.setattr(server, "_client", mock)
+    response = await client.post("/v1/chat/completions", headers=AUTH,
+                                 json={"model": "auto", "stream": True, "messages": [{"role": "user", "content": "hello"}]})
+    assert response.status_code == 200
+    assert "completed" in response.text
+    assert "upstream_truncated" not in response.text
+    assert "data: [DONE]" in response.text
+    await mock.aclose()
+

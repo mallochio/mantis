@@ -3184,17 +3184,26 @@ async def chat_completions(
             if saw_refusal:
                 _log_outcome(_prompt_hash(prompt), "refusal", request_id=request_id,
                              decision_occurrence_id=occurrence_id, model=backend["model"])
-            elif not saw_done:
+            elif not saw_done and not saw_finish:
                 _log_outcome(_prompt_hash(prompt), "truncated", request_id=request_id,
                              decision_occurrence_id=occurrence_id, model=backend["model"], abrupt_eof=True)
                 if not emitted_error:
                     yield _stream_error("Upstream stream ended before completion", "upstream_truncated", request_id)
-            elif saw_length:
-                _log_outcome(_prompt_hash(prompt), "truncated", request_id=request_id,
-                             decision_occurrence_id=occurrence_id, model=backend["model"])
-            elif cache_parts is not None:
-                content = b"".join(cache_parts)
-                _cache_put(cache_key, body, content)
+            else:
+                # A finish_reason (or a bare [DONE]) is a valid terminal signal.
+                # Some providers omit the terminal [DONE] frame, so synthesize it
+                # when absent so clients see a clean SSE terminator and the
+                # response can be cached/replayed.
+                if saw_length:
+                    _log_outcome(_prompt_hash(prompt), "truncated", request_id=request_id,
+                                 decision_occurrence_id=occurrence_id, model=backend["model"])
+                if not saw_done:
+                    remember(b"data: [DONE]\n\n")
+                    yield b"data: [DONE]\n\n"
+                    saw_done = True
+                if cache_parts is not None and not saw_length:
+                    content = b"".join(cache_parts)
+                    _cache_put(cache_key, body, content)
         except asyncio.CancelledError:
             _log_outcome(_prompt_hash(prompt), "disconnected", request_id=request_id,
                          decision_occurrence_id=occurrence_id, model=backend["model"])
