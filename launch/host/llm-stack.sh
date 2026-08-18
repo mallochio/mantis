@@ -49,6 +49,28 @@ ok()   { printf '  \033[1;32mok\033[0m    %s\n' "$1"; }
 warn() { printf '  \033[1;33mwarn\033[0m  %s\n' "$1"; }
 fail() { printf '  \033[1;31mFAIL\033[0m  %s\n' "$1" >&2; }
 
+LOCK_DIR="$HOME/.local/share/llm-stack/.lock"
+
+acquire_lock() {
+  mkdir -p "$HOME/.local/share/llm-stack"
+  if [ -d "$LOCK_DIR" ]; then
+    local holder
+    holder=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "unknown")
+    if [ "$holder" != "unknown" ] && ! kill -0 "$holder" 2>/dev/null; then
+      warn "removing stale llm-stack lock (pid $holder)"
+      rm -rf "$LOCK_DIR"
+    fi
+  fi
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    local holder
+    holder=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "unknown")
+    fail "another llm-stack process is already running (pid $holder). Use status or wait."
+    exit 1
+  fi
+  echo $$ > "$LOCK_DIR/pid"
+  trap 'rm -rf "$LOCK_DIR"' EXIT
+}
+
 health_ok()   { curl -fsS --max-time 5 "$1" >/dev/null 2>&1; }
 gateway_ready() { curl -fsS --max-time 5 "$ROUTER_URL" 2>/dev/null | grep -q '"ready":true'; }
 pid_on_port() { lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | head -n1 || true; }
@@ -76,6 +98,7 @@ start_one() { # step_no name script url timeout_s [grep]
 }
 
 cmd_start() {
+  acquire_lock
   printf '\n\033[1mStarting the LLM stack (Bifrost -> direct gateway -> Mantis API)\033[0m\n'
   printf '\033[2mComponents already running are restarted so the latest catalog/config is loaded.\033[0m\n'
   [ -f "$CATALOG" ] || warn "catalog missing: $CATALOG (required by the gateway and API)"
@@ -86,6 +109,7 @@ cmd_start() {
 }
 
 cmd_restart() {
+  acquire_lock
   printf '\n\033[1mRestarting the whole stack (Bifrost -> direct gateway -> Mantis API)\033[0m\n'
   start_one "1/3" "bifrost" "$LIB_DIR/bifrost-local.sh" "$BIFROST_URL" 90 || return 1
   start_one "2/3" "direct gateway" "$LIB_DIR/llm-router.sh" "$ROUTER_URL" 120 '"ready":true' || return 1
@@ -94,6 +118,7 @@ cmd_restart() {
 }
 
 cmd_stop() {
+  acquire_lock
   printf '\n\033[1mStopping the stack (Mantis API -> direct gateway -> Bifrost)\033[0m\n'
   step "1/3 stopping Mantis API (:8088)"
   local mp="$HOME/.local/share/mantis/server.pid"
