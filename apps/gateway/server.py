@@ -1165,11 +1165,37 @@ def _completion_token_cap(backend: dict) -> int:
     return min(cap, MANTIS_ROUTER_MAX_TOKENS)
 
 
+def _tool_sort_name(tool) -> str:
+    if not isinstance(tool, dict):
+        return ""
+    function = tool.get("function")
+    if isinstance(function, dict) and function.get("name"):
+        return str(function["name"])
+    return str(tool.get("name") or "")
+
+
+def _canonicalize_tools(tools):
+    """Sort tools by name without dropping unknown tool types.
+
+    Client registration order must not change the cached request prefix.
+    Equal names keep their original relative order.
+    """
+    if not isinstance(tools, list):
+        return tools
+    indexed = list(enumerate(tools))
+    indexed.sort(key=lambda item: (_tool_sort_name(item[1]), item[0]))
+    return [tool for _, tool in indexed]
+
+
 def _build_outgoing_body(body: dict, backend: dict) -> dict:
     out_body = dict(body)
     if isinstance(out_body.get("messages"), list):
         out_body["messages"] = _normalize_messages_for_backend(
             out_body["messages"], developer_role=backend.get("developer_role", "system"))
+    if isinstance(out_body.get("tools"), list):
+        out_body["tools"] = _canonicalize_tools(out_body["tools"])
+    if isinstance(out_body.get("functions"), list):
+        out_body["functions"] = _canonicalize_tools(out_body["functions"])
     out_body["model"] = backend["model"]
     cap = _completion_token_cap(backend)
     if isinstance(out_body.get("max_tokens"), int):
@@ -1193,6 +1219,8 @@ def _build_outgoing_body(body: dict, backend: dict) -> dict:
 
 def _build_responses_body(body: dict, backend: dict) -> dict:
     out_body = dict(body)
+    if isinstance(out_body.get("tools"), list):
+        out_body["tools"] = _canonicalize_tools(out_body["tools"])
     out_body["model"] = backend["model"]
     if isinstance(out_body.get("max_output_tokens"), int):
         out_body["max_output_tokens"] = min(out_body["max_output_tokens"],

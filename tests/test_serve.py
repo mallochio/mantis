@@ -1634,6 +1634,14 @@ def test_standard_tool_validation_and_model_ids():
         ]
     )
     assert [tool["function"]["name"] for tool in tools] == ["read"]
+    shuffled = [
+        {"type": "function", "function": {"name": "zsh", "parameters": {"type": "object"}}},
+        {"type": "function", "function": {"name": "bash", "parameters": {"type": "object"}}},
+        {"type": "function", "function": {"name": "read", "parameters": {"type": "object"}}},
+    ]
+    names = [tool["function"]["name"] for tool in serve._convert_tools(shuffled)]
+    assert names == ["bash", "read", "zsh"]
+    assert serve._convert_tools(shuffled) == serve._convert_tools(list(reversed(shuffled)))
     assert serve._mode_for_model("mantis/trinity") == "trinity"
     assert serve._mode_for_model("mantis/ultra") == "conductor"
     for model in ("mantis", "mantis-trinity", "mantis-ultra", "trinity", "fugu", "conductor", "ultra", "unknown"):

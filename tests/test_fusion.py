@@ -483,6 +483,85 @@ def test_fusion_trim_keeps_frozen_prefix_when_budget_allows():
     assert second[:3] == prefix
 
 
+def test_fusion_freezes_tools_in_name_order():
+    tools = [
+        {"type": "function", "function": {"name": "zsh", "parameters": {"type": "object"}}},
+        {"type": "function", "function": {"name": "bash", "parameters": {"type": "object"}}},
+    ]
+    run = fusion.FusionRun("tool-order", "brief", tools)
+    assert [tool["function"]["name"] for tool in run.tools] == ["bash", "zsh"]
+
+
+def test_fusion_repeat_tool_reminder_is_a_user_message():
+    run = fusion.FusionRun("repeat", "brief")
+    run.active_role = "main"
+    run.pending_tool_calls = [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "bash", "arguments": "{}"},
+        }
+    ]
+    for _ in range(3):
+        run._append_tool_results([{"tool_call_id": "call_1", "content": "ok"}])
+    reminders = [
+        message
+        for message in run.main_messages
+        if message.get("role") == "user" and "<system-reminder>" in str(message.get("content", ""))
+    ]
+    assert reminders
+    assert not any(
+        message.get("role") == "system" and "Advisory Notice" in str(message.get("content", ""))
+        for message in run.main_messages
+    )
+
+
+def test_fusion_compaction_replays_same_slot_and_keeps_system(monkeypatch):
+    coordinator = fusion.FusionCoordinator()
+    monkeypatch.setattr(coordinator, "_output_tokens_for", lambda _slot: 256)
+    calls: list[dict[str, Any]] = []
+
+    def fake_provider(spec, messages, max_tokens, temperature, tools=None):
+        calls.append({"spec": spec, "messages": messages, "tools": tools})
+        last = messages[-1]["content"] if messages else ""
+        if last == fusion.COMPACTION_INSTRUCTION:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "<compacted-summary>inspected files</compacted-summary>",
+                        }
+                    }
+                ],
+                "usage": {},
+            }
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}], "usage": {}}
+
+    monkeypatch.setattr(providers, "_provider_response", fake_provider)
+    pad = "x" * 320
+    messages = [{"role": "system", "content": "system prompt"}]
+    for index in range(6):
+        messages.append({"role": "user", "content": f"{index}-{pad}"})
+        messages.append({"role": "assistant", "content": f"a{index}-{pad}"})
+    messages.append({"role": "user", "content": "latest"})
+    tools = [
+        {"type": "function", "function": {"name": "bash"}},
+        {"type": "function", "function": {"name": "read"}},
+    ]
+    fitted = coordinator._fit_messages("gpt-5_6-sol", messages, tools, 400)
+    assert fitted[0]["content"] == "system prompt"
+    assert fitted[1]["content"].startswith("<compacted-summary>")
+    assert "inspected files" in fitted[1]["content"]
+    assert fitted[-1]["content"] == "latest"
+    assert calls
+    compact = calls[0]
+    assert compact["spec"] == "gpt-5_6-sol"
+    assert compact["tools"] == tools
+    assert compact["messages"][0]["content"] == "system prompt"
+    assert compact["messages"][-1]["content"] == fusion.COMPACTION_INSTRUCTION
+
+
 def test_fusion_trimmer_keeps_tool_call_result_pairs():
     coordinator = fusion.FusionCoordinator()
     messages = [

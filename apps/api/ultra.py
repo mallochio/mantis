@@ -207,29 +207,35 @@ def visible_indices(access_list: list, step: int) -> list[int]:
     return sorted(out)
 
 
-# ---- the Conductor prompt (prompted stand-in for the RL-trained 7B) [DOC] ----
-def conductor_prompt(query: str, slot_labels: list[str]) -> list[dict]:
+# Frozen planner identity. Pool and query are user-turn facts so a repair
+# retry reuses the same prompt-cache prefix as the first planner call.
+PLANNER_SYSTEM = (
+    "You are a Conductor that orchestrates a pool of worker LLMs to solve a task. "
+    "Design an agentic workflow as THREE equal-length Python lists:\n"
+    "  model_id   = [int, ...]   # which worker (0-indexed) runs each step\n"
+    "  subtasks   = [str, ...]   # the natural-language instruction for each step\n"
+    "  access_list= [list, ...]  # for each step, the indices of EARLIER steps whose\n"
+    '                            # outputs that step may see ([] = none, may use "all")\n'
+    "Rules: lists must be equal length (<=5 steps); access_list may only reference "
+    "strictly earlier steps (it is a DAG executed in order); the LAST step's output "
+    "is the final answer. Pick workers to match each subtask's demands: prefer cheaper "
+    "workers for search, inspection, or reading; reserve frontier reasoning models for "
+    "synthesis, complex debugging, and final code generation. "
+    "Return a JSON object with keys model_id, subtasks, and access_list, or output "
+    "the three lists explicitly as 'model_id: [...]', 'subtasks: [...]', "
+    "'access_list: [...]'. You may reason first, but the three lists must appear."
+)
+
+
+def _planner_user(query: str, slot_labels: list[str]) -> str:
     pool = "\n".join(f"  {i}: {name}" for i, name in enumerate(slot_labels))
-    sys = (
-        "You are a Conductor that orchestrates a pool of worker LLMs to solve a task. "
-        "Design an agentic workflow as THREE equal-length Python lists:\n"
-        "  model_id   = [int, ...]   # which worker (0-indexed) runs each step\n"
-        "  subtasks   = [str, ...]   # the natural-language instruction for each step\n"
-        "  access_list= [list, ...]  # for each step, the indices of EARLIER steps whose\n"
-        '                            # outputs that step may see ([] = none, may use "all")\n'
-        "Rules: lists must be equal length (<=5 steps); access_list may only reference "
-        "strictly earlier steps (it is a DAG executed in order); the LAST step's output "
-        "is the final answer. Pick workers to match each subtask's demands: prefer cheaper "
-        "workers for search, inspection, or reading; reserve frontier reasoning models for "
-        "synthesis, complex debugging, and final code generation.\n\n"
-        f"AVAILABLE LANGUAGE MODELS:\n{pool}\n\n"
-        "Return a JSON object with keys model_id, subtasks, and access_list, or output "
-        "the three lists explicitly as 'model_id: [...]', 'subtasks: [...]', "
-        "'access_list: [...]'. You may reason first, but the three lists must appear."
-    )
+    return f"AVAILABLE LANGUAGE MODELS:\n{pool}\n\nUSER QUESTION: {query}"
+
+
+def conductor_prompt(query: str, slot_labels: list[str]) -> list[dict]:
     return [
-        {"role": "system", "content": sys},
-        {"role": "user", "content": f"USER QUESTION: {query}"},
+        {"role": "system", "content": PLANNER_SYSTEM},
+        {"role": "user", "content": _planner_user(query, slot_labels)},
     ]
 
 
@@ -240,18 +246,10 @@ def planner_repair_messages(
     error: str,
 ) -> list[dict]:
     """One-shot repair turn after a planner parse/validation failure."""
-    pool = "\n".join(f"  {i}: {name}" for i, name in enumerate(slot_labels))
-    sys = (
-        "You are a Conductor repairing an invalid workflow plan. "
-        "Return a JSON object with exactly three keys: model_id (array of ints), "
-        "subtasks (array of strings), and access_list (array of int arrays or \"all\"). "
-        "Lists must be equal length (1-5 steps); access_list may only reference earlier steps.\n\n"
-        f"AVAILABLE LANGUAGE MODELS:\n{pool}"
-    )
     clipped = bad_text.strip()[:8000] or "(empty)"
     return [
-        {"role": "system", "content": sys},
-        {"role": "user", "content": f"USER QUESTION: {query}"},
+        {"role": "system", "content": PLANNER_SYSTEM},
+        {"role": "user", "content": _planner_user(query, slot_labels)},
         {"role": "assistant", "content": clipped},
         {
             "role": "user",

@@ -133,3 +133,21 @@ def test_planner_repair_retries_once(monkeypatch):
     event = run._run_planner()
     assert calls["n"] == 2
     assert event["type"] == "step_complete"
+
+
+def test_planner_keeps_query_and_pool_out_of_system():
+    from apps.api import ultra
+
+    first = ultra.conductor_prompt("SECRET_QUERY", ["luna-slot", "sol-slot"])
+    assert first[0]["role"] == "system"
+    assert first[0]["content"] == ultra.PLANNER_SYSTEM
+    assert "SECRET_QUERY" not in first[0]["content"]
+    assert "luna-slot" not in first[0]["content"]
+    assert "SECRET_QUERY" in first[1]["content"]
+    assert "luna-slot" in first[1]["content"]
+    repair = ultra.planner_repair_messages(
+        "SECRET_QUERY", ["luna-slot", "sol-slot"], "bad", "missing lists"
+    )
+    assert repair[0] == first[0]
+    assert repair[1] == first[1]
+    assert repair[2]["role"] == "assistant"

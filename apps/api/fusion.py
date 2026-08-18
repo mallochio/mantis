@@ -73,6 +73,14 @@ PLAN_TOOL_BUDGET_PROMPT = (
     "'PLAN:' and 'BRIEF:'. No other text or tool calls."
 )
 
+COMPACTION_INSTRUCTION = (
+    "Condense the conversation above into a checkpoint another model can resume from. "
+    "Output exactly one <compacted-summary> block with terse bullets for: goal, "
+    "files touched, decisions, and remaining work. Do not call tools."
+)
+COMPACTION_RETAIN_RATIO = 0.16
+COMPACTION_MAX_OUTPUT_TOKENS = 1024
+
 PLAN_UNKNOWN_TOOL_PROMPT = (
     "You tried to call tools that are not available for planning: {names}. "
     "Stop calling tools and reply with exactly two sections: "
@@ -284,6 +292,9 @@ class FusionCoordinator:
                 text += str(value)
         return max(1, len(text) // 4)
 
+    def _token_sum(self, messages: list[dict[str, Any]]) -> int:
+        return sum(self._estimate_message_tokens(message) for message in messages)
+
     def _message_groups(
         self,
         messages: list[dict[str, Any]],
@@ -335,44 +346,169 @@ class FusionCoordinator:
                 pruned.append(msg)
         return pruned
 
-    def _trim_messages(
-        self,
-        messages: list[dict[str, Any]],
-        max_input_tokens: int,
+    def _prune_for_budget(
+        self, messages: list[dict[str, Any]], max_input_tokens: int
     ) -> list[dict[str, Any]]:
-        """Fit history to the window without rewriting the cacheable prefix first.
-
-        Oversized tool bodies are compacted (twice, more aggressively if needed)
-        before any message is dropped. Only then are oldest non-system groups
-        removed from the front, which is a cache miss and is the last resort.
-        """
         if not messages:
             return messages
-        pruned_messages = self._prune_tool_messages(
+        pruned = self._prune_tool_messages(
             messages, max_chars=8192, head_chars=4096, tail_chars=1024
         )
-        estimates = [self._estimate_message_tokens(m) for m in pruned_messages]
-        if sum(estimates) <= max_input_tokens:
-            return pruned_messages
-
-        pruned_messages = self._prune_tool_messages(
-            pruned_messages, max_chars=2048, head_chars=1024, tail_chars=256
+        if self._token_sum(pruned) <= max_input_tokens:
+            return pruned
+        return self._prune_tool_messages(
+            pruned, max_chars=2048, head_chars=1024, tail_chars=256
         )
-        estimates = [self._estimate_message_tokens(m) for m in pruned_messages]
-        if sum(estimates) <= max_input_tokens:
-            return pruned_messages
 
-        trimmed = [pruned_messages[0]]
+    def _drop_old_groups(
+        self, messages: list[dict[str, Any]], max_input_tokens: int
+    ) -> list[dict[str, Any]]:
+        if not messages:
+            return messages
+        estimates = [self._estimate_message_tokens(message) for message in messages]
+        trimmed = [messages[0]]
         budget = max_input_tokens - estimates[0]
         tail: list[dict[str, Any]] = []
-        for group in reversed(self._message_groups(pruned_messages[1:])):
-            group_tokens = sum(self._estimate_message_tokens(m) for m in group)
+        for group in reversed(self._message_groups(messages[1:])):
+            group_tokens = sum(self._estimate_message_tokens(item) for item in group)
             if group_tokens > budget:
                 break
             tail.extend(reversed(group))
             budget -= group_tokens
         trimmed.extend(reversed(tail))
         return trimmed
+
+    def _flatten_groups(self, groups: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+        flattened: list[dict[str, Any]] = []
+        for group in groups:
+            flattened.extend(group)
+        return flattened
+
+    def _compact_replay(
+        self,
+        slot: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        max_input_tokens: int,
+    ) -> list[dict[str, Any]] | None:
+        """Summarize the middle of history on the same slot, replaying the prefix.
+
+        The summarizer request is system + history + a trailing instruction so
+        the provider cache stays warm up to that instruction. Stored history
+        keeps the original system message and a verbatim tail.
+        """
+        if len(messages) < 3:
+            return None
+        system = messages[0]
+        groups = self._message_groups(messages[1:])
+        if len(groups) < 2:
+            return None
+        instruction = {"role": "user", "content": COMPACTION_INSTRUCTION}
+        system_tokens = self._estimate_message_tokens(system)
+        instruction_tokens = self._estimate_message_tokens(instruction)
+        min_middle_tokens = self._token_sum(groups[0])
+        max_tail = min(
+            max_input_tokens - system_tokens - instruction_tokens - min_middle_tokens,
+            max_input_tokens - system_tokens - 64,
+        )
+        if max_tail <= 0:
+            return None
+        body_tokens = sum(self._token_sum(group) for group in groups)
+        tail_target = max(1, min(int(body_tokens * COMPACTION_RETAIN_RATIO), max_tail))
+        tail_groups: list[list[dict[str, Any]]] = []
+        tail_tokens = 0
+        while len(groups) > 1:
+            group = groups[-1]
+            group_tokens = self._token_sum(group)
+            if tail_groups and tail_tokens + group_tokens > tail_target:
+                break
+            if not tail_groups and group_tokens > tail_target:
+                return None
+            groups.pop()
+            tail_groups.insert(0, group)
+            tail_tokens += group_tokens
+            if tail_tokens >= tail_target:
+                break
+        if not groups or not tail_groups:
+            return None
+
+        def replay(middle: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+            return [
+                system,
+                *self._flatten_groups(middle),
+                *self._flatten_groups(tail_groups),
+                instruction,
+            ]
+
+        while groups and self._token_sum(replay(groups)) > max_input_tokens:
+            groups.pop(0)
+        if not groups:
+            return None
+
+        run = getattr(serve_config._history_context, "active_run", None)
+        previous_choice = getattr(run, "active_tool_choice", None) if run is not None else None
+        if run is not None:
+            run.active_tool_choice = "none"
+        try:
+            data = providers._provider_response(
+                slot,
+                replay(groups),
+                min(COMPACTION_MAX_OUTPUT_TOKENS, self._output_tokens_for(slot)),
+                0.7,
+                tools,
+            )
+        except (RuntimeError, TypeError, KeyError, IndexError):
+            return None
+        finally:
+            if run is not None:
+                run.active_tool_choice = previous_choice
+
+        message = (data.get("choices") or [{}])[0].get("message") or {}
+        if message.get("tool_calls"):
+            return None
+        text = str(message.get("content") or "").strip()
+        if not text:
+            return None
+        summary = text
+        match = re.search(
+            r"<compacted-summary>\s*([\s\S]*?)\s*</compacted-summary>", text, re.IGNORECASE
+        )
+        if match:
+            summary = match.group(1).strip() or text
+        return [
+            system,
+            {
+                "role": "user",
+                "content": f"<compacted-summary>\n{summary}\n</compacted-summary>",
+            },
+            *self._flatten_groups(tail_groups),
+        ]
+
+    def _fit_messages(
+        self,
+        slot: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        max_input_tokens: int,
+    ) -> list[dict[str, Any]]:
+        pruned = self._prune_for_budget(messages, max_input_tokens)
+        if self._token_sum(pruned) <= max_input_tokens:
+            return pruned
+        compacted = self._compact_replay(slot, pruned, tools, max_input_tokens)
+        if compacted is not None and self._token_sum(compacted) <= max_input_tokens:
+            return compacted
+        return self._drop_old_groups(compacted or pruned, max_input_tokens)
+
+    def _trim_messages(
+        self,
+        messages: list[dict[str, Any]],
+        max_input_tokens: int,
+    ) -> list[dict[str, Any]]:
+        """Fit history without a model call: prune tool bodies, then drop groups."""
+        pruned = self._prune_for_budget(messages, max_input_tokens)
+        if self._token_sum(pruned) <= max_input_tokens:
+            return pruned
+        return self._drop_old_groups(pruned, max_input_tokens)
 
     def _output_tokens_for(self, slot: str) -> int:
         """Return the model-specific output token cap from the catalog."""
@@ -397,8 +533,8 @@ class FusionCoordinator:
         model_cap = self._output_tokens_for(slot)
         output_tokens = min(self.max_output_tokens, model_cap)
         input_budget = max(0, self.context_window - output_tokens)
-        trimmed = self._trim_messages(messages, input_budget)
-        data = providers._provider_response(slot, trimmed, output_tokens, 0.7, tools)
+        fitted = self._fit_messages(slot, messages, tools, input_budget)
+        data = providers._provider_response(slot, fitted, output_tokens, 0.7, tools)
         msg = dict(data["choices"][0]["message"])
         msg.setdefault("role", "assistant")
         msg["content"] = str(msg.get("content") or "")
@@ -441,7 +577,7 @@ class FusionRun(NativeRun):
         # if the catalog is changed while a run is in progress.
         self.main_slot = coordinator.main_slot
         self.sidekick_slot = coordinator.sidekick_slot
-        self.tools = tools or []
+        self.tools = utils._convert_tools(tools)
         if messages:
             self.main_messages: list[dict[str, Any]] = [
                 {"role": "system", "content": MAIN_PREAMBLE},
@@ -508,7 +644,9 @@ class FusionRun(NativeRun):
                 fn = call_info["function"]
                 reminder = self.repeat_guard.observe(fn.get("name", ""), fn.get("arguments", "{}"))
                 if reminder:
-                    target.append({"role": "system", "content": reminder})
+                    target.append(
+                        {"role": "user", "content": utils.system_reminder(reminder)}
+                    )
 
     def _call_main(
         self,

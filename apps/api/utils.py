@@ -323,7 +323,11 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _convert_tools(tools: Any) -> list[dict[str, Any]]:
-    """Validate and copy standard OpenAI function tools."""
+    """Validate, copy, and freeze OpenAI function tools in name order.
+
+    Lexicographic order is locale-independent so a client reshuffle cannot
+    bust the provider prompt-cache prefix.
+    """
     if not isinstance(tools, list):
         return []
     out: list[dict[str, Any]] = []
@@ -334,7 +338,13 @@ def _convert_tools(tools: Any) -> list[dict[str, Any]]:
         if not isinstance(function, dict) or not function.get("name"):
             continue
         out.append({"type": "function", "function": dict(function)})
+    out.sort(key=lambda tool: str(tool["function"]["name"]))
     return out
+
+
+def system_reminder(text: str) -> str:
+    """Wrap a harness notice as user-visible text that must not enter system."""
+    return f"<system-reminder>\n{text}\n</system-reminder>"
 
 
 def _model_completion(

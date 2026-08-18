@@ -112,3 +112,23 @@ def test_catalog_backend_explicit_cap_is_honored_not_clamped():
     # models.dev) must not be silently reduced to the router-wide fallback.
     backend = {"model": "deepseek-v4-pro", "effort": "", "max_tokens": 384000}
     assert server._completion_token_cap(backend) == 384000
+
+
+def test_outgoing_bodies_sort_tools_by_name():
+    backend = {"model": "google/gemini-3.7-flash", "effort": ""}
+    tools = [
+        {"type": "function", "function": {"name": "zsh"}},
+        {"type": "web_search"},
+        {"type": "function", "function": {"name": "bash"}},
+    ]
+    chat = server._build_outgoing_body(
+        {"model": "auto", "messages": [{"role": "user", "content": "hi"}], "tools": tools},
+        backend,
+    )
+    names = [server._tool_sort_name(tool) for tool in chat["tools"]]
+    assert names == ["", "bash", "zsh"]
+    responses = server._build_responses_body(
+        {"model": "auto", "input": "hi", "tools": list(reversed(tools))},
+        backend,
+    )
+    assert [server._tool_sort_name(tool) for tool in responses["tools"]] == names
