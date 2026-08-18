@@ -75,29 +75,22 @@ fi
 # The router is owned here and restarted to pick up config/env changes.
 if lsof -nP -iTCP:"$MANTIS_ROUTER_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   echo "gateway already running on :$MANTIS_ROUTER_PORT — stopping for restart"
-  # Refuse to kill a listener unless the recorded PID owns this port and its
-  # command is this checkout's server. A stale PID file must fail closed.
-  ROUTER_PID=""
-  CANDIDATE=$(cat "$ROUTER_LOG_DIR/server.pid" 2>/dev/null || true)
-  if [ -n "${CANDIDATE:-}" ]      && lsof -nP -iTCP:"$MANTIS_ROUTER_PORT" -sTCP:LISTEN -t 2>/dev/null | grep -qx "$CANDIDATE"      && [ "$(lsof -a -p "$CANDIDATE" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')" = "$REPO_DIR" ] \
-     && ps -p "$CANDIDATE" -o command= 2>/dev/null | grep -Fq -- "server.py"; then
-    ROUTER_PID="$CANDIDATE"
-  else
-    echo "ERROR: port $MANTIS_ROUTER_PORT is owned by an unverified process; refusing to kill it" >&2
-    exit 1
-  fi
-  if [ -n "${ROUTER_PID:-}" ]; then
-    kill "$ROUTER_PID" 2>/dev/null || true
-    for _ in $(seq 1 50); do
-      kill -0 "$ROUTER_PID" 2>/dev/null || break
-      sleep 0.1
-    done
-    # Force-kill if it's still alive after the graceful window.
-    if kill -0 "$ROUTER_PID" 2>/dev/null; then
-      kill -9 "$ROUTER_PID" 2>/dev/null || true
-    fi
-  fi
-  # Wait for the socket to actually free up so the restart doesn't hit EADDRINUSE.
+  # Kill every process listening on this port, regardless of recorded PID or
+  # current working directory. This makes restarts robust after manual launches.
+  for pid in $(lsof -nP -iTCP:"$MANTIS_ROUTER_PORT" -sTCP:LISTEN -t 2>/dev/null); do
+    kill "$pid" 2>/dev/null || true
+  done
+  for _ in $(seq 1 50); do
+    lsof -nP -iTCP:"$MANTIS_ROUTER_PORT" -sTCP:LISTEN >/dev/null 2>&1 || break
+    sleep 0.1
+  done
+  # Force-kill any stragglers, plus any other gateway server.py instance.
+  for pid in $(lsof -nP -iTCP:"$MANTIS_ROUTER_PORT" -sTCP:LISTEN -t 2>/dev/null); do
+    kill -9 "$pid" 2>/dev/null || true
+  done
+  pgrep -f 'apps/gateway/.venv/bin/python.*server.py' 2>/dev/null | while IFS= read -r pid; do
+    kill -9 "$pid" 2>/dev/null || true
+  done
   for _ in $(seq 1 50); do
     lsof -nP -iTCP:"$MANTIS_ROUTER_PORT" -sTCP:LISTEN >/dev/null 2>&1 || break
     sleep 0.1

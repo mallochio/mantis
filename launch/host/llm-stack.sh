@@ -75,6 +75,29 @@ health_ok()   { curl -fsS --max-time 5 "$1" >/dev/null 2>&1; }
 gateway_ready() { curl -fsS --max-time 5 "$ROUTER_URL" 2>/dev/null | grep -q '"ready":true'; }
 pid_on_port() { lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | head -n1 || true; }
 
+kill_all_listeners() { # port
+  local port="$1" pid
+  [ -n "$port" ] || return 0
+  for pid in $(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null); do
+    kill "$pid" 2>/dev/null || true
+  done
+  for _ in $(seq 1 50); do
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 || break
+    sleep 0.1
+  done
+  for pid in $(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null); do
+    kill -9 "$pid" 2>/dev/null || true
+  done
+  for _ in $(seq 1 50); do
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 || break
+    sleep 0.1
+  done
+}
+
+port_from_url() { # url
+  echo "$1" | awk -F: '{print $3}' | cut -d/ -f1
+}
+
 wait_ready() { # name url timeout_s [grep_pattern]
   local name="$1" url="$2" timeout_s="${3:-90}" pat="${4:-}" i=0
   while [ "$i" -lt "$timeout_s" ]; do
@@ -121,32 +144,26 @@ cmd_stop() {
   acquire_lock
   printf '\n\033[1mStopping the stack (Mantis API -> direct gateway -> Bifrost)\033[0m\n'
   step "1/3 stopping Mantis API (:8088)"
+  kill_all_listeners "$(port_from_url "$MANTIS_URL")"
   local mp="$HOME/.local/share/mantis/server.pid"
-  if [ -f "$mp" ] && kill -0 "$(cat "$mp")" 2>/dev/null; then
-    kill "$(cat "$mp")" 2>/dev/null || true
+  if [ -f "$mp" ]; then
+    local pid; pid=$(cat "$mp" 2>/dev/null || true)
+    if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      for _ in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
     rm -f "$mp"
-    ok "Mantis API process stopped"
-  else
-    ok "Mantis API process not running"
   fi
+  ok "Mantis API stopped"
   step "2/3 stopping direct gateway (:5500)"
-  if health_ok "$ROUTER_URL"; then
-    local rp; rp=$(cat "$GATEWAY_PIDFILE" 2>/dev/null || true)
-    if [ -n "${rp:-}" ] && kill -0 "$rp" 2>/dev/null; then kill "$rp" 2>/dev/null || true; fi
-    for _ in $(seq 1 50); do health_ok "$ROUTER_URL" || break; sleep 0.1; done
-    ok "direct gateway stopped"
-  else
-    ok "direct gateway not running"
-  fi
+  kill_all_listeners "$(port_from_url "$ROUTER_URL")"
+  rm -f "$GATEWAY_PIDFILE"
+  ok "direct gateway stopped"
   step "3/3 stopping bifrost (:8080)"
-  if health_ok "$BIFROST_URL"; then
-    local bp; bp=$(cat "$BIFROST_PIDFILE" 2>/dev/null || true)
-    if [ -n "${bp:-}" ] && kill -0 "$bp" 2>/dev/null; then kill "$bp" 2>/dev/null || true; fi
-    for _ in $(seq 1 50); do health_ok "$BIFROST_URL" || break; sleep 0.1; done
-    ok "bifrost stopped"
-  else
-    ok "bifrost not running"
-  fi
+  kill_all_listeners "$(port_from_url "$BIFROST_URL")"
+  rm -f "$BIFROST_PIDFILE"
+  ok "bifrost stopped"
 }
 
 cmd_status() {

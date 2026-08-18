@@ -49,28 +49,23 @@ HOST="${BIFROST_HOST:-127.0.0.1}"
 PORT="${BIFROST_PORT:-8080}"
 
 # If the gateway is already listening, stop it so we start a clean instance.
-# Refuse to kill a listener unless the recorded PID owns this port and its
-# command is a bifrost-http binary or the npx wrapper.
+# Kill every listener on this port and any other obvious bifrost process,
+# regardless of recorded PID. This makes restarts robust after manual launches.
 if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   echo "bifrost already running on :$PORT — stopping for restart"
-  BIFROST_PID=""
-  CANDIDATE=$(cat "$DATA_DIR/server.pid" 2>/dev/null || true)
-  if [ -n "${CANDIDATE:-}" ] \
-     && lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | grep -qx "$CANDIDATE" \
-     && ps -p "$CANDIDATE" -o command= 2>/dev/null | grep -Eq -- "bifrost-http|@maximhq/bifrost"; then
-    BIFROST_PID="$CANDIDATE"
-  else
-    echo "ERROR: port $PORT is owned by an unverified process; refusing to kill it" >&2
-    exit 1
-  fi
-  kill "$BIFROST_PID" 2>/dev/null || true
+  for pid in $(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null); do
+    kill "$pid" 2>/dev/null || true
+  done
   for _ in $(seq 1 50); do
-    kill -0 "$BIFROST_PID" 2>/dev/null || break
+    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || break
     sleep 0.1
   done
-  if kill -0 "$BIFROST_PID" 2>/dev/null; then
-    kill -9 "$BIFROST_PID" 2>/dev/null || true
-  fi
+  for pid in $(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null); do
+    kill -9 "$pid" 2>/dev/null || true
+  done
+  pgrep -f 'bifrost-http|@maximhq/bifrost' 2>/dev/null | while IFS= read -r pid; do
+    kill -9 "$pid" 2>/dev/null || true
+  done
   for _ in $(seq 1 50); do
     lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || break
     sleep 0.1
