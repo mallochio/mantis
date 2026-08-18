@@ -1136,11 +1136,13 @@ def _build_outgoing_body(body: dict, backend: dict) -> dict:
         out_body["messages"] = _normalize_messages_for_backend(
             out_body["messages"], developer_role=backend.get("developer_role", "system"))
     out_body["model"] = backend["model"]
+    cap = _completion_token_cap(backend)
     if isinstance(out_body.get("max_tokens"), int):
-        out_body["max_completion_tokens"] = out_body.pop("max_tokens")
-    if isinstance(out_body.get("max_completion_tokens"), int):
-        out_body["max_completion_tokens"] = min(out_body["max_completion_tokens"],
-                                                _completion_token_cap(backend))
+        out_body["max_tokens"] = min(out_body["max_tokens"], cap)
+        out_body["max_completion_tokens"] = out_body["max_tokens"]
+    elif isinstance(out_body.get("max_completion_tokens"), int):
+        out_body["max_completion_tokens"] = min(out_body["max_completion_tokens"], cap)
+        out_body["max_tokens"] = out_body["max_completion_tokens"]
     out_body.pop("stop", None)
     if (backend["effort"] or backend["model"].rsplit("/", 1)[-1].startswith(("gpt-5.6-", "glm-", "claude-"))) and out_body.get("temperature") not in (None, 1):
         out_body.pop("temperature")
@@ -2290,10 +2292,24 @@ async def healthz():
 
 @app.get("/v1/models")
 async def list_models():
-    return {"object": "list", "data": [{
-        "id": MODEL_ID, "object": "model", "owned_by": "mantis",
-        "context_window": await _get_context_window(), "max_tokens": MANTIS_ROUTER_MAX_TOKENS,
-    }]}
+    ctx = await _get_context_window()
+    model_ids = [MODEL_ID, "mantis/base", "base", "mantis/trinity", "trinity", "mantis/ultra", "ultra", "mantis/fusion", "fusion"]
+    for target in BACKENDS:
+        if target not in model_ids:
+            model_ids.append(target)
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": mid,
+                "object": "model",
+                "owned_by": "mantis",
+                "context_window": ctx,
+                "max_tokens": MANTIS_ROUTER_MAX_TOKENS,
+            }
+            for mid in model_ids
+        ],
+    }
 
 
 MAX_SSE_EVENT_BYTES = _env_int("MANTIS_ROUTER_MAX_SSE_EVENT_BYTES", 1024 * 1024)
@@ -2373,9 +2389,8 @@ def _sse_contains_refusal(content: bytes) -> bool:
 
 def _possible_refusal_prefix(text: str) -> bool:
     value = text.strip().lower()
-    leads = ("i", "i'", "i’m", "i am", "i cannot", "i can't", "i’m sorry",
-             "i'm sorry", "sorry", "unfortunately", "as an ai", "cannot")
-    return any(lead.startswith(value) or value.startswith(lead) for lead in leads)
+    leads = ("i cannot", "i can't", "i’m sorry", "i'm sorry", "sorry", "unfortunately", "as an ai", "cannot")
+    return any((lead.startswith(value) or value.startswith(lead)) for lead in leads if len(value) >= 3)
 
 
 async def _prefetch_sse(events, deadline: float):
@@ -3161,10 +3176,7 @@ async def chat_completions(
                         raise asyncio.CancelledError
                     done = track(event)
                     if done and not saw_finish:
-                        saw_done = False
-                        emitted_error = True
-                        yield _stream_error("Upstream stream ended without a finish reason", "upstream_truncated", request_id)
-                        break
+                        saw_finish = True
                     remember(event)
                     yield event
                     if done:
@@ -3172,10 +3184,10 @@ async def chat_completions(
             if saw_refusal:
                 _log_outcome(_prompt_hash(prompt), "refusal", request_id=request_id,
                              decision_occurrence_id=occurrence_id, model=backend["model"])
-            elif not saw_done or not saw_finish:
+            elif not saw_done:
                 _log_outcome(_prompt_hash(prompt), "truncated", request_id=request_id,
                              decision_occurrence_id=occurrence_id, model=backend["model"], abrupt_eof=True)
-                if not saw_done and not emitted_error:
+                if not emitted_error:
                     yield _stream_error("Upstream stream ended before completion", "upstream_truncated", request_id)
             elif saw_length:
                 _log_outcome(_prompt_hash(prompt), "truncated", request_id=request_id,

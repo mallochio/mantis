@@ -149,3 +149,32 @@ async def test_middle_failover_uses_middle_model(client, monkeypatch):
     assert calls[0][1] == server.BACKENDS["cheap"]["model"] and calls[1][1] == server.BACKENDS["middle"]["model"]
     assert response.headers["x-route-decision"] == "middle"
     await mock.aclose()
+
+
+@pytest.mark.anyio
+async def test_list_models_returns_aliases_and_backends(client):
+    response = await client.get("/v1/models")
+    assert response.status_code == 200
+    data = response.json().get("data", [])
+    model_ids = {item["id"] for item in data}
+    assert "base" in model_ids
+    assert "mantis/base" in model_ids
+    assert "mantis/fusion" in model_ids
+    for target in server.BACKENDS:
+        assert target in model_ids
+
+
+@pytest.mark.anyio
+async def test_stream_done_without_explicit_finish_reason_completes_cleanly(client, monkeypatch):
+    payload = (b'data: {"choices":[{"delta":{"content":"completed"}}]}\n\n'
+               b'data: [DONE]\n\n')
+    mock = upstream(lambda request: httpx.Response(200, content=payload, headers={"content-type": "text/event-stream"}))
+    monkeypatch.setattr(server, "_client", mock)
+    response = await client.post("/v1/chat/completions", headers=AUTH,
+                                 json={"model": "auto", "stream": True, "messages": [{"role": "user", "content": "hello"}]})
+    assert response.status_code == 200
+    assert "completed" in response.text
+    assert "upstream_truncated" not in response.text
+    assert "data: [DONE]" in response.text
+    await mock.aclose()
+
