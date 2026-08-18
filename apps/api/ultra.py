@@ -32,6 +32,7 @@ from typing import Any
 
 N_AGENTS = 7
 MAX_STEPS = 5  # [DOC] Conductor workflows up to 5 steps
+PLANNER_PREFILL = "Plan:\n"
 _SMART = str.maketrans("“”‘’", "\"\"''")
 
 DEFAULT_SLOT_LABELS = [  # [DATA] training metadata; remappable to any provider
@@ -99,11 +100,81 @@ def extract_list(text: str, labels: list[str]) -> list[Any]:
     return [int(x) if x.isdigit() else x for x in items]
 
 
+def _parse_json_workflow(text: str) -> tuple[list, list, list] | None:
+    stripped = text.strip()
+    fenced = re.match(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", stripped, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        stripped = fenced.group(1).strip()
+    if not stripped.startswith("{"):
+        return None
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    model_ids = data.get("model_id", data.get("model_ids"))
+    subtasks = data.get("subtasks", data.get("subtask"))
+    access = data.get("access_list", data.get("access"))
+    if not (isinstance(model_ids, list) and isinstance(subtasks, list) and isinstance(access, list)):
+        return None
+    if not (model_ids and subtasks and access):
+        return None
+    return [int(x) for x in model_ids], list(subtasks), list(access)
+
+
 def parse_workflow(text: str) -> tuple[list, list, list]:
+    parsed = _parse_json_workflow(text)
+    if parsed is not None:
+        return parsed
     model_ids = extract_list(text, ["model_id", "model id", "model_ids", "model ids"])
     subtasks = extract_list(text, ["subtasks", "subtask"])
     access = extract_list(text, ["access_list", "access list", "access"])
     return model_ids, subtasks, access
+
+
+def planner_response_format() -> dict[str, Any]:
+    """Structured planner output: three equal-length workflow lists."""
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "conductor_workflow",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "model_id": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "minItems": 1,
+                        "maxItems": MAX_STEPS,
+                    },
+                    "subtasks": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": MAX_STEPS,
+                    },
+                    "access_list": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MAX_STEPS,
+                        "items": {
+                            "anyOf": [
+                                {
+                                    "type": "array",
+                                    "items": {"type": "integer"},
+                                },
+                                {"type": "string", "enum": ["all"]},
+                            ],
+                        },
+                    },
+                },
+                "required": ["model_id", "subtasks", "access_list"],
+                "additionalProperties": False,
+            },
+        },
+    }
 
 
 def _is_all(x) -> bool:
@@ -152,12 +223,43 @@ def conductor_prompt(query: str, slot_labels: list[str]) -> list[dict]:
         "workers for search, inspection, or reading; reserve frontier reasoning models for "
         "synthesis, complex debugging, and final code generation.\n\n"
         f"AVAILABLE LANGUAGE MODELS:\n{pool}\n\n"
-        "Output the three lists explicitly as 'model_id: [...]', 'subtasks: [...]', "
+        "Return a JSON object with keys model_id, subtasks, and access_list, or output "
+        "the three lists explicitly as 'model_id: [...]', 'subtasks: [...]', "
         "'access_list: [...]'. You may reason first, but the three lists must appear."
     )
     return [
         {"role": "system", "content": sys},
         {"role": "user", "content": f"USER QUESTION: {query}"},
+    ]
+
+
+def planner_repair_messages(
+    query: str,
+    slot_labels: list[str],
+    bad_text: str,
+    error: str,
+) -> list[dict]:
+    """One-shot repair turn after a planner parse/validation failure."""
+    pool = "\n".join(f"  {i}: {name}" for i, name in enumerate(slot_labels))
+    sys = (
+        "You are a Conductor repairing an invalid workflow plan. "
+        "Return a JSON object with exactly three keys: model_id (array of ints), "
+        "subtasks (array of strings), and access_list (array of int arrays or \"all\"). "
+        "Lists must be equal length (1-5 steps); access_list may only reference earlier steps.\n\n"
+        f"AVAILABLE LANGUAGE MODELS:\n{pool}"
+    )
+    clipped = bad_text.strip()[:8000] or "(empty)"
+    return [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": f"USER QUESTION: {query}"},
+        {"role": "assistant", "content": clipped},
+        {
+            "role": "user",
+            "content": (
+                f"The previous workflow was invalid: {error}. "
+                "Emit a corrected workflow as JSON with model_id, subtasks, and access_list."
+            ),
+        },
     ]
 
 

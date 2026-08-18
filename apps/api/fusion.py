@@ -314,34 +314,54 @@ class FusionCoordinator:
                 i += 1
         return groups
 
+    def _prune_tool_messages(
+        self, messages: list[dict[str, Any]], *, max_chars: int, head_chars: int, tail_chars: int
+    ) -> list[dict[str, Any]]:
+        pruned: list[dict[str, Any]] = []
+        for msg in messages:
+            if msg.get("role") == "tool" and isinstance(msg.get("content"), str):
+                pruned.append(
+                    {
+                        **msg,
+                        "content": utils.prune_tool_result(
+                            msg["content"],
+                            max_chars=max_chars,
+                            head_chars=head_chars,
+                            tail_chars=tail_chars,
+                        ),
+                    }
+                )
+            else:
+                pruned.append(msg)
+        return pruned
+
     def _trim_messages(
         self,
         messages: list[dict[str, Any]],
         max_input_tokens: int,
     ) -> list[dict[str, Any]]:
-        """Prune large tool results and drop oldest non-system groups until fitting budget."""
+        """Fit history to the window without rewriting the cacheable prefix first.
+
+        Oversized tool bodies are compacted (twice, more aggressively if needed)
+        before any message is dropped. Only then are oldest non-system groups
+        removed from the front, which is a cache miss and is the last resort.
+        """
         if not messages:
             return messages
-        # Step 1: Replay-safe pruning on oversized tool outputs
-        pruned_messages: list[dict[str, Any]] = []
-        for msg in messages:
-            if msg.get("role") == "tool" and isinstance(msg.get("content"), str):
-                pruned_messages.append(
-                    {
-                        **msg,
-                        "content": utils.prune_tool_result(
-                            msg["content"], max_chars=8192, head_chars=4096, tail_chars=1024
-                        ),
-                    }
-                )
-            else:
-                pruned_messages.append(msg)
-
+        pruned_messages = self._prune_tool_messages(
+            messages, max_chars=8192, head_chars=4096, tail_chars=1024
+        )
         estimates = [self._estimate_message_tokens(m) for m in pruned_messages]
         if sum(estimates) <= max_input_tokens:
             return pruned_messages
 
-        # Step 2: Preserve system message and keep newest whole conversational groups
+        pruned_messages = self._prune_tool_messages(
+            pruned_messages, max_chars=2048, head_chars=1024, tail_chars=256
+        )
+        estimates = [self._estimate_message_tokens(m) for m in pruned_messages]
+        if sum(estimates) <= max_input_tokens:
+            return pruned_messages
+
         trimmed = [pruned_messages[0]]
         budget = max_input_tokens - estimates[0]
         tail: list[dict[str, Any]] = []

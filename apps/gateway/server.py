@@ -1123,6 +1123,41 @@ def _is_refusal(status: int, data: dict) -> bool:
     return bool(_REFUSAL_RE.search(text))
 
 
+def _choice_has_payload(choice: dict) -> bool:
+    """True when a Chat choice carries visible text or a tool/function call.
+
+    Reasoning-only deltas are not a payload: coding clients treat a stop with
+    no content and no tool_calls as the assistant giving up mid-turn.
+    """
+    if not isinstance(choice, dict):
+        return False
+    for obj in (choice.get("delta"), choice.get("message")):
+        if not isinstance(obj, dict):
+            continue
+        content = obj.get("content")
+        if isinstance(content, str) and content.strip():
+            return True
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, str) and part.strip():
+                    return True
+                if isinstance(part, dict) and str(part.get("text") or "").strip():
+                    return True
+        if obj.get("tool_calls") or obj.get("function_call"):
+            return True
+    return False
+
+
+def _is_empty_completion(data: dict | None) -> bool:
+    """True for a Chat Completions body with no visible text or tool calls."""
+    if not isinstance(data, dict):
+        return False
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return True
+    return not any(_choice_has_payload(choice) for choice in choices)
+
+
 def _completion_token_cap(backend: dict) -> int:
     # Catalog targets omit max_tokens entirely (None = uncapped), so the
     # router-wide default is the only clamp that protects them.
@@ -2158,8 +2193,14 @@ async def _open_with_failover(body: dict, decision: str, deadline: float, *, str
                 if not stream or response.status_code != 200:
                     data = _safe_json(await response.aread())
             refusal = data is not None and _is_refusal(response.status_code, data)
-            attempts.append((current, backend, response.status_code, "refusal" if refusal else None))
-            retry = refusal or _retryable(response.status_code)
+            empty = (
+                api_format == "chat"
+                and data is not None and response.status_code == 200 and not refusal
+                and _is_empty_completion(data)
+            )
+            failure = "refusal" if refusal else ("empty_completion" if empty else None)
+            attempts.append((current, backend, response.status_code, failure))
+            retry = failure is not None or _retryable(response.status_code)
             if not retry or index == len(routes) - 1:
                 return current, backend, response, attempts
             await response.aclose()
@@ -2394,9 +2435,15 @@ def _possible_refusal_prefix(text: str) -> bool:
 
 
 async def _prefetch_sse(events, deadline: float):
-    """Inspect a small prefix for standard delta-based refusals before release."""
+    """Inspect a prefix for refusals or empty completions before release.
+
+    Role, reasoning, and keepalive frames are held so a thinking-only stop can
+    still fail over. The first visible text, tool call, or non-empty finish
+    commits the stream.
+    """
     prefix, text_parts = [], []
-    prefix_bytes = data_events = 0
+    prefix_bytes = 0
+    saw_payload = False
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -2405,25 +2452,22 @@ async def _prefetch_sse(events, deadline: float):
             async with asyncio.timeout(remaining):
                 event = await anext(events)
         except StopAsyncIteration:
-            return prefix, False
+            return prefix, ("empty_completion" if prefix and not saw_payload else None)
         prefix.append(event)
         prefix_bytes += len(event)
-        if prefix_bytes >= MAX_SSE_EVENT_BYTES or data_events >= 8:
-            return prefix, False
+        if prefix_bytes >= MAX_SSE_EVENT_BYTES:
+            return prefix, None
         data = _sse_data(event)
         if data is None:
-            # Comment/keepalive frames carry no decision signal. Commit so a
-            # ping-only stream is forwarded instead of being held for prose.
-            return prefix, False
-        data_events += 1
+            continue
         if data.strip() == "[DONE]":
-            return prefix, False
+            return prefix, (None if saw_payload else "empty_completion")
         try:
             payload = json.loads(data)
         except json.JSONDecodeError:
-            return prefix, False
+            return prefix, None
         if _is_refusal(200, payload):
-            return prefix, True
+            return prefix, "refusal"
         choices = payload.get("choices") or []
         finish = None
         event_content = []
@@ -2431,33 +2475,29 @@ async def _prefetch_sse(events, deadline: float):
             if not isinstance(choice, dict):
                 continue
             if choice.get("finish_reason") == "content_filter":
-                return prefix, True
+                return prefix, "refusal"
+            if _choice_has_payload(choice):
+                saw_payload = True
             delta = choice.get("delta") or {}
             message = choice.get("message") or {}
             for obj in (delta, message):
                 if not isinstance(obj, dict):
                     continue
                 if isinstance(obj.get("refusal"), str):
-                    return prefix, True
-                for field in ("content", "reasoning_content"):
-                    value = obj.get(field)
-                    if isinstance(value, str):
-                        text_parts.append(value)
-                        event_content.append(value)
+                    return prefix, "refusal"
+                value = obj.get("content")
+                if isinstance(value, str) and value:
+                    text_parts.append(value)
+                    event_content.append(value)
             if finish is None and choice.get("finish_reason") is not None:
                 finish = choice.get("finish_reason")
         combined = "".join(text_parts)
         if _REFUSAL_RE.search(combined):
-            return prefix, True
+            return prefix, "refusal"
         if finish is not None:
-            return prefix, False
+            return prefix, (None if saw_payload else "empty_completion")
         if event_content and not _possible_refusal_prefix(combined):
-            return prefix, False
-        if not event_content:
-            # Metadata-only chunk (for example the common role delta). Holding
-            # the live stream here for prose would starve normal/sparse streams
-            # until the request deadline.
-            return prefix, False
+            return prefix, None
 
 
 async def _responses_prefetch_sse(events, deadline: float):
@@ -2838,11 +2878,13 @@ async def _chat_prefetch_with_failover(body: dict, decision: str, deadline: floa
                                         upstream, backend, selected, attempts):
     """Bounded Chat SSE preflight with one compatible fallback.
 
-    Both a structured/prose refusal and a transport failure before any frame
-    escapes are failover signals. The fallback is always prefetched before its
-    bytes are exposed, and the final attempt's frames are what reach the client.
+    Structured/prose refusals, empty completions, and transport failures
+    before any frame escapes are failover signals. The fallback is always
+    prefetched before its bytes are exposed, and the final attempt's frames
+    are what reach the client.
     """
     prefix, events = [], None
+    failure = None
     tried = [item[0] for item in attempts]
     while True:
         try:
@@ -2850,22 +2892,19 @@ async def _chat_prefetch_with_failover(body: dict, decision: str, deadline: floa
                 break
             try:
                 events = _iter_sse_events(upstream)
-                prefix, refusal = await _prefetch_sse(events, deadline)
+                prefix, failure = await _prefetch_sse(events, deadline)
             except (httpx.TransportError, TimeoutError, asyncio.TimeoutError, ValueError) as exc:
                 if upstream is not None:
                     await upstream.aclose()
                     upstream = None
                 attempts.append((selected, backend, None, type(exc).__name__))
                 events = None
-                refusal = False
+                prefix = []
+                failure = None
             else:
-                if refusal:
-                    # The buffered prefix belongs to the current target. Mark it
-                    # explicitly so API-scoped refusal learning is attributed to
-                    # the refusal rather than its retry route.
-                    refused, refused_backend, refused_status, _ = attempts[-1]
-                    attempts[-1] = (refused, refused_backend, refused_status, "refusal")
-            failure = "refusal" if refusal else None
+                if failure:
+                    failed, failed_backend, failed_status, _ = attempts[-1]
+                    attempts[-1] = (failed, failed_backend, failed_status, failure)
         except asyncio.CancelledError:
             # Cancellation can arrive while the fallback prefetch is blocked
             # before the helper returns it to the caller. Close the current
@@ -2874,10 +2913,10 @@ async def _chat_prefetch_with_failover(body: dict, decision: str, deadline: floa
                 await asyncio.shield(upstream.aclose())
             raise
         if failure is None:
-            # Transport failure is visible through a non-refusal attempt error
+            # Transport failure is visible through a non-success attempt error
             # while upstream was closed by the handler above.
             last = attempts[-1][3] if attempts else None
-            if last not in (None, "refusal"):
+            if last not in (None, "refusal", "empty_completion"):
                 failure = "transport"
             else:
                 return selected, backend, upstream, prefix, events
@@ -3069,12 +3108,16 @@ async def chat_completions(
                     and set(choice_indexes) == set(range(n_expected))
                     and all(isinstance(choice, dict) and choice.get("finish_reason")
                             for choice in choices_data if isinstance(choice, dict)))
+        empty = _is_empty_completion(data)
         if upstream.status_code == 200 and not refused and not complete and not truncated:
             _log_outcome(_prompt_hash(prompt), "truncated", request_id=request_id,
                          decision_occurrence_id=occurrence_id, model=backend["model"])
+        if upstream.status_code == 200 and not refused and empty:
+            _log_outcome(_prompt_hash(prompt), "empty_completion", request_id=request_id,
+                         decision_occurrence_id=occurrence_id, model=backend["model"])
         if upstream.status_code == 200 and not refused:
             _cache_put(cache_key, body, content)
-            if not truncated and complete:
+            if not truncated and complete and not empty:
                 if session_id is None:
                     _store_note(prompt_hash, selected, ok=True, score=score, api_format="chat")
                 else:
@@ -3105,7 +3148,7 @@ async def chat_completions(
     async def event_stream():
         cache_parts: list[bytes] | None = [] if cache_key is not None else None
         cache_size = 0
-        saw_done = saw_finish = saw_length = saw_refusal = False
+        saw_done = saw_finish = saw_length = saw_refusal = saw_payload = False
         emitted_error = False
         usage: dict = {}
         started = time.monotonic()
@@ -3125,7 +3168,7 @@ async def chat_completions(
         n_expected = int(body.get("n", 1) or 1)
 
         def track(event: bytes) -> bool:
-            nonlocal saw_done, saw_finish, saw_length, saw_refusal, saw_explicit_index
+            nonlocal saw_done, saw_finish, saw_length, saw_refusal, saw_explicit_index, saw_payload
             data_text = _sse_data(event)
             if data_text is None:
                 return False
@@ -3144,6 +3187,8 @@ async def chat_completions(
             for choice in choices:
                 if not isinstance(choice, dict):
                     continue
+                if _choice_has_payload(choice):
+                    saw_payload = True
                 if choice.get("finish_reason") is not None:
                     index = choice.get("index")
                     if isinstance(index, int):
@@ -3177,6 +3222,12 @@ async def chat_completions(
                     done = track(event)
                     if done and not saw_finish:
                         saw_finish = True
+                    if (saw_finish or saw_done) and not saw_payload and not saw_refusal:
+                        emitted_error = True
+                        yield _stream_error(
+                            "Upstream completed without assistant content or tool calls",
+                            "empty_completion", request_id)
+                        break
                     remember(event)
                     yield event
                     if done:
@@ -3189,6 +3240,13 @@ async def chat_completions(
                              decision_occurrence_id=occurrence_id, model=backend["model"], abrupt_eof=True)
                 if not emitted_error:
                     yield _stream_error("Upstream stream ended before completion", "upstream_truncated", request_id)
+            elif not saw_payload:
+                _log_outcome(_prompt_hash(prompt), "empty_completion", request_id=request_id,
+                             decision_occurrence_id=occurrence_id, model=backend["model"])
+                if not emitted_error:
+                    yield _stream_error(
+                        "Upstream completed without assistant content or tool calls",
+                        "empty_completion", request_id)
             else:
                 # A finish_reason (or a bare [DONE]) is a valid terminal signal.
                 # Some providers omit the terminal [DONE] frame, so synthesize it
@@ -3217,7 +3275,7 @@ async def chat_completions(
             _log(selected, score, backend["model"], prompt, int((time.monotonic() - started) * 1000),
                  supra_complexity, supra_ms, usage=usage or None, request_id=request_id,
                  occurrence_id=occurrence_id, record_type="decision",
-                 attempts=len(attempts), completed=saw_done and saw_finish and not saw_refusal, pinned=pinned,
+                 attempts=len(attempts), completed=saw_done and saw_finish and saw_payload and not saw_refusal, pinned=pinned,
                  tier=backend.get("tier"), route_reason=route_reason,
                  session_id=session_id, session_source=session_source)
             if saw_refusal:
@@ -3228,13 +3286,13 @@ async def chat_completions(
                     _record_refusal_learning(
                         prompt_hash, [(selected, backend, upstream.status_code, "refusal")],
                         session_id, supra_complexity, api_format="chat")
-            elif saw_done and saw_finish and not saw_length:
+            elif saw_done and saw_finish and saw_payload and not saw_length:
                 if session_id is None:
                     _store_note(prompt_hash, selected, ok=True, score=score, api_format="chat")
                 else:
                     _session_note(session_id, selected, supra_complexity, usage or None, api_format="chat")
             result = None
-            if cache_parts is not None and saw_done and saw_finish and not saw_refusal and not saw_length:
+            if cache_parts is not None and saw_done and saw_finish and saw_payload and not saw_refusal and not saw_length:
                 content = b"".join(cache_parts)
                 if _response_replay_safe(body, content):
                     result = (content, 200, "text/event-stream", headers)

@@ -204,8 +204,8 @@ reasoning engine or search crawler.
 | `MANTIS_FINAL_CHUNK_DELAY_MS` | Delay between verified final-answer chunks | `5` |
 | `MANTIS_MAX_BODY_BYTES` | Maximum request body size | `52428800` |
 | `MANTIS_UPSTREAM_STREAM` | Stream provider responses upstream (SSE) instead of buffering | `1` |
-| `MANTIS_CACHE_BREAKPOINTS` | Add prompt-cache breakpoints to Claude-family requests | `1` |
-| `MANTIS_OPENAI_CACHE_BREAKPOINTS` | Add explicit `prompt_cache_options` breakpoints for `gpt-5.6-*` / `o3*` / `o4*` chat | `0` |
+| `MANTIS_CACHE_BREAKPOINTS` | Master switch for provider prompt-cache markup. Claude-family ids (including Bifrost `bedrock/anthropic/claude-*`) get `cache_control`; `gpt-5.6-*` / `o3*` / `o4*` chat get explicit breakpoints. Gemini is left unmarked (implicit prefix cache). | `1` |
+| `MANTIS_OPENAI_CACHE_BREAKPOINTS` | Override OpenAI explicit `prompt_cache_options` for `gpt-5.6-*` / `o3*` / `o4*` chat. Unset follows `MANTIS_CACHE_BREAKPOINTS`; `0` disables OpenAI markup only | unset |
 | `MANTIS_CACHE_RETENTION` | OpenRouter cache stickiness: `short`, `long`, or `none` | `short` |
 | `MANTIS_ROUTER_URL` | Base URL of the in-repo Mantis router for `mantis/base` | `http://127.0.0.1:5500/v1` |
 | `MANTIS_ROUTER_DOWNGRADE_IDLE_S` | Allow a routed session to downgrade after N seconds idle (cache ratchet) | `0` |

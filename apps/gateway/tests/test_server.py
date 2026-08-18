@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import pytest
 
@@ -52,7 +54,7 @@ async def test_stream_abrupt_eof_is_error_without_done(client, monkeypatch):
 
 @pytest.mark.anyio
 async def test_stream_stops_at_done(client, monkeypatch):
-    payload = (b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+    payload = (b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n'
                b'data: [DONE]\n\n'
                b'data: {"should":"not appear"}\n\n')
     mock = upstream(lambda request: httpx.Response(200, content=payload))
@@ -60,6 +62,108 @@ async def test_stream_stops_at_done(client, monkeypatch):
     response = await client.post("/v1/chat/completions", headers=AUTH, json={"model": "auto", "stream": True, "messages": [{"role": "user", "content": "hello"}]})
     assert response.text.count("[DONE]") == 1
     assert "should" not in response.text
+    await mock.aclose()
+
+
+@pytest.mark.anyio
+async def test_stream_empty_stop_failsover_to_next_tier(client, monkeypatch):
+    calls = []
+    empty = (b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+             b'data: [DONE]\n\n')
+    success = (b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n'
+               b'data: [DONE]\n\n')
+
+    def handler(request):
+        calls.append(json.loads(request.content)["model"])
+        return httpx.Response(
+            200, content=empty if len(calls) == 1 else success,
+            headers={"content-type": "text/event-stream"},
+        )
+
+    mock = upstream(handler)
+    monkeypatch.setattr(server, "_client", mock)
+    response = await client.post("/v1/chat/completions", headers=AUTH, json={
+        "model": "auto", "stream": True, "messages": [{"role": "user", "content": "hello"}],
+    })
+    assert response.status_code == 200
+    assert "ok" in response.text
+    assert "empty_completion" not in response.text
+    assert response.headers["x-route-fallback"] == "true"
+    assert len(calls) == 2
+    await mock.aclose()
+
+
+@pytest.mark.anyio
+async def test_stream_reasoning_only_stop_failsover(client, monkeypatch):
+    calls = []
+    thinking = (
+        b'data: {"choices":[{"delta":{"reasoning_content":"plan the edit"},"finish_reason":null}]}\n\n'
+        b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        b'data: [DONE]\n\n'
+    )
+    success = (b'data: {"choices":[{"delta":{"content":"patched"},"finish_reason":"stop"}]}\n\n'
+               b'data: [DONE]\n\n')
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(
+            200, content=thinking if len(calls) == 1 else success,
+            headers={"content-type": "text/event-stream"},
+        )
+
+    mock = upstream(handler)
+    monkeypatch.setattr(server, "_client", mock)
+    response = await client.post("/v1/chat/completions", headers=AUTH, json={
+        "model": "auto", "stream": True, "messages": [{"role": "user", "content": "continue"}],
+    })
+    assert "patched" in response.text
+    assert "empty_completion" not in response.text
+    assert len(calls) == 2
+    await mock.aclose()
+
+
+@pytest.mark.anyio
+async def test_nonstream_empty_message_failsover(client, monkeypatch):
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        if len(calls) == 1:
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content": ""}, "finish_reason": "stop"}],
+            })
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+        })
+
+    mock = upstream(handler)
+    monkeypatch.setattr(server, "_client", mock)
+    response = await client.post("/v1/chat/completions", headers=AUTH, json={
+        "model": "auto", "messages": [{"role": "user", "content": "hello"}],
+    })
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "ok"
+    assert response.headers["x-route-fallback"] == "true"
+    assert len(calls) == 2
+    await mock.aclose()
+
+
+@pytest.mark.anyio
+async def test_stream_last_empty_emits_empty_completion(client, monkeypatch):
+    empty = (b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+             b'data: [DONE]\n\n')
+
+    def handler(request):
+        return httpx.Response(200, content=empty, headers={"content-type": "text/event-stream"})
+
+    mock = upstream(handler)
+    monkeypatch.setattr(server, "_client", mock)
+    response = await client.post("/v1/chat/completions", headers=AUTH, json={
+        "model": "auto", "stream": True, "messages": [{"role": "user", "content": "hello"}],
+    })
+    assert response.status_code == 200
+    assert "empty_completion" in response.text
+    assert response.headers["x-route-fallback"] == "true"
     await mock.aclose()
 
 

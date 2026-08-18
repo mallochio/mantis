@@ -64,7 +64,15 @@ from serve_config import (
     RUN_MAX_MSG_BYTES,
     RUN_STORE,
 )
-from ultra import ConductorExecutor, conductor_prompt, parse_workflow, visible_indices
+from ultra import (
+    ConductorExecutor,
+    PLANNER_PREFILL,
+    conductor_prompt,
+    parse_workflow,
+    planner_repair_messages,
+    planner_response_format,
+    visible_indices,
+)
 
 
 def _learning_enabled() -> bool:
@@ -974,12 +982,37 @@ class ConductorRun(NativeRun):
         self._expected_ids: set[str] = set()
         self._tool_rounds = 0
         self.repeat_guard = utils.RepeatToolGuard()
+        self._planner_repair_attempted = False
+        self._planner_last_error = ""
+        self._last_planner_text = ""
 
-    def _planner_messages(self) -> list[dict[str, Any]]:
+    def _planner_messages(self, *, repair: tuple[str, str] | None = None) -> list[dict[str, Any]]:
+        if repair is not None:
+            bad_text, error = repair
+            return cast(
+                list[dict[str, Any]],
+                planner_repair_messages(self.query, self.slot_models, bad_text, error),
+            )
         prior = [m for m in self.history if isinstance(m, dict) and m.get("role") != "system"]
-        return cast(
+        messages = cast(
             list[dict[str, Any]],
             conductor_prompt(self.query, self.slot_models) + prior[-4:],
+        )
+        messages.append({"role": "assistant", "content": PLANNER_PREFILL})
+        return messages
+
+    def _run_planner(self) -> dict[str, Any]:
+        event = self._run_model(
+            "Planner", self.conductor_model, self._planner_messages()
+        )
+        if event.get("type") != "error" or self._planner_repair_attempted:
+            return event
+        self._planner_repair_attempted = True
+        self._planner_last_error = str(event.get("error", "invalid workflow"))
+        return self._run_model(
+            "Planner",
+            self.conductor_model,
+            self._planner_messages(repair=(self._last_planner_text, self._planner_last_error)),
         )
 
     def _node_messages(self, node_index: int, mid: int, sub: str) -> list[dict[str, Any]]:
@@ -1026,7 +1059,13 @@ class ConductorRun(NativeRun):
             and self._workflow is not None
             and self._next_node >= len(self._workflow[1])
         )
-        self.active_response_format = self.response_format if is_final_worker else None
+        self.active_response_format = (
+            planner_response_format()
+            if role == "Planner"
+            else self.response_format
+            if is_final_worker
+            else None
+        )
         self.active_tool_choice = (
             self.tool_choice if role == "Worker" and self._tool_rounds == 0 else None
         )
@@ -1042,6 +1081,8 @@ class ConductorRun(NativeRun):
         )
         try:
             text, calls = utils._model_completion(model, messages, self.tools)
+            if role == "Planner":
+                self._last_planner_text = text
             calls = self.own_tool_calls(calls)
             duration_ms = (time.monotonic() - started) * 1000.0
         except Exception as error:
@@ -1226,9 +1267,7 @@ class ConductorRun(NativeRun):
                     )
 
                 if self._workflow is None:
-                    return self._run_model(
-                        "Planner", self.conductor_model, self._planner_messages()
-                    )
+                    return self._run_planner()
                 mids, subs, access = self._workflow
                 if self._next_node >= len(subs):
                     self.finished = True

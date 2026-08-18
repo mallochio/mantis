@@ -13,7 +13,7 @@ SPEC.loader.exec_module(run_eval)
 def test_catalog_models_drive_eval_costs():
     models, conductor = run_eval.load_catalog_models(ROOT / "config" / "catalog.toml")
     assert models[0] == "google/gemini-3.7-flash"
-    assert conductor == "google/gemini-3.5-flash-lite"
+    assert conductor == "gpt-5.6-luna"
     assert run_eval.model_cost("bifrost/openai/gpt-5.6-sol", {"openai/gpt-5.6-sol": 0.04}) == 0.04
 
 

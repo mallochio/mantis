@@ -84,7 +84,7 @@ async def test_stream_refusal_falls_back_before_output(client, monkeypatch):
 async def test_sse_comments_multiline_data_and_crlf_are_preserved(client, monkeypatch):
     first = (b': provider-comment\r\n'
              b'data: {\r\n'
-             b'data: "choices":[{"delta":{},"finish_reason":"stop"}]}\r\n\r\n')
+             b'data: "choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\r\n\r\n')
     wire = first + b'data: [DONE]\r\n\r\n'
     mock = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=wire)))
     monkeypatch.setattr(server, "_client", mock)
@@ -145,7 +145,7 @@ class BlockingStream(httpx.AsyncByteStream):
         self.blocked = asyncio.Event()
         self.closed = False
     async def __aiter__(self):
-        yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        yield b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}\n\n'
         self.blocked.set()
         await asyncio.Event().wait()
     async def aclose(self):
@@ -253,7 +253,7 @@ async def test_realistic_delta_refusal_falls_back(client, monkeypatch):
 async def test_stream_content_filter_falls_back(client, monkeypatch):
     calls = 0
     filtered = (b'data: {"choices":[{"delta":{},"finish_reason":"content_filter"}]}\n\n')
-    success = (b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+    success = (b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n'
                b'data: [DONE]\n\n')
     def handler(request):
         nonlocal calls
@@ -275,7 +275,7 @@ async def test_stream_content_filter_falls_back(client, monkeypatch):
     (b"\r", b"\r\n"), (b"\n", b"\r"),
 ])
 async def test_sse_line_ending_matrix_preserved(client, monkeypatch, first, second):
-    finish = b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}' + first + second
+    finish = b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}' + first + second
     done = b'data: [DONE]' + first + second
     wire = finish + done
     mock = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=wire)))
@@ -311,7 +311,7 @@ async def test_keyed_cancel_during_prefetch_cleans_owner_and_allows_retry(client
     assert blocked.closed
     assert not server._inflight
     await first_mock.aclose()
-    wire = (b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+    wire = (b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n'
             b'data: [DONE]\n\n')
     retry_mock = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=wire)))
     monkeypatch.setattr(server, "_client", retry_mock)
@@ -339,7 +339,7 @@ async def test_keyed_cancel_before_stream_iteration_cleans_owner_and_retries(cli
     release.set()
     assert not server._inflight
     monkeypatch.setattr(server, "_decide", lambda prompt: ("cheap", 0.1, None, None))
-    wire = (b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+    wire = (b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n'
             b'data: [DONE]\n\n')
     mock = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=wire)))
     monkeypatch.setattr(server, "_client", mock)
@@ -374,13 +374,14 @@ def test_legacy_migration_mismatched_counts_fails_without_changes(tmp_path):
 
 
 @pytest.mark.anyio
-async def test_chat_prefetch_commits_role_only_chunk(client, monkeypatch):
+async def test_chat_prefetch_holds_role_until_payload(client, monkeypatch):
     role = b'data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+    payload = b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n'
 
-    async def role_then_silence():
+    async def role_then_payload():
         yield role
-        await asyncio.Event().wait()
+        yield payload
 
-    prefix, refusal = await asyncio.wait_for(
-        server._prefetch_sse(role_then_silence(), asyncio.get_running_loop().time() + 30), timeout=1)
-    assert refusal is False and role in prefix
+    prefix, failure = await asyncio.wait_for(
+        server._prefetch_sse(role_then_payload(), asyncio.get_running_loop().time() + 30), timeout=1)
+    assert failure is None and role in prefix and payload in prefix

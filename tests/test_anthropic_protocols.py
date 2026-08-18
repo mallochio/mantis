@@ -6,6 +6,7 @@ import json
 
 from anthropic_protocols import (
     anthropic_to_chat,
+    apply_anthropic_prompt_cache,
     assemble_anthropic_stream,
     build_anthropic_body,
     chat_to_anthropic,
@@ -36,6 +37,23 @@ def test_native_body_lifts_system_and_enables_thinking():
         {"name": "read", "description": "Read", "input_schema": {"type": "object"}}
     ]
     assert body["tool_choice"] == {"type": "tool", "name": "read"}
+
+
+def test_apply_anthropic_prompt_cache_marks_system_last_tool_and_penultimate():
+    body = {
+        "system": [{"type": "text", "text": "Be exact."}],
+        "tools": [{"name": "read", "input_schema": {"type": "object"}}],
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "history"}]},
+            {"role": "user", "content": [{"type": "text", "text": "latest"}]},
+        ],
+    }
+    marked = apply_anthropic_prompt_cache(body)
+    assert marked["system"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert marked["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert marked["messages"][-2]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in marked["messages"][-1]["content"][-1]
+    assert "cache_control" not in body["system"][0]
 
 
 def test_native_body_preserves_images_and_scalar_tool_choices():

@@ -281,6 +281,13 @@ def test_build_request_adds_breakpoints_only_for_claude_on_openrouter(monkeypatc
     url, headers, body = serve._build_request("openrouter/openai/gpt-5.6-luna", messages, 100, 0.7)
     assert url.endswith("/responses")
     assert body["input"][0]["content"] == [{"type": "input_text", "text": "you are helpful"}]
+    assert "prompt_cache_options" not in body
+    url, headers, body = serve._build_request(
+        "openrouter/google/gemini-3.7-flash", messages, 100, 0.7
+    )
+    assert url.endswith("/chat/completions")
+    assert "prompt_cache_options" not in body
+    assert "cache_control" not in json.dumps(body["messages"])
     monkeypatch.setenv("MANTIS_CACHE_BREAKPOINTS", "0")
     url, headers, body = serve._build_request(
         "openrouter/anthropic/claude-sonnet-5", messages, 100, 0.7

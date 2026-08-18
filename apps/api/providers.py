@@ -39,6 +39,7 @@ import utils
 from anthropic_protocols import (
     anthropic_headers,
     anthropic_to_chat,
+    apply_anthropic_prompt_cache,
     assemble_anthropic_stream,
     build_anthropic_body,
 )
@@ -197,8 +198,24 @@ def _is_reasoning_model(model: str) -> bool:
 
 def _is_openai_caching_model(model: str) -> bool:
     """Models that accept OpenAI's explicit prompt_cache_options / breakpoints."""
+    return _model_cache_family(model) == "openai"
+
+
+def _model_cache_family(model: str) -> str | None:
+    """Return the prompt-cache dialect for an upstream model id, or None.
+
+    Family is taken from the last path segment so Bifrost ids such as
+    ``bedrock/anthropic/claude-opus-5`` and ``google/gemini-3.7-flash`` match
+    the same rules as OpenRouter ``anthropic/claude-…`` / ``google/gemini-…``.
+    """
     name = model.rsplit("/", 1)[-1].lower()
-    return name.startswith("gpt-5.6-") or name.startswith("o3") or name.startswith("o4")
+    if name.startswith("claude-"):
+        return "anthropic"
+    if name.startswith("gpt-5.6-") or name.startswith("o3") or name.startswith("o4"):
+        return "openai"
+    if name.startswith("gemini-"):
+        return "gemini"
+    return None
 
 
 def _coerce_reasoning_effort(model: str, effort: str | None) -> str | None:
@@ -266,8 +283,18 @@ def _cache_retention_enabled() -> bool:
 
 
 def _openai_cache_breakpoints_enabled() -> bool:
-    value = os.environ.get("MANTIS_OPENAI_CACHE_BREAKPOINTS", "0").lower()
-    return value not in {"0", "false", "no", "off"}
+    """GPT-5.6 explicit cache follows the master breakpoint switch unless overridden.
+
+    ``MANTIS_OPENAI_CACHE_BREAKPOINTS`` unset means “same as MANTIS_CACHE_BREAKPOINTS”.
+    An explicit 0 still disables OpenAI markup without turning off Anthropic
+    ``cache_control``.
+    """
+    if not _cache_breakpoints_enabled():
+        return False
+    value = os.environ.get("MANTIS_OPENAI_CACHE_BREAKPOINTS")
+    if value is None:
+        return True
+    return value.lower() not in {"0", "false", "no", "off"}
 
 
 def _with_openai_cache_breakpoints(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -323,6 +350,25 @@ def _with_cache_breakpoints(messages: list[dict[str, Any]]) -> list[dict[str, An
     if len(out) >= 3:
         _mark(out[-2])
     return out
+
+
+def _apply_chat_prompt_cache(
+    model: str, messages: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Return (messages, extra body fields) for the model's cache dialect.
+
+    Gemini uses implicit prefix caching: extra markup is omitted so Bifrost /
+    Vertex OpenAI-compat cannot 400 on Anthropic or GPT-5.6 fields. Unknown
+    families are also left unmarked.
+    """
+    extra: dict[str, Any] = {}
+    family = _model_cache_family(model)
+    if family == "anthropic" and _cache_breakpoints_enabled():
+        return _with_cache_breakpoints(messages), extra
+    if family == "openai" and _openai_cache_breakpoints_enabled():
+        extra["prompt_cache_options"] = {"mode": "explicit", "ttl": "30m"}
+        return _with_openai_cache_breakpoints(messages), extra
+    return messages, extra
 
 
 def _normalize_upstream_tool_ids(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -491,6 +537,8 @@ def _build_request(
         body = build_anthropic_body(
             model, sanitized_messages, max_tokens, effort, tools, tool_choice
         )
+        if _cache_breakpoints_enabled() and _model_cache_family(model) == "anthropic":
+            body = apply_anthropic_prompt_cache(body)
         headers = anthropic_headers(key)
         path = "v1/messages"
     elif is_responses:
@@ -513,11 +561,9 @@ def _build_request(
         path = "responses"
     else:
         body = {"model": model, "messages": sanitized_messages, "max_tokens": max_tokens}
-        if _cache_breakpoints_enabled() and model.startswith("anthropic/claude-"):
-            body["messages"] = _with_cache_breakpoints(sanitized_messages)
-        elif _openai_cache_breakpoints_enabled() and _is_openai_caching_model(model):
-            body["prompt_cache_options"] = {"mode": "explicit", "ttl": "30m"}
-            body["messages"] = _with_openai_cache_breakpoints(sanitized_messages)
+        cached_messages, cache_extra = _apply_chat_prompt_cache(model, sanitized_messages)
+        body["messages"] = cached_messages
+        body.update(cache_extra)
         if coerced_effort:
             body["reasoning_effort"] = coerced_effort
         if not effort and not _is_reasoning_model(model):

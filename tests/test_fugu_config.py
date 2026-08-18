@@ -73,3 +73,63 @@ def test_ultra_offline_executor_and_validation():
         executor.validate([7], ["task"], [[]])
     with pytest.raises(TypeError, match="non-integer"):
         executor.validate(["0"], ["task"], [[]])
+
+
+def test_parse_workflow_accepts_json():
+    from apps.api import ultra
+
+    payload = json.dumps(
+        {
+            "model_id": [0, 1],
+            "subtasks": ["plan", "implement"],
+            "access_list": [[], [0]],
+        }
+    )
+    assert ultra.parse_workflow(payload) == ([0, 1], ["plan", "implement"], [[], [0]])
+    assert ultra.parse_workflow(f"```json\n{payload}\n```") == (
+        [0, 1],
+        ["plan", "implement"],
+        [[], [0]],
+    )
+
+
+def test_planner_messages_prefill_and_repair():
+    from apps.api import ultra
+    from apps.api import runs as serve
+
+    run = serve.ConductorRun(
+        "planner",
+        [{"role": "user", "content": "task"}],
+        [],
+        slot_models=["a", "b"],
+    )
+    first = run._planner_messages()
+    assert first[-1] == {"role": "assistant", "content": ultra.PLANNER_PREFILL}
+    repair = run._planner_messages(repair=("bad", "missing lists"))
+    assert repair[2]["role"] == "assistant"
+    assert "missing lists" in repair[-1]["content"]
+
+
+def test_planner_repair_retries_once(monkeypatch):
+    from apps.api import runs as serve
+
+    run = serve.ConductorRun(
+        "retry",
+        [{"role": "user", "content": "task"}],
+        [],
+        slot_models=["worker"],
+    )
+    calls = {"n": 0}
+
+    def fake_run_model(role, model, messages):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            run._last_planner_text = "not a workflow"
+            return {"type": "error", "error": "Conductor emitted an invalid workflow: missing lists"}
+        run._workflow = ([0], ["task"], [[]])
+        return {"type": "step_complete", "role": "Planner", "turn": 0}
+
+    monkeypatch.setattr(run, "_run_model", fake_run_model)
+    event = run._run_planner()
+    assert calls["n"] == 2
+    assert event["type"] == "step_complete"

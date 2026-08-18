@@ -968,6 +968,177 @@ def test_openai_cache_breakpoints_mark_system_and_penultimate():
     assert "prompt_cache_breakpoint" not in out[-1]
 
 
+def test_model_cache_family_uses_last_path_segment():
+    assert providers._model_cache_family("bedrock/anthropic/claude-opus-5") == "anthropic"
+    assert providers._model_cache_family("anthropic/claude-sonnet-5") == "anthropic"
+    assert providers._model_cache_family("gpt-5.6-sol") == "openai"
+    assert providers._model_cache_family("openai/gpt-5.6-luna") == "openai"
+    assert providers._model_cache_family("google/gemini-3.7-flash") == "gemini"
+    assert providers._model_cache_family("gemini-3.1-pro-preview") == "gemini"
+    assert providers._model_cache_family("deepseek-v4-flash") is None
+
+
+def _chat_resolved(model: str) -> providers.ResolvedModelSpec:
+    return providers.ResolvedModelSpec(
+        adapter="openai-compatible",
+        model=model,
+        effort=None,
+        base_url="http://127.0.0.1:8080/v1",
+        credential_env="BIFROST_API_KEY",
+        binding=None,
+        protocols=("chat_completions",),
+        slot=None,
+    )
+
+
+def _anthropic_resolved(
+    model: str = "bedrock/anthropic/claude-opus-5",
+) -> providers.ResolvedModelSpec:
+    return providers.ResolvedModelSpec(
+        adapter="anthropic",
+        model=model,
+        effort="medium",
+        base_url="http://127.0.0.1:8080/anthropic",
+        credential_env="BIFROST_API_KEY",
+        binding=None,
+        protocols=("anthropic_messages",),
+        slot=None,
+    )
+
+
+def test_build_request_marks_openai_and_claude_chat_but_not_gemini(monkeypatch):
+    monkeypatch.setenv("BIFROST_API_KEY", "k")
+    messages = [
+        {"role": "system", "content": "you are helpful"},
+        {"role": "user", "content": "history"},
+        {"role": "user", "content": "latest"},
+    ]
+    _, _, gpt_body = providers._build_request(
+        "gpt-5.6-sol", messages, 100, 0.7, resolved=_chat_resolved("gpt-5.6-sol")
+    )
+    assert gpt_body["prompt_cache_options"] == {"mode": "explicit", "ttl": "30m"}
+    assert gpt_body["messages"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+    assert "cache_control" not in json.dumps(gpt_body["messages"])
+
+    _, _, claude_body = providers._build_request(
+        "claude-chat",
+        messages,
+        100,
+        0.7,
+        resolved=_chat_resolved("anthropic/claude-opus-5"),
+    )
+    assert "prompt_cache_options" not in claude_body
+    assert claude_body["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+
+    _, _, gemini_body = providers._build_request(
+        "gemini",
+        messages,
+        100,
+        0.7,
+        resolved=_chat_resolved("google/gemini-3.7-flash"),
+    )
+    dumped = json.dumps(gemini_body)
+    assert "prompt_cache_options" not in gemini_body
+    assert "prompt_cache_breakpoint" not in dumped
+    assert "cache_control" not in dumped
+    assert gemini_body["messages"][0]["content"] == "you are helpful"
+
+    _, _, deepseek_body = providers._build_request(
+        "deepseek",
+        messages,
+        100,
+        0.7,
+        resolved=_chat_resolved("deepseek-v4-flash"),
+    )
+    dumped = json.dumps(deepseek_body)
+    assert "prompt_cache_options" not in deepseek_body
+    assert "cache_control" not in dumped
+
+
+def test_build_request_native_anthropic_marks_system_tools_and_history(monkeypatch):
+    monkeypatch.setenv("BIFROST_API_KEY", "k")
+    messages = [
+        {"role": "system", "content": "Be exact."},
+        {"role": "user", "content": "history"},
+        {"role": "user", "content": "latest"},
+    ]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read",
+                "description": "Read",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+    _, _, body = providers._build_request(
+        "claude-opus-5",
+        messages,
+        100,
+        0.7,
+        tools=tools,
+        resolved=_anthropic_resolved(),
+    )
+    assert body["system"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert body["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert body["messages"][-2]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in json.dumps(body["messages"][-1])
+
+
+def test_openai_cache_override_can_disable_without_touching_anthropic(monkeypatch):
+    monkeypatch.setenv("BIFROST_API_KEY", "k")
+    monkeypatch.setenv("MANTIS_OPENAI_CACHE_BREAKPOINTS", "0")
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "history"},
+        {"role": "user", "content": "latest"},
+    ]
+    _, _, gpt_body = providers._build_request(
+        "gpt-5.6-sol", messages, 100, 0.7, resolved=_chat_resolved("gpt-5.6-sol")
+    )
+    assert "prompt_cache_options" not in gpt_body
+    assert "prompt_cache_breakpoint" not in json.dumps(gpt_body["messages"])
+
+    _, _, claude_body = providers._build_request(
+        "claude-chat",
+        messages,
+        100,
+        0.7,
+        resolved=_chat_resolved("bedrock/anthropic/claude-opus-5"),
+    )
+    assert claude_body["messages"][0]["content"][0]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_master_cache_switch_disables_all_explicit_markup(monkeypatch):
+    monkeypatch.setenv("BIFROST_API_KEY", "k")
+    monkeypatch.setenv("MANTIS_CACHE_BREAKPOINTS", "0")
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "history"},
+        {"role": "user", "content": "latest"},
+    ]
+    _, _, gpt_body = providers._build_request(
+        "gpt-5.6-sol", messages, 100, 0.7, resolved=_chat_resolved("gpt-5.6-sol")
+    )
+    _, _, claude_body = providers._build_request(
+        "claude",
+        messages,
+        100,
+        0.7,
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "read", "parameters": {"type": "object"}},
+            }
+        ],
+        resolved=_anthropic_resolved(),
+    )
+    assert "prompt_cache_options" not in gpt_body
+    assert "cache_control" not in json.dumps(gpt_body)
+    assert "cache_control" not in json.dumps(claude_body)
+
+
 def test_cache_retention_can_disable_openrouter_stickiness(monkeypatch):
     monkeypatch.setenv("MANTIS_CACHE_RETENTION", "none")
     assert not providers._cache_retention_enabled()

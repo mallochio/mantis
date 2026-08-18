@@ -166,6 +166,46 @@ def build_anthropic_body(
     return body
 
 
+def _mark_anthropic_block(block: dict[str, Any]) -> None:
+    if "cache_control" not in block:
+        block["cache_control"] = {"type": "ephemeral"}
+
+
+def apply_anthropic_prompt_cache(body: dict[str, Any]) -> dict[str, Any]:
+    """Mark system, tools, and the history prefix for Anthropic prompt cache.
+
+    Breakpoints follow Anthropic's 4-breakpoint budget: last system block, last
+    tool, and the last content block of the message before the latest turn.
+    The input dict is copied; nested lists/dicts that are marked are copied.
+    """
+    out = dict(body)
+    system = out.get("system")
+    if isinstance(system, list) and system:
+        blocks = [dict(block) if isinstance(block, dict) else block for block in system]
+        if isinstance(blocks[-1], dict):
+            _mark_anthropic_block(blocks[-1])
+        out["system"] = blocks
+    tools = out.get("tools")
+    if isinstance(tools, list) and tools and isinstance(tools[-1], dict):
+        marked_tools = [dict(tool) if isinstance(tool, dict) else tool for tool in tools]
+        if isinstance(marked_tools[-1], dict):
+            _mark_anthropic_block(marked_tools[-1])
+        out["tools"] = marked_tools
+    history = out.get("messages")
+    if isinstance(history, list) and len(history) >= 2:
+        messages = [dict(message) for message in history]
+        prior = messages[-2]
+        content = prior.get("content")
+        if isinstance(content, list) and content and isinstance(content[-1], dict):
+            blocks = [dict(block) if isinstance(block, dict) else block for block in content]
+            if isinstance(blocks[-1], dict):
+                _mark_anthropic_block(blocks[-1])
+            prior["content"] = blocks
+            messages[-2] = prior
+            out["messages"] = messages
+    return out
+
+
 def anthropic_to_chat(response: dict[str, Any]) -> dict[str, Any]:
     content = response.get("content") or []
     text = "".join(

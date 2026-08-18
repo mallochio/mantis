@@ -1216,16 +1216,17 @@ async def test_chat_nonstream_duplicate_choice_indexes_do_not_seed_success(catal
 
 
 @pytest.mark.anyio
-async def test_chat_prefetch_commits_on_comment_keepalive_frame(catalog_server):
+async def test_chat_prefetch_skips_keepalive_until_payload(catalog_server):
     comment = b': synthetic keepalive\n\n'
+    payload = b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n'
 
-    async def comment_then_silence():
+    async def comment_then_payload():
         yield comment
-        await asyncio.Event().wait()
+        yield payload
 
-    prefix, refusal = await asyncio.wait_for(
-        catalog_server._prefetch_sse(comment_then_silence(), asyncio.get_running_loop().time() + 30), timeout=1)
-    assert refusal is False and comment in prefix
+    prefix, failure = await asyncio.wait_for(
+        catalog_server._prefetch_sse(comment_then_payload(), asyncio.get_running_loop().time() + 30), timeout=1)
+    assert failure is None and comment in prefix and payload in prefix
 
 
 @pytest.mark.anyio

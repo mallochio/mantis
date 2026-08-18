@@ -435,6 +435,54 @@ def test_fusion_context_window_trims_old_messages():
     assert trimmed[-1]["content"] == "new brief"
 
 
+def test_fusion_trim_prunes_tool_results_before_dropping_prefix():
+    coordinator = fusion.FusionCoordinator()
+    messages = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "keep me"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "x" * 20_000},
+        {"role": "user", "content": "latest"},
+    ]
+    trimmed = coordinator._trim_messages(messages, 500)
+    assert [m["role"] for m in trimmed] == ["system", "user", "assistant", "tool", "user"]
+    assert trimmed[1]["content"] == "keep me"
+    assert len(trimmed[-2]["content"]) < 3_000
+    assert trimmed[-1]["content"] == "latest"
+
+
+def test_fusion_trim_keeps_frozen_prefix_when_budget_allows():
+    coordinator = fusion.FusionCoordinator()
+    prefix = [
+        {"role": "system", "content": fusion.MAIN_PREAMBLE},
+        {"role": "user", "content": "client history"},
+        {"role": "assistant", "content": "ack"},
+    ]
+    first = coordinator._trim_messages(
+        [*prefix, {"role": "user", "content": "plan now"}], 100_000
+    )
+    second = coordinator._trim_messages(
+        [
+            *prefix,
+            {"role": "user", "content": "plan now"},
+            {"role": "assistant", "content": "PLAN:\nx\nBRIEF:\ny"},
+        ],
+        100_000,
+    )
+    assert first[:3] == prefix
+    assert second[:3] == prefix
+
+
 def test_fusion_trimmer_keeps_tool_call_result_pairs():
     coordinator = fusion.FusionCoordinator()
     messages = [
