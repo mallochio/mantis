@@ -120,6 +120,81 @@ class FakeWorker:
         )
 
 
+DEFAULT_USAGE = {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}
+
+BASH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "bash",
+        "description": "run a shell command",
+        "parameters": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+        },
+    },
+}
+
+BASH_CALL = [
+    {
+        "id": "call_0",
+        "type": "function",
+        "function": {"name": "bash", "arguments": '{"command": "echo hello"}'},
+    }
+]
+
+
+class SequenceWorker:
+    """Deterministic worker that returns a configured sequence of outputs."""
+
+    def __init__(
+        self,
+        main_outputs: list[tuple[str, list[dict[str, Any]] | None, dict[str, Any]]],
+        sidekick_outputs: list[tuple[str, list[dict[str, Any]] | None, dict[str, Any]]],
+    ) -> None:
+        self.main_outputs = main_outputs
+        self.sidekick_outputs = sidekick_outputs
+        self.main_idx = 0
+        self.sidekick_idx = 0
+        self.calls: list[tuple[str, list[dict[str, Any]], list[dict[str, Any]] | None]] = []
+
+    @staticmethod
+    def _message(
+        content: str,
+        tool_calls: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        message: dict[str, Any] = {"role": "assistant", "content": content or ""}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        return message
+
+    def _next(
+        self,
+        outputs: list[tuple[str, list[dict[str, Any]] | None, dict[str, Any]]],
+        idx: int,
+    ) -> tuple[str, list[dict[str, Any]] | None, dict[str, Any]]:
+        if idx < len(outputs):
+            return outputs[idx]
+        if outputs:
+            return outputs[-1]
+        return ("", None, DEFAULT_USAGE)
+
+    def __call__(
+        self,
+        slot: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        self.calls.append((slot, messages, tools))
+        first_content = messages[0].get("content", "")
+        if first_content == fusion.MAIN_PREAMBLE:
+            content, tool_calls, usage = self._next(self.main_outputs, self.main_idx)
+            self.main_idx += 1
+        else:
+            content, tool_calls, usage = self._next(self.sidekick_outputs, self.sidekick_idx)
+            self.sidekick_idx += 1
+        return self._message(content, tool_calls), usage
+
+
 @pytest.fixture
 def client(monkeypatch, tmp_path):
     monkeypatch.setenv("MANTIS_API_KEY", "test-key")
@@ -988,4 +1063,121 @@ def test_fusion_review_receives_sidekick_tool_activity(client, monkeypatch):
     assert "Tool Activity by Sidekick:" in review_prompts[0]
     assert "run_test" in review_prompts[0]
     assert "OK: 5 passed" in review_prompts[0]
+
+
+def test_fusion_retries_malformed_plan(monkeypatch):
+    """If the main model emits prose instead of PLAN:/BRIEF:, Fusion retries once."""
+    main_outputs = [
+        ("I will inspect the codebase and then make a plan.", None, DEFAULT_USAGE),
+        (
+            "PLAN: inspect and extract abstractions\n"
+            "BRIEF: implement the first two targets",
+            None,
+            DEFAULT_USAGE,
+        ),
+        ("ACCEPT", None, DEFAULT_USAGE),
+    ]
+    sidekick_outputs = [
+        ("", BASH_CALL, DEFAULT_USAGE),
+        ("Done.", None, DEFAULT_USAGE),
+    ]
+    worker = SequenceWorker(main_outputs, sidekick_outputs)
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+
+    run = fusion.FusionRun("retry-run", "spin out Cerberus", tools=[BASH_TOOL])
+    event = run.advance(coordinator=fusion.FusionCoordinator())
+    assert event["status"] == "awaiting_tools"
+    assert worker.main_idx == 2  # bad plan + retry produced a good plan
+
+    event = run.advance(
+        tool_results=[{"tool_call_id": "call_0", "content": "hello"}],
+        request_id="req-1",
+        coordinator=fusion.FusionCoordinator(),
+    )
+    assert event["status"] == "completed"
+    assert "Done." in (event["report"] or "")
+
+
+def test_fusion_rejects_unknown_planning_tools(monkeypatch):
+    """If the main calls a tool not in the allowed set, Fusion forces it back to text."""
+    ipython_call = [
+        {
+            "id": "call_ipython",
+            "type": "function",
+            "function": {
+                "name": "ipython",
+                "arguments": '{"code": "1+1"}',
+            },
+        }
+    ]
+    main_outputs = [
+        ("", ipython_call, DEFAULT_USAGE),
+        ("PLAN: use bash\nBRIEF: implement the task", None, DEFAULT_USAGE),
+        ("ACCEPT", None, DEFAULT_USAGE),
+    ]
+    sidekick_outputs = [("Done.", None, DEFAULT_USAGE)]
+    worker = SequenceWorker(main_outputs, sidekick_outputs)
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+
+    run = fusion.FusionRun("unknown-tool-run", "do work", tools=[BASH_TOOL])
+    event = run.advance(coordinator=fusion.FusionCoordinator())
+    assert event["status"] == "completed"
+    assert "Done." in (event["report"] or "")
+    # The retry should have been invoked with tools=None to stop hallucination.
+    assert any(t is None for _s, _m, t in worker.calls)
+
+
+def test_fusion_enforces_planning_tool_budget(monkeypatch):
+    """After two planning tool rounds, the main must produce text or error."""
+    bash_call_1 = [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "bash", "arguments": '{"command":"ls"}'},
+        }
+    ]
+    bash_call_2 = [
+        {
+            "id": "call_2",
+            "type": "function",
+            "function": {"name": "bash", "arguments": '{"command":"cat"}'},
+        }
+    ]
+    bash_call_3 = [
+        {
+            "id": "call_3",
+            "type": "function",
+            "function": {"name": "bash", "arguments": '{"command":"more"}'},
+        }
+    ]
+    main_outputs = [
+        ("", bash_call_1, DEFAULT_USAGE),
+        ("", bash_call_2, DEFAULT_USAGE),
+        ("", bash_call_3, DEFAULT_USAGE),
+    ]
+    sidekick_outputs = [("Done.", None, DEFAULT_USAGE)]
+    worker = SequenceWorker(main_outputs, sidekick_outputs)
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+
+    run = fusion.FusionRun("budget-run", "do work", tools=[BASH_TOOL])
+    event = run.advance(coordinator=fusion.FusionCoordinator())
+    assert event["status"] == "awaiting_tools"
+    assert run.planning_tool_rounds == 1
+
+    event = run.advance(
+        tool_results=[{"tool_call_id": "call_1", "content": "ok"}],
+        request_id="req-1",
+        coordinator=fusion.FusionCoordinator(),
+    )
+    assert event["status"] == "awaiting_tools"
+    assert run.planning_tool_rounds == 2
+
+    event = run.advance(
+        tool_results=[{"tool_call_id": "call_2", "content": "ok"}],
+        request_id="req-2",
+        coordinator=fusion.FusionCoordinator(),
+    )
+    assert event["status"] == "error"
+    assert run.status == "error"
+    assert "plan was required" in (run.error or "")
 

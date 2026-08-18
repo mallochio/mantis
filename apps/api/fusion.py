@@ -59,6 +59,26 @@ REVIEW_PROMPT = (
     "so the sidekick can revise.\n\nReport:\n"
 )
 
+PLAN_REMINDER_PROMPT = (
+    "Your previous response did not contain the required sections. "
+    "Reply with exactly two sections and nothing else: "
+    "'PLAN:' containing the high-level plan, and "
+    "'BRIEF:' containing a self-contained brief for the sidekick. "
+    "Do not include commentary, markdown, or tool calls."
+)
+
+PLAN_TOOL_BUDGET_PROMPT = (
+    "You have already used the allowed planning tool budget. "
+    "Stop calling tools and reply with exactly two sections: "
+    "'PLAN:' and 'BRIEF:'. No other text or tool calls."
+)
+
+PLAN_UNKNOWN_TOOL_PROMPT = (
+    "You tried to call tools that are not available for planning: {names}. "
+    "Stop calling tools and reply with exactly two sections: "
+    "'PLAN:' and 'BRIEF:'. No other text or tool calls."
+)
+
 
 class FusionConfig:
     """Runtime fusion settings loaded from the shared catalog."""
@@ -457,7 +477,11 @@ class FusionRun(NativeRun):
             )
             # Advisory repeat-tool check
             call_info = next(
-                (tc for tc in self.pending_tool_calls if tc.get("id") == result.get("tool_call_id")),
+                (
+                    tc
+                    for tc in self.pending_tool_calls
+                    if tc.get("id") == result.get("tool_call_id")
+                ),
                 None,
             )
             if call_info and isinstance(call_info.get("function"), dict):
@@ -525,7 +549,9 @@ class FusionRun(NativeRun):
 
     def _parse_main_review(self, text: str) -> tuple[bool, str]:
         stripped = text.strip()
-        if stripped.upper().startswith("ACCEPT") or re.search(r"^\s*ACCEPT\b", stripped, re.IGNORECASE):
+        if stripped.upper().startswith("ACCEPT") or re.search(
+            r"^\s*ACCEPT\b", stripped, re.IGNORECASE
+        ):
             return True, ""
         follow_match = re.search(r"\bFOLLOW_UP:\s*(.*)", stripped, re.DOTALL | re.IGNORECASE)
         if follow_match:
@@ -535,7 +561,8 @@ class FusionRun(NativeRun):
         if stripped.upper().startswith("REJECT"):
             return False, stripped
         raise ValueError(
-            f"main review did not output a valid decision ('ACCEPT' or 'FOLLOW_UP: <feedback>'), got: {stripped[:120]!r}"
+            "main review did not output a valid decision "
+            f"('ACCEPT' or 'FOLLOW_UP: <feedback>'), got: {stripped[:120]!r}"
         )
 
     def _validate_tool_results(self, tool_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -543,7 +570,9 @@ class FusionRun(NativeRun):
         validated = utils._validate_tool_results(tool_results, expected_ids)
         id_order = {
             tc_id: idx
-            for idx, tc_id in enumerate(str(tc.get("id")) for tc in self.pending_tool_calls if tc.get("id"))
+            for idx, tc_id in enumerate(
+                str(tc.get("id")) for tc in self.pending_tool_calls if tc.get("id")
+            )
         }
         validated.sort(key=lambda r: id_order.get(str(r.get("tool_call_id")), 999))
         return validated
@@ -561,7 +590,7 @@ class FusionRun(NativeRun):
         event = {
             "run_id": self.run_id,
             "status": "error",
-            "report": None,
+            "report": self.error,
             "pending_tool_calls": None,
             "usage": self.usage,
             "activity": self._activity,
@@ -653,12 +682,57 @@ class FusionRun(NativeRun):
             main_text, main_calls, _ = self._call_main(
                 coordinator, tools=available_tools
             )
+
+            # The main model may only call tools it was given, and only during the
+            # first two planning rounds. After that (or if it calls an unknown tool)
+            # it must produce the PLAN/BRIEF text.
             if main_calls:
-                self.planning_tool_rounds += 1
-                self.pending_tool_calls = main_calls
-                self.status = "awaiting_tools"
-                return self._ok_event(request_id)
-            self.plan, self.sidekick_brief = self._parse_main_plan(main_text)
+                allowed_names = {
+                    t.get("function", {}).get("name")
+                    for t in self.tools
+                    if t.get("function")
+                }
+                unknown = [
+                    c
+                    for c in main_calls
+                    if c.get("function", {}).get("name") not in allowed_names
+                ]
+                if unknown or self.planning_tool_rounds >= 2:
+                    if unknown:
+                        unknown_names = {
+                            str(c.get("function", {}).get("name", "")) for c in unknown
+                        }
+                        names = ", ".join(sorted(unknown_names))
+                        reminder = PLAN_UNKNOWN_TOOL_PROMPT.format(names=names)
+                    else:
+                        reminder = PLAN_TOOL_BUDGET_PROMPT
+                    main_text, main_calls, _ = self._call_main(
+                        coordinator, prompt=reminder, tools=None
+                    )
+                    if main_calls:
+                        call_names = {
+                            str(c.get("function", {}).get("name", "")) for c in main_calls
+                        }
+                        names = ", ".join(sorted(call_names))
+                        raise ValueError(
+                            f"main kept calling tools when a plan was required: {names}"
+                        )
+                else:
+                    self.planning_tool_rounds += 1
+                    self.pending_tool_calls = main_calls
+                    self.status = "awaiting_tools"
+                    return self._ok_event(request_id)
+
+            # Parse the plan, with one retry on malformed output.
+            try:
+                self.plan, self.sidekick_brief = self._parse_main_plan(main_text)
+            except ValueError:
+                main_text, main_calls, _ = self._call_main(
+                    coordinator, prompt=PLAN_REMINDER_PROMPT, tools=None
+                )
+                if main_calls:
+                    raise ValueError("main called tools instead of producing a plan") from None
+                self.plan, self.sidekick_brief = self._parse_main_plan(main_text)
             self.sidekick_messages.append(
                 {"role": "user", "content": self.sidekick_brief}
             )
