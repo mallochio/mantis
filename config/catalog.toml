@@ -52,11 +52,10 @@ protocols = ["chat_completions", "responses"]
 rank = 2
 
 [gateway.policies.coding]
-# 5 operating points: 3 on the cheap model with escalating effort, then
-# middle (claude-opus-5) and expensive (gpt-5.6-sol).  Cost-monotonic:
-# gemini-flash@low < gemini-flash@medium < gemini-flash@high < opus-5 < sol.
+# 5 operating points: 3 on the cheap model with low effort, then
+# middle (claude-opus-5) and expensive (gpt-5.6-sol).
 complexity_targets = ["cheap", "cheap", "cheap", "middle", "expensive"]
-complexity_efforts = ["low", "medium", "high", "medium", "high"]
+complexity_efforts = ["low", "low", "low", "medium", "high"]
 invalid_complexity_target = "expensive"
 
 

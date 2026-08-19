@@ -1148,14 +1148,48 @@ def _choice_has_payload(choice: dict) -> bool:
     return False
 
 
+def _is_incomplete_tail(text: str) -> bool:
+    """True if text ends abruptly on an open delimiter or unclosed construct."""
+    t = text.strip()
+    if not t:
+        return True
+    if t.endswith(("(", "[", "{")):
+        return True
+    if t.count("(") > t.count(")"):
+        return True
+    if t.count("[") > t.count("]"):
+        return True
+    if t.count("{") > t.count("}"):
+        return True
+    return False
+
+
 def _is_empty_completion(data: dict | None) -> bool:
-    """True for a Chat Completions body with no visible text or tool calls."""
+    """True for a Chat Completions body with no visible text, incomplete tails, or tool calls."""
     if not isinstance(data, dict):
         return False
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices:
         return True
-    return not any(_choice_has_payload(choice) for choice in choices)
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        msg = choice.get("message") or {}
+        if msg.get("tool_calls") or msg.get("function_call"):
+            return False
+        content = msg.get("content")
+        if isinstance(content, str) and content.strip():
+            if not _is_incomplete_tail(content):
+                return False
+        elif isinstance(content, list):
+            parts = [
+                part if isinstance(part, str) else str(part.get("text") or "")
+                for part in content if isinstance(part, (str, dict))
+            ]
+            full_text = "".join(parts).strip()
+            if full_text and not _is_incomplete_tail(full_text):
+                return False
+    return True
 
 
 def _completion_token_cap(backend: dict) -> int:
@@ -2472,6 +2506,7 @@ async def _prefetch_sse(events, deadline: float):
     prefix, text_parts = [], []
     prefix_bytes = 0
     saw_payload = False
+    saw_tool_call = False
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -2480,6 +2515,8 @@ async def _prefetch_sse(events, deadline: float):
             async with asyncio.timeout(remaining):
                 event = await anext(events)
         except StopAsyncIteration:
+            if prefix and saw_payload and not saw_tool_call and _is_incomplete_tail("".join(text_parts)):
+                return prefix, "empty_completion"
             return prefix, ("empty_completion" if prefix and not saw_payload else None)
         prefix.append(event)
         prefix_bytes += len(event)
@@ -2489,6 +2526,8 @@ async def _prefetch_sse(events, deadline: float):
         if data is None:
             continue
         if data.strip() == "[DONE]":
+            if saw_payload and not saw_tool_call and _is_incomplete_tail("".join(text_parts)):
+                return prefix, "empty_completion"
             return prefix, (None if saw_payload else "empty_completion")
         try:
             payload = json.loads(data)
@@ -2511,6 +2550,8 @@ async def _prefetch_sse(events, deadline: float):
             for obj in (delta, message):
                 if not isinstance(obj, dict):
                     continue
+                if obj.get("tool_calls") or obj.get("function_call"):
+                    saw_tool_call = True
                 if isinstance(obj.get("refusal"), str):
                     return prefix, "refusal"
                 value = obj.get("content")
@@ -2523,6 +2564,8 @@ async def _prefetch_sse(events, deadline: float):
         if _REFUSAL_RE.search(combined):
             return prefix, "refusal"
         if finish is not None:
+            if saw_payload and not saw_tool_call and _is_incomplete_tail(combined):
+                return prefix, "empty_completion"
             return prefix, (None if saw_payload else "empty_completion")
         if event_content and not _possible_refusal_prefix(combined):
             return prefix, None

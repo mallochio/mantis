@@ -168,6 +168,64 @@ async def test_stream_last_empty_emits_empty_completion(client, monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_stream_incomplete_tail_failsover(client, monkeypatch):
+    calls = []
+    incomplete = (
+        b'data: {"choices":[{"delta":{"content":"In Cerberus ("},"finish_reason":"stop"}]}\n\n'
+        b'data: [DONE]\n\n'
+    )
+    success = (
+        b'data: {"choices":[{"delta":{"content":"In Cerberus (full explanation)."},"finish_reason":"stop"}]}\n\n'
+        b'data: [DONE]\n\n'
+    )
+
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(
+            200, content=incomplete if len(calls) == 1 else success,
+            headers={"content-type": "text/event-stream"},
+        )
+
+    mock = upstream(handler)
+    monkeypatch.setattr(server, "_client", mock)
+    response = await client.post("/v1/chat/completions", headers=AUTH, json={
+        "model": "auto", "stream": True, "messages": [{"role": "user", "content": "explain"}],
+    })
+    assert response.status_code == 200
+    assert "full explanation" in response.text
+    assert "empty_completion" not in response.text
+    assert response.headers["x-route-fallback"] == "true"
+    assert len(calls) == 2
+    await mock.aclose()
+
+
+@pytest.mark.anyio
+async def test_nonstream_incomplete_tail_failsover(client, monkeypatch):
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        if len(calls) == 1:
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content": "In Cerberus ["}, "finish_reason": "stop"}],
+            })
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "In Cerberus [complete]"}, "finish_reason": "stop"}],
+        })
+
+    mock = upstream(handler)
+    monkeypatch.setattr(server, "_client", mock)
+    response = await client.post("/v1/chat/completions", headers=AUTH, json={
+        "model": "auto", "messages": [{"role": "user", "content": "explain"}],
+    })
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "In Cerberus [complete]"
+    assert response.headers["x-route-fallback"] == "true"
+    assert len(calls) == 2
+    await mock.aclose()
+
+
+@pytest.mark.anyio
 async def test_body_limit_without_content_length(client, monkeypatch):
     monkeypatch.setattr(server, "MAX_BODY_BYTES", 20)
     response = await client.post("/v1/chat/completions", headers={**AUTH, "transfer-encoding": "chunked"}, content=b'{' + b' ' * 50 + b'}')
