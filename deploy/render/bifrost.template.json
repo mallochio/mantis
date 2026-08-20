@@ -397,6 +397,26 @@
         ]
       },
       {
+        "id": "rule-complexity-pilot-default",
+        "name": "pilot: unclassified auto request -> balanced default",
+        "cel_expression": "model == \"auto\"",
+        "targets": [
+          {
+            "provider": "azure",
+            "model": "gpt-5.6-terra",
+            "weight": 1.0
+          }
+        ],
+        "fallbacks": [
+          "bedrock/gpt-5.6-terra",
+          "openrouter/gpt-5.6-terra"
+        ],
+        "enabled": true,
+        "priority": 5,
+        "scope": "virtual_key",
+        "scope_id": "vk-interactive-complexity-pilot"
+      },
+      {
         "id": "rule-claude-sonnet-5-fallback",
         "name": "Claude Sonnet 5 (Vertex -> Bedrock fallback)",
         "cel_expression": "model == \"claude-sonnet-5\" || model == \"anthropic/claude-sonnet-5\" || model == \"bedrock/anthropic/claude-sonnet-5\"",

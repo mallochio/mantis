@@ -108,8 +108,9 @@ curl "$BIFROST_URL/chat/completions" \
 | MEDIUM | Azure `gpt-5.6-terra` | Bedrock Terra → OpenRouter Terra |
 | COMPLEX | Azure `gpt-5.6-sol` | Bedrock Sol → OpenRouter Sol |
 | REASONING | Bedrock `anthropic/claude-opus-5` | Vertex Claude Opus 5 → OpenRouter Claude Opus 5 |
+| Unclassified `auto` | Azure `gpt-5.6-terra` | Bedrock Terra → OpenRouter Terra |
 
-The analyzer is a fast, deterministic lexical classifier. It uses coding and systems vocabulary, conservative high-precision reasoning phrases, and boundaries `.10 / .35 / .60`. Requests without a supported text signal fall through to their existing route rather than being guessed. Use the dashboard's **Complexity Router** and **Routing Logs** pages to inspect `tier`, score, and selected model before broadening this pilot.
+The analyzer is a fast, deterministic lexical classifier. It uses coding and systems vocabulary, conservative high-precision reasoning phrases, and boundaries `.10 / .35 / .60`. The four classified tier rules have priorities 1–4. A pilot-scoped priority-5 `model == "auto"` catch-all sends requests without a supported lexical signal to the balanced Terra route instead of failing provider resolution. Use the dashboard's **Complexity Router** and **Routing Logs** pages to inspect `tier`, score, and selected model before broadening this pilot.
 
 ## Prime Agent
 

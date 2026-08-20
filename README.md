@@ -55,7 +55,7 @@ Mantis runs as the `mantis-orchestrator` Render web service. The public OpenAI-c
 https://mantis-orchestrator.onrender.com/v1
 ```
 
-Bifrost remains private on the Tailnet; it is not exposed through the public Render URL. See the complete setup, credentials, Tailscale access, complexity-router pilot, and Prime Agent instructions in [`deploy/README.md`](deploy/README.md).
+Bifrost remains private on the Tailnet; it is not exposed through the public Render URL. Its pilot uses four classified tiers and a balanced Terra catch-all for unclassified `auto` requests. See the complete setup, credentials, Tailscale access, complexity-router pilot, and Prime Agent instructions in [`deploy/README.md`](deploy/README.md).
 
 ### Quick start
 
