@@ -54,38 +54,39 @@ cleanup() {
 }
 trap cleanup SIGTERM SIGINT SIGHUP
 
-# 3. Optional Tailscale Integration
+# 3. Optional Tailscale Integration (Backgrounded so it never blocks web service startup)
 if [[ -n "${TAILSCALE_AUTHKEY:-}" ]]; then
-  echo "[Mantis Render Entrypoint] Initializing Tailscale..."
-  TS_HOSTNAME="${TAILSCALE_HOSTNAME:-mantis-render}"
-  TS_STATE_DIR="${TAILSCALE_STATE_DIR:-/var/lib/tailscale}"
-  TS_EXTRA_ARGS="${TAILSCALE_EXTRA_ARGS:-}"
+  echo "[Mantis Render Entrypoint] Launching Tailscale in background..."
+  (
+    set +e
+    TS_HOSTNAME="${TAILSCALE_HOSTNAME:-mantis-render}"
+    TS_STATE_DIR="${TAILSCALE_STATE_DIR:-/var/lib/tailscale}"
+    TS_EXTRA_ARGS="${TAILSCALE_EXTRA_ARGS:-}"
 
-  # Determine tun mode: check if /dev/net/tun is available, otherwise userspace-networking
-  TUN_ARG=""
-  if [[ ! -c /dev/net/tun ]]; then
-    TUN_ARG="--tun=userspace-networking"
-  fi
-
-  tailscaled --statedir="$TS_STATE_DIR" $TUN_ARG &
-  tailscale_pid=$!
-
-  # Wait for tailscaled socket
-  for i in $(seq 1 30); do
-    if tailscale status >/dev/null 2>&1 || [ $? -eq 1 ]; then
-      break
+    TUN_ARG=""
+    if [[ ! -c /dev/net/tun ]]; then
+      TUN_ARG="--tun=userspace-networking"
     fi
-    sleep 0.5
-  done
 
-  # Connect to Tailnet
-  echo "[Mantis Render Entrypoint] Authenticating Tailscale node '$TS_HOSTNAME'..."
-  tailscale up --authkey="$TAILSCALE_AUTHKEY" --hostname="$TS_HOSTNAME" $TS_EXTRA_ARGS
+    tailscaled --statedir="$TS_STATE_DIR" $TUN_ARG &
+    ts_daemon_pid=$!
 
-  # Expose Bifrost Web UI (:8080) directly over Tailscale Serve
-  echo "[Mantis Render Entrypoint] Exposing Bifrost (:8080) over Tailscale Serve..."
-  tailscale serve --bg --http=8080 8080 || tailscale serve --bg 8080 || true
-  echo "[Mantis Render Entrypoint] Tailscale is up! Node: $(tailscale ip -4 2>/dev/null || echo "$TS_HOSTNAME")"
+    # Wait up to 15s for socket
+    for i in $(seq 1 30); do
+      if tailscale status >/dev/null 2>&1 || [ $? -eq 1 ]; then
+        break
+      fi
+      sleep 0.5
+    done
+
+    echo "[Tailscale Background] Authenticating node '$TS_HOSTNAME'..."
+    tailscale up --authkey="$TAILSCALE_AUTHKEY" --hostname="$TS_HOSTNAME" --timeout=30s $TS_EXTRA_ARGS
+
+    echo "[Tailscale Background] Exposing Bifrost (:8080) over Tailscale Serve..."
+    tailscale serve --bg --http=8080 8080 || tailscale serve --bg 8080 || true
+    echo "[Tailscale Background] Tailscale setup complete. IP: $(tailscale ip -4 2>/dev/null || echo "$TS_HOSTNAME")"
+  ) &
+  tailscale_pid=$!
 fi
 
 # 4. Start Bifrost on :8080 (listen on 0.0.0.0 so Tailscale can forward traffic to it)
