@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Zen-only SWE-rebench Phase 2 worker: run ONE fixed model arm across the full
 # 40-task manifest. Each arm is its own SkyPilot cluster; results fan in to
-# gs://ih-storage-sid/<RUN_ID>/<ARM>/results.jsonl.
+# gs://your-eval-storage-bucket/<RUN_ID>/<ARM>/results.jsonl.
 #
 # Env:
 #   ARM       (required) one of: deepseek mimo hy3 nemotron-ultra nemotron-lightning laguna
@@ -37,7 +37,7 @@ export EVAL_PROXY_RETRY_BASE="${EVAL_PROXY_RETRY_BASE:-1.0}"
 export EVAL_PROXY_RETRY_MAX_WAIT="${EVAL_PROXY_RETRY_MAX_WAIT:-60.0}"
 export EVAL_PROXY_RETRY_ON_STATUS="${EVAL_PROXY_RETRY_ON_STATUS:-429,500,502,503,504}"
 
-BUCKET_PREFIX="gs://ih-storage-sid/${RUN_ID}/${ARM}"
+BUCKET_PREFIX="${GCS_EVAL_BUCKET:-gs://your-eval-storage-bucket}/${RUN_ID}/${ARM}"
 
 fail() { echo "PHASE2_FAIL[$ARM]: $*" >&2; exit 1; }
 
@@ -191,7 +191,7 @@ results = [json.loads(l) for l in lines if json.loads(l).get("record_type") == "
 resolved = sum(1 for r in results if r.get("resolved"))
 json.dump({
     "arm": arm, "run_id": run_id, "phase": "p2-tier-selection", "timestamp": ts,
-    "bucket": "gs://ih-storage-sid", "arm_exit_code": rc,
+    "bucket": os.environ.get("GCS_EVAL_BUCKET", "gs://your-eval-storage-bucket"), "arm_exit_code": rc,
     "result_rows": len(results), "resolved_rows": resolved,
     "rate_limit_policy": {
         "retries": os.environ.get("EVAL_PROXY_RETRIES"),

@@ -10,7 +10,7 @@
 # No `workdir`, no storage mounts, and no managed-jobs controller: SkyPilot
 # rsyncs the local file_mounts straight to the VM, so no GCS bucket is ever
 # created. Results are written (upload-only) to the pre-existing
-# gs://ih-storage-sid bucket under a fresh job-<suffix>/ prefix.
+# gs://your-eval-storage-bucket bucket under a fresh job-<suffix>/ prefix.
 
 name: zen-swe-rebench-preflight
 

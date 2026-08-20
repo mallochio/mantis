@@ -3,7 +3,7 @@
 # Same setup as the preflight launch so SkyPilot skips re-running it on the
 # already-provisioned cluster. No `workdir`, no storage mounts: SkyPilot
 # rsyncs local file_mounts straight to the VM, so no GCS bucket is created.
-# Results are written (upload-only) to gs://ih-storage-sid/<JOB_ID>/ under an
+# Results are written (upload-only) to gs://your-eval-storage-bucket/<JOB_ID>/ under an
 # auto-generated (or env-supplied, for resume) job suffix.
 
 name: zen-swe-rebench-pilot

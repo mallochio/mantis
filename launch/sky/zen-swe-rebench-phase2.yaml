@@ -1,7 +1,7 @@
 # Zen-only SWE-rebench Phase 2 fixed-arm tier selection (per-arm shard).
 #
 # One cluster per model arm; all shards share a RUN_ID and fan in to
-# gs://ih-storage-sid/<RUN_ID>/<ARM>/results.jsonl. No workdir, no storage
+# gs://your-eval-storage-bucket/<RUN_ID>/<ARM>/results.jsonl. No workdir, no storage
 # mounts: SkyPilot rsyncs local file_mounts to the VM, so no GCS bucket is
 # created. Launch with:
 #   sky launch -y -d --cluster zen-phase2-<ARM> launch/sky/zen-swe-rebench-phase2.yaml #     --env ARM=<ARM> --env RUN_ID=<RUN_ID> #     --env OPENCODE_API_KEY=... --env BIFROST_API_KEY=... --env BIFROST_ENCRYPTION_KEY=...

@@ -1,5 +1,5 @@
 # Binary direct-router development screen: one fixed arm per GCP Spot worker.
-# No workdir or storage mounts; results upload to the existing ih-storage-sid bucket.
+# No workdir or storage mounts; results upload to the existing your-eval-storage-bucket bucket.
 name: binary-router-swerebench-dev
 resources:
   cloud: gcp

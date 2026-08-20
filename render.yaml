@@ -20,7 +20,7 @@ services:
       - key: TAILSCALE_HOSTNAME
         value: mantis-render
       - key: AZURE_OPENAI_RESOURCE_URL
-        value: https://ih-foundry-resource.openai.azure.com
+        value: https://<your-resource-name>.openai.azure.com
       - key: AZURE_OPENAI_API_KEY
         sync: false
       - key: AWS_ACCESS_KEY_ID
@@ -30,7 +30,7 @@ services:
       - key: AWS_BEDROCK_REGION
         value: eu-central-1
       - key: VERTEXAI_PROJECT
-        value: interhuman-ai-prod
+        value: <your-gcp-project-id>
       - key: VERTEXAI_LOCATION
         value: global
       - key: OPENCODE_API_KEY

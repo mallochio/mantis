@@ -3,7 +3,7 @@
 #
 # Starts a private Zen-only Bifrost on 127.0.0.1:8080 (same worker), then runs
 # eval/router_eval.py in fixed-arm shadow-cost mode with resume. A heartbeat
-# loop uploads the incremental JSONL to gs://ih-storage-sid/<JOB_ID>/ so a
+# loop uploads the incremental JSONL to gs://your-eval-storage-bucket/<JOB_ID>/ so a
 # spot preemption loses at most one heartbeat interval of work.
 set -euo pipefail
 
@@ -23,7 +23,7 @@ export EVAL_PROXY_RETRY_BASE="${EVAL_PROXY_RETRY_BASE:-1.0}"
 export EVAL_PROXY_RETRY_MAX_WAIT="${EVAL_PROXY_RETRY_MAX_WAIT:-60.0}"
 export EVAL_PROXY_RETRY_ON_STATUS="${EVAL_PROXY_RETRY_ON_STATUS:-429,500,502,503,504}"
 
-BUCKET_PREFIX="gs://ih-storage-sid/${JOB_ID}"
+BUCKET_PREFIX="${GCS_EVAL_BUCKET:-gs://your-eval-storage-bucket}/${JOB_ID}"
 
 fail() { echo "PILOT_FAIL: $*" >&2; exit 1; }
 
@@ -194,7 +194,7 @@ json.dump({
     "job_id": job_id,
     "phase": "p1-pilot",
     "timestamp": ts,
-    "bucket": "gs://ih-storage-sid",
+    "bucket": os.environ.get("GCS_EVAL_BUCKET", "gs://your-eval-storage-bucket"),
     "pilot_exit_code": rc,
     "result_rows": len(results),
     "resolved_rows": resolved,

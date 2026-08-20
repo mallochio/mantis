@@ -15,7 +15,7 @@ RESULT_DIR="/tmp/binary-router-results"
 LOG_DIR="$RESULT_DIR/logs"
 BIFROST_DIR="${BIFROST_DIR:-$HOME/.bifrost-data}"
 OUT_FILE="$RESULT_DIR/results.jsonl"
-BUCKET_PREFIX="gs://ih-storage-sid/${RUN_ID}/${ARM}"
+BUCKET_PREFIX="${GCS_EVAL_BUCKET:-gs://your-eval-storage-bucket}/${RUN_ID}/${ARM}"
 mkdir -p "$LOG_DIR" "$BIFROST_DIR"
 chmod 700 "$RESULT_DIR" "$BIFROST_DIR"
 # Single-writer guard: refuse to start if another shard is already running.

@@ -648,7 +648,7 @@
         "base_provider_type": "openai"
       },
       "network_config": {
-        "base_url": "https://interhuman-ai--ep-kimi-k3-server.us-west.modal.direct"
+        "base_url": "https://<your-org>--ep-kimi-k3-server.us-west.modal.direct"
       },
       "keys": [
         {

@@ -102,9 +102,9 @@ its public test split is not a hyperparameter hill-climbing target.
 `launch/sky/zen-swe-rebench-*.yaml` define the GCP/SkyPilot tasks; the worker
 scripts under `scripts/zen_swe_rebench_*.sh` host a private Zen-only Bifrost on
 `127.0.0.1:8080` on each worker, verify the model allowlist, and upload results
-to `gs://ih-storage-sid/<job-id>/` (upload-only; no GCS bucket is created).
+to `gs://your-eval-storage-bucket/<job-id>/` (upload-only; no GCS bucket is created).
 Phase 2 shards one cluster per fixed arm and fans results in to
-`gs://ih-storage-sid/<run-id>/<arm>/results.jsonl`.
+`gs://your-eval-storage-bucket/<run-id>/<arm>/results.jsonl`.
 
 ```bash
 sky launch -y -d --cluster zen-phase2-hy3 launch/sky/zen-swe-rebench-phase2.yaml   --env ARM=hy3 --env RUN_ID=job-<8hex>   --env OPENCODE_API_KEY=... --env BIFROST_API_KEY=... --env BIFROST_ENCRYPTION_KEY=...
