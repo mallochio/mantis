@@ -14,8 +14,8 @@
   "governance": {
     "auth_config": {
       "is_enabled": true,
-      "admin_username": "admin",
-      "admin_password": "env.BIFROST_API_KEY"
+      "admin_username": "env.BIFROST_ADMIN_USERNAME",
+      "admin_password": "env.BIFROST_ADMIN_PASSWORD"
     },
     "virtual_keys": [
       {

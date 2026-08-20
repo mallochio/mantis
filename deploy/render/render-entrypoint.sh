@@ -25,6 +25,11 @@ if [[ "${BIFROST_API_KEY:-}" != sk-bf-* ]]; then
   export BIFROST_API_KEY="sk-bf-${BIFROST_API_KEY:-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')}"
 fi
 export BIFROST_ENCRYPTION_KEY="${BIFROST_ENCRYPTION_KEY:-760529c75e2b39a8bb728cdcd5b2dcef91b0f1a9a4e320f7ca7da41bc88bb254}"
+# Dashboard credentials are deliberately separate from BIFROST_API_KEY (a
+# virtual-key secret). The fallback preserves compatibility until Render has
+# generated the new BIFROST_ADMIN_PASSWORD on Blueprint sync.
+export BIFROST_ADMIN_USERNAME="${BIFROST_ADMIN_USERNAME:-admin}"
+export BIFROST_ADMIN_PASSWORD="${BIFROST_ADMIN_PASSWORD:-$BIFROST_API_KEY}"
 export BIFROST_COMPLEXITY_PILOT_KEY="${BIFROST_COMPLEXITY_PILOT_KEY:-sk-bf-$(od -An -N8 -tx1 /dev/urandom | tr -d " \n")}"
 export OPENCODE_API_KEY="${OPENCODE_API_KEY:-${OPENCODE_GO_API_KEY:-}}"
 
