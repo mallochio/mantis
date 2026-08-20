@@ -1,0 +1,39 @@
+services:
+  - type: web
+    name: mantis-orchestrator
+    runtime: docker
+    plan: standard
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /ready
+    envVars:
+      - key: MANTIS_API_KEY
+        generateValue: true
+      - key: MANTIS_ROUTER_KEY
+        generateValue: true
+      - key: BIFROST_API_KEY
+        generateValue: true
+      - key: BIFROST_ENCRYPTION_KEY
+        generateValue: true
+      - key: AZURE_OPENAI_RESOURCE_URL
+        value: https://ih-foundry-resource.openai.azure.com
+      - key: AZURE_OPENAI_API_KEY
+        sync: false
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: AWS_BEDROCK_REGION
+        value: eu-central-1
+      - key: VERTEXAI_PROJECT
+        value: interhuman-ai-prod
+      - key: VERTEXAI_LOCATION
+        value: global
+      - key: OPENCODE_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: META_API_KEY
+        sync: false
+      - key: MODAL_PROXY_TOKEN
+        sync: false
