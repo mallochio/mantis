@@ -19,6 +19,7 @@ import fusion
 import httpx
 import model_catalog
 import serve
+import utils
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi import Request as HttpRequest
 from fastapi.exceptions import RequestValidationError
@@ -897,9 +898,13 @@ def _stream_fusion_chat(
             yield _chunk({"role": "assistant"}, None)
             yield _chunk({"content": msg}, "stop")
             completion_text = msg
-        messages = [msg.model_dump(exclude_none=True) for msg in request.messages]
-        usage = utils._request_usage(messages, completion_text)
-        yield f"data: {json.dumps({**base, 'choices': [], 'usage': usage})}\n\n".encode()
+        include_usage = bool(
+            request.stream_options and request.stream_options.include_usage
+        )
+        if include_usage:
+            messages = [msg.model_dump(exclude_none=True) for msg in request.messages]
+            usage = utils._request_usage(messages, completion_text)
+            yield f"data: {json.dumps({**base, 'choices': [], 'usage': usage})}\n\n".encode()
     finally:
         _capacity.release()
     yield b"data: [DONE]\n\n"
