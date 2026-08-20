@@ -171,19 +171,19 @@ The private dashboard is available only on this machine at `http://127.0.0.1:808
 Use distinct provider IDs to avoid stale credentials stored for previous provider names. A local configuration should expose:
 
 ```text
-mantis-local/base
-mantis-local/trinity
-mantis-local/ultra
-mantis-local/fusion
-bifrost-local-complexity/auto
+mantis/base
+mantis/trinity
+mantis/ultra
+mantis/fusion
+bifrost/auto
 ```
 
-All are configured with a 262,144-token context window. `mantis-local/trinity` and `mantis-local/ultra` return an experimental-mode error unless the stack was started with `--experimental`; Base, Fusion, and Bifrost Auto remain available normally. API keys should resolve from `MANTIS_API_KEY` and `BIFROST_COMPLEXITY_PILOT_KEY` at runtime rather than being embedded in `~/.prime/agent/models.json`.
+All are configured with a 262,144-token context window. `mantis/trinity` and `mantis/ultra` return an experimental-mode error unless the stack was started with `--experimental`; Base, Fusion, and Bifrost Auto remain available normally. API keys should resolve from `MANTIS_API_KEY` and `BIFROST_COMPLEXITY_PILOT_KEY` at runtime rather than being embedded in `~/.prime/agent/models.json`.
 
 Example headless task:
 
 ```bash
-prime-agent --mode text --provider mantis-local --model base --no-session \
+prime-agent --mode text --provider mantis --model base --no-session \
   -p 'Inspect this repository, implement the requested change, run tests, and fix failures.'
 ```
 
