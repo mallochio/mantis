@@ -19,8 +19,8 @@ Commands:
   status [URL]               Check health and readiness of the cloud deployment
   test [URL] [API_KEY]       Run a test inference request through cloud Mantis
   sync                       Sync local catalog/bifrost configs and push to GitHub (triggers Render deploy)
-  use-cloud <URL> <KEY>      Configure local shell (~/.zshrc) to route to Render & stop local servers
-  use-local                  Revert local shell (~/.zshrc) to local loopback servers (127.0.0.1:8088)
+  use-cloud <URL> <KEY>      Configure local shell (~/.zshrc) and Prime Agent (~/.prime/) to route to Render & stop local servers
+  use-local                  Revert local shell (~/.zshrc) and Prime Agent (~/.prime/) to local loopback servers (127.0.0.1:8088)
 
 Examples:
   ./scripts/mantis-cloud.sh status https://mantis-orchestrator.onrender.com
@@ -96,12 +96,13 @@ case "$cmd" in
     fi
     URL="${URL%/}"
     [[ "$URL" =~ /v1$ ]] || URL="$URL/v1"
-    echo "Configuring local ~/.zshrc to use Cloud Mantis at $URL..."
+    echo "Configuring local environment & Prime Agent to use Cloud Mantis at $URL..."
 
     # Stop local background stack to save battery
     echo "Stopping local background Mantis stack..."
     "$REPO_ROOT/launch/host/llm-stack.sh" stop || true
 
+    # 1. Update ~/.zshrc
     python3 - << PY
 import re
 zshrc_path = "$HOME/.zshrc"
@@ -114,11 +115,28 @@ text = re.sub(r'export MANTIS_API_KEY=.*', f'export MANTIS_API_KEY="{KEY}"', tex
 with open(zshrc_path, "w") as f:
     f.write(text)
 PY
-    echo "Updated ~/.zshrc. Local battery drain eliminated!"
+    echo "Updated ~/.zshrc."
+
+    # 2. Update ~/.prime/agent/models.json
+    python3 - << PY
+import json, os
+models_path = os.path.expanduser("~/.prime/agent/models.json")
+if os.path.isfile(models_path):
+    with open(models_path, "r") as f:
+        data = json.load(f)
+    if "providers" in data and "mantis" in data["providers"]:
+        data["providers"]["mantis"]["baseUrl"] = "$URL"
+        data["providers"]["mantis"]["name"] = "Mantis Router (Cloud)"
+        with open(models_path, "w") as f:
+            json.dump(data, f, indent=2)
+        print("Updated ~/.prime/agent/models.json (mantis baseUrl -> $URL)")
+PY
+
+    echo "Cloud Mantis is now active across shell & Prime Agent! Local battery drain eliminated."
     ;;
 
   use-local)
-    echo "Switching ~/.zshrc back to local Mantis stack (127.0.0.1:8088/v1)..."
+    echo "Switching ~/.zshrc & Prime Agent back to local Mantis stack (127.0.0.1:8088/v1)..."
     python3 - << PY
 import re
 zshrc_path = "$HOME/.zshrc"
@@ -131,6 +149,21 @@ text = re.sub(r'export MANTIS_API_KEY=.*', 'export MANTIS_API_KEY="${MANTIS_API_
 with open(zshrc_path, "w") as f:
     f.write(text)
 PY
+
+    python3 - << PY
+import json, os
+models_path = os.path.expanduser("~/.prime/agent/models.json")
+if os.path.isfile(models_path):
+    with open(models_path, "r") as f:
+        data = json.load(f)
+    if "providers" in data and "mantis" in data["providers"]:
+        data["providers"]["mantis"]["baseUrl"] = "http://127.0.0.1:8088/v1"
+        data["providers"]["mantis"]["name"] = "Mantis Router (Local)"
+        with open(models_path, "w") as f:
+            json.dump(data, f, indent=2)
+        print("Updated ~/.prime/agent/models.json (mantis baseUrl -> http://127.0.0.1:8088/v1)")
+PY
+
     echo "Restarting local Mantis stack..."
     "$REPO_ROOT/launch/host/llm-stack.sh" start
     echo "Local stack is up."
