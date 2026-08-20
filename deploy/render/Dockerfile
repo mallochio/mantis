@@ -7,6 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MANTIS_HOST=0.0.0.0 \
     MANTIS_CONDUCTOR_DEVICE=cpu \
     MANTIS_CONDUCTOR_DTYPE=float32 \
+    MANTIS_MODEL=/opt/models/qwen3-0.6b \
     AI_ROUTING_CONFIG=/app/config/catalog.toml \
     PATH="/usr/local/bin:$PATH"
 
@@ -42,6 +43,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     UV_PROJECT_ENVIRONMENT=/opt/mantis-venv uv sync --locked --no-dev
 RUN --mount=type=cache,target=/root/.cache/uv \
     cd apps/gateway && UV_PROJECT_ENVIRONMENT=/opt/gateway-venv uv sync --no-dev
+
+# Trinity uses Qwen3-0.6B as its coordinator/router backbone. Bake it into the
+# image so the first Trinity request does not depend on a slow runtime download
+# into Render's ephemeral filesystem.
+RUN --mount=type=cache,target=/root/.cache/huggingface \
+    /opt/mantis-venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-0.6B', local_dir='/opt/models/qwen3-0.6b')"
 
 # Copy the rest of the application
 COPY . .

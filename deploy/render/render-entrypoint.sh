@@ -10,6 +10,10 @@ echo "=== [Mantis Render Entrypoint] Starting initialization ==="
 export AI_ROUTING_CONFIG="${AI_ROUTING_CONFIG:-$REPO_ROOT/config/catalog.toml}"
 export BIFROST_DATA_DIR="${BIFROST_DATA_DIR:-/tmp/bifrost}"
 export MANTIS_DATA_DIR="${MANTIS_DATA_DIR:-/tmp/mantis}"
+# Trinity's coordinator defaults to a cwd-relative vector name. The Render
+# image stores the generated vector under /app/artifacts, so make that absolute
+# path explicit for every API worker.
+export MANTIS_VECTOR="${MANTIS_VECTOR:-$REPO_ROOT/artifacts/model_iter_60.npy}"
 export MANTIS_ROUTER_URL="http://127.0.0.1:5500/v1"
 export MANTIS_ROUTER_HOST="127.0.0.1"
 export MANTIS_ROUTER_PORT="5500"
