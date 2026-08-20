@@ -1,5 +1,7 @@
 # Mantis Cloud Deployment (Render)
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/mallochio/mantis)
+
 This directory contains the production container deployment configuration for Mantis + Bifrost on Render.
 
 ## Overview

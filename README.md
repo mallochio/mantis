@@ -1,5 +1,7 @@
 # Mantis
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/mallochio/mantis)
+
 Mantis is an intelligent AI model orchestration and routing platform providing four OpenAI-compatible modes.
 
 ## Modes
