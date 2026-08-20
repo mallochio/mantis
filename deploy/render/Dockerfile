@@ -45,7 +45,7 @@ COPY . .
 
 # Ensure vector artifacts exist
 RUN if [ ! -f "artifacts/model_iter_60.npy" ]; then \
-      uv run --no-sync python scripts/make_vec.py; \
+      uv run --no-sync python scripts/make_vec.py --mode head-only --input artifacts/router_head.safetensors --output artifacts/model_iter_60.npy; \
     fi
 
 RUN chmod +x deploy/render/render-entrypoint.sh scripts/run_mantis_native.sh

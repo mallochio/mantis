@@ -13,14 +13,17 @@ SVF_LEN = 9216
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=("head-only", "full"), required=True)
-    parser.add_argument("--input", default=os.environ.get("MANTIS_ROUTER_HEAD"))
+    parser.add_argument("--mode", choices=("head-only", "full"), default="head-only")
+    parser.add_argument(
+        "--input",
+        default=os.environ.get("MANTIS_ROUTER_HEAD", "artifacts/router_head.safetensors"),
+    )
     parser.add_argument(
         "--output", default=os.environ.get("MANTIS_VECTOR_OUT", "artifacts/model_iter_60.npy")
     )
     args = parser.parse_args()
-    if not args.input:
-        parser.error("--input or MANTIS_ROUTER_HEAD is required")
+    if not args.input or not Path(args.input).exists():
+        parser.error(f"--input or MANTIS_ROUTER_HEAD file not found: {args.input}")
     if args.mode == "head-only":
         with safe_open(args.input, framework="pt") as handle:
             head = handle.get_tensor("trinity_router_head")
