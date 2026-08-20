@@ -31,6 +31,8 @@ mkdir -p "$BIFROST_DATA_DIR" "$MANTIS_DATA_DIR/router"
 # 2. Setup Bifrost config
 if [[ -f "$REPO_ROOT/config/bifrost.json" ]]; then
   cp "$REPO_ROOT/config/bifrost.json" "$BIFROST_DATA_DIR/config.json"
+elif [[ -f "$REPO_ROOT/deploy/render/bifrost.template.json" ]]; then
+  cp "$REPO_ROOT/deploy/render/bifrost.template.json" "$BIFROST_DATA_DIR/config.json"
 elif [[ -f "$REPO_ROOT/config/bifrost.template.json" ]]; then
   cp "$REPO_ROOT/config/bifrost.template.json" "$BIFROST_DATA_DIR/config.json"
 fi
@@ -91,7 +93,7 @@ done
 
 # 5. Start Mantis API on 0.0.0.0:$MANTIS_PORT
 echo "[Mantis Render Entrypoint] 3/3 Starting Mantis API on 0.0.0.0:$MANTIS_PORT..."
-export PYTHONPATH="$REPO_ROOT/scripts:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$REPO_ROOT/scripts:$REPO_ROOT/apps/gateway:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 if catalog_render=$(uv run --no-sync python scripts/model_catalog.py render 2>/dev/null); then
   if [[ -n "$catalog_render" ]]; then
     eval "$catalog_render"

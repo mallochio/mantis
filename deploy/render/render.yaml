@@ -3,7 +3,7 @@ services:
     name: mantis-orchestrator
     runtime: docker
     plan: standard
-    dockerfilePath: ./deploy/render/Dockerfile
+    dockerfilePath: ./Dockerfile
     dockerContext: .
     healthCheckPath: /ready
     envVars:
