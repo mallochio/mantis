@@ -305,8 +305,56 @@
     ],
     "routing_rules": [
       {
+        "id": "rule-complexity-pilot-simple",
+        "name": "pilot: SIMPLE tier -> fast cheap model",
+        "cel_expression": "complexity_tier == \"SIMPLE\"",
+        "targets": [
+          {
+            "provider": "vertex",
+            "model": "google/gemini-3.5-flash-lite",
+            "weight": 1.0
+          }
+        ],
+        "enabled": true,
+        "priority": 1,
+        "scope": "virtual_key",
+        "scope_id": "vk-interactive-complexity-pilot"
+      },
+      {
+        "id": "rule-complexity-pilot-medium",
+        "name": "pilot: MEDIUM tier -> balanced model",
+        "cel_expression": "complexity_tier == \"MEDIUM\"",
+        "targets": [
+          {
+            "provider": "vertex",
+            "model": "google/gemini-3.7-flash",
+            "weight": 1.0
+          }
+        ],
+        "enabled": true,
+        "priority": 2,
+        "scope": "virtual_key",
+        "scope_id": "vk-interactive-complexity-pilot"
+      },
+      {
+        "id": "rule-complexity-pilot-complex",
+        "name": "pilot: COMPLEX tier -> strong general model",
+        "cel_expression": "complexity_tier == \"COMPLEX\"",
+        "targets": [
+          {
+            "provider": "bedrock",
+            "model": "anthropic/claude-sonnet-5",
+            "weight": 1.0
+          }
+        ],
+        "enabled": true,
+        "priority": 3,
+        "scope": "virtual_key",
+        "scope_id": "vk-interactive-complexity-pilot"
+      },
+      {
         "id": "rule-complexity-pilot-reasoning",
-        "name": "pilot: reasoning tier -> strongest model",
+        "name": "pilot: REASONING tier -> frontier model",
         "cel_expression": "complexity_tier == \"REASONING\"",
         "targets": [
           {
@@ -316,7 +364,7 @@
           }
         ],
         "enabled": true,
-        "priority": 1,
+        "priority": 4,
         "scope": "virtual_key",
         "scope_id": "vk-interactive-complexity-pilot"
       },
@@ -524,7 +572,82 @@
         "scope": "global",
         "priority": 21
       }
-    ]
+    ],
+    "complexity_analyzer_config": {
+      "tier_boundaries": {
+        "simple_medium": 0.15,
+        "medium_complex": 0.35,
+        "complex_reasoning": 0.6
+      },
+      "keywords": {
+        "code_keywords": [
+          "function",
+          "class",
+          "api",
+          "debug",
+          "refactor",
+          "bug",
+          "error",
+          "patch",
+          "test",
+          "import",
+          "module",
+          "database",
+          "schema",
+          "git",
+          "commit",
+          "deploy",
+          "build",
+          "compile",
+          "crash",
+          "stack trace",
+          "exception",
+          "endpoint",
+          "regex",
+          "docker"
+        ],
+        "reasoning_keywords": [
+          "step by step",
+          "explain why",
+          "root cause",
+          "trade-offs",
+          "prove that",
+          "formal proof",
+          "system design",
+          "deep dive",
+          "think through",
+          "carefully reason"
+        ],
+        "technical_keywords": [
+          "architecture",
+          "kubernetes",
+          "latency",
+          "authentication",
+          "authorization",
+          "migration",
+          "concurrency",
+          "distributed",
+          "scalability",
+          "caching",
+          "infrastructure",
+          "observability",
+          "load balancing",
+          "sharding",
+          "consensus"
+        ],
+        "simple_keywords": [
+          "hello",
+          "hi",
+          "thanks",
+          "what is",
+          "define",
+          "translate",
+          "good morning",
+          "good night",
+          "summarize briefly"
+        ]
+      }
+    }
   },
   "providers": {
     "opencode-go": {
@@ -749,6 +872,5 @@
         }
       ]
     }
-  },
-  "source_of_truth": "config.json"
+  }
 }

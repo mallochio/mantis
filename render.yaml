@@ -17,6 +17,8 @@ services:
         generateValue: true
       - key: BIFROST_COMPLEXITY_PILOT_KEY
         generateValue: true
+      - key: GCP_SERVICE_ACCOUNT_JSON
+        sync: false
       - key: TAILSCALE_AUTHKEY
         sync: false
       - key: TAILSCALE_HOSTNAME

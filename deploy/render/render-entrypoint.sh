@@ -28,7 +28,15 @@ export BIFROST_ENCRYPTION_KEY="${BIFROST_ENCRYPTION_KEY:-760529c75e2b39a8bb728cd
 export BIFROST_COMPLEXITY_PILOT_KEY="${BIFROST_COMPLEXITY_PILOT_KEY:-sk-bf-$(od -An -N8 -tx1 /dev/urandom | tr -d " \n")}"
 export OPENCODE_API_KEY="${OPENCODE_API_KEY:-${OPENCODE_GO_API_KEY:-}}"
 
-# Secret files from Render (e.g. /etc/secrets/gcp-service-account.json)
+# Secret files from Render (e.g. /etc/secrets/gcp-service-account.json).
+# Also accept the service-account JSON inline as GCP_SERVICE_ACCOUNT_JSON for
+# services where Secret Files are not configured.
+if [[ -n "${GCP_SERVICE_ACCOUNT_JSON:-}" && ! -f "/etc/secrets/gcp-service-account.json" ]]; then
+  mkdir -p /etc/secrets
+  printf '%s' "$GCP_SERVICE_ACCOUNT_JSON" > /etc/secrets/gcp-service-account.json
+  chmod 600 /etc/secrets/gcp-service-account.json
+  echo "[Mantis Render Entrypoint] Wrote GCP service account from GCP_SERVICE_ACCOUNT_JSON env."
+fi
 if [[ -f "/etc/secrets/gcp-service-account.json" ]]; then
   export GOOGLE_APPLICATION_CREDENTIALS="/etc/secrets/gcp-service-account.json"
 fi
