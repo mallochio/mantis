@@ -2,8 +2,9 @@
 
 > Internal direct-mode gateway. Run with `uv run --directory apps/gateway ...`; it serves :5500 and is exposed to clients as `mantis` through the Mantis API at :8088.
 
-The gateway implements Mantis's direct mode: it scores one request and sends it
-to one cheap, middle, or expensive model through Bifrost. It exposes
+The gateway implements Mantis's direct/Base mode: it scores one request and sends it
+to one cheap, middle, or expensive model through Bifrost. Normal local startup exposes
+Base and Fusion; Trinity and Ultra/Conductor require `llm-stack.sh start --experimental`. It exposes
 OpenAI-compatible `/v1/chat/completions` and `/v1/responses` endpoints. All
 tiers route through the local Bifrost gateway per the shared routing catalog.
 The server uses one lifespan-owned asynchronous HTTP pool.

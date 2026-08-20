@@ -40,6 +40,7 @@ def _chat(
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Drive a deterministic Worker -> Verifier(accept) run through the HTTP API."""
     monkeypatch.setenv("MANTIS_API_KEY", "test-key")
+    monkeypatch.setenv("MANTIS_EXPERIMENTAL_MODES", "1")
     monkeypatch.setenv("OPENROUTER_API_KEY", "provider-key")
     monkeypatch.setenv("MANTIS_WORKER_MODELS", "openrouter/test-worker")
     monkeypatch.setattr(serve, "_args", None)

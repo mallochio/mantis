@@ -2,12 +2,13 @@
 # llm-stack.sh — Local Mantis/Bifrost stack controller.
 #
 # Supports:
-#   start     Start the local LLM stack (Bifrost :8080 -> Gateway :5500 -> Mantis API :8088)
-#   stop      Stop the local LLM stack to save battery and RAM
-#   restart   Restart the local LLM stack
-#   status    Check status of local and cloud Mantis endpoints
+#   start [--experimental]    Start normal Base/Fusion mode, or opt into Trinity/Ultra
+#   restart [--experimental]  Restart in normal or experimental mode
+#   stop                      Stop the local stack to save battery and RAM
+#   status                    Check local process health
 #
-# Usage: ~/Startup/llm-stack.sh [start|stop|restart|status]
+# A bare invocation (as used by StartupFolder) starts normal Base/Fusion mode.
+# Usage: ~/Startup/llm-stack.sh [start [--experimental]|restart [--experimental]|--experimental|stop|status]
 set -euo pipefail
 
 SELF="$0"
@@ -107,18 +108,57 @@ start_one() {
   wait_ready "$name" "$url" "$timeout_s" "$pat" || return 1
 }
 
+EXPERIMENTAL_MODES=0
+
+configure_runtime_mode() {
+  if [ "$EXPERIMENTAL_MODES" = 1 ]; then
+    export MANTIS_EXPERIMENTAL_MODES=1
+    ok "experimental modes enabled (Trinity + Ultra)"
+  else
+    unset MANTIS_EXPERIMENTAL_MODES
+    ok "normal mode (Base + Fusion; Trinity/Ultra gated)"
+  fi
+}
+
+api_runtime_mode() {
+  curl -fsS --max-time 3 "$MANTIS_LOCAL_READY" 2>/dev/null \
+    | sed -n 's/.*"runtime_mode":"\([^"]*\)".*/\1/p'
+}
+
 cmd_start() {
   acquire_lock
-  printf '\n\033[1mStarting the local LLM stack (Bifrost -> direct gateway -> Mantis API)\033[0m\n'
+  configure_runtime_mode
+  printf '
+\033[1mStarting the local LLM stack (Bifrost -> direct gateway -> Mantis API)\033[0m
+'
   [ -f "$CATALOG" ] || warn "catalog missing: $CATALOG (required by the gateway and API)"
-  start_one "1/3" "bifrost" "$LIB_DIR/bifrost-local.sh" "$BIFROST_URL" 90 || return 1
-  start_one "2/3" "direct gateway" "$LIB_DIR/llm-router.sh" "$ROUTER_URL" 120 '"ready":true' || return 1
-  start_one "3/3" "Mantis API" "$LIB_DIR/mantis-local.sh" "$MANTIS_LOCAL_READY" 180 || return 1
+  if health_ok "$BIFROST_URL"; then
+    ok "bifrost already ready"
+  elif [ -n "$(pid_on_port 8080)" ] && wait_ready "existing bifrost" "$BIFROST_URL" 30; then
+    :
+  else
+    start_one "1/3" "bifrost" "$LIB_DIR/bifrost-local.sh" "$BIFROST_URL" 90 || return 1
+  fi
+  if gateway_ready; then
+    ok "direct gateway already ready"
+  elif [ -n "$(pid_on_port 5500)" ] && wait_ready "existing direct gateway" "$ROUTER_URL" 30 '"ready":true'; then
+    :
+  else
+    start_one "2/3" "direct gateway" "$LIB_DIR/llm-router.sh" "$ROUTER_URL" 120 '"ready":true' || return 1
+  fi
+  local desired_mode="normal"
+  [ "$EXPERIMENTAL_MODES" = 1 ] && desired_mode="experimental"
+  if health_ok "$MANTIS_LOCAL_READY" && [ "$(api_runtime_mode)" = "$desired_mode" ]; then
+    ok "Mantis API already ready in $desired_mode mode"
+  else
+    start_one "3/3" "Mantis API" "$LIB_DIR/mantis-local.sh" "$MANTIS_LOCAL_READY" 180 || return 1
+  fi
   cmd_status
 }
 
 cmd_restart() {
   acquire_lock
+  configure_runtime_mode
   printf '\n\033[1mRestarting the whole local stack\033[0m\n'
   start_one "1/3" "bifrost" "$LIB_DIR/bifrost-local.sh" "$BIFROST_URL" 90 || return 1
   start_one "2/3" "direct gateway" "$LIB_DIR/llm-router.sh" "$ROUTER_URL" 120 '"ready":true' || return 1
@@ -176,10 +216,22 @@ cmd_status() {
   printf '  Routing target: \033[1;33mLocal Loopback\033[0m\n\n'
 }
 
-case "${1:-status}" in
-  start)   cmd_start ;;
-  restart) cmd_restart ;;
-  status)  cmd_status ;;
-  stop)    cmd_stop ;;
-  *) echo "usage: $0 [start|stop|restart|status]" >&2; exit 2 ;;
+command="${1:-start}"
+case "$command" in
+  --experimental)
+    EXPERIMENTAL_MODES=1
+    cmd_start
+    ;;
+  start|restart)
+    if [ "${2:-}" = "--experimental" ]; then
+      EXPERIMENTAL_MODES=1
+    elif [ -n "${2:-}" ]; then
+      echo "usage: $0 $command [--experimental]" >&2
+      exit 2
+    fi
+    if [ "$command" = start ]; then cmd_start; else cmd_restart; fi
+    ;;
+  status) cmd_status ;;
+  stop) cmd_stop ;;
+  *) echo "usage: $0 [start [--experimental]|restart [--experimental]|--experimental|stop|status]" >&2; exit 2 ;;
 esac

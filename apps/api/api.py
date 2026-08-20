@@ -621,6 +621,12 @@ def ready(response: Response) -> dict[str, Any]:
     body: dict[str, Any] = {
         "status": "ready",
         "model": serve.MODEL_NAME,
+        "runtime_mode": "experimental" if _experimental_modes_enabled() else "normal",
+        "available_modes": (
+            ["base", "trinity", "ultra", "fusion"]
+            if _experimental_modes_enabled()
+            else ["base", "fusion"]
+        ),
         "endpoint_profile": profile,
         "endpoint_hosts": {name: values[0] for name, values in metadata.items()},
         "endpoint_fingerprints": {name: values[1] for name, values in metadata.items()},
@@ -940,6 +946,28 @@ def _run_fusion_chat(
     return event
 
 
+_EXPERIMENTAL_MODELS = {"mantis/trinity", "mantis/ultra"}
+
+
+def _experimental_modes_enabled() -> bool:
+    return os.environ.get("MANTIS_EXPERIMENTAL_MODES", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _experimental_gate(request: ChatRequest) -> JSONResponse | None:
+    if request.model not in _EXPERIMENTAL_MODELS or _experimental_modes_enabled():
+        return None
+    return _error(
+        400,
+        f"{request.model} is experimental; restart the local stack with --experimental",
+        "invalid_request_error",
+    )
+
+
 @app.get("/v1/models", dependencies=[Depends(_authorize)])
 def models() -> dict[str, Any]:
     descriptor = {
@@ -951,16 +979,21 @@ def models() -> dict[str, Any]:
         "supported_parameters": _SUPPORTED_PARAMETERS,
         "pricing": {"prompt": "0", "completion": "0"},
     }
-    basic = {**descriptor, "context_length": descriptor["context_length"], "max_completion_tokens": 131072}
-    return {
-        "object": "list",
-        "data": [
-            {"id": _BASIC_MODEL, **basic},
-            {"id": "mantis/trinity", **descriptor},
-            {"id": "mantis/ultra", **descriptor},
-            {"id": "mantis/fusion", **descriptor},
-        ],
+    basic = {
+        **descriptor,
+        "context_length": descriptor["context_length"],
+        "max_completion_tokens": 131072,
     }
+    data = [
+        {"id": _BASIC_MODEL, "status": "stable", **basic},
+        {"id": "mantis/fusion", "status": "stable", **descriptor},
+    ]
+    if _experimental_modes_enabled():
+        data[1:1] = [
+            {"id": "mantis/trinity", "status": "experimental", **descriptor},
+            {"id": "mantis/ultra", "status": "experimental", **descriptor},
+        ]
+    return {"object": "list", "data": data}
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(_authorize)])
@@ -968,10 +1001,12 @@ def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Respons
     request_id = uuid.uuid4().hex
     response.headers["X-Request-Id"] = request_id
     headers = dict(http.headers)
-    if not _capacity.acquire(blocking=False):
-        return _error(429, "Mantis is at capacity", "rate_limit_error")
     if request.model in _MODEL_ALIASES:
         request = request.model_copy(update={"model": _MODEL_ALIASES[request.model]})
+    if experimental_error := _experimental_gate(request):
+        return experimental_error
+    if not _capacity.acquire(blocking=False):
+        return _error(429, "Mantis is at capacity", "rate_limit_error")
     if request.model == "mantis/fusion":
         return_reasoning = _fusion_return_reasoning(headers)
         if request.stream:

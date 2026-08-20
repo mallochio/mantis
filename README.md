@@ -17,7 +17,7 @@ No service binds publicly by default. Provider credentials remain on this machin
 | `mantis/ultra` | Ultra | Conductor plans and executes a bounded workflow DAG over the worker pool. |
 | `mantis/fusion` | Fusion | Lead/sidekick orchestration with tool-use follow-ups and a review loop. |
 
-Mantis never switches among these four modes automatically; clients select the desired model ID.
+Mantis never switches among these four modes automatically. Base and Fusion are available in normal mode; Trinity and Ultra are experimental and require starting the stack with `--experimental`.
 
 ## Layout
 
@@ -87,16 +87,24 @@ Install the optional StartupFolder-compatible controller link:
 ln -sfn "$PWD/launch/host/llm-stack.sh" ~/Startup/llm-stack.sh
 ```
 
-Control the complete stack:
+Control the stack:
 
 ```bash
+# Normal mode: Bifrost + Supra + Mantis API; exposes Base and Fusion only.
 ~/Startup/llm-stack.sh start
+
+# Experimental mode: additionally exposes Trinity and Ultra/Conductor.
+~/Startup/llm-stack.sh start --experimental
+# Equivalent shorthand:
+~/Startup/llm-stack.sh --experimental
+
 ~/Startup/llm-stack.sh status
-~/Startup/llm-stack.sh restart
+~/Startup/llm-stack.sh restart                 # return to normal mode
+~/Startup/llm-stack.sh restart --experimental  # experimental mode
 ~/Startup/llm-stack.sh stop
 ```
 
-The controller starts Bifrost, the gateway, and the API in dependency order and checks readiness. Runtime state/logs live under `~/.local/share/bifrost` and `~/.local/share/mantis`.
+A bare StartupFolder invocation defaults to `start` in normal mode. The controller starts Bifrost, the gateway, and the API in dependency order and checks readiness. Trinity's Qwen coordinator remains lazy and is not loaded unless an experimental Trinity request is made; Ultra/Conductor also starts work only on an experimental request. Runtime state/logs live under `~/.local/share/bifrost` and `~/.local/share/mantis`.
 
 You can also run only the Mantis API in the foreground for development:
 
@@ -170,7 +178,7 @@ mantis-local/fusion
 bifrost-local-complexity/auto
 ```
 
-All are configured with a 262,144-token context window. API keys should resolve from `MANTIS_API_KEY` and `BIFROST_COMPLEXITY_PILOT_KEY` at runtime rather than being embedded in `~/.prime/agent/models.json`.
+All are configured with a 262,144-token context window. `mantis-local/trinity` and `mantis-local/ultra` return an experimental-mode error unless the stack was started with `--experimental`; Base, Fusion, and Bifrost Auto remain available normally. API keys should resolve from `MANTIS_API_KEY` and `BIFROST_COMPLEXITY_PILOT_KEY` at runtime rather than being embedded in `~/.prime/agent/models.json`.
 
 Example headless task:
 

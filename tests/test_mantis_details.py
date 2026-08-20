@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setenv("MANTIS_API_KEY", "test-key")
+    monkeypatch.setenv("MANTIS_EXPERIMENTAL_MODES", "1")
     return TestClient(api.app)
 
 

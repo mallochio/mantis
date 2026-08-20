@@ -17,6 +17,7 @@ from openai import OpenAI
 def client(monkeypatch):
     monkeypatch.setenv("MANTIS_API_KEY", "test-key")
     monkeypatch.setenv("MANTIS_ROUTER_KEY", "gateway-key")
+    monkeypatch.setenv("MANTIS_EXPERIMENTAL_MODES", "1")
     return TestClient(api.app)
 
 
@@ -1144,3 +1145,67 @@ def test_cache_retention_can_disable_openrouter_stickiness(monkeypatch):
     assert not providers._cache_retention_enabled()
     monkeypatch.setenv("MANTIS_CACHE_RETENTION", "long")
     assert providers._cache_retention_long()
+
+
+def test_experimental_modes_are_hidden_and_rejected_by_default(client, monkeypatch):
+    monkeypatch.delenv("MANTIS_EXPERIMENTAL_MODES", raising=False)
+    models = client.get("/v1/models", headers=_headers()).json()["data"]
+    assert [(item["id"], item["status"]) for item in models] == [
+        ("mantis/base", "stable"),
+        ("mantis/fusion", "stable"),
+    ]
+
+    calls = {"acquire": 0, "release": 0}
+
+    class CapacitySpy:
+        def acquire(self, **_kwargs):
+            calls["acquire"] += 1
+            return True
+
+        def release(self):
+            calls["release"] += 1
+
+    monkeypatch.setattr(api, "_capacity", CapacitySpy())
+    for model, canonical in (
+        ("mantis/trinity", "mantis/trinity"),
+        ("trinity", "mantis/trinity"),
+        ("mantis-trinity", "mantis/trinity"),
+        ("mantis/ultra", "mantis/ultra"),
+        ("ultra", "mantis/ultra"),
+        ("mantis-ultra", "mantis/ultra"),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            headers=_headers(),
+            json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert response.status_code == 400
+        error = response.json()["error"]
+        assert error["type"] == "invalid_request_error"
+        assert canonical in error["message"]
+        assert "--experimental" in error["message"]
+    assert calls == {"acquire": 0, "release": 0}
+
+
+def test_experimental_startup_exposes_and_allows_trinity_and_ultra(client, monkeypatch):
+    monkeypatch.setenv("MANTIS_EXPERIMENTAL_MODES", "1")
+    models = client.get("/v1/models", headers=_headers()).json()["data"]
+    assert [(item["id"], item["status"]) for item in models] == [
+        ("mantis/base", "stable"),
+        ("mantis/trinity", "experimental"),
+        ("mantis/ultra", "experimental"),
+        ("mantis/fusion", "stable"),
+    ]
+    assert api._experimental_gate(
+        api.ChatRequest(model="mantis/trinity", messages=[api.Message(role="user", content="hi")])
+    ) is None
+    assert api._experimental_gate(
+        api.ChatRequest(model="mantis/ultra", messages=[api.Message(role="user", content="hi")])
+    ) is None
+
+
+def test_base_and_fusion_are_never_experimental(monkeypatch):
+    monkeypatch.delenv("MANTIS_EXPERIMENTAL_MODES", raising=False)
+    for model in ("mantis/base", "mantis/fusion"):
+        request = api.ChatRequest(model=model, messages=[api.Message(role="user", content="hi")])
+        assert api._experimental_gate(request) is None
