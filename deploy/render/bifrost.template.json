@@ -193,6 +193,19 @@
             "key_ids": [
               "*"
             ]
+          },
+          {
+            "provider": "openrouter",
+            "weight": 1.0,
+            "allowed_models": [
+              "google/gemini-3.7-flash",
+              "gpt-5.6-terra",
+              "gpt-5.6-sol",
+              "anthropic/claude-opus-5"
+            ],
+            "key_ids": [
+              "*"
+            ]
           }
         ]
       }
@@ -318,7 +331,10 @@
         "enabled": true,
         "priority": 1,
         "scope": "virtual_key",
-        "scope_id": "vk-interactive-complexity-pilot"
+        "scope_id": "vk-interactive-complexity-pilot",
+        "fallbacks": [
+          "openrouter/google/gemini-3.7-flash"
+        ]
       },
       {
         "id": "rule-complexity-pilot-medium",
@@ -334,7 +350,11 @@
         "enabled": true,
         "priority": 2,
         "scope": "virtual_key",
-        "scope_id": "vk-interactive-complexity-pilot"
+        "scope_id": "vk-interactive-complexity-pilot",
+        "fallbacks": [
+          "bedrock/gpt-5.6-terra",
+          "openrouter/gpt-5.6-terra"
+        ]
       },
       {
         "id": "rule-complexity-pilot-complex",
@@ -350,7 +370,11 @@
         "enabled": true,
         "priority": 3,
         "scope": "virtual_key",
-        "scope_id": "vk-interactive-complexity-pilot"
+        "scope_id": "vk-interactive-complexity-pilot",
+        "fallbacks": [
+          "bedrock/gpt-5.6-sol",
+          "openrouter/gpt-5.6-sol"
+        ]
       },
       {
         "id": "rule-complexity-pilot-reasoning",
@@ -366,7 +390,11 @@
         "enabled": true,
         "priority": 4,
         "scope": "virtual_key",
-        "scope_id": "vk-interactive-complexity-pilot"
+        "scope_id": "vk-interactive-complexity-pilot",
+        "fallbacks": [
+          "vertex/claude-opus-5",
+          "openrouter/anthropic/claude-opus-5"
+        ]
       },
       {
         "id": "rule-claude-sonnet-5-fallback",
@@ -380,8 +408,8 @@
           }
         ],
         "fallbacks": [
-          "bedrock",
-          "openrouter"
+          "bedrock/anthropic/claude-sonnet-5",
+          "openrouter/anthropic/claude-sonnet-5"
         ],
         "enabled": true,
         "scope": "global",
@@ -399,8 +427,8 @@
           }
         ],
         "fallbacks": [
-          "bedrock",
-          "openrouter"
+          "bedrock/anthropic/claude-opus-5",
+          "openrouter/anthropic/claude-opus-5"
         ],
         "enabled": true,
         "scope": "global",
@@ -418,8 +446,8 @@
           }
         ],
         "fallbacks": [
-          "vertex",
-          "openrouter"
+          "vertex/claude-fable-5",
+          "openrouter/anthropic/claude-fable-5"
         ],
         "enabled": true,
         "scope": "global",
@@ -437,7 +465,7 @@
           }
         ],
         "fallbacks": [
-          "azure"
+          "azure/DeepSeek-V4-Pro"
         ],
         "enabled": true,
         "scope": "global",
@@ -455,7 +483,7 @@
           }
         ],
         "fallbacks": [
-          "azure"
+          "azure/DeepSeek-V4-Flash"
         ],
         "enabled": true,
         "scope": "global",
@@ -473,7 +501,7 @@
           }
         ],
         "fallbacks": [
-          "openrouter"
+          "openrouter/google/gemini-3.7-flash"
         ],
         "enabled": true,
         "scope": "global",
@@ -491,7 +519,7 @@
           }
         ],
         "fallbacks": [
-          "openrouter"
+          "openrouter/google/gemini-3.1-pro-preview"
         ],
         "enabled": true,
         "scope": "global",
@@ -509,7 +537,7 @@
           }
         ],
         "fallbacks": [
-          "openrouter"
+          "openrouter/google/gemini-3.5-flash-lite"
         ],
         "enabled": true,
         "scope": "global",
@@ -527,8 +555,8 @@
           }
         ],
         "fallbacks": [
-          "bedrock",
-          "openrouter"
+          "bedrock/gpt-5.6-luna",
+          "openrouter/gpt-5.6-luna"
         ],
         "enabled": true,
         "scope": "global",
@@ -546,8 +574,8 @@
           }
         ],
         "fallbacks": [
-          "bedrock",
-          "openrouter"
+          "bedrock/gpt-5.6-sol",
+          "openrouter/gpt-5.6-sol"
         ],
         "enabled": true,
         "scope": "global",
@@ -565,8 +593,8 @@
           }
         ],
         "fallbacks": [
-          "bedrock",
-          "openrouter"
+          "bedrock/gpt-5.6-terra",
+          "openrouter/gpt-5.6-terra"
         ],
         "enabled": true,
         "scope": "global",
@@ -575,7 +603,7 @@
     ],
     "complexity_analyzer_config": {
       "tier_boundaries": {
-        "simple_medium": 0.15,
+        "simple_medium": 0.1,
         "medium_complex": 0.35,
         "complex_reasoning": 0.6
       },
@@ -584,66 +612,246 @@
           "function",
           "class",
           "api",
+          "database",
+          "algorithm",
+          "code",
+          "implement",
           "debug",
+          "error",
+          "syntax",
+          "compile",
+          "runtime",
+          "library",
+          "framework",
+          "variable",
+          "loop",
+          "array",
+          "object",
+          "method",
+          "interface",
+          "regex",
+          "deploy",
+          "docker",
+          "sql",
+          "query",
+          "schema",
+          "endpoint",
           "refactor",
           "bug",
-          "error",
-          "patch",
+          "parse",
+          "async",
+          "webhook",
+          "migration",
+          "ci/cd",
+          "pipeline",
+          "rest",
+          "graphql",
           "test",
-          "import",
-          "module",
-          "database",
-          "schema",
-          "git",
+          "unit test",
+          "python",
+          "javascript",
+          "typescript",
+          "golang",
+          "java",
+          "ruby",
+          "github actions",
+          "monorepo",
+          "aws cli",
+          "config rule",
+          "config rules",
+          "retry",
+          "fallback",
+          "middleware",
+          "patch",
+          "diff",
+          "pr",
+          "pull request",
           "commit",
-          "deploy",
-          "build",
-          "compile",
-          "crash",
-          "stack trace",
-          "exception",
-          "endpoint",
-          "regex",
-          "docker"
+          "commit message",
+          "behavior change",
+          "cel",
+          "auto-routing",
+          "rwmutex",
+          "goroutine",
+          "repository",
+          "repo",
+          "codebase",
+          "file",
+          "files",
+          "package",
+          "dependency",
+          "lockfile",
+          "lint",
+          "linter",
+          "typecheck",
+          "build failure",
+          "failing test",
+          "test failure",
+          "integration test",
+          "e2e",
+          "regression",
+          "code review",
+          "merge conflict",
+          "fix",
+          "pytest",
+          "jest",
+          "cargo",
+          "npm",
+          "pip",
+          "sdk",
+          "react",
+          "node",
+          "rust",
+          "cursor pagination",
+          "minimal reproduction"
         ],
         "reasoning_keywords": [
           "step by step",
-          "explain why",
-          "root cause",
-          "trade-offs",
-          "prove that",
+          "root cause analysis",
+          "reconstruct the sequence",
+          "reconstruct the most likely sequence",
+          "what should have happened instead",
+          "explain your reasoning",
           "formal proof",
-          "system design",
-          "deep dive",
-          "think through",
-          "carefully reason"
+          "prove that",
+          "counterexample",
+          "compare alternatives",
+          "evaluate tradeoffs",
+          "weigh the tradeoffs",
+          "recommend a design",
+          "design a migration plan",
+          "debug this systematically",
+          "investigate the failure"
         ],
         "technical_keywords": [
           "architecture",
-          "kubernetes",
-          "latency",
-          "authentication",
-          "authorization",
-          "migration",
-          "concurrency",
           "distributed",
+          "encryption",
+          "authentication",
           "scalability",
-          "caching",
+          "microservices",
+          "kubernetes",
           "infrastructure",
-          "observability",
-          "load balancing",
+          "protocol",
+          "latency",
+          "throughput",
+          "concurrency",
+          "optimization",
+          "load balancer",
+          "caching",
           "sharding",
-          "consensus"
+          "replication",
+          "consensus",
+          "mutex",
+          "deadlock",
+          "race condition",
+          "api gateway",
+          "terraform",
+          "observability",
+          "access token",
+          "refresh token",
+          "rbac",
+          "sso",
+          "oidc",
+          "saml",
+          "tenant",
+          "multi-tenant",
+          "audit log",
+          "failover",
+          "idempotency",
+          "zero downtime",
+          "incident",
+          "outage",
+          "postmortem",
+          "root cause",
+          "telemetry",
+          "metrics",
+          "configmap",
+          "connection pool",
+          "payment processing",
+          "saas",
+          "feature flag",
+          "operational risk",
+          "vendor lock-in",
+          "s3 bucket",
+          "misconfiguration",
+          "remediation",
+          "oltp",
+          "olap",
+          "ledger",
+          "metering",
+          "aggregation",
+          "proration",
+          "credits",
+          "dunning",
+          "invoice",
+          "invoice generation",
+          "double-entry",
+          "reconciliation",
+          "chart of accounts",
+          "hipaa",
+          "quarantine workflow",
+          "retention policy",
+          "audit trail",
+          "pre-signed url",
+          "entitlements",
+          "seat limits",
+          "usage quotas",
+          "deprovisioning",
+          "permission drift",
+          "role mapping",
+          "fraud detection",
+          "manual review",
+          "feedback loop",
+          "model serving",
+          "a/b testing",
+          "identity resolution",
+          "deterministic replay",
+          "tamper evidence",
+          "hash chain",
+          "approval workflow",
+          "vpc",
+          "soc 2",
+          "data residency",
+          "disaster recovery",
+          "data race",
+          "struct copy",
+          "hybrid search",
+          "distributed system",
+          "database migration",
+          "dependency graph",
+          "breaking change",
+          "backward compatibility",
+          "memory leak",
+          "performance regression",
+          "rate limit",
+          "throttling",
+          "timeout",
+          "secret",
+          "credential",
+          "authorization",
+          "supply chain",
+          "vulnerability",
+          "cve",
+          "production incident",
+          "service mesh",
+          "query plan",
+          "data loss",
+          "data integrity",
+          "rollback",
+          "threat model"
         ],
         "simple_keywords": [
           "hello",
           "hi",
           "thanks",
+          "good morning",
+          "good night",
+          "how are you",
           "what is",
           "define",
           "translate",
-          "good morning",
-          "good night",
+          "how do i spell",
           "summarize briefly"
         ]
       }
@@ -872,5 +1080,6 @@
         }
       ]
     }
-  }
+  },
+  "source_of_truth": "config.json"
 }
