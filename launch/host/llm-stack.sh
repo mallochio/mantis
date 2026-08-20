@@ -4,7 +4,7 @@
 # Supports:
 #   start [--experimental]    Start normal Base/Fusion mode, or opt into Trinity/Ultra
 #   restart [--experimental]  Restart in normal or experimental mode
-#   stop                      Stop the local stack to save battery and RAM
+#   stop                      Stop the local stack
 #   status                    Check local process health
 #
 # A bare invocation (as used by StartupFolder) starts normal Base/Fusion mode.
@@ -198,17 +198,17 @@ cmd_status() {
   if health_ok "$BIFROST_URL"; then
     printf '  %-14s %-7s %-8s \033[1;32mup\033[0m\n' bifrost :8080 "$(pid_on_port 8080)"
   else
-    printf '  %-14s %-7s %-8s \033[1;31mdown (saved battery)\033[0m\n' bifrost :8080 -
+    printf '  %-14s %-7s %-8s \033[1;31mdown\033[0m\n' bifrost :8080 -
   fi
   if gateway_ready; then
     printf '  %-14s %-7s %-8s \033[1;32mup\033[0m\n' gateway :5500 "$(pid_on_port 5500)"
   else
-    printf '  %-14s %-7s %-8s \033[1;31mdown (saved battery)\033[0m\n' gateway :5500 -
+    printf '  %-14s %-7s %-8s \033[1;31mdown\033[0m\n' gateway :5500 -
   fi
   if health_ok "$MANTIS_LOCAL_READY"; then
     printf '  %-14s %-7s %-8s \033[1;32mup\033[0m\n' mantis-api :8088 "$(pid_on_port 8088)"
   else
-    printf '  %-14s %-7s %-8s \033[1;31mdown (saved battery)\033[0m\n' mantis-api :8088 -
+    printf '  %-14s %-7s %-8s \033[1;31mdown\033[0m\n' mantis-api :8088 -
   fi
 
   local active_url="${MANTIS_URL:-http://127.0.0.1:8088/v1}"
