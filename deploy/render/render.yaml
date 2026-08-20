@@ -3,7 +3,7 @@ services:
     name: mantis-orchestrator
     runtime: docker
     plan: standard
-    dockerfilePath: ./Dockerfile
+    dockerfilePath: ./deploy/render/Dockerfile
     dockerContext: .
     healthCheckPath: /ready
     envVars:
@@ -15,6 +15,10 @@ services:
         generateValue: true
       - key: BIFROST_ENCRYPTION_KEY
         generateValue: true
+      - key: TAILSCALE_AUTHKEY
+        sync: false
+      - key: TAILSCALE_HOSTNAME
+        value: mantis-render
       - key: AZURE_OPENAI_RESOURCE_URL
         value: https://ih-foundry-resource.openai.azure.com
       - key: AZURE_OPENAI_API_KEY

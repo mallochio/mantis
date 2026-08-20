@@ -26,7 +26,7 @@ if [[ -f "/etc/secrets/gcp-service-account.json" ]]; then
   export GOOGLE_APPLICATION_CREDENTIALS="/etc/secrets/gcp-service-account.json"
 fi
 
-mkdir -p "$BIFROST_DATA_DIR" "$MANTIS_DATA_DIR/router"
+mkdir -p "$BIFROST_DATA_DIR" "$MANTIS_DATA_DIR/router" /var/run/tailscale /var/lib/tailscale
 
 # 2. Setup Bifrost config
 if [[ -f "$REPO_ROOT/config/bifrost.json" ]]; then
@@ -38,6 +38,7 @@ elif [[ -f "$REPO_ROOT/config/bifrost.template.json" ]]; then
 fi
 
 # Process cleanup trap
+tailscale_pid=""
 bifrost_pid=""
 gateway_pid=""
 mantis_pid=""
@@ -47,14 +48,49 @@ cleanup() {
   [[ -n "$mantis_pid" ]] && kill -TERM "$mantis_pid" 2>/dev/null || true
   [[ -n "$gateway_pid" ]] && kill -TERM "$gateway_pid" 2>/dev/null || true
   [[ -n "$bifrost_pid" ]] && kill -TERM "$bifrost_pid" 2>/dev/null || true
+  [[ -n "$tailscale_pid" ]] && kill -TERM "$tailscale_pid" 2>/dev/null || true
   wait 2>/dev/null || true
   echo "[Mantis Render Entrypoint] Shutdown complete."
 }
 trap cleanup SIGTERM SIGINT SIGHUP
 
-# 3. Start Bifrost on :8080
-echo "[Mantis Render Entrypoint] 1/3 Starting Bifrost on 127.0.0.1:8080..."
-bifrost -app-dir "$BIFROST_DATA_DIR" -host 127.0.0.1 -port 8080 -log-style pretty &
+# 3. Optional Tailscale Integration
+if [[ -n "${TAILSCALE_AUTHKEY:-}" ]]; then
+  echo "[Mantis Render Entrypoint] Initializing Tailscale..."
+  TS_HOSTNAME="${TAILSCALE_HOSTNAME:-mantis-render}"
+  TS_STATE_DIR="${TAILSCALE_STATE_DIR:-/var/lib/tailscale}"
+  TS_EXTRA_ARGS="${TAILSCALE_EXTRA_ARGS:-}"
+
+  # Determine tun mode: check if /dev/net/tun is available, otherwise userspace-networking
+  TUN_ARG=""
+  if [[ ! -c /dev/net/tun ]]; then
+    TUN_ARG="--tun=userspace-networking"
+  fi
+
+  tailscaled --statedir="$TS_STATE_DIR" $TUN_ARG &
+  tailscale_pid=$!
+
+  # Wait for tailscaled socket
+  for i in $(seq 1 30); do
+    if tailscale status >/dev/null 2>&1 || [ $? -eq 1 ]; then
+      break
+    fi
+    sleep 0.5
+  done
+
+  # Connect to Tailnet
+  echo "[Mantis Render Entrypoint] Authenticating Tailscale node '$TS_HOSTNAME'..."
+  tailscale up --authkey="$TAILSCALE_AUTHKEY" --hostname="$TS_HOSTNAME" $TS_EXTRA_ARGS
+
+  # Expose Bifrost Web UI (:8080) directly over Tailscale Serve
+  echo "[Mantis Render Entrypoint] Exposing Bifrost (:8080) over Tailscale Serve..."
+  tailscale serve --bg --http=8080 8080 || tailscale serve --bg 8080 || true
+  echo "[Mantis Render Entrypoint] Tailscale is up! Node: $(tailscale ip -4 2>/dev/null || echo "$TS_HOSTNAME")"
+fi
+
+# 4. Start Bifrost on :8080 (listen on 0.0.0.0 so Tailscale can forward traffic to it)
+echo "[Mantis Render Entrypoint] 1/3 Starting Bifrost on 0.0.0.0:8080..."
+bifrost -app-dir "$BIFROST_DATA_DIR" -host 0.0.0.0 -port 8080 -log-style pretty &
 bifrost_pid=$!
 
 # Wait for Bifrost ready
@@ -70,7 +106,7 @@ for i in $(seq 1 60); do
   sleep 0.5
 done
 
-# 4. Start Direct Gateway / Router on :5500
+# 5. Start Direct Gateway / Router on :5500
 echo "[Mantis Render Entrypoint] 2/3 Starting Mantis Router on 127.0.0.1:5500..."
 (
   cd "$REPO_ROOT/apps/gateway"
@@ -91,7 +127,7 @@ for i in $(seq 1 60); do
   sleep 0.5
 done
 
-# 5. Start Mantis API on 0.0.0.0:$MANTIS_PORT
+# 6. Start Mantis API on 0.0.0.0:$MANTIS_PORT
 echo "[Mantis Render Entrypoint] 3/3 Starting Mantis API on 0.0.0.0:$MANTIS_PORT..."
 export PYTHONPATH="$REPO_ROOT/scripts:$REPO_ROOT/apps/gateway:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 if catalog_render=$(uv run --no-sync python scripts/model_catalog.py render 2>/dev/null); then

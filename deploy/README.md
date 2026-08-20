@@ -9,8 +9,9 @@ The deployment packages the complete Mantis stack into a single private/public D
 1. **Bifrost AI Gateway (`:8080`)**: Unified upstream routing to OpenAI/Azure, AWS Bedrock, Google Vertex, OpenCode, OpenRouter, and Meta with rate limiting and fallback cascades.
 2. **Mantis Router / Gateway (`:5500`)**: Supra classifier scoring and smart session-ratchet routing configured via `config/catalog.toml`.
 3. **Mantis API (`:8088` mapped to `$PORT`)**: OpenAI-compatible API serving `mantis/base`, `mantis/trinity`, `mantis/ultra`, and `mantis/fusion`.
+4. **Tailscale Daemon (Optional)**: Secure peer-to-peer overlay network enabling private browser access to the Bifrost Web UI (:8080) directly over your Tailnet.
 
-All three processes run in the container on loopback with zero public surface for internal components. The public endpoint is exposed with HTTPS and secured via `MANTIS_API_KEY`.
+All internal processes run secured in the container. The public endpoint is exposed with HTTPS and secured via `MANTIS_API_KEY`.
 
 ---
 
@@ -19,7 +20,7 @@ All three processes run in the container on loopback with zero public surface fo
 ```text
 deploy/
 ├── render/
-│   ├── Dockerfile                 # Debian-based Python 3.13 + Node + uv + Bifrost runtime
+│   ├── Dockerfile                 # Debian-based Python 3.13 + Node + uv + Bifrost + Tailscale runtime
 │   ├── render.yaml                # Render Blueprint service definition
 │   ├── render-entrypoint.sh       # Container supervisor & service orchestrator
 │   └── bifrost.template.json      # Gateway upstream provider routing template
@@ -40,11 +41,23 @@ deploy/
    - `AWS_ACCESS_KEY_ID` & `AWS_SECRET_ACCESS_KEY`
    - `OPENCODE_API_KEY` / `OPENROUTER_API_KEY` / `META_API_KEY`
    - `MANTIS_API_KEY` *(the secret key used by your local machine / agents to authorize requests)*
+   - `TAILSCALE_AUTHKEY` *(Optional: Generate a reusable or ephemeral auth key from [Tailscale Admin Console](https://login.tailscale.com/admin/settings/keys))*
 5. Click **Apply**.
 
 ---
 
-## 2. Managing & Controlling from Local Machine
+## 2. Accessing the Bifrost Web UI over Tailscale
+
+When `TAILSCALE_AUTHKEY` is provided:
+1. The container will automatically join your Tailnet as `mantis-render` (configurable via `TAILSCALE_HOSTNAME`).
+2. Bifrost (`:8080`) is served directly over Tailscale.
+3. Open your browser on any Tailscale-connected device and navigate to:
+   - `http://mantis-render:8080` (or `http://<tailscale-ip>:8080`)
+4. You get full access to the Bifrost dashboard, live request logs, provider metrics, and latency graphs securely without exposing port 8080 to the public internet!
+
+---
+
+## 3. Managing & Controlling from Local Machine
 
 Use the local CLI script (`./scripts/mantis-cloud.sh` or `./deploy/scripts/mantis-cloud.sh`):
 
@@ -69,7 +82,7 @@ When you modify `config/catalog.toml` or `deploy/render/bifrost.template.json` l
 ```bash
 ./scripts/mantis-cloud.sh use-cloud https://mantis-orchestrator.onrender.com/v1 <YOUR_MANTIS_API_KEY>
 ```
-This stops local background Python/Go processes on your Mac and sets `MANTIS_URL` in `~/.zshrc`.
+This stops local background Python/Go processes on your Mac and sets `MANTIS_URL` in `~/.zshrc` and `~/.prime/agent/models.json`.
 
 ### Revert to Local Stack
 ```bash
