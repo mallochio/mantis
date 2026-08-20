@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-# llm-stack.sh — Universal switcher and launcher for Mantis (Local vs Cloud).
+# llm-stack.sh — Local Mantis/Bifrost stack controller.
 #
 # Supports:
 #   start     Start the local LLM stack (Bifrost :8080 -> Gateway :5500 -> Mantis API :8088)
 #   stop      Stop the local LLM stack to save battery and RAM
 #   restart   Restart the local LLM stack
 #   status    Check status of local and cloud Mantis endpoints
-#   cloud     Manage cloud deployment (status, test, sync, use-cloud, use-local)
 #
-# Usage: ~/Startup/llm-stack.sh [start|stop|restart|status|cloud]
+# Usage: ~/Startup/llm-stack.sh [start|stop|restart|status]
 set -euo pipefail
 
 SELF="$0"
@@ -172,24 +171,9 @@ cmd_status() {
     printf '  %-14s %-7s %-8s \033[1;31mdown (saved battery)\033[0m\n' mantis-api :8088 -
   fi
 
-  # Check active MANTIS_URL in environment
   local active_url="${MANTIS_URL:-http://127.0.0.1:8088/v1}"
   printf '\n  Active Environment MANTIS_URL: %s\n' "$active_url"
-  if [[ "$active_url" =~ ^https?://(127\.0\.0\.1|localhost) ]]; then
-    printf '  Routing target: \033[1;33mLocal Loopback\033[0m\n'
-  else
-    printf '  Routing target: \033[1;32mRender Cloud Instance\033[0m\n'
-    if curl -fsS --max-time 5 "${active_url%/v1}/ready" >/dev/null 2>&1; then
-      printf '  Cloud Status:   \033[1;32mOnline & Healthy\033[0m\n'
-    else
-      printf '  Cloud Status:   \033[1;31mUnreachable / Deploying\033[0m\n'
-    fi
-  fi
-  printf '\n'
-}
-
-cmd_cloud() {
-  exec "$REPO_ROOT/deploy/scripts/mantis-cloud.sh" "$@"
+  printf '  Routing target: \033[1;33mLocal Loopback\033[0m\n\n'
 }
 
 case "${1:-status}" in
@@ -197,6 +181,5 @@ case "${1:-status}" in
   restart) cmd_restart ;;
   status)  cmd_status ;;
   stop)    cmd_stop ;;
-  cloud)   shift; cmd_cloud "$@" ;;
-  *) echo "usage: $0 [start|stop|restart|status|cloud ...]" >&2; exit 2 ;;
+  *) echo "usage: $0 [start|stop|restart|status]" >&2; exit 2 ;;
 esac

@@ -30,11 +30,10 @@ this checkout.
 
 Targets, provider bindings, and the Supra complexity policy come from one
 explicit source: the shared routing catalog (`[gateway]` section of
-`~/.config/ai-routing/catalog.toml`) or `MANTIS_ROUTER_TARGETS_JSON`. In the
-Render image, `AI_ROUTING_CONFIG=/app/config/catalog.toml`; that internal
-cheap/middle/expensive Supra policy is distinct from Bifrost's separately
-scoped `vk-interactive-complexity-pilot` lexical four-tier pilot. There is no
-environment-variable fallback contract; `user` is not treated as a session
+`~/.config/ai-routing/catalog.toml`) or `MANTIS_ROUTER_TARGETS_JSON`. This
+internal cheap/middle/expensive Supra policy is distinct from Bifrost's
+separately scoped `vk-interactive-complexity-pilot` lexical four-tier pilot.
+There is no environment-variable fallback contract; `user` is not treated as a session
 identifier unless `MANTIS_ROUTER_SESSION_FROM_USER=1` is set; prefer
 `X-Route-Session` for conversation affinity.
 

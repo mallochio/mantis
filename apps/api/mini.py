@@ -163,7 +163,7 @@ class FuguRouter:
         else:
             # Reconstructing unchanged matrices with nine float32 SVDs is both
             # numerically pointless and a multi-GB transient memory spike.
-            # Render ships a head-only vector, so skip SVF entirely.
+            # Head-only deployments skip SVF entirely.
             self.svf_keys = []
         # head: last 10240 -> (10, 1024) [EXEC]
         self.head = (

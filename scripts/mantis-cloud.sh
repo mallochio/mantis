@@ -1,1 +1,0 @@
-../deploy/scripts/mantis-cloud.sh

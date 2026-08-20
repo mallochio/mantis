@@ -1,126 +1,120 @@
 # Mantis
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/mallochio/mantis)
+Mantis is a local AI model orchestration and routing platform with an OpenAI-compatible API. The supported runtime is a three-process loopback stack:
 
-Mantis is an intelligent AI model orchestration and routing platform providing four OpenAI-compatible modes.
+```text
+Bifrost :8080 → Mantis direct router :5500 → Mantis API :8088
+```
+
+No service binds publicly by default. Provider credentials remain on this machine.
 
 ## Modes
 
 | Model | Mode | Use |
 |---|---|---|
-| `mantis/base` | Direct | The gateway scores one request with Supra classifier and sends it to a cheap, middle, or expensive model through Bifrost. |
+| `mantis/base` | Direct | Supra scores the request and chooses a cheap, middle, or expensive worker through Bifrost. |
 | `mantis/trinity` | Trinity | Multi-agent coordination over Worker, Thinker, and Verifier roles. |
 | `mantis/ultra` | Ultra | Conductor plans and executes a bounded workflow DAG over the worker pool. |
-| `mantis/fusion` | Fusion | Lead/sidekick orchestration with tool-use follow-ups and a review loop. Works as `model: mantis/fusion` in chat or via `/v1/fusion/delegate`. |
+| `mantis/fusion` | Fusion | Lead/sidekick orchestration with tool-use follow-ups and a review loop. |
 
-Only these model IDs are accepted. Select `mantis/trinity`, `mantis/ultra`, or `mantis/fusion` manually; Mantis never selects between modes. All four paths send model calls through the Bifrost gateway.
+Mantis never switches among these four modes automatically; clients select the desired model ID.
 
----
-
-## Architecture & Directory Layout
+## Layout
 
 ```text
 mantis/
 ├── apps/
-│   ├── api/                    # Mantis public API server (:8088 / $PORT)
-│   └── gateway/                # Internal Direct-mode router & classifier (:5500)
+│   ├── api/                    # Mantis API (:8088)
+│   └── gateway/                # Internal Supra router (:5500)
+├── artifacts/                  # Trinity router vector/head
 ├── config/
-│   ├── catalog.toml            # Tracked model routing catalog (source of truth)
-│   └── worker-costs.json       # Cost evaluation price tables
-├── deploy/                     # Cloud container deployment (Cleanly isolated)
-│   ├── render/
-│   │   ├── Dockerfile          # Debian-based container definition
-│   │   ├── render.yaml         # Render Blueprint service manifest
-│   │   ├── render-entrypoint.sh# Multi-service container supervisor
-│   │   └── bifrost.template.json # Bifrost upstream provider config template
-│   ├── scripts/
-│   │   └── mantis-cloud.sh     # Local CLI for cloud monitoring & switching
-│   └── README.md               # Detailed cloud deployment guide
-├── artifacts/                  # Trained router weights & manifests
-├── eval/                       # Router evaluation & SWE-rebench harnesses
-├── launch/
-│   ├── host/                   # Local host system service launcher (llm-stack.sh)
-│   └── sky/                    # SkyPilot cluster launch definitions
-├── scripts/                    # Development, retraining, and verification scripts
-└── tests/                      # Automated test suite (420+ tests)
+│   ├── catalog.toml            # Shared model/provider routing catalog
+│   ├── bifrost.template.json   # Canonical Bifrost providers, keys, rules and complexity policy
+│   └── worker-costs.json       # Evaluation price tables
+├── launch/host/
+│   ├── llm-stack.sh            # Full local stack controller
+│   └── lib/                    # Bifrost, gateway and API launchers
+├── scripts/                    # Development, retraining and verification
+├── eval/                       # Router evaluations and SWE-rebench harnesses
+└── tests/                      # Test suite
 ```
 
----
+## Local setup
 
-## Cloud Deployment (Render)
+### Requirements
 
-Mantis runs as the `mantis-orchestrator` Render web service. The public OpenAI-compatible endpoint is:
+- macOS or Linux with `zsh`, `curl`, and `lsof`
+- Node/npm (`npx` launches `@maximhq/bifrost`)
+- [`uv`](https://docs.astral.sh/uv/)
+- Python 3.13
+- Provider credentials exported in `~/.zshrc`
 
-```text
-https://mantis-orchestrator.onrender.com/v1
-```
-
-Bifrost remains private on the Tailnet; it is not exposed through the public Render URL. Its pilot uses four classified tiers and a balanced Terra catch-all for unclassified `auto` requests. See the complete setup, credentials, Tailscale access, complexity-router pilot, and Prime Agent instructions in [`deploy/README.md`](deploy/README.md).
-
-### Quick start
-
-1. In Render, create/apply the Blueprint for `main` and configure the required provider credentials.
-2. Add the Vertex service account as a Render Secret File named `gcp-service-account.json` (preferred) or `GCP_SERVICE_ACCOUNT_JSON`.
-3. Verify deployment without credentials:
-
-   ```bash
-   curl -fsS https://mantis-orchestrator.onrender.com/ready
-   ```
-
-4. Set the public API key only in your local runtime environment:
-
-   ```bash
-   export MANTIS_RENDER_API_KEY='<Render MANTIS_API_KEY>'
-   ```
-
-5. Use `mantis-render/base` in Prime Agent or call Mantis directly. The supported Prime provider configuration is documented in [`deploy/README.md`](deploy/README.md#prime-agent).
-
-### Cloud status helper
+Install the Python environments:
 
 ```bash
-./scripts/mantis-cloud.sh status https://mantis-orchestrator.onrender.com
-./scripts/mantis-cloud.sh test https://mantis-orchestrator.onrender.com "$MANTIS_RENDER_API_KEY"
+cd ~/Personal/other/mantis
+uv sync --locked --no-dev
+cd apps/gateway && uv sync --dev
 ```
 
-The legacy local-stack switching workflow is retained only for development compatibility. It is not the supported way to configure Render-backed Prime providers.
+Create private runtime directories and seed Bifrost from the tracked, secret-free template:
 
----
+```bash
+install -d -m 700 ~/.local/share/bifrost/logs ~/.local/share/mantis/router ~/.local/share/llm-stack
+install -m 600 config/bifrost.template.json ~/.local/share/bifrost/config.json
+ln -sfn "$PWD/config/catalog.toml" ~/.config/ai-routing/catalog.toml
+```
 
-## Local development only
+The Bifrost template references environment variables; never place secret values in the tracked JSON. At minimum configure:
 
-The Render deployment is the supported operational path. Contributors who need
-a local development stack can start it in the foreground:
+```text
+MANTIS_API_KEY
+MANTIS_ROUTER_KEY
+BIFROST_API_KEY                 # must start with sk-bf-
+BIFROST_ENCRYPTION_KEY
+BIFROST_ADMIN_USERNAME
+BIFROST_ADMIN_PASSWORD
+BIFROST_COMPLEXITY_PILOT_KEY    # must start with sk-bf-
+```
+
+Provider routes additionally require the matching Azure, AWS/Bedrock, Vertex ADC, OpenRouter, or OpenCode credentials. For Vertex, export `GOOGLE_APPLICATION_CREDENTIALS`, `VERTEXAI_PROJECT`, and `VERTEXAI_LOCATION`.
+
+## Start and stop
+
+Install the optional StartupFolder-compatible controller link:
+
+```bash
+ln -sfn "$PWD/launch/host/llm-stack.sh" ~/Startup/llm-stack.sh
+```
+
+Control the complete stack:
+
+```bash
+~/Startup/llm-stack.sh start
+~/Startup/llm-stack.sh status
+~/Startup/llm-stack.sh restart
+~/Startup/llm-stack.sh stop
+```
+
+The controller starts Bifrost, the gateway, and the API in dependency order and checks readiness. Runtime state/logs live under `~/.local/share/bifrost` and `~/.local/share/mantis`.
+
+You can also run only the Mantis API in the foreground for development:
 
 ```bash
 ./scripts/run_mantis_native.sh
 ```
 
-This binds development-only loopback services (Bifrost `:8080`, gateway `:5500`,
-and Mantis API `:8088`). Do not use those addresses for cloud clients or copy
-local credentials into Render. See [`apps/gateway/README.md`](apps/gateway/README.md)
-for internal gateway development details.
+That command expects Bifrost and the internal gateway to be available separately.
 
----
-
-## Routing Ratchet and Cost Control
-
-`mantis/base` uses a classifier (Supra) to pick a worker tier per request and a session ratchet to keep the warm prompt-cache prefix on one tier. The ratchet climbs freely but does not downgrade by default.
-
-Two knobs relax this without breaking multi-turn tool loops:
-- `MANTIS_ROUTER_DOWNGRADE_IDLE_S=N`: after `N` seconds of silence the next turn drops to the freshly scored tier.
-- `MANTIS_ROUTER_RESCORE_EVERY_N=N`: every `N` completed turns the ratchet releases and the classifier's current tier wins.
-
----
-
-## Calling the API (OpenAI Compatible)
+## Call Mantis
 
 ```python
 import os
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="https://mantis-orchestrator.onrender.com/v1",
-    api_key=os.environ["MANTIS_RENDER_API_KEY"],
+    base_url="http://127.0.0.1:8088/v1",
+    api_key=os.environ["MANTIS_API_KEY"],
 )
 
 response = client.chat.completions.create(
@@ -130,32 +124,78 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-`stream=True` returns standard `text/event-stream` chunks. Internal status frames are emitted under `delta.reasoning` / `mantis_event`. For local development, replace the endpoint and use the explicitly configured local credential; do not copy local credentials into the Render deployment.
+Health and catalog:
 
----
+```bash
+curl -fsS http://127.0.0.1:8088/ready
+curl -fsS http://127.0.0.1:8088/v1/models \
+  -H "Authorization: Bearer $MANTIS_API_KEY"
+```
 
-## Maintenance, Hygiene & Cleanup
+## Bifrost complexity router
 
-### Marked for Deletion / Cleaned:
-1. **Empty directories**:
-   - `openfugu/` (legacy empty directory — *removed*)
-   - `eval/runs/worktrees/**/db_files` (stale empty test fixture dir — *removed*)
-2. **Local runtime / Build artifacts (Ignored in Git)**:
-   - `mantis.egg-info/` — generated build metadata.
-   - `coverage.xml`, `.coverage` — generated test coverage files.
-   - `outputs/conductor_retrain/` — local scratch training runs.
-   - `runs/logs/` — legacy manual benchmark execution logs.
-   - `.scratch/`, `apps/.scratch/` — transient tool caches.
+The complexity ladder is scoped to virtual key `vk-interactive-complexity-pilot`; normal Mantis traffic continues to use the Supra router. Send direct pilot requests to local Bifrost with model `auto`:
 
-### Verification & Testing
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer $BIFROST_COMPLEXITY_PILOT_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "auto",
+    "messages": [{"role": "user", "content": "Fix the failing test in src/auth.py"}]
+  }'
+```
+
+| Tier | Primary | Fallback chain |
+|---|---|---|
+| SIMPLE | Vertex `google/gemini-3.7-flash` | OpenRouter Gemini 3.7 Flash |
+| MEDIUM | Azure `gpt-5.6-terra` | Bedrock Terra → OpenRouter Terra |
+| COMPLEX | Azure `gpt-5.6-sol` | Bedrock Sol → OpenRouter Sol |
+| REASONING | Bedrock `anthropic/claude-opus-5` | Vertex Claude Opus 5 → OpenRouter Claude Opus 5 |
+| Unclassified `auto` | Azure `gpt-5.6-terra` | Bedrock Terra → OpenRouter Terra |
+
+The analyzer uses coding/systems vocabulary, conservative multiword Reasoning triggers, and `.10 / .35 / .60` boundaries. The default priority-5 route prevents unclassified `auto` prompts from failing provider resolution.
+
+The private dashboard is available only on this machine at `http://127.0.0.1:8080`; log in with `BIFROST_ADMIN_USERNAME` and `BIFROST_ADMIN_PASSWORD`.
+
+## Prime Agent
+
+Use distinct provider IDs to avoid stale credentials stored for previous provider names. A local configuration should expose:
+
+```text
+mantis-local/base
+mantis-local/trinity
+mantis-local/ultra
+mantis-local/fusion
+bifrost-local-complexity/auto
+```
+
+All are configured with a 262,144-token context window. API keys should resolve from `MANTIS_API_KEY` and `BIFROST_COMPLEXITY_PILOT_KEY` at runtime rather than being embedded in `~/.prime/agent/models.json`.
+
+Example headless task:
+
+```bash
+prime-agent --mode text --provider mantis-local --model base --no-session \
+  -p 'Inspect this repository, implement the requested change, run tests, and fix failures.'
+```
+
+## Routing and cost control
+
+`mantis/base` uses Supra to select one worker tier per request and a session ratchet to keep a warm prompt-cache prefix on one tier. It climbs freely but does not downgrade by default.
+
+- `MANTIS_ROUTER_DOWNGRADE_IDLE_S=N`: after `N` seconds of silence, the next turn can drop to the freshly scored tier.
+- `MANTIS_ROUTER_RESCORE_EVERY_N=N`: every `N` completed turns, release the ratchet and use the classifier's current tier.
+
+See [`apps/gateway/README.md`](apps/gateway/README.md) for routing behavior and internal protocol details.
+
+## Checks
+
 ```bash
 uv run pytest tests -q
 uv run ruff check .
 ./scripts/verify.sh
 ```
 
----
-
 ## Security
 
-Render provides TLS for the public endpoint. Keep `MANTIS_API_KEY`, provider credentials, GCP service-account JSON, Bifrost admin credentials, and virtual keys in Render Environment/Secret Files; never commit or embed them in client configuration. Use a local runtime variable such as `MANTIS_RENDER_API_KEY` for clients.
+All services bind to loopback by default. Keep local API keys and provider credentials out of Git, protect `~/.zshrc` and runtime config files with mode `0600`, and do not expose ports 8080, 5500, or 8088 without TLS and non-default credentials.
