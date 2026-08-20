@@ -49,51 +49,56 @@ mantis/
 
 ## Cloud Deployment (Render)
 
-Mantis can run in the cloud on **Render** to eliminate battery/memory drain on your local machine while remaining fully controllable from your local Git repo and CLI.
+Mantis runs as the `mantis-orchestrator` Render web service. The public OpenAI-compatible endpoint is:
 
-### Quick Start
-1. Go to **[Render Dashboard](https://dashboard.render.com/)** → **New +** → **Blueprint**.
-2. Connect `mallochio/mantis` (branch `main`).
-3. Fill in your cloud provider keys (`AZURE_OPENAI_API_KEY`, `AWS_ACCESS_KEY_ID`, etc.) and deploy.
-
-### Local Cloud Control CLI
-Manage your cloud instance locally using `./scripts/mantis-cloud.sh`:
-
-```bash
-# Check cloud deployment status
-./scripts/mantis-cloud.sh status https://mantis-orchestrator.onrender.com
-
-# Test an end-to-end chat completion
-./scripts/mantis-cloud.sh test https://mantis-orchestrator.onrender.com <MANTIS_API_KEY>
-
-# Sync local config/catalog.toml changes & trigger auto-deploy
-./scripts/mantis-cloud.sh sync
-
-# Switch your Mac's environment (~/.zshrc) to the Cloud instance (stops local daemons to save battery)
-./scripts/mantis-cloud.sh use-cloud https://mantis-orchestrator.onrender.com/v1 <MANTIS_API_KEY>
-
-# Revert local machine to local host stack
-./scripts/mantis-cloud.sh use-local
+```text
+https://mantis-orchestrator.onrender.com/v1
 ```
 
-For detailed container specs and environment configurations, see [`deploy/README.md`](deploy/README.md).
+Bifrost remains private on the Tailnet; it is not exposed through the public Render URL. See the complete setup, credentials, Tailscale access, complexity-router pilot, and Prime Agent instructions in [`deploy/README.md`](deploy/README.md).
+
+### Quick start
+
+1. In Render, create/apply the Blueprint for `main` and configure the required provider credentials.
+2. Add the Vertex service account as a Render Secret File named `gcp-service-account.json` (preferred) or `GCP_SERVICE_ACCOUNT_JSON`.
+3. Verify deployment without credentials:
+
+   ```bash
+   curl -fsS https://mantis-orchestrator.onrender.com/ready
+   ```
+
+4. Set the public API key only in your local runtime environment:
+
+   ```bash
+   export MANTIS_RENDER_API_KEY='<Render MANTIS_API_KEY>'
+   ```
+
+5. Use `mantis-render/base` in Prime Agent or call Mantis directly. The supported Prime provider configuration is documented in [`deploy/README.md`](deploy/README.md#prime-agent).
+
+### Cloud status helper
+
+```bash
+./scripts/mantis-cloud.sh status https://mantis-orchestrator.onrender.com
+./scripts/mantis-cloud.sh test https://mantis-orchestrator.onrender.com "$MANTIS_RENDER_API_KEY"
+```
+
+The legacy local-stack switching workflow is retained only for development compatibility. It is not the supported way to configure Render-backed Prime providers.
 
 ---
 
-## Running Locally on Host
+## Local development only
 
-The local launcher stack runs Bifrost, Mantis Router, and Mantis API as background processes:
+The Render deployment is the supported operational path. Contributors who need
+a local development stack can start it in the foreground:
 
-```bash
-~/Startup/llm-stack.sh start   # Bifrost :8080 -> gateway :5500 -> Mantis API :8088
-~/Startup/llm-stack.sh status
-~/Startup/llm-stack.sh stop
-```
-
-Or start directly in foreground:
 ```bash
 ./scripts/run_mantis_native.sh
 ```
+
+This binds development-only loopback services (Bifrost `:8080`, gateway `:5500`,
+and Mantis API `:8088`). Do not use those addresses for cloud clients or copy
+local credentials into Render. See [`apps/gateway/README.md`](apps/gateway/README.md)
+for internal gateway development details.
 
 ---
 
@@ -110,11 +115,12 @@ Two knobs relax this without breaking multi-turn tool loops:
 ## Calling the API (OpenAI Compatible)
 
 ```python
+import os
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://127.0.0.1:8088/v1",  # Or your Render URL
-    api_key="sk-mantis-local",
+    base_url="https://mantis-orchestrator.onrender.com/v1",
+    api_key=os.environ["MANTIS_RENDER_API_KEY"],
 )
 
 response = client.chat.completions.create(
@@ -124,7 +130,7 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-`stream=True` returns standard `text/event-stream` chunks. Internal status frames are emitted under `delta.reasoning` / `mantis_event`.
+`stream=True` returns standard `text/event-stream` chunks. Internal status frames are emitted under `delta.reasoning` / `mantis_event`. For local development, replace the endpoint and use the explicitly configured local credential; do not copy local credentials into the Render deployment.
 
 ---
 
@@ -152,4 +158,4 @@ uv run ruff check .
 
 ## Security
 
-Use a strong `MANTIS_API_KEY`, put TLS in front of public endpoints, and keep provider keys server-side in your deployment environment variables or secret store.
+Render provides TLS for the public endpoint. Keep `MANTIS_API_KEY`, provider credentials, GCP service-account JSON, Bifrost admin credentials, and virtual keys in Render Environment/Secret Files; never commit or embed them in client configuration. Use a local runtime variable such as `MANTIS_RENDER_API_KEY` for clients.

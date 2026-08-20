@@ -19,13 +19,14 @@ Commands:
   status [URL]               Check health and readiness of the cloud deployment
   test [URL] [API_KEY]       Run a test inference request through cloud Mantis
   sync                       Sync local catalog/bifrost configs and push to GitHub (triggers Render deploy)
-  use-cloud <URL> <KEY>      Configure local shell (~/.zshrc) and Prime Agent (~/.prime/) to route to Render & stop local servers
-  use-local                  Revert local shell (~/.zshrc) and Prime Agent (~/.prime/) to local loopback servers (127.0.0.1:8088)
+  use-cloud <URL> <KEY>      LEGACY: updates retired local-provider names; does not configure mantis-render/bifrost-complexity
+  use-local                  LEGACY: restores the retired local-provider workflow
 
 Examples:
   ./scripts/mantis-cloud.sh status https://mantis-orchestrator.onrender.com
   ./scripts/mantis-cloud.sh test https://mantis-orchestrator.onrender.com sk-your-key
-  ./scripts/mantis-cloud.sh use-cloud https://mantis-orchestrator.onrender.com/v1 sk-your-key
+  # For supported Prime setup, see deploy/README.md#prime-agent.
+  # use-cloud/use-local are legacy compatibility commands.
 USAGE
   exit 1
 }
@@ -96,7 +97,7 @@ case "$cmd" in
     fi
     URL="${URL%/}"
     [[ "$URL" =~ /v1$ ]] || URL="$URL/v1"
-    echo "Configuring local environment & Prime Agent to use Cloud Mantis at $URL..."
+    echo "WARNING: use-cloud is a legacy workflow for retired provider names; it does not configure mantis-render/bifrost-complexity. See deploy/README.md#prime-agent."
 
     # Stop local background stack to save battery
     echo "Stopping local background Mantis stack..."
@@ -132,11 +133,11 @@ if os.path.isfile(models_path):
         print("Updated ~/.prime/agent/models.json (mantis baseUrl -> $URL)")
 PY
 
-    echo "Cloud Mantis is now active across shell & Prime Agent! Local battery drain eliminated."
+    echo "Legacy use-cloud update complete. Configure supported Render Prime providers as documented in deploy/README.md#prime-agent."
     ;;
 
   use-local)
-    echo "Switching ~/.zshrc & Prime Agent back to local Mantis stack (127.0.0.1:8088/v1)..."
+    echo "WARNING: use-local restores the legacy local-provider workflow; it does not manage mantis-render/bifrost-complexity."
     python3 - << PY
 import re
 zshrc_path = "$HOME/.zshrc"
@@ -166,7 +167,7 @@ PY
 
     echo "Restarting local Mantis stack..."
     "$REPO_ROOT/launch/host/llm-stack.sh" start
-    echo "Local stack is up."
+    echo "Legacy local workflow started."
     ;;
 
   *)

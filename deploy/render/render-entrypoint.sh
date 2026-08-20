@@ -30,7 +30,12 @@ export BIFROST_ENCRYPTION_KEY="${BIFROST_ENCRYPTION_KEY:-760529c75e2b39a8bb728cd
 # generated the new BIFROST_ADMIN_PASSWORD on Blueprint sync.
 export BIFROST_ADMIN_USERNAME="${BIFROST_ADMIN_USERNAME:-admin}"
 export BIFROST_ADMIN_PASSWORD="${BIFROST_ADMIN_PASSWORD:-$BIFROST_API_KEY}"
-export BIFROST_COMPLEXITY_PILOT_KEY="${BIFROST_COMPLEXITY_PILOT_KEY:-sk-bf-$(od -An -N8 -tx1 /dev/urandom | tr -d " \n")}"
+# Render's generateValue is not prefixed, while Bifrost virtual-key values must
+# be sk-bf-... . Normalize the pilot key exactly as the Mantis virtual key so
+# the value in the template and the client-facing key always agree.
+if [[ "${BIFROST_COMPLEXITY_PILOT_KEY:-}" != sk-bf-* ]]; then
+  export BIFROST_COMPLEXITY_PILOT_KEY="sk-bf-${BIFROST_COMPLEXITY_PILOT_KEY:-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')}"
+fi
 export OPENCODE_API_KEY="${OPENCODE_API_KEY:-${OPENCODE_GO_API_KEY:-}}"
 
 # Secret files from Render (e.g. /etc/secrets/gcp-service-account.json).
