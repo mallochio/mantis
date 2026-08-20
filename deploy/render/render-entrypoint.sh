@@ -17,8 +17,15 @@ export MANTIS_HOST="0.0.0.0"
 export MANTIS_PORT="${PORT:-8088}"
 export MANTIS_API_KEY="${MANTIS_API_KEY:-sk-mantis-local}"
 export MANTIS_ROUTER_KEY="${MANTIS_ROUTER_KEY:-sk-route-local}"
-export BIFROST_API_KEY="${BIFROST_API_KEY:-sk-bifrost-local}"
+# Bifrost virtual keys require the sk-bf- prefix; Render-provided generated
+# secrets lack it, which would make Bifrost regenerate a DIFFERENT key than
+# the gateway holds (auth mismatch). Enforce a stable prefixed value here so
+# both sides always agree.
+if [[ "${BIFROST_API_KEY:-}" != sk-bf-* ]]; then
+  export BIFROST_API_KEY="sk-bf-${BIFROST_API_KEY:-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')}"
+fi
 export BIFROST_ENCRYPTION_KEY="${BIFROST_ENCRYPTION_KEY:-760529c75e2b39a8bb728cdcd5b2dcef91b0f1a9a4e320f7ca7da41bc88bb254}"
+export BIFROST_COMPLEXITY_PILOT_KEY="${BIFROST_COMPLEXITY_PILOT_KEY:-sk-bf-$(od -An -N8 -tx1 /dev/urandom | tr -d " \n")}"
 export OPENCODE_API_KEY="${OPENCODE_API_KEY:-${OPENCODE_GO_API_KEY:-}}"
 
 # Secret files from Render (e.g. /etc/secrets/gcp-service-account.json)
@@ -111,7 +118,7 @@ done
 echo "[Mantis Render Entrypoint] 2/3 Starting Mantis Router on 127.0.0.1:5500..."
 (
   cd "$REPO_ROOT/apps/gateway"
-  exec uv run --no-sync python server.py
+  exec /opt/gateway-venv/bin/python server.py
 ) &
 gateway_pid=$!
 
@@ -131,10 +138,10 @@ done
 # 6. Start Mantis API on 0.0.0.0:$MANTIS_PORT
 echo "[Mantis Render Entrypoint] 3/3 Starting Mantis API on 0.0.0.0:$MANTIS_PORT..."
 export PYTHONPATH="$REPO_ROOT/scripts:$REPO_ROOT/apps/gateway:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-if catalog_render=$(uv run --no-sync python scripts/model_catalog.py render 2>/dev/null); then
+if catalog_render=$(/opt/mantis-venv/bin/python scripts/model_catalog.py render 2>/dev/null); then
   if [[ -n "$catalog_render" ]]; then
     eval "$catalog_render"
-    export MANTIS_PROVIDER_KEYS="$(uv run --no-sync python - <<'PY'
+    export MANTIS_PROVIDER_KEYS="$(/opt/mantis-venv/bin/python - <<'PY'
 import json, model_catalog
 catalog = model_catalog.load_mantis_catalog()
 if catalog is not None:
@@ -145,5 +152,5 @@ PY
   fi
 fi
 
-exec uv run --no-sync python -m uvicorn api:app --app-dir "$REPO_ROOT/apps/api" \
+exec /opt/mantis-venv/bin/python -m uvicorn api:app --app-dir "$REPO_ROOT/apps/api" \
   --host "$MANTIS_HOST" --port "$MANTIS_PORT"

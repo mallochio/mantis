@@ -1,0 +1,37 @@
+# VCS
+.git
+.gitignore
+
+# Local runtime data / caches (keep the build context small)
+.scratch
+.output
+outputs
+runs
+eval/runs
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.hypothesis
+*.pyc
+__pycache__
+
+# Environments
+.venv
+.venv*
+venv
+venv*
+
+# Private/secrets
+.env
+.env.*
+!.env.example
+config/bifrost.json
+.poolside/settings.local.yaml
+
+# Editor/OS
+.DS_Store
+.idea
+.vscode
+
+# Render deployment internal files (already included explicitly via COPY)
+# (deploy/ is needed; nothing to exclude there)
