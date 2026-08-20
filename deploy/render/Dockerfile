@@ -7,6 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MANTIS_HOST=0.0.0.0 \
     MANTIS_CONDUCTOR_DEVICE=cpu \
     MANTIS_CONDUCTOR_DTYPE=float32 \
+    MANTIS_ROUTER_DTYPE=bfloat16 \
     MANTIS_MODEL=/opt/models/qwen3-0.6b \
     AI_ROUTING_CONFIG=/app/config/catalog.toml \
     PATH="/usr/local/bin:$PATH"

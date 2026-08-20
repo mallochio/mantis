@@ -381,7 +381,13 @@ def get_router() -> FuguRouter:
                 args = utils._parse_args()
                 device = os.environ.get("MANTIS_DEVICE")
                 print(f"[serve] loading TRINITY router ({args.model}) ...", flush=True)
-                router = FuguRouter(args.model, args.vector, device=device, seed=0)
+                router = FuguRouter(
+                    args.model,
+                    args.vector,
+                    dtype=os.environ.get("MANTIS_ROUTER_DTYPE", "float32"),
+                    device=device,
+                    seed=0,
+                )
                 if args.head:  # layer a trained head over base SVF
                     head = _load_head(args.head)
                     router.head = (

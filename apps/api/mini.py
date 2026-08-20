@@ -158,7 +158,13 @@ class FuguRouter:
 
         self.vector_mode = "head-only" if np.all(vec[:SVF_LEN] == 0) else "full"
         print(f"FuguRouter vector mode: {self.vector_mode}", flush=True)
-        self._apply_svf(vec[:SVF_LEN])
+        if self.vector_mode == "full":
+            self._apply_svf(vec[:SVF_LEN])
+        else:
+            # Reconstructing unchanged matrices with nine float32 SVDs is both
+            # numerically pointless and a multi-GB transient memory spike.
+            # Render ships a head-only vector, so skip SVF entirely.
+            self.svf_keys = []
         # head: last 10240 -> (10, 1024) [EXEC]
         self.head = (
             torch.from_numpy(vec[SVF_LEN:].copy())
@@ -219,7 +225,9 @@ class FuguRouter:
 
     def route(self, messages: list[dict], sample: bool = False, agent_mask=None) -> dict:
         h = self._hidden(messages)
-        logits = self.head @ h  # (10,)
+        # The Render backbone may use bfloat16 to stay within memory; keep the
+        # small learned routing head and its logits in float32.
+        logits = self.head @ h.float()  # (10,)
         agent_logits, role_logits = logits[:N_AGENTS], logits[N_AGENTS:]
         if agent_mask is not None:  # adaptive k-of-n: only route to
             torch = self.torch  # workers offered this turn [CODE]

@@ -2,7 +2,7 @@ services:
   - type: web
     name: mantis-orchestrator
     runtime: docker
-    plan: standard
+    plan: pro
     dockerfilePath: ./deploy/render/Dockerfile
     dockerContext: .
     healthCheckPath: /ready

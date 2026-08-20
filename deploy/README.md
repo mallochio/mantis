@@ -9,7 +9,7 @@ This directory deploys the complete Mantis stack as one Render web service:
 3. **Bifrost** — internal upstream gateway on `:8080`; its dashboard is private over Tailscale only.
 4. **Tailscale** — optional private access to Bifrost at `:8080`.
 
-The public service health check is `GET /ready`. A successful `/ready` response confirms that Bifrost, the Mantis direct router, and the Mantis API have all started.
+The public service health check is `GET /ready`. A successful `/ready` response confirms that Bifrost, the Mantis direct router, and the Mantis API have all started. The Blueprint uses Render's `pro` instance: all services share one process container, and Trinity's local Qwen coordinator requires memory headroom beyond `standard` when combined with Bifrost and Supra.
 
 ## Deploy
 
@@ -168,4 +168,4 @@ The `bifrost-complexity/auto` provider is suitable for testing the four-tier pil
 
 ## Development-only local stack
 
-The repository still contains local development launchers and loopback addresses for contributors. They are not part of the supported cloud-control path and should not be used as public endpoints. See `apps/gateway/README.md` for internal gateway development details.
+The repository still contains local development launchers and loopback addresses for contributors. They are not part of the supported cloud-control path and should not be used as public endpoints. See `apps/gateway/README.md` for internal gateway development details. Trinity uses `/app/artifacts/model_iter_60.npy` and the baked `/opt/models/qwen3-0.6b` model; the head-only vector skips unnecessary SVF decompositions and the router backbone uses bfloat16 to reduce cold-load memory without changing its learned float32 head.
