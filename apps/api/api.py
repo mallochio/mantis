@@ -775,14 +775,18 @@ def _build_fusion_chat_response(
     request_id: str,
     model: str,
     event: dict[str, Any],
+    request: ChatRequest,
 ) -> JSONResponse:
     status = event.get("status")
+    messages = [msg.model_dump(exclude_none=True) for msg in request.messages]
     if status == "completed":
+        content = event.get("report") or ""
         message: dict[str, Any] = {
             "role": "assistant",
-            "content": event.get("report") or "",
+            "content": content,
         }
         finish = "stop"
+        completion_text = content
     elif status == "awaiting_tools":
         run_id = event["run_id"]
         pending = event.get("pending_tool_calls") or []
@@ -796,6 +800,10 @@ def _build_fusion_chat_response(
         ]
         message = {"role": "assistant", "content": "", "tool_calls": tool_calls}
         finish = "tool_calls"
+        completion_text = "".join(
+            f"{call['function'].get('name', '')}:{call['function'].get('arguments', '')}"
+            for call in tool_calls
+        )
     else:
         return _error(
             500,
@@ -805,6 +813,7 @@ def _build_fusion_chat_response(
     reasoning_trace = event.get("reasoning_trace")
     if reasoning_trace:
         message["reasoning"] = reasoning_trace
+    usage = utils._request_usage(messages, completion_text)
     return JSONResponse(
         {
             "id": request_id,
@@ -818,7 +827,7 @@ def _build_fusion_chat_response(
                     "finish_reason": finish,
                 }
             ],
-            "usage": event.get("usage") or {},
+            "usage": usage,
         },
         headers={"X-Request-Id": request_id},
     )
@@ -861,6 +870,7 @@ def _stream_fusion_chat(
             if reasoning_trace:
                 yield _chunk({"reasoning": reasoning_trace}, None)
             yield _chunk({"content": report}, "stop")
+            completion_text = report
         elif status == "awaiting_tools":
             run_id = event["run_id"]
             pending = event.get("pending_tool_calls") or []
@@ -878,10 +888,18 @@ def _stream_fusion_chat(
             if reasoning_trace:
                 yield _chunk({"reasoning": reasoning_trace}, None)
             yield _chunk({"tool_calls": tool_calls}, "tool_calls")
+            completion_text = "".join(
+                f"{call['function'].get('name', '')}:{call['function'].get('arguments', '')}"
+                for call in tool_calls
+            )
         else:
             msg = event.get("report") or f"fusion run failed with status {status}"
             yield _chunk({"role": "assistant"}, None)
             yield _chunk({"content": msg}, "stop")
+            completion_text = msg
+        messages = [msg.model_dump(exclude_none=True) for msg in request.messages]
+        usage = utils._request_usage(messages, completion_text)
+        yield f"data: {json.dumps({**base, 'choices': [], 'usage': usage})}\n\n".encode()
     finally:
         _capacity.release()
     yield b"data: [DONE]\n\n"
@@ -1017,7 +1035,9 @@ def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Respons
             )
         try:
             event = _run_fusion_chat(request, return_reasoning=return_reasoning)
-            return _build_fusion_chat_response(request_id, "mantis/fusion", event)
+            return _build_fusion_chat_response(
+                request_id, "mantis/fusion", event, request
+            )
         except Exception as exc:  # noqa: BLE001 - chat adapter error boundary
             return _error(500, f"fusion chat failed: {exc}", "upstream_error")
         finally:

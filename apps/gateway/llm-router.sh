@@ -5,13 +5,13 @@
 #
 # Loads exported env from ~/.zshrc (with a hard timeout so Starship/dumb TERM
 # cannot wedge the launcher), kills any previous gateway or stuck copy of this
-# script, then starts server.py in a new session so it survives this script
+# script, then starts lean_server.py in a new session so it survives this script
 # exiting. Running the script again is a neat restart.
 #
 # Usage: ~/Startup/llm-router.sh          (router backgrounded, prints status)
 set -euo pipefail
 
-# Resources (server.py, .venv, logs/) live in the repo dir, not next to this
+# Resources (lean_server.py, .venv, logs/) live in the repo dir, not next to this
 # script, so cd there explicitly — StartupFolder may invoke us from / and
 # ~/Startup/llm-router.sh is a symlink to this file.
 SELF="$0"
@@ -248,7 +248,7 @@ os.dup2(err, 2)
 for fd in (devnull, out, err):
     if fd > 2:
         os.close(fd)
-os.execve(python, [python, "server.py"], os.environ)
+os.execve(python, [python, "lean_server.py"], os.environ)
 PY
 }
 
