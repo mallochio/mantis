@@ -70,13 +70,18 @@ def _ensure_lean_catalog_env():
         "active_policy": "default",
     }
     os.environ.setdefault("MANTIS_ROUTER_TEST_CRED", "test-only")
-    os.environ.setdefault("MANTIS_ROUTER_KEY", "sk-route-local")
+    prev_key = os.environ.get("MANTIS_ROUTER_KEY")
+    os.environ["MANTIS_ROUTER_KEY"] = "sk-route-local"
     prev_targets = os.environ.get("MANTIS_ROUTER_TARGETS_JSON")
     prev_catalog = os.environ.pop("AI_ROUTING_CONFIG", None)
     os.environ["MANTIS_ROUTER_TARGETS_JSON"] = json.dumps(payload)
     try:
         import lean.config  # noqa: F401
     finally:
+        if prev_key is None:
+            os.environ.pop("MANTIS_ROUTER_KEY", None)
+        else:
+            os.environ["MANTIS_ROUTER_KEY"] = prev_key
         if prev_targets is None:
             os.environ.pop("MANTIS_ROUTER_TARGETS_JSON", None)
         else:
