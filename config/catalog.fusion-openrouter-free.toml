@@ -1,0 +1,136 @@
+# Fusion headless harness catalog: OpenRouter :free models for lead/sidekick only.
+# Slot IDs and trained_slot_contract match config/catalog.toml so ABI validation passes.
+# Other workers remain on bifrost and are not used by mantis/fusion.
+
+version = 1
+
+[providers.bifrost]
+adapter = "openai-compatible"
+base_url = "http://127.0.0.1:8080/v1"
+credential_env = "BIFROST_API_KEY"
+developer_role = "system"
+protocols = ["chat_completions", "responses"]
+
+[providers.bifrost-anthropic]
+adapter = "anthropic"
+base_url = "http://127.0.0.1:8080/anthropic"
+credential_env = "BIFROST_API_KEY"
+protocols = ["anthropic_messages"]
+
+[providers.openrouter]
+adapter = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+credential_env = "OPENROUTER_API_KEY"
+protocols = ["chat_completions", "responses"]
+
+[gateway]
+active_policy = "coding"
+revision = "fusion-openrouter-free-harness"
+
+[gateway.targets.cheap]
+provider = "bifrost"
+reasoning_effort = "medium"
+force_reasoning_effort = true
+max_tokens = 65536
+upstream_model = "google/gemini-3.7-flash"
+protocols = ["chat_completions", "responses"]
+rank = 0
+
+[gateway.targets.middle]
+provider = "bifrost"
+reasoning_effort = "medium"
+force_reasoning_effort = true
+max_tokens = 128000
+upstream_model = "anthropic/claude-opus-5"
+protocols = ["chat_completions", "responses"]
+rank = 1
+
+[gateway.targets.expensive]
+provider = "bifrost"
+reasoning_effort = "high"
+force_reasoning_effort = true
+max_tokens = 128000
+upstream_model = "gpt-5.6-sol"
+protocols = ["chat_completions", "responses"]
+rank = 2
+
+[gateway.policies.coding]
+complexity_targets = ["cheap", "cheap", "cheap", "middle", "expensive"]
+complexity_efforts = ["low", "low", "low", "medium", "high"]
+invalid_complexity_target = "expensive"
+
+[mantis]
+slot_order = [
+    "gemini-3_6-flash",
+    "gpt-5_6-luna",
+    "gpt-5_6-sol",
+    "deepseek-v4-flash",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "gemini-3_1-pro-preview",
+]
+conductor = "gpt-5_6-luna"
+conductor_model = "bifrost/gpt-5.6-luna"
+trained_slot_contract = "52eac89b5e96f1bf64b2bd83af4d8fbc649ddaaf162f4cabf9504aa93b6ae4cf"
+
+[mantis.workers.gemini-3_6-flash]
+provider = "bifrost"
+max_tokens = 65536
+upstream_model = "google/gemini-3.7-flash"
+model_identity = "gemini-3.6-flash"
+reasoning_effort = "high"
+protocols = ["chat_completions"]
+
+[mantis.workers.gpt-5_6-luna]
+provider = "openrouter"
+max_tokens = 8192
+upstream_model = "nvidia/nemotron-3-nano-30b-a3b:free"
+model_identity = "gpt-5.6-luna"
+reasoning_effort = "xhigh"
+protocols = ["chat_completions"]
+
+[mantis.workers.gpt-5_6-sol]
+provider = "openrouter"
+max_tokens = 8192
+upstream_model = "poolside/laguna-s-2.1:free"
+model_identity = "gpt-5.6-sol"
+reasoning_effort = "medium"
+protocols = ["chat_completions"]
+
+[mantis.workers.deepseek-v4-flash]
+provider = "bifrost"
+max_tokens = 384000
+upstream_model = "deepseek-v4-flash"
+model_identity = "deepseek-v4-flash"
+protocols = ["chat_completions"]
+
+[mantis.workers.claude-opus-5]
+provider = "bifrost-anthropic"
+max_tokens = 128000
+upstream_model = "bedrock/anthropic/claude-opus-5"
+model_identity = "claude-opus-5"
+reasoning_effort = "medium"
+protocols = ["anthropic_messages"]
+
+[mantis.workers.claude-sonnet-5]
+provider = "bifrost-anthropic"
+max_tokens = 128000
+upstream_model = "bedrock/anthropic/claude-sonnet-5"
+model_identity = "claude-sonnet-5"
+reasoning_effort = "medium"
+protocols = ["anthropic_messages"]
+
+[mantis.workers.gemini-3_1-pro-preview]
+provider = "bifrost"
+max_tokens = 65536
+upstream_model = "google/gemini-3.1-pro-preview"
+model_identity = "gemini-3.1-pro-preview"
+reasoning_effort = "high"
+protocols = ["chat_completions"]
+
+[fusion]
+main = "gpt-5_6-sol"
+sidekick = "gpt-5_6-luna"
+max_follow_ups = 3
+context_window = 131072
+max_output_tokens = 2048
