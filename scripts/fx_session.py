@@ -47,10 +47,10 @@ FREE_MAIN_CANDIDATES = (
     "openai/gpt-oss-20b:free",
 )
 FREE_SIDEKICK_CANDIDATES = (
-    "openrouter/owl-alpha",
-    "openrouter/hunter-alpha",
-    "openrouter/healer-alpha",
+    # OpenRouter stealth provider currently exposes only stealth/ox-alpha (Aug 2026).
     "stealth/ox-alpha",
+    "cohere/north-mini-code:free",
+    "z-ai/glm-5.2:free",
     "meta-llama/llama-3.2-3b-instruct:free",
     "qwen/qwen-2.5-7b-instruct:free",
     "google/gemma-2-9b-it:free",

@@ -84,7 +84,7 @@ protocols = ["chat_completions"]
 [mantis.workers.gpt-5_6-luna]
 provider = "openrouter"
 max_tokens = 32768
-upstream_model = "openrouter/owl-alpha"
+upstream_model = "stealth/ox-alpha"
 model_identity = "gpt-5.6-luna"
 reasoning_effort = "xhigh"
 protocols = ["chat_completions"]
