@@ -47,12 +47,14 @@ FREE_MAIN_CANDIDATES = (
     "openai/gpt-oss-20b:free",
 )
 FREE_SIDEKICK_CANDIDATES = (
-    "openrouter/free",
+    "openrouter/owl-alpha",
+    "openrouter/hunter-alpha",
+    "openrouter/healer-alpha",
+    "stealth/ox-alpha",
     "meta-llama/llama-3.2-3b-instruct:free",
     "qwen/qwen-2.5-7b-instruct:free",
     "google/gemma-2-9b-it:free",
     "nvidia/nemotron-3-nano-30b-a3b:free",
-    "nvidia/nemotron-3-nano-9b-v2:free",
     "openai/gpt-oss-20b:free",
 )
 PRIVACY_POLICY_HINT = (

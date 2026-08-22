@@ -8,7 +8,7 @@
 #   FX_BRIEF            — override the default multi-step brief
 #   FX_FOLLOW_UP        — second user turn for chat/completions path
 #   FX_MAIN_MODEL       — Fusion lead model (default stealth/ox-alpha)
-#   FX_SIDEKICK_MODEL   — Fusion sidekick model (optional; auto-probed if unset)
+#   FX_SIDEKICK_MODEL   — Fusion sidekick model (default openrouter/owl-alpha)
 #   FX_PORT             — local Mantis API port (default 5511)
 #   MANTIS_API_KEY      — local API auth token (default sk-fx-headless)
 #
@@ -29,7 +29,7 @@ OUTPUT="${FX_OUTPUT:-$REPO_ROOT/artifacts/fx-session-report.json}"
 BRIEF="${FX_BRIEF:-In this scratch directory, create hello.py that prints exactly HELLO-FX, run it with python3, then run python3 -m py_compile hello.py. Report whether both commands succeeded.}"
 FOLLOW_UP="${FX_FOLLOW_UP:-Without rerunning everything, confirm hello.py still prints HELLO-FX.}"
 MAIN_MODEL="${FX_MAIN_MODEL:-stealth/ox-alpha}"
-SIDEKICK_MODEL="${FX_SIDEKICK_MODEL:-}"
+SIDEKICK_MODEL="${FX_SIDEKICK_MODEL:-openrouter/owl-alpha}"
 
 [[ -f "$CATALOG" ]] || { echo "[fx] missing catalog: $CATALOG" >&2; exit 1; }
 [[ -n "${OPENROUTER_API_KEY:-}" ]] || {
@@ -82,8 +82,6 @@ FX_ARGS=(
   --max-iterations "${FX_MAX_ITERATIONS:-12}"
   --output "$OUTPUT"
   --main-model "$MAIN_MODEL"
+  --sidekick-model "$SIDEKICK_MODEL"
 )
-if [[ -n "$SIDEKICK_MODEL" ]]; then
-  FX_ARGS+=(--sidekick-model "$SIDEKICK_MODEL")
-fi
 exec $PYTHON "$REPO_ROOT/scripts/fx_session.py" "${FX_ARGS[@]}"

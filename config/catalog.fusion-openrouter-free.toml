@@ -83,8 +83,8 @@ protocols = ["chat_completions"]
 
 [mantis.workers.gpt-5_6-luna]
 provider = "openrouter"
-max_tokens = 8192
-upstream_model = "nvidia/nemotron-3-nano-30b-a3b:free"
+max_tokens = 32768
+upstream_model = "openrouter/owl-alpha"
 model_identity = "gpt-5.6-luna"
 reasoning_effort = "xhigh"
 protocols = ["chat_completions"]
