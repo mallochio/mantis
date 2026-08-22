@@ -1,6 +1,6 @@
 # 006 — Fusion context retention & prompt-cache architecture
 
-**Status:** Active improvement plan (quality + cost)  
+**Status:** Active improvement plan (quality + cost) — **Phase 1 landed** on branch `fix/fusion-context-cache-plan-56fa`  
 **Priority:** P0 for cache/context correctness; P1 for handoff quality; P2 for eval instrumentation  
 **Related:** [005 — Fusion hardening](005-fusion-hardening.md) (correctness/safety), [`plans/trinity-prompt-cache.md`](../plans/trinity-prompt-cache.md) (reuse Fusion markup once this lands)
 
@@ -150,6 +150,8 @@ Rules:
 
 **Goal:** Prove cache/context failure with numbers, not vibes.
 
+**Status:** Partial — unit harness for lead tool stability, cache namespace, and brief packet added in `tests/test_fusion.py`.
+
 1. Add a Fusion **prefix-stability unit harness**:
    - Two consecutive sidekick tool rounds → identical model id, identical tools JSON, identical message prefix; only the tail grows.
    - Lead plan turn N vs N+1 with tools always present → same tools key.
@@ -163,6 +165,8 @@ Rules:
 
 **Goal:** Near-zero intentional cache busts on the lead slot during a single run.
 
+**Status:** Implemented — lead always sends frozen tools; `tool_choice="none"` blocks calls after budget/reminders.
+
 1. **Never pass `tools=None` on lead** when `self.tools` is non-empty. Use `tool_choice="none"` or a `submit_plan` tool / reminder message to exit planning.
 2. Same rule for reminder and review calls.
 3. Freeze tools once on `FusionRun.__init__` (already sorted); reuse the same list object for all lead calls.
@@ -173,6 +177,8 @@ Rules:
 ### Phase 2 — Structured handoff & review (P0/P1)
 
 **Goal:** Sidekick and lead stop “forgetting” mid-task.
+
+**Status:** Partial — `<fusion-brief>` / `<fusion-follow-up>` packets landed; review slim-down still pending.
 
 1. Introduce brief packet + follow-up delta messages (schema above).
 2. Have lead fill packet fields from plan + optional checkpoint; include bounded evidence from lead tool results.

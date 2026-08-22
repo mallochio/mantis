@@ -492,6 +492,78 @@ def test_fusion_freezes_tools_in_name_order():
     assert [tool["function"]["name"] for tool in run.tools] == ["bash", "zsh"]
 
 
+def test_fusion_sets_cache_namespace():
+    run = fusion.FusionRun("cache-ns", "inspect repo", tools=[BASH_TOOL])
+    assert run.cache_namespace
+    assert len(run.cache_namespace) == 32
+
+
+def test_fusion_lead_tools_stable_across_planning_reminder(monkeypatch):
+    """Lead calls must keep the same tools JSON; tool_choice blocks calls instead."""
+    ipython_call = [
+        {
+            "id": "call_ipython",
+            "type": "function",
+            "function": {"name": "ipython", "arguments": '{"code": "1+1"}'},
+        }
+    ]
+    main_outputs = [
+        ("", ipython_call, DEFAULT_USAGE),
+        ("PLAN: use bash\nBRIEF: implement the task", None, DEFAULT_USAGE),
+        ("ACCEPT", None, DEFAULT_USAGE),
+    ]
+    sidekick_outputs = [("Done.", None, DEFAULT_USAGE)]
+    worker = SequenceWorker(main_outputs, sidekick_outputs)
+    tool_choices: list[Any] = []
+    original_call_main = fusion.FusionRun._call_main
+
+    def tracking_call_main(self, coordinator, prompt=None, *, tool_choice=None):
+        tool_choices.append(tool_choice)
+        return original_call_main(self, coordinator, prompt=prompt, tool_choice=tool_choice)
+
+    monkeypatch.setattr(fusion.FusionRun, "_call_main", tracking_call_main)
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+
+    run = fusion.FusionRun("stable-tools", "do work", tools=[BASH_TOOL])
+    event = run.advance(coordinator=fusion.FusionCoordinator())
+    assert event["status"] == "completed"
+
+    lead_tool_lists = [
+        tools
+        for slot, _messages, tools in worker.calls
+        if _messages and _messages[0].get("content") == fusion.MAIN_PREAMBLE
+    ]
+    assert lead_tool_lists
+    assert all(tools == [BASH_TOOL] for tools in lead_tool_lists)
+    assert tool_choices[0] == "auto"
+    assert tool_choices[1] == "none"
+
+
+def test_fusion_sidekick_receives_brief_packet(monkeypatch):
+    main_outputs = [
+        ("PLAN: inspect\nBRIEF: implement tests", None, DEFAULT_USAGE),
+        ("ACCEPT", None, DEFAULT_USAGE),
+    ]
+    sidekick_outputs = [("Done.", None, DEFAULT_USAGE)]
+    worker = SequenceWorker(main_outputs, sidekick_outputs)
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+
+    run = fusion.FusionRun("brief-packet", "fix failing test", tools=[BASH_TOOL])
+    event = run.advance(coordinator=fusion.FusionCoordinator())
+    assert event["status"] == "completed"
+
+    brief_msgs = [
+        m
+        for m in run.sidekick_messages
+        if m.get("role") == "user" and fusion.FUSION_BRIEF_OPEN in str(m.get("content", ""))
+    ]
+    assert len(brief_msgs) == 1
+    content = brief_msgs[0]["content"]
+    assert "goal: fix failing test" in content
+    assert "plan: inspect" in content
+    assert "brief: implement tests" in content
+
+
 def test_fusion_repeat_tool_reminder_is_a_user_message():
     run = fusion.FusionRun("repeat", "brief")
     run.active_role = "main"
@@ -1250,8 +1322,14 @@ def test_fusion_rejects_unknown_planning_tools(monkeypatch):
     event = run.advance(coordinator=fusion.FusionCoordinator())
     assert event["status"] == "completed"
     assert "Done." in (event["report"] or "")
-    # The retry should have been invoked with tools=None to stop hallucination.
-    assert any(t is None for _s, _m, t in worker.calls)
+    # Retry keeps tools in the body; tool_choice="none" blocks further calls.
+    lead_calls = [
+        tools
+        for _slot, messages, tools in worker.calls
+        if messages and messages[0].get("content") == fusion.MAIN_PREAMBLE
+    ]
+    assert lead_calls
+    assert all(tools == [BASH_TOOL] for tools in lead_calls)
 
 
 def test_fusion_enforces_planning_tool_budget(monkeypatch):

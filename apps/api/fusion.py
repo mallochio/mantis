@@ -87,6 +87,27 @@ PLAN_UNKNOWN_TOOL_PROMPT = (
     "'PLAN:' and 'BRIEF:'. No other text or tool calls."
 )
 
+FUSION_BRIEF_OPEN = "<fusion-brief>"
+FUSION_BRIEF_CLOSE = "</fusion-brief>"
+FUSION_FOLLOW_UP_OPEN = "<fusion-follow-up>"
+FUSION_FOLLOW_UP_CLOSE = "</fusion-follow-up>"
+
+
+def _format_sidekick_brief_packet(goal: str, plan: str, brief: str) -> str:
+    """Structured handoff the sidekick can resume from without lead tool history."""
+    goal_line = goal.strip() or "see conversation above"
+    return (
+        f"{FUSION_BRIEF_OPEN}\n"
+        f"goal: {goal_line}\n"
+        f"plan: {plan.strip()}\n"
+        f"brief: {brief.strip()}\n"
+        f"{FUSION_BRIEF_CLOSE}"
+    )
+
+
+def _format_sidekick_follow_up(feedback: str) -> str:
+    return f"{FUSION_FOLLOW_UP_OPEN}\n{feedback.strip()}\n{FUSION_FOLLOW_UP_CLOSE}"
+
 
 class FusionConfig:
     """Runtime fusion settings loaded from the shared catalog."""
@@ -601,6 +622,13 @@ class FusionRun(NativeRun):
         self.error: str | None = None
         self.follow_up_count = 0
         self.status = "main_planning"
+        self.cache_namespace = providers._prompt_cache_namespace(
+            self.main_messages, self.tools or None
+        )
+
+    def _lead_tools(self) -> list[dict[str, Any]] | None:
+        """Frozen client tool list for every lead provider call (never omitted mid-run)."""
+        return self.tools or None
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         super().__setstate__(state)
@@ -652,13 +680,21 @@ class FusionRun(NativeRun):
         self,
         coordinator: FusionCoordinator,
         prompt: str | None = None,
-        tools: list[dict[str, Any]] | None = None,
+        *,
+        tool_choice: Any | None = None,
     ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
         if prompt is not None:
             self.main_messages.append({"role": "user", "content": prompt})
-        message, usage = coordinator._call_worker(
-            coordinator.main_slot, self.main_messages, tools
-        )
+        previous_choice = self.active_tool_choice
+        if tool_choice is not None:
+            self.active_tool_choice = tool_choice
+        try:
+            message, usage = coordinator._call_worker(
+                coordinator.main_slot, self.main_messages, self._lead_tools()
+            )
+        finally:
+            if tool_choice is not None:
+                self.active_tool_choice = previous_choice
         self.main_messages.append(message)
         text = str(message.get("content") or "")
         calls = message.get("tool_calls") or []
@@ -836,14 +872,16 @@ class FusionRun(NativeRun):
         # Main planning on a fresh run or resumed planning.
         if self.status == "main_planning":
             self.active_role = "main"
-            available_tools = self.tools if (self.planning_tool_rounds < 2 and self.tools) else None
+            planning_tools_allowed = self.planning_tool_rounds < 2 and bool(self.tools)
             main_text, main_calls, _ = self._call_main(
-                coordinator, tools=available_tools
+                coordinator,
+                tool_choice="auto" if planning_tools_allowed else "none",
             )
 
             # The main model may only call tools it was given, and only during the
             # first two planning rounds. After that (or if it calls an unknown tool)
-            # it must produce the PLAN/BRIEF text.
+            # it must produce the PLAN/BRIEF text. Tools stay in the provider body;
+            # tool_choice="none" blocks further calls without busting the cache prefix.
             if main_calls:
                 allowed_names = {
                     t.get("function", {}).get("name")
@@ -865,7 +903,7 @@ class FusionRun(NativeRun):
                     else:
                         reminder = PLAN_TOOL_BUDGET_PROMPT
                     main_text, main_calls, _ = self._call_main(
-                        coordinator, prompt=reminder, tools=None
+                        coordinator, prompt=reminder, tool_choice="none"
                     )
                     if main_calls:
                         call_names = {
@@ -886,13 +924,18 @@ class FusionRun(NativeRun):
                 self.plan, self.sidekick_brief = self._parse_main_plan(main_text)
             except ValueError:
                 main_text, main_calls, _ = self._call_main(
-                    coordinator, prompt=PLAN_REMINDER_PROMPT, tools=None
+                    coordinator, prompt=PLAN_REMINDER_PROMPT, tool_choice="none"
                 )
                 if main_calls:
                     raise ValueError("main called tools instead of producing a plan") from None
                 self.plan, self.sidekick_brief = self._parse_main_plan(main_text)
             self.sidekick_messages.append(
-                {"role": "user", "content": self.sidekick_brief}
+                {
+                    "role": "user",
+                    "content": _format_sidekick_brief_packet(
+                        self.brief, self.plan, self.sidekick_brief
+                    ),
+                }
             )
             self.status = "sidekick_pending"
 
@@ -916,7 +959,7 @@ class FusionRun(NativeRun):
                     f"Report:\n{sidekick_text}"
                 )
                 review_text, review_calls, _ = self._call_main(
-                    coordinator, review_prompt, tools=self.tools or None
+                    coordinator, review_prompt, tool_choice="auto"
                 )
                 if review_calls:
                     self.pending_tool_calls = review_calls
@@ -933,7 +976,9 @@ class FusionRun(NativeRun):
                     self.report = sidekick_text
                     self.status = "completed"
                     break
-                self.sidekick_messages.append({"role": "user", "content": feedback})
+                self.sidekick_messages.append(
+                    {"role": "user", "content": _format_sidekick_follow_up(feedback)}
+                )
                 self.record_activity(
                     "follow_up",
                     role="main",
@@ -946,7 +991,7 @@ class FusionRun(NativeRun):
             if self.status == "main_review":
                 self.active_role = "main"
                 review_text, review_calls, _ = self._call_main(
-                    coordinator, tools=self.tools or None
+                    coordinator, tool_choice="auto"
                 )
                 if review_calls:
                     self.pending_tool_calls = review_calls
@@ -964,7 +1009,9 @@ class FusionRun(NativeRun):
                     self.report = self.report or last_sidekick_text
                     self.status = "completed"
                     break
-                self.sidekick_messages.append({"role": "user", "content": feedback})
+                self.sidekick_messages.append(
+                    {"role": "user", "content": _format_sidekick_follow_up(feedback)}
+                )
                 self.status = "sidekick_pending"
                 continue
             if self.status in ("completed", "awaiting_tools", "error"):
