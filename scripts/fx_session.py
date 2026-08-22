@@ -35,6 +35,31 @@ BASH_TOOL = {
     },
 }
 
+# Ordered by tool-use suitability; fx picks the first pair that passes probe.
+FREE_MAIN_CANDIDATES = (
+    "openrouter/free",
+    "meta-llama/llama-3.2-3b-instruct:free",
+    "qwen/qwen-2.5-7b-instruct:free",
+    "google/gemma-2-9b-it:free",
+    "poolside/laguna-s-2.1:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "openai/gpt-oss-20b:free",
+)
+FREE_SIDEKICK_CANDIDATES = (
+    "openrouter/free",
+    "meta-llama/llama-3.2-3b-instruct:free",
+    "qwen/qwen-2.5-7b-instruct:free",
+    "google/gemma-2-9b-it:free",
+    "nvidia/nemotron-3-nano-30b-a3b:free",
+    "nvidia/nemotron-3-nano-9b-v2:free",
+    "openai/gpt-oss-20b:free",
+)
+PRIVACY_POLICY_HINT = (
+    "OpenRouter blocked free models for this account (privacy/guardrail policy). "
+    "Adjust https://openrouter.ai/settings/privacy to allow free-model routing, "
+    "then rerun ./scripts/fx.sh"
+)
+
 
 def _usage_cache_summary(usage: dict[str, Any]) -> dict[str, int]:
     prompt = int(usage.get("prompt_tokens") or 0)
@@ -320,6 +345,43 @@ def probe_openrouter(api_key: str, model: str) -> dict[str, Any]:
     return {"model": model, "reply": text.strip(), "usage": body.get("usage") or {}}
 
 
+def _select_free_model(api_key: str, candidates: tuple[str, ...], role: str) -> str:
+    errors: list[str] = []
+    for model in candidates:
+        try:
+            probe = probe_openrouter(api_key, model)
+            print(f"[fx] probe {role} {model}: {probe['reply']!r}")
+            return model
+        except RuntimeError as exc:
+            errors.append(f"{model}: {exc}")
+    raise RuntimeError(
+        f"No working OpenRouter free model for {role}. Tried:\n"
+        + "\n".join(errors)
+        + f"\n{PRIVACY_POLICY_HINT}"
+    )
+
+
+def _catalog_with_models(catalog_path: Path, main_model: str, sidekick_model: str) -> Path:
+    """Write a temp catalog with the selected upstream models for Fusion slots."""
+    text = catalog_path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    out: list[str] = []
+    section: str | None = None
+    for line in lines:
+        if line.startswith("[") and line.endswith("]"):
+            section = line.strip("[]")
+        if section == "mantis.workers.gpt-5_6-sol" and line.startswith("upstream_model"):
+            out.append(f'upstream_model = "{main_model}"')
+            continue
+        if section == "mantis.workers.gpt-5_6-luna" and line.startswith("upstream_model"):
+            out.append(f'upstream_model = "{sidekick_model}"')
+            continue
+        out.append(line)
+    temp = Path(tempfile.mkdtemp(prefix="fx-catalog-")) / "catalog.toml"
+    temp.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return temp
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fusion fx harness session driver")
     parser.add_argument("--url", default="http://127.0.0.1:5511")
@@ -333,6 +395,8 @@ def main() -> None:
     parser.add_argument("--max-iterations", type=int, default=12)
     parser.add_argument("--managed", action="store_true")
     parser.add_argument("--skip-probe", action="store_true")
+    parser.add_argument("--main-model", default=os.environ.get("FX_MAIN_MODEL", ""))
+    parser.add_argument("--sidekick-model", default=os.environ.get("FX_SIDEKICK_MODEL", ""))
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
 
@@ -342,26 +406,39 @@ def main() -> None:
 
     import model_catalog
 
-    catalog = model_catalog.load_mantis_catalog(args.catalog)
-    if catalog is None:
-        raise SystemExit(f"catalog failed to load: {args.catalog}")
-    main_model = catalog.bindings.workers["gpt-5_6-sol"].upstream_model
-    sidekick_model = catalog.bindings.workers["gpt-5_6-luna"].upstream_model
-    print(f"[fx] catalog={args.catalog}")
-    print(f"[fx] fusion main={main_model} sidekick={sidekick_model}")
+    base_catalog = args.catalog
+    if args.main_model and args.sidekick_model:
+        main_model = args.main_model
+        sidekick_model = args.sidekick_model
+        catalog_path = _catalog_with_models(base_catalog, main_model, sidekick_model)
+    elif not args.skip_probe:
+        main_model = _select_free_model(api_key, FREE_MAIN_CANDIDATES, "main")
+        sidekick_model = _select_free_model(api_key, FREE_SIDEKICK_CANDIDATES, "sidekick")
+        catalog_path = _catalog_with_models(base_catalog, main_model, sidekick_model)
+    else:
+        catalog_path = base_catalog
+        catalog = model_catalog.load_mantis_catalog(catalog_path)
+        if catalog is None:
+            raise SystemExit(f"catalog failed to load: {catalog_path}")
+        main_model = catalog.bindings.workers["gpt-5_6-sol"].upstream_model
+        sidekick_model = catalog.bindings.workers["gpt-5_6-luna"].upstream_model
 
-    if not args.skip_probe:
-        for model in (main_model, sidekick_model):
-            probe = probe_openrouter(api_key, model)
-            print(f"[fx] probe {model}: {probe['reply']!r}")
+    catalog = model_catalog.load_mantis_catalog(catalog_path)
+    if catalog is None:
+        raise SystemExit(f"catalog failed to load: {catalog_path}")
+    print(f"[fx] catalog={catalog_path}")
+    print(f"[fx] fusion main={main_model} sidekick={sidekick_model}")
 
     server = None
     workdir = None
-    report: dict[str, Any] = {"catalog": str(args.catalog), "models": {"main": main_model, "sidekick": sidekick_model}}
+    report: dict[str, Any] = {
+        "catalog": str(catalog_path),
+        "models": {"main": main_model, "sidekick": sidekick_model},
+    }
     try:
         if args.managed:
             workdir = Path(tempfile.mkdtemp(prefix="fx-runs-"))
-            server = _start_server(args.url, workdir, args.token, args.catalog)
+            server = _start_server(args.url, workdir, args.token, catalog_path)
             _wait_for_server(args.url, args.token)
 
         report["delegate"] = run_delegate_multiturn(
