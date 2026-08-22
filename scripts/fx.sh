@@ -7,6 +7,8 @@
 # Optional:
 #   FX_BRIEF            — override the default multi-step brief
 #   FX_FOLLOW_UP        — second user turn for chat/completions path
+#   FX_MAIN_MODEL       — Fusion lead model (default stealth/ox-alpha)
+#   FX_SIDEKICK_MODEL   — Fusion sidekick model (optional; auto-probed if unset)
 #   FX_PORT             — local Mantis API port (default 5511)
 #   MANTIS_API_KEY      — local API auth token (default sk-fx-headless)
 #
@@ -26,6 +28,8 @@ TOKEN="${MANTIS_API_KEY:-sk-fx-headless}"
 OUTPUT="${FX_OUTPUT:-$REPO_ROOT/artifacts/fx-session-report.json}"
 BRIEF="${FX_BRIEF:-In this scratch directory, create hello.py that prints exactly HELLO-FX, run it with python3, then run python3 -m py_compile hello.py. Report whether both commands succeeded.}"
 FOLLOW_UP="${FX_FOLLOW_UP:-Without rerunning everything, confirm hello.py still prints HELLO-FX.}"
+MAIN_MODEL="${FX_MAIN_MODEL:-stealth/ox-alpha}"
+SIDEKICK_MODEL="${FX_SIDEKICK_MODEL:-}"
 
 [[ -f "$CATALOG" ]] || { echo "[fx] missing catalog: $CATALOG" >&2; exit 1; }
 [[ -n "${OPENROUTER_API_KEY:-}" ]] || {
@@ -68,12 +72,18 @@ print(f"[fx] side  {side.provider} -> {side.upstream_model}")
 PY
 
 echo "[fx] running multi-turn session (delegate + chat)..."
-exec $PYTHON "$REPO_ROOT/scripts/fx_session.py" \
-  --managed \
-  --url "$URL" \
-  --token "$TOKEN" \
-  --catalog "$CATALOG" \
-  --brief "$BRIEF" \
-  --follow-up "$FOLLOW_UP" \
-  --max-iterations "${FX_MAX_ITERATIONS:-12}" \
+FX_ARGS=(
+  --managed
+  --url "$URL"
+  --token "$TOKEN"
+  --catalog "$CATALOG"
+  --brief "$BRIEF"
+  --follow-up "$FOLLOW_UP"
+  --max-iterations "${FX_MAX_ITERATIONS:-12}"
   --output "$OUTPUT"
+  --main-model "$MAIN_MODEL"
+)
+if [[ -n "$SIDEKICK_MODEL" ]]; then
+  FX_ARGS+=(--sidekick-model "$SIDEKICK_MODEL")
+fi
+exec $PYTHON "$REPO_ROOT/scripts/fx_session.py" "${FX_ARGS[@]}"

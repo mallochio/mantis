@@ -37,6 +37,7 @@ BASH_TOOL = {
 
 # Ordered by tool-use suitability; fx picks the first pair that passes probe.
 FREE_MAIN_CANDIDATES = (
+    "stealth/ox-alpha",
     "openrouter/free",
     "meta-llama/llama-3.2-3b-instruct:free",
     "qwen/qwen-2.5-7b-instruct:free",
@@ -410,6 +411,23 @@ def main() -> None:
     if args.main_model and args.sidekick_model:
         main_model = args.main_model
         sidekick_model = args.sidekick_model
+        if not args.skip_probe:
+            probe_openrouter(api_key, main_model)
+            probe_openrouter(api_key, sidekick_model)
+            print(f"[fx] probe main {main_model}: ok")
+            print(f"[fx] probe sidekick {sidekick_model}: ok")
+        catalog_path = _catalog_with_models(base_catalog, main_model, sidekick_model)
+    elif args.main_model:
+        main_model = args.main_model
+        if not args.skip_probe:
+            probe = probe_openrouter(api_key, main_model)
+            print(f"[fx] probe main {main_model}: {probe['reply']!r}")
+            sidekick_model = _select_free_model(api_key, FREE_SIDEKICK_CANDIDATES, "sidekick")
+        else:
+            catalog = model_catalog.load_mantis_catalog(base_catalog)
+            if catalog is None:
+                raise SystemExit(f"catalog failed to load: {base_catalog}")
+            sidekick_model = catalog.bindings.workers["gpt-5_6-luna"].upstream_model
         catalog_path = _catalog_with_models(base_catalog, main_model, sidekick_model)
     elif not args.skip_probe:
         main_model = _select_free_model(api_key, FREE_MAIN_CANDIDATES, "main")
