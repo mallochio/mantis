@@ -65,7 +65,7 @@ def _catalog(contract: str = "") -> str:
 
 
 def _shared_catalog(contract: str) -> str:
-    """Combined fixture for the Mantis and Mantis router consumers."""
+    """Combined fixture for the Mantis workers and Switchyard Base consumers."""
     abi = model_catalog.load_abi_manifest()
     provider_order = [
         "modal.prod", "generic.openai", "code", "router",
@@ -112,19 +112,15 @@ def _shared_catalog(contract: str) -> str:
         'credential_env = "GENERIC_KEY"\n\n'
         "[base]\n"
         'revision = "fixture"\n'
-        'route_id = "mantis-base"\n'
-        'algorithm = "stage_router"\n'
         'picker = "efficient_first"\n'
         "confidence_threshold = 0.5\n\n"
         "[base.targets.efficient]\n"
         'provider = "generic.openai"\n'
         'upstream_model = "vendor/low"\n'
-        'reasoning_effort = "none"\n'
-        'protocols = ["chat_completions"]\n\n'
+        'reasoning_effort = "none"\n\n'
         "[base.targets.capable]\n"
         'provider = "router"\n'
         'upstream_model = "openai/safe"\n'
-        'protocols = ["chat_completions", "responses"]\n'
         "[mantis]\n"
         f"slot_order = {json.dumps(list(abi.slot_order))}\n"
         f'conductor = "{abi.conductor}"\n'
@@ -459,12 +455,9 @@ def test_shared_catalog_fixture_both_consumers_parse(tmp_path):
         "openai-compatible",
     }
     route = model_catalog.load_base_route(tomllib.loads(path.read_text()))
-    assert route.route_id == "mantis-base"
     assert route.efficient.upstream_model == "vendor/low"
     assert route.capable.upstream_model == "openai/safe"
-    assert catalog.base_route_id == "mantis-base"
-    rendered = model_catalog.render_mantis_environment(catalog)
-    assert rendered["MANTIS_BASE_ROUTE_ID"] == "mantis-base"
+    assert "MANTIS_BASE_ROUTE_ID" not in model_catalog.render_mantis_environment(catalog)
 
 
 def test_stable_slot_resolves_to_bound_endpoint_and_model(monkeypatch):

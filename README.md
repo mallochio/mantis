@@ -161,9 +161,7 @@ prime-agent --mode text --provider mantis --model base --no-session \
 
 ## Switching models and providers
 
-`config/catalog.toml` is the only place that names Base models and the provider they ride on. Edit `[base.targets.efficient]` / `[base.targets.capable]` (or the `[providers.*]` they reference), then restart the stack. Launch regenerates Switchyard's `routes.toml` from that catalog; the API sends `base.route_id` (exported as `MANTIS_BASE_ROUTE_ID`). Application code does not hard-code upstream IDs.
-
-To change how Base decides, set `base.algorithm` to `stage_router` (default, tool-signal routing) or `escalation` (weak-first with a judge). Optional `[base.targets.judge]` selects the escalation judge model.
+`config/catalog.toml` is the only place that names Base models and the provider they ride on. Edit `[base.targets.efficient]` / `[base.targets.capable]` (or the `[providers.*]` they reference), then restart the stack. Launch regenerates Switchyard's `routes.toml` from that catalog. The Switchyard route id is `mantis/base`, so the API forwards the public model name without rewriting it.
 
 Trinity, Ultra, and Fusion keep using `[mantis.workers]` and `[fusion]` in the same file.
 

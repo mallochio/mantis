@@ -1,7 +1,7 @@
-"""Shared, secret-free catalog schema for the Mantis and router consumers.
+"""Shared, secret-free catalog schema for Mantis workers and the Base route.
 
-The identifier grammar and the adapter/protocol table are identical to the
-Mantis router consumer so one catalog can feed both servers.
+Trinity/Ultra/Fusion read ``[mantis.workers]``. Switchyard Base reads ``[base]``.
+Both share the provider/adapter table; Base does not reuse the worker ABI.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
-# Identifier grammar shared with the router consumer.
+# Identifier grammar for catalog table keys and provider names.
 TARGET_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _CONTRACT = re.compile(r"[0-9a-f]{64}\Z")
@@ -41,16 +41,21 @@ BASE_TARGET_ROLES = ("efficient", "capable")
 BASE_SECTION_KEYS = frozenset(
     {
         "revision",
-        "route_id",
-        "algorithm",
         "picker",
         "confidence_threshold",
         "recent_turn_window",
-        "confirmations",
         "targets",
     }
 )
-BASE_TARGET_KEYS = frozenset({"efficient", "capable", "judge"})
+BASE_TARGET_FIELDS = frozenset(
+    {
+        "provider",
+        "upstream_model",
+        "reasoning_effort",
+        "max_tokens",
+        "format",
+    }
+)
 
 
 class CatalogError(ValueError):
@@ -83,10 +88,9 @@ class RuntimeBindings:
 
 @dataclass(frozen=True)
 class BaseTarget:
-    role: Literal["efficient", "capable", "judge"]
+    role: Literal["efficient", "capable"]
     provider: str
     upstream_model: str
-    protocols: tuple[str, ...]
     reasoning_effort: str | None
     max_tokens: int | None
     wire_format: str
@@ -95,15 +99,11 @@ class BaseTarget:
 @dataclass(frozen=True)
 class BaseRoute:
     revision: str
-    route_id: str
-    algorithm: Literal["stage_router", "escalation"]
     picker: Literal["efficient_first", "capable_first"]
     confidence_threshold: float
     recent_turn_window: int
-    confirmations: int
     efficient: BaseTarget
     capable: BaseTarget
-    judge: BaseTarget | None
     providers: dict[str, ProviderBinding]
 
 
@@ -183,34 +183,43 @@ def _provider(value: Any, label: str) -> ProviderBinding:
     )
 
 
+def _model_name(value: Any, label: str) -> str:
+    name = _string(value, label)
+    if any(char in name for char in ",|\r\n"):
+        raise CatalogError(f"{label} contains a reserved character")
+    return name
+
+
+def _reasoning_effort(value: Any, label: str) -> str | None:
+    if value is None:
+        return None
+    effort = _string(value, label)
+    if effort not in EFFORTS:
+        raise CatalogError(f"{label} is unsupported")
+    return None if effort == "none" else effort
+
+
+def _max_tokens(value: Any, label: str) -> int | None:
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise CatalogError(f"{label} must be a positive integer")
+    return value
+
+
 def _worker(value: Any, label: str) -> WorkerBinding:
     table = _mapping(value, label)
-    upstream_model = _string(table.get("upstream_model"), f"{label}.upstream_model")
-    if any(char in upstream_model for char in ",|\r\n"):
-        raise CatalogError(f"{label}.upstream_model contains a reserved character")
-    model_identity = table.get("model_identity", upstream_model)
-    model_identity = _string(model_identity, f"{label}.model_identity")
-    if any(char in model_identity for char in ",|\r\n"):
-        raise CatalogError(f"{label}.model_identity contains a reserved character")
-    effort = table.get("reasoning_effort")
-    if effort is not None:
-        effort = _string(effort, f"{label}.reasoning_effort")
-        if effort not in EFFORTS:
-            raise CatalogError(f"{label}.reasoning_effort is unsupported")
-        if effort == "none":
-            effort = None
-    max_tokens = table.get("max_tokens")
-    if max_tokens is not None and (
-        not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0
-    ):
-        raise CatalogError(f"{label}.max_tokens must be a positive integer")
+    upstream_model = _model_name(table.get("upstream_model"), f"{label}.upstream_model")
+    model_identity = _model_name(
+        table.get("model_identity", upstream_model), f"{label}.model_identity"
+    )
     return WorkerBinding(
         _identifier(table.get("provider"), f"{label}.provider"),
         upstream_model,
         model_identity,
-        effort,
+        _reasoning_effort(table.get("reasoning_effort"), f"{label}.reasoning_effort"),
         _protocols(table.get("protocols"), f"{label}.protocols", required=True),
-        max_tokens,
+        _max_tokens(table.get("max_tokens"), f"{label}.max_tokens"),
     )
 
 
@@ -278,29 +287,24 @@ def _switchyard_format(provider: ProviderBinding, raw: Any, label: str) -> str:
 
 def _base_target(
     value: Any,
-    role: Literal["efficient", "capable", "judge"],
+    role: Literal["efficient", "capable"],
     providers: Mapping[str, ProviderBinding],
 ) -> BaseTarget:
     label = f"base.targets.{role}"
     table = _mapping(value, label)
+    unknown = sorted(set(table) - BASE_TARGET_FIELDS)
+    if unknown:
+        raise CatalogError(f"{label} contains unknown keys: {', '.join(unknown)}")
     provider_name = _identifier(table.get("provider"), f"{label}.provider")
     if provider_name not in providers:
         raise CatalogError(f"{label} references unknown provider {provider_name}")
     provider = providers[provider_name]
-    worker = _worker(value, label)
-    if worker.provider != provider_name:
-        raise CatalogError(f"{label}.provider is inconsistent")
-    if provider.protocols and not set(worker.protocols) <= set(provider.protocols):
-        raise CatalogError(f"{label}.protocols exceeds provider protocols")
-    if not set(worker.protocols) <= ADAPTER_PROTOCOLS[provider.adapter]:
-        raise CatalogError(f"{label}.protocols exceeds adapter capabilities")
     return BaseTarget(
         role,
         provider_name,
-        worker.upstream_model,
-        worker.protocols,
-        worker.reasoning_effort,
-        worker.max_tokens,
+        _model_name(table.get("upstream_model"), f"{label}.upstream_model"),
+        _reasoning_effort(table.get("reasoning_effort"), f"{label}.reasoning_effort"),
+        _max_tokens(table.get("max_tokens"), f"{label}.max_tokens"),
         _switchyard_format(provider, table.get("format"), f"{label}.format"),
     )
 
@@ -316,17 +320,16 @@ def _load_named_providers(providers_raw: Any, names: set[str]) -> dict[str, Prov
 
 
 def load_base_route(root: Mapping[str, Any]) -> BaseRoute:
-    """Parse the catalog [base] route used to generate Switchyard config."""
+    """Parse the catalog [base] stage-router used to generate Switchyard config."""
     if root.get("version") != 1:
         raise CatalogError("catalog version must be 1 when base is configured")
     section = _mapping(root.get("base"), "base")
     unknown_section = sorted(set(section) - BASE_SECTION_KEYS)
     if unknown_section:
         raise CatalogError(f"base contains unknown keys: {', '.join(unknown_section)}")
-    algorithm = _string(section.get("algorithm", "stage_router"), "base.algorithm")
     picker = _string(section.get("picker", "efficient_first"), "base.picker")
     targets = _mapping(section.get("targets"), "base.targets")
-    unknown_targets = sorted(set(targets) - BASE_TARGET_KEYS)
+    unknown_targets = sorted(set(targets) - set(BASE_TARGET_ROLES))
     if unknown_targets:
         raise CatalogError(
             f"base.targets contains unknown roles: {', '.join(unknown_targets)}"
@@ -341,30 +344,14 @@ def load_base_route(root: Mapping[str, Any]) -> BaseRoute:
         )
         for role in BASE_TARGET_ROLES
     }
-    if "judge" in targets:
-        provider_names.add(
-            _identifier(
-                _mapping(targets["judge"], "base.targets.judge").get("provider"),
-                "base.targets.judge.provider",
-            )
-        )
     providers = _load_named_providers(root.get("providers"), provider_names)
     efficient = _base_target(targets["efficient"], "efficient", providers)
     capable = _base_target(targets["capable"], "capable", providers)
-    judge = _base_target(targets["judge"], "judge", providers) if "judge" in targets else None
     if (
         efficient.upstream_model == capable.upstream_model
         and efficient.provider == capable.provider
     ):
         raise CatalogError("base.targets.efficient and capable must be distinct models")
-    typed_algorithm: Literal["stage_router", "escalation"]
-    match algorithm:
-        case "stage_router":
-            typed_algorithm = "stage_router"
-        case "escalation":
-            typed_algorithm = "escalation"
-        case _:
-            raise CatalogError("base.algorithm must be stage_router or escalation")
     typed_picker: Literal["efficient_first", "capable_first"]
     match picker:
         case "efficient_first":
@@ -373,20 +360,12 @@ def load_base_route(root: Mapping[str, Any]) -> BaseRoute:
             typed_picker = "capable_first"
         case _:
             raise CatalogError("base.picker must be efficient_first or capable_first")
-    if typed_algorithm == "escalation" and typed_picker != "efficient_first":
-        raise CatalogError("escalation routes must use picker efficient_first")
-    if typed_algorithm == "stage_router" and judge is not None:
-        raise CatalogError("stage_router does not use base.targets.judge")
     return BaseRoute(
         _string(section.get("revision", "unspecified"), "base.revision"),
-        _string(section.get("route_id", "mantis-base"), "base.route_id"),
-        typed_algorithm,
         typed_picker,
         _unit_interval(section.get("confidence_threshold", 0.5), "base.confidence_threshold"),
         _positive_int(section.get("recent_turn_window", 3), "base.recent_turn_window", 3),
-        _positive_int(section.get("confirmations", 2), "base.confirmations", 2),
         efficient,
         capable,
-        judge,
         providers,
     )

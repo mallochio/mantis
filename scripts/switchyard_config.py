@@ -3,6 +3,9 @@
 The catalog [base] section names the efficient/capable models and the provider
 those models ride on. Changing a model or provider in the catalog is enough to
 retarget Base; this module never hard-codes upstream IDs.
+
+The Switchyard route id is the public Mantis model name so the API can forward
+chat requests without rewriting ``model``.
 """
 
 from __future__ import annotations
@@ -11,7 +14,7 @@ import argparse
 import sys
 import tomllib
 from pathlib import Path
-from typing import Any, Literal, TextIO
+from typing import Any, TextIO
 
 from model_catalog import catalog_path
 from model_catalog_schema import (
@@ -21,6 +24,8 @@ from model_catalog_schema import (
     ProviderBinding,
     load_base_route,
 )
+
+SWITCHYARD_ROUTE_ID = "mantis/base"
 
 
 def load_catalog_root(path: str | Path | None = None) -> tuple[Path, dict[str, Any]]:
@@ -83,9 +88,7 @@ def _target_extra_body(target: BaseTarget) -> str:
 def _render_clients(route: BaseRoute) -> str:
     blocks: list[str] = []
     seen: set[str] = set()
-    for target in (route.efficient, route.capable, route.judge):
-        if target is None:
-            continue
+    for target in (route.efficient, route.capable):
         key = _client_key(target.provider)
         if key in seen:
             continue
@@ -117,11 +120,12 @@ def _render_target(target: BaseTarget) -> str:
     )
 
 
-def _render_stage_router(route: BaseRoute) -> str:
-    return "\n".join(
+def render_switchyard_toml(route: BaseRoute) -> str:
+    """Render a Switchyard native TOML deployment from a parsed [base] route."""
+    route_block = "\n".join(
         [
             "[routes.mantis_base]",
-            f"id = {_toml_str(route.route_id)}",
+            f"id = {_toml_str(SWITCHYARD_ROUTE_ID)}",
             'type = "stage_router"',
             'capable_target = "capable"',
             'efficient_target = "efficient"',
@@ -131,45 +135,13 @@ def _render_stage_router(route: BaseRoute) -> str:
             "",
         ]
     )
-
-
-def _render_escalation(route: BaseRoute) -> str:
-    judge = "judge" if route.judge is not None else "efficient"
-    return "\n".join(
-        [
-            "[routes.mantis_base]",
-            f"id = {_toml_str(route.route_id)}",
-            'type = "llm_classifier"',
-            'mode = "escalation"',
-            f"classifier_target = {_toml_str(judge)}",
-            'strong_target = "capable"',
-            'weak_target = "efficient"',
-            f"escalation = {{ confirmations = {route.confirmations}, "
-            f"recent_turn_window = {route.recent_turn_window} }}",
-            "",
-        ]
-    )
-
-
-def render_switchyard_toml(route: BaseRoute) -> str:
-    """Render a Switchyard native TOML deployment from a parsed [base] route."""
-    algorithm: Literal["stage_router", "escalation"] = route.algorithm
-    match algorithm:
-        case "stage_router":
-            route_block = _render_stage_router(route)
-        case "escalation":
-            route_block = _render_escalation(route)
-        case _:
-            raise CatalogError(f"unsupported base.algorithm {algorithm}")
-    targets = [_render_target(route.efficient), _render_target(route.capable)]
-    if route.judge is not None:
-        targets.append(_render_target(route.judge))
     return (
         "schema_version = 1\n"
         f"# generated from catalog [base] revision {route.revision}\n"
         "\n"
         f"{_render_clients(route)}"
-        f"{''.join(targets)}"
+        f"{_render_target(route.efficient)}"
+        f"{_render_target(route.capable)}"
         f"{route_block}"
     )
 
@@ -194,12 +166,10 @@ def main(argv: list[str] | None = None, stdout: TextIO | None = None) -> int:
         print(error, file=sys.stderr)
         return 1
     if args.command == "validate":
-        stream = stdout
         print(
-            f"valid Switchyard base route: {route.route_id} "
-            f"({route.algorithm} {route.efficient.upstream_model} -> "
-            f"{route.capable.upstream_model})",
-            file=stream,
+            f"valid Switchyard base route: {SWITCHYARD_ROUTE_ID} "
+            f"({route.efficient.upstream_model} -> {route.capable.upstream_model})",
+            file=stdout,
         )
         return 0
     text = render_switchyard_toml(route)

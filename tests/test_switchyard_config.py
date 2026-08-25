@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from model_catalog_schema import CatalogError, load_base_route
 from switchyard_config import (
+    SWITCHYARD_ROUTE_ID,
     load_switchyard_route,
     main,
     render_switchyard_toml,
@@ -16,7 +17,7 @@ from switchyard_config import (
 )
 
 
-def _catalog(*, algorithm: str = "stage_router", extra: str = "") -> str:
+def _catalog(*, extra: str = "") -> str:
     return (
         "version = 1\n\n"
         "[providers.bifrost]\n"
@@ -31,8 +32,6 @@ def _catalog(*, algorithm: str = "stage_router", extra: str = "") -> str:
         'protocols = ["chat_completions"]\n\n'
         "[base]\n"
         'revision = "test-rev"\n'
-        'route_id = "mantis-base"\n'
-        f'algorithm = "{algorithm}"\n'
         'picker = "efficient_first"\n'
         "confidence_threshold = 0.5\n"
         "recent_turn_window = 3\n\n"
@@ -40,14 +39,12 @@ def _catalog(*, algorithm: str = "stage_router", extra: str = "") -> str:
         'provider = "bifrost"\n'
         'upstream_model = "google/gemini-3.7-flash"\n'
         'reasoning_effort = "medium"\n'
-        "max_tokens = 65536\n"
-        'protocols = ["chat_completions", "responses"]\n\n'
+        "max_tokens = 65536\n\n"
         "[base.targets.capable]\n"
         'provider = "bifrost"\n'
         'upstream_model = "anthropic/claude-opus-5"\n'
         'reasoning_effort = "medium"\n'
         "max_tokens = 128000\n"
-        'protocols = ["chat_completions", "responses"]\n'
         f"{extra}"
     )
 
@@ -64,7 +61,7 @@ def test_shipped_catalog_renders_stage_router():
     parsed = tomllib.loads(text)
     assert parsed["schema_version"] == 1
     assert parsed["routes"]["mantis_base"]["type"] == "stage_router"
-    assert parsed["routes"]["mantis_base"]["id"] == "mantis-base"
+    assert parsed["routes"]["mantis_base"]["id"] == SWITCHYARD_ROUTE_ID
     assert parsed["routes"]["mantis_base"]["picker"] == "efficient_first"
     assert parsed["targets"]["efficient"]["id"] == "google/gemini-3.7-flash"
     assert parsed["targets"]["capable"]["id"] == "anthropic/claude-opus-5"
@@ -78,12 +75,10 @@ def test_render_quotes_dotted_provider_names(tmp_path):
         'provider = "bifrost"\n'
         'upstream_model = "google/gemini-3.7-flash"\n'
         'reasoning_effort = "medium"\n'
-        "max_tokens = 65536\n"
-        'protocols = ["chat_completions", "responses"]\n',
+        "max_tokens = 65536\n",
         '[base.targets.efficient]\n'
         'provider = "modal.prod"\n'
-        'upstream_model = "vendor/fast"\n'
-        'protocols = ["chat_completions"]\n',
+        'upstream_model = "vendor/fast"\n',
         1,
     )
     path = _write(tmp_path, content)
@@ -92,25 +87,6 @@ def test_render_quotes_dotted_provider_names(tmp_path):
     assert parsed["llm_clients"]["modal_prod"]["base_url"] == "https://modal.example.test/v1"
     assert parsed["targets"]["efficient"]["llm_client"] == "modal_prod"
     assert parsed["targets"]["capable"]["llm_client"] == "bifrost"
-
-
-def test_escalation_uses_optional_judge_target(tmp_path):
-    extra = (
-        "\n[base.targets.judge]\n"
-        'provider = "bifrost"\n'
-        'upstream_model = "google/gemini-3.7-flash"\n'
-        'protocols = ["chat_completions"]\n'
-    )
-    path = _write(tmp_path, _catalog(algorithm="escalation", extra=extra))
-    text = render_switchyard_toml(load_switchyard_route(path))
-    parsed = tomllib.loads(text)
-    route = parsed["routes"]["mantis_base"]
-    assert route["type"] == "llm_classifier"
-    assert route["mode"] == "escalation"
-    assert route["classifier_target"] == "judge"
-    assert route["weak_target"] == "efficient"
-    assert route["strong_target"] == "capable"
-    assert parsed["targets"]["judge"]["id"] == "google/gemini-3.7-flash"
 
 
 def test_rejects_identical_efficient_and_capable(tmp_path):
@@ -124,18 +100,12 @@ def test_rejects_identical_efficient_and_capable(tmp_path):
         load_switchyard_route(path)
 
 
-def test_rejects_unknown_algorithm(tmp_path):
-    path = _write(tmp_path, _catalog(algorithm="random"))
-    with pytest.raises(CatalogError, match="stage_router or escalation"):
-        load_base_route(tomllib.loads(path.read_text()))
-
-
 def test_cli_validate_and_render(tmp_path, monkeypatch):
     catalog = _write(tmp_path, _catalog())
     monkeypatch.chdir(tmp_path)
     out = io.StringIO()
     assert main(["validate", "--catalog", str(catalog)], stdout=out) == 0
-    assert "mantis-base" in out.getvalue()
+    assert SWITCHYARD_ROUTE_ID in out.getvalue()
     rendered = tmp_path / "routes.toml"
     assert main(["render", "--catalog", str(catalog), "--output", str(rendered)]) == 0
     parsed = tomllib.loads(rendered.read_text())
@@ -153,32 +123,11 @@ def test_rejects_unknown_picker():
         load_base_route(tomllib.loads(content))
 
 
-def test_rejects_escalation_without_efficient_first(tmp_path):
-    content = _catalog(algorithm="escalation").replace(
-        'picker = "efficient_first"',
-        'picker = "capable_first"',
-    )
-    with pytest.raises(CatalogError, match="efficient_first"):
-        load_switchyard_route(_write(tmp_path, content))
-
-
-def test_rejects_judge_on_stage_router(tmp_path):
-    extra = (
-        "\n[base.targets.judge]\n"
-        'provider = "bifrost"\n'
-        'upstream_model = "google/gemini-3.7-flash"\n'
-        'protocols = ["chat_completions"]\n'
-    )
-    with pytest.raises(CatalogError, match="does not use base.targets.judge"):
-        load_switchyard_route(_write(tmp_path, _catalog(extra=extra)))
-
-
 def test_rejects_unknown_target_role(tmp_path):
     extra = (
         "\n[base.targets.mid]\n"
         'provider = "bifrost"\n'
         'upstream_model = "google/gemini-3.7-flash"\n'
-        'protocols = ["chat_completions"]\n'
     )
     with pytest.raises(CatalogError, match="unknown roles"):
         load_switchyard_route(_write(tmp_path, _catalog(extra=extra)))
@@ -187,7 +136,18 @@ def test_rejects_unknown_target_role(tmp_path):
 def test_rejects_unknown_base_keys(tmp_path):
     content = _catalog().replace(
         "confidence_threshold = 0.5\n",
-        "confidence_threshold = 0.5\ncomplexity_threshold = 3\n",
+        "confidence_threshold = 0.5\nalgorithm = \"stage_router\"\n",
+        1,
+    )
+    with pytest.raises(CatalogError, match="unknown keys"):
+        load_switchyard_route(_write(tmp_path, content))
+
+
+def test_rejects_legacy_protocols_on_base_target(tmp_path):
+    extra = 'protocols = ["chat_completions"]\n'
+    content = _catalog().replace(
+        'upstream_model = "google/gemini-3.7-flash"\n',
+        'upstream_model = "google/gemini-3.7-flash"\n' + extra,
         1,
     )
     with pytest.raises(CatalogError, match="unknown keys"):
@@ -200,8 +160,7 @@ def test_rejects_missing_efficient_target():
         'provider = "bifrost"\n'
         'upstream_model = "google/gemini-3.7-flash"\n'
         'reasoning_effort = "medium"\n'
-        "max_tokens = 65536\n"
-        'protocols = ["chat_completions", "responses"]\n\n',
+        "max_tokens = 65536\n\n",
         "",
         1,
     )
@@ -222,12 +181,10 @@ def test_omits_extra_body_when_target_has_no_caps(tmp_path):
         'provider = "bifrost"\n'
         'upstream_model = "google/gemini-3.7-flash"\n'
         'reasoning_effort = "medium"\n'
-        "max_tokens = 65536\n"
-        'protocols = ["chat_completions", "responses"]\n',
+        "max_tokens = 65536\n",
         '[base.targets.efficient]\n'
         'provider = "bifrost"\n'
-        'upstream_model = "google/gemini-3.7-flash"\n'
-        'protocols = ["chat_completions"]\n',
+        'upstream_model = "google/gemini-3.7-flash"\n',
         1,
     )
     route = load_switchyard_route(_write(tmp_path, content))
@@ -260,20 +217,10 @@ def test_cli_reports_catalog_errors(tmp_path, capsys):
     assert "no [base] route" in capsys.readouterr().err
 
 
-def test_escalation_without_judge_uses_efficient(tmp_path):
-    catalog = _write(tmp_path, _catalog(algorithm="escalation"))
-    parsed = tomllib.loads(render_switchyard_toml(load_switchyard_route(catalog)))
-    assert parsed["routes"]["mantis_base"]["classifier_target"] == "efficient"
-    assert "judge" not in parsed["targets"]
-
-
 def test_rejects_anthropic_format_on_openai_adapter(tmp_path):
     content = _catalog().replace(
-        'protocols = ["chat_completions", "responses"]\n\n'
-        "[base.targets.capable]",
-        'protocols = ["chat_completions", "responses"]\n'
-        'format = "anthropic_messages"\n\n'
-        "[base.targets.capable]",
+        'upstream_model = "google/gemini-3.7-flash"\n',
+        'upstream_model = "google/gemini-3.7-flash"\nformat = "anthropic_messages"\n',
         1,
     )
     with pytest.raises(CatalogError, match="requires the anthropic adapter"):
@@ -282,11 +229,8 @@ def test_rejects_anthropic_format_on_openai_adapter(tmp_path):
 
 def test_rejects_unknown_switchyard_format(tmp_path):
     content = _catalog().replace(
-        'protocols = ["chat_completions", "responses"]\n\n'
-        "[base.targets.capable]",
-        'protocols = ["chat_completions", "responses"]\n'
-        'format = "openai_compat"\n\n'
-        "[base.targets.capable]",
+        'upstream_model = "google/gemini-3.7-flash"\n',
+        'upstream_model = "google/gemini-3.7-flash"\nformat = "openai_compat"\n',
         1,
     )
     with pytest.raises(CatalogError, match="unsupported"):
@@ -310,7 +254,9 @@ def test_rejects_unknown_base_provider(tmp_path):
 
 
 def test_rejects_confidence_outside_unit_interval(tmp_path):
-    content = _catalog().replace("confidence_threshold = 0.5\n", "confidence_threshold = 1.5\n")
+    content = _catalog().replace(
+        "confidence_threshold = 0.5\n", "confidence_threshold = 1.5\n"
+    )
     with pytest.raises(CatalogError, match="\\[0, 1\\]"):
         load_switchyard_route(_write(tmp_path, content))
 
@@ -340,20 +286,17 @@ def test_quotes_non_identifier_client_keys(tmp_path):
         'credential_env = "BIFROST_API_KEY"\n'
         'protocols = ["chat_completions", "responses"]\n\n'
         "[base]\n"
-        'route_id = "mantis-base"\n'
-        'algorithm = "stage_router"\n'
         'picker = "efficient_first"\n'
         "confidence_threshold = 0.5\n\n"
         "[base.targets.efficient]\n"
         'provider = "edge-fast"\n'
-        'upstream_model = "vendor/fast"\n'
-        'protocols = ["chat_completions"]\n\n'
+        'upstream_model = "vendor/fast"\n\n'
         "[base.targets.capable]\n"
         'provider = "bifrost"\n'
         'upstream_model = "anthropic/claude-opus-5"\n'
-        'protocols = ["chat_completions"]\n'
     )
     text = render_switchyard_toml(load_switchyard_route(_write(tmp_path, content)))
     assert '[llm_clients."edge-fast"]' in text
     parsed = tomllib.loads(text)
     assert parsed["targets"]["efficient"]["llm_client"] == "edge-fast"
+    assert parsed["routes"]["mantis_base"]["id"] == SWITCHYARD_ROUTE_ID

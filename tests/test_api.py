@@ -731,11 +731,10 @@ def test_basic_model_relays_router_response_and_session(client, monkeypatch):
     assert response.status_code == 200
     assert response.json()["id"] == "chatcmpl-router"
     assert response.headers["x-route-model"] == "anthropic/claude-opus-5"
-    assert response.headers["x-route-reason"] == "stage_signal"
-    assert seen["body"]["model"] == "mantis-base"
+    assert seen["body"]["model"] == "mantis/base"
     assert seen["headers"]["authorization"] == "Bearer router-key"
-    assert seen["headers"]["x-route-session"] == "pi-session"
     assert seen["headers"]["x-switchyard-session-id"] == "pi-session"
+    assert "x-route-session" not in seen["headers"]
 
 
 def test_basic_model_relays_body_session_identity_as_header(client, monkeypatch):
@@ -765,7 +764,7 @@ def test_basic_model_relays_body_session_identity_as_header(client, monkeypatch)
     assert response.status_code == 200
     # Body session identity must reach Switchyard as x-switchyard-session-id...
     assert seen["headers"]["x-switchyard-session-id"] == "meta-session"
-    assert seen["headers"]["x-route-session"] == "meta-session"
+    assert "x-route-session" not in seen["headers"]
     # ...but must not leak into the upstream body where strict providers
     # reject unknown top-level fields.
     assert "metadata" not in seen["body"]
@@ -803,7 +802,10 @@ def test_basic_model_relays_router_stream(client, monkeypatch):
         return __import__("httpx").Response(
             200,
             content=b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
-            headers={"content-type": "text/event-stream", "x-route-decision": "cheap"},
+            headers={
+                "content-type": "text/event-stream",
+                "x-model-router-selected-model": "google/gemini-3.7-flash",
+            },
         )
 
     monkeypatch.setenv("MANTIS_ROUTER_KEY", "router-key")
@@ -818,7 +820,7 @@ def test_basic_model_relays_router_stream(client, monkeypatch):
         },
     )
     assert response.status_code == 200
-    assert response.headers["x-route-decision"] == "cheap"
+    assert response.headers["x-route-model"] == "google/gemini-3.7-flash"
     assert response.headers["content-type"].startswith("text/event-stream")
     assert response.content.endswith(b"data: [DONE]\n\n")
 
@@ -864,7 +866,7 @@ def test_basic_model_forwards_without_router_key(client, monkeypatch):
     assert "authorization" not in seen["headers"]
 
 
-def test_basic_model_uses_catalog_route_id(client, monkeypatch):
+def test_basic_model_forwards_public_model_id(client, monkeypatch):
     seen = {}
 
     def handler(request):
@@ -882,7 +884,7 @@ def test_basic_model_uses_catalog_route_id(client, monkeypatch):
         json={"model": "mantis/base", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert response.status_code == 200
-    assert seen["body"]["model"] == "custom-base"
+    assert seen["body"]["model"] == "mantis/base"
 
 
 def test_only_public_mantis_model_ids_are_accepted(client):

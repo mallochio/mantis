@@ -17,8 +17,6 @@ protocols = ["anthropic_messages"]
 # Switchyard stage-router for mantis/base. Swap these models or their
 # providers without changing application code; launch regenerates routes.toml.
 revision = "switchyard-2026-08-25-flash-opus"
-route_id = "mantis-base"
-algorithm = "stage_router"
 picker = "efficient_first"
 confidence_threshold = 0.5
 recent_turn_window = 3
@@ -30,7 +28,6 @@ provider = "bifrost"
 reasoning_effort = "medium"
 max_tokens = 65536
 upstream_model = "google/gemini-3.7-flash"
-protocols = ["chat_completions", "responses"]
 
 [base.targets.capable]
 provider = "bifrost"
@@ -39,7 +36,6 @@ provider = "bifrost"
 reasoning_effort = "medium"
 max_tokens = 128000
 upstream_model = "anthropic/claude-opus-5"
-protocols = ["chat_completions", "responses"]
 
 
 [mantis]
