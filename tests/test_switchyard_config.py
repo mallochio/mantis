@@ -278,3 +278,82 @@ def test_rejects_anthropic_format_on_openai_adapter(tmp_path):
     )
     with pytest.raises(CatalogError, match="requires the anthropic adapter"):
         load_switchyard_route(_write(tmp_path, content))
+
+
+def test_rejects_unknown_switchyard_format(tmp_path):
+    content = _catalog().replace(
+        'protocols = ["chat_completions", "responses"]\n\n'
+        "[base.targets.capable]",
+        'protocols = ["chat_completions", "responses"]\n'
+        'format = "openai_compat"\n\n'
+        "[base.targets.capable]",
+        1,
+    )
+    with pytest.raises(CatalogError, match="unsupported"):
+        load_switchyard_route(_write(tmp_path, content))
+
+
+def test_rejects_catalog_version_other_than_1():
+    content = _catalog().replace("version = 1\n", "version = 2\n", 1)
+    with pytest.raises(CatalogError, match="version must be 1"):
+        load_base_route(tomllib.loads(content))
+
+
+def test_rejects_unknown_base_provider(tmp_path):
+    content = _catalog().replace(
+        '[base.targets.efficient]\nprovider = "bifrost"',
+        '[base.targets.efficient]\nprovider = "missing"',
+        1,
+    )
+    with pytest.raises(CatalogError, match="unknown provider"):
+        load_switchyard_route(_write(tmp_path, content))
+
+
+def test_rejects_confidence_outside_unit_interval(tmp_path):
+    content = _catalog().replace("confidence_threshold = 0.5\n", "confidence_threshold = 1.5\n")
+    with pytest.raises(CatalogError, match="\\[0, 1\\]"):
+        load_switchyard_route(_write(tmp_path, content))
+
+
+def test_rejects_non_positive_turn_window(tmp_path):
+    content = _catalog().replace("recent_turn_window = 3\n", "recent_turn_window = 0\n")
+    with pytest.raises(CatalogError, match="positive integer"):
+        load_switchyard_route(_write(tmp_path, content))
+
+
+def test_rejects_catalog_directory(tmp_path):
+    with pytest.raises(CatalogError, match="is not a file"):
+        load_switchyard_route(tmp_path)
+
+
+def test_quotes_non_identifier_client_keys(tmp_path):
+    content = (
+        "version = 1\n\n"
+        '[providers."edge-fast"]\n'
+        'adapter = "openai-compatible"\n'
+        'base_url = "https://edge.example.test/v1"\n'
+        'credential_env = "EDGE_KEY"\n'
+        'protocols = ["chat_completions"]\n\n'
+        "[providers.bifrost]\n"
+        'adapter = "openai-compatible"\n'
+        'base_url = "http://127.0.0.1:8080/v1"\n'
+        'credential_env = "BIFROST_API_KEY"\n'
+        'protocols = ["chat_completions", "responses"]\n\n'
+        "[base]\n"
+        'route_id = "mantis-base"\n'
+        'algorithm = "stage_router"\n'
+        'picker = "efficient_first"\n'
+        "confidence_threshold = 0.5\n\n"
+        "[base.targets.efficient]\n"
+        'provider = "edge-fast"\n'
+        'upstream_model = "vendor/fast"\n'
+        'protocols = ["chat_completions"]\n\n'
+        "[base.targets.capable]\n"
+        'provider = "bifrost"\n'
+        'upstream_model = "anthropic/claude-opus-5"\n'
+        'protocols = ["chat_completions"]\n'
+    )
+    text = render_switchyard_toml(load_switchyard_route(_write(tmp_path, content)))
+    assert '[llm_clients."edge-fast"]' in text
+    parsed = tomllib.loads(text)
+    assert parsed["targets"]["efficient"]["llm_client"] == "edge-fast"

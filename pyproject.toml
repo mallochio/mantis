@@ -149,6 +149,8 @@ omit = [
     "scripts/retrain_conductor.py",
     "scripts/verify.sh",
     "scripts/toolscale_data.py",
+    "scripts/fusion_headless.py",
+    "scripts/build_swerebench_manifest.py",
 ]
 
 [tool.coverage.report]
