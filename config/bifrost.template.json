@@ -109,6 +109,16 @@
             "key_ids": [
               "*"
             ]
+          },
+          {
+            "provider": "qwen",
+            "weight": 1.0,
+            "allowed_models": [
+              "*"
+            ],
+            "key_ids": [
+              "*"
+            ]
           }
         ]
       }
@@ -217,6 +227,19 @@
           "responses"
         ],
         "pricing_patch": "{\"input_cost_per_token\": 1.25e-06, \"output_cost_per_token\": 4.25e-06, \"cache_read_input_token_cost\": 1.5e-07}"
+      },
+      {
+        "id": "po-qwen3-8-2-4t-a95b-modal",
+        "name": "Qwen3.8 2.4T A95B Modal pricing ($2/$6/$0.20 per MTok)",
+        "scope_kind": "provider",
+        "provider_id": "qwen",
+        "match_type": "exact",
+        "pattern": "Qwen/Qwen3.8-2.4T-A95B",
+        "request_types": [
+          "chat_completion",
+          "responses"
+        ],
+        "pricing_patch": "{\"input_cost_per_token\": 2e-06, \"output_cost_per_token\": 6e-06, \"cache_read_input_token_cost\": 2e-07}"
       }
     ],
     "routing_rules": [
@@ -648,6 +671,36 @@
           }
         }
       ]
+    },
+    "qwen": {
+      "custom_provider_config": {
+        "base_provider_type": "openai"
+      },
+      "network_config": {
+        "base_url": "https://<your-org>--ep-qwen3-8-2-4t-a95b-server.us-west.modal.direct"
+      },
+      "keys": [
+        {
+          "name": "qwen-modal-primary",
+          "value": "env.MODAL_PROXY_TOKEN",
+          "models": [
+            "qwen3-8-2-4t-a95b",
+            "Qwen 3.8 Max"
+          ],
+          "weight": 1.0,
+          "aliases": {
+            "qwen3-8-2-4t-a95b": {
+              "model_id": "Qwen/Qwen3.8-2.4T-A95B",
+              "model_name": "Qwen 3.8 Max"
+            },
+            "Qwen 3.8 Max": {
+              "model_id": "Qwen/Qwen3.8-2.4T-A95B",
+              "model_name": "Qwen 3.8 Max"
+            }
+          }
+        }
+      ],
+      "store_raw_request_response": false
     }
   },
   "source_of_truth": "config.json"

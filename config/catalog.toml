@@ -16,26 +16,25 @@ protocols = ["anthropic_messages"]
 [base]
 # Switchyard stage-router for mantis/base. Swap these models or their
 # providers without changing application code; launch regenerates routes.toml.
-revision = "switchyard-2026-08-25-flash-opus"
+revision = "switchyard-2026-08-25-qwen-gpt-sol-high"
 picker = "efficient_first"
 confidence_threshold = 0.5
 recent_turn_window = 3
 
 [base.targets.efficient]
 provider = "bifrost"
-# gemini-3.7-flash (models.dev google/google-vertex): max output 65536,
-# cost $0.75/$3.75 per 1M in/out.
-reasoning_effort = "medium"
-max_tokens = 65536
-upstream_model = "google/gemini-3.7-flash"
+# qwen3.8 through Bifrost (Qwen/Qwen3.8-2.4T-A95B on Modal, 1M context).
+reasoning_effort = "high"
+max_tokens = 262144
+upstream_model = "qwen3-8-2-4t-a95b"
 
 [base.targets.capable]
 provider = "bifrost"
-# claude-opus-5 through Bifrost (vertex-primary, bedrock fallback).
-# Cost-monotonic: $5/$25 per 1M in/out — cheaper than gpt-5.6-sol ($5/$30).
-reasoning_effort = "medium"
+# gpt-5.6-sol (models.dev azure/openai): max output 128000,
+# cost $5/$30 per 1M in/out — the most capable tier.
+reasoning_effort = "high"
 max_tokens = 128000
-upstream_model = "anthropic/claude-opus-5"
+upstream_model = "gpt-5.6-sol"
 
 
 [mantis]

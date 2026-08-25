@@ -56,7 +56,7 @@ if [ "$HOST" != "127.0.0.1" ] && [ "$HOST" != "::1" ] && [ "$HOST" != "localhost
 fi
 
 export PYTHONPATH="$REPO_ROOT/scripts${PYTHONPATH:+:$PYTHONPATH}"
-if ! python3 "$REPO_ROOT/scripts/switchyard_config.py" render --catalog "$CATALOG" --output "$CONFIG_OUT"; then
+if ! uv run --no-sync python "$REPO_ROOT/scripts/switchyard_config.py" render --catalog "$CATALOG" --output "$CONFIG_OUT"; then
   echo "ERROR: failed to render Switchyard config from $CATALOG" >&2
   exit 1
 fi

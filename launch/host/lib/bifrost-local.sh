@@ -42,8 +42,18 @@ export OPENCODE_API_KEY="${OPENCODE_API_KEY:-${OPENCODE_GO_API_KEY:-}}"
 
 DATA_DIR="${BIFROST_DATA_DIR:-$HOME/.local/share/bifrost}"
 LOG_DIR="$DATA_DIR/logs"
+CONFIG_SRC="${BIFROST_CONFIG:-$HOME/.config/ai-routing/bifrost.json}"
 mkdir -p "$LOG_DIR"
 chmod 700 "$DATA_DIR" "$LOG_DIR"
+
+# The app-dir config.json is a derived copy. The canonical file to edit is
+# ~/.config/ai-routing/bifrost.json (symlinked into the mantis repo). Sync it
+# on every launch so restarts always apply edits and the two can never drift.
+if [ -f "$CONFIG_SRC" ] && ! cmp -s "$CONFIG_SRC" "$DATA_DIR/config.json" 2>/dev/null; then
+  cp "$CONFIG_SRC" "$DATA_DIR/config.json"
+  chmod 600 "$DATA_DIR/config.json"
+  echo "bifrost config synced from $CONFIG_SRC"
+fi
 
 HOST="${BIFROST_HOST:-127.0.0.1}"
 PORT="${BIFROST_PORT:-8080}"
