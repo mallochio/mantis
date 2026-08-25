@@ -65,8 +65,8 @@ from serve_config import (
     RUN_STORE,
 )
 from ultra import (
-    ConductorExecutor,
     PLANNER_PREFILL,
+    ConductorExecutor,
     conductor_prompt,
     parse_workflow,
     planner_repair_messages,
@@ -945,7 +945,7 @@ class TrinityRun(NativeRun):
 def _load_mantis_catalog() -> model_catalog.MantisCatalog | None:
     try:
         return model_catalog.load_mantis_catalog(require_contract=False)
-    except Exception:
+    except (model_catalog.CatalogError, OSError, ValueError):
         return None
 
 

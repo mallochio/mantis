@@ -94,8 +94,8 @@ def test_parse_workflow_accepts_json():
 
 
 def test_planner_messages_prefill_and_repair():
-    from apps.api import ultra
     from apps.api import runs as serve
+    from apps.api import ultra
 
     run = serve.ConductorRun(
         "planner",
@@ -125,7 +125,10 @@ def test_planner_repair_retries_once(monkeypatch):
         calls["n"] += 1
         if calls["n"] == 1:
             run._last_planner_text = "not a workflow"
-            return {"type": "error", "error": "Conductor emitted an invalid workflow: missing lists"}
+            return {
+                "type": "error",
+                "error": "Conductor emitted an invalid workflow: missing lists",
+            }
         run._workflow = ([0], ["task"], [[]])
         return {"type": "step_complete", "role": "Planner", "turn": 0}
 

@@ -33,6 +33,7 @@ if not (_HERE / "mini.py").exists():
         sys.path.insert(0, str(_OPENFUGU))
 
 import providers
+import runs
 import serve_config
 from mini import (
     DEFAULT_SLOT_LABELS,
@@ -44,8 +45,6 @@ from serve_config import (
     MODEL_MODES,
     RUN_MAX_MSG_BYTES,
 )
-
-import runs
 
 
 def _split_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
@@ -451,12 +450,14 @@ class RepeatToolGuard:
         for thresh in self.thresholds:
             if self.consecutive_count == thresh:
                 preview = canonical[:120]
-                return (
-                    f"[Advisory Notice: Tool '{tool_name}' has been called {self.consecutive_count} "
-                    f"times consecutively with identical arguments ({preview}). "
-                    f"If the tool result is unchanged or not making progress, adjust parameters, "
-                    f"try an alternate approach, or conclude your response.]"
+                msg = (
+                    f"[Advisory Notice: Tool '{tool_name}' has been called "
+                    f"{self.consecutive_count} times consecutively with identical "
+                    f"arguments ({preview}). If the tool result is unchanged or not making "
+                    f"progress, adjust parameters, try an alternate approach, or conclude "
+                    f"your response.]"
                 )
+                return msg
         return None
 
     def reset(self) -> None:

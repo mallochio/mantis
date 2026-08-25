@@ -3,9 +3,8 @@
 import time
 
 import pytest
-import serve_config
-
 import runs
+import serve_config
 
 
 @pytest.fixture

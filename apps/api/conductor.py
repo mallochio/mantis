@@ -42,7 +42,7 @@ from ultra import ConductorExecutor, conductor_prompt, parse_workflow
 def _load_mantis_catalog() -> model_catalog.MantisCatalog | None:
     try:
         return model_catalog.load_mantis_catalog(require_contract=False)
-    except Exception:
+    except (model_catalog.CatalogError, OSError, ValueError):
         return None
 
 

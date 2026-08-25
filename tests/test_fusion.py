@@ -10,10 +10,9 @@ import api
 import fusion
 import providers
 import pytest
+import runs
 import serve_config
 from fastapi.testclient import TestClient
-
-import runs
 
 
 class FakeWorker:
