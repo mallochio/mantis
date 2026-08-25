@@ -7,7 +7,7 @@ this module forwards the chat body without rewriting ``model``.
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any, Protocol
 
 import httpx
@@ -91,12 +91,21 @@ def router_error(upstream: httpx.Response) -> JSONResponse:
     return JSONResponse(body, status_code=upstream.status_code)
 
 
-def _router_stream(client: httpx.Client, stream: Any, upstream: httpx.Response) -> Iterator[bytes]:
+def _router_stream(
+    client: httpx.Client,
+    stream: Any,
+    upstream: httpx.Response,
+    on_close: Callable[[], None] | None = None,
+) -> Iterator[bytes]:
     try:
         yield from upstream.iter_bytes()
     finally:
-        stream.__exit__(None, None, None)
-        client.close()
+        try:
+            stream.__exit__(None, None, None)
+        finally:
+            client.close()
+            if on_close is not None:
+                on_close()
 
 
 def forward(
@@ -104,6 +113,7 @@ def forward(
     headers: dict[str, str],
     request_id: str,
     client_factory: Any,
+    on_close: Callable[[], None] | None = None,
 ) -> tuple[JSONResponse | StreamingResponse, bool]:
     """Proxy a Base chat request to Switchyard.
 
@@ -125,7 +135,7 @@ def forward(
             return error, False
         return (
             StreamingResponse(
-                _router_stream(client, stream, upstream),
+                _router_stream(client, stream, upstream, on_close=on_close),
                 media_type="text/event-stream",
                 headers={"X-Request-Id": request_id, **router_response_headers(upstream)},
             ),

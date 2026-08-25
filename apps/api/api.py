@@ -977,7 +977,11 @@ def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Respons
         handed_off = False
         try:
             response, handed_off = base_proxy.forward(
-                request, headers, request_id, _router_client
+                request,
+                headers,
+                request_id,
+                _router_client,
+                on_close=_capacity.release,
             )
         except httpx.HTTPError as error:
             return _error(502, f"router unavailable: {error}", "upstream_error")

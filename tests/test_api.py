@@ -810,6 +810,7 @@ def test_basic_model_relays_router_stream(client, monkeypatch):
 
     monkeypatch.setenv("MANTIS_ROUTER_KEY", "router-key")
     monkeypatch.setattr(api, "_router_client", lambda: _router_client(handler))
+    initial_value = api._capacity._value
     response = client.post(
         "/v1/chat/completions",
         headers=_headers(),
@@ -823,6 +824,8 @@ def test_basic_model_relays_router_stream(client, monkeypatch):
     assert response.headers["x-route-model"] == "google/gemini-3.7-flash"
     assert response.headers["content-type"].startswith("text/event-stream")
     assert response.content.endswith(b"data: [DONE]\n\n")
+    # Concurrency capacity semaphore must be released when stream completes
+    assert api._capacity._value == initial_value
 
 
 def test_basic_model_reports_router_connection_failure(client, monkeypatch):
