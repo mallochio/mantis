@@ -69,6 +69,17 @@ def test_shipped_catalog_renders_stage_router():
     assert parsed["llm_clients"]["bifrost"]["base_url"] == "http://127.0.0.1:8080/v1"
 
 
+def test_openrouter_free_smoke_catalog_renders_distinct_targets():
+    route = load_switchyard_route(Path("config/catalog.openrouter-free.toml"))
+    parsed = tomllib.loads(render_switchyard_toml(route))
+    assert parsed["targets"]["efficient"]["id"] == "openrouter/free"
+    assert parsed["targets"]["capable"]["id"] == "stealth/ox-alpha"
+    assert parsed["llm_clients"]["openrouter"]["base_url"] == "https://openrouter.ai/api/v1"
+    assert parsed["llm_clients"]["openrouter"]["api_key_env"] == "OPENROUTER_API_KEY"
+    assert parsed["routes"]["mantis_base"]["id"] == SWITCHYARD_ROUTE_ID
+    assert parsed["routes"]["mantis_base"]["picker"] == "efficient_first"
+
+
 def test_render_quotes_dotted_provider_names(tmp_path):
     content = _catalog().replace(
         '[base.targets.efficient]\n'
