@@ -166,6 +166,7 @@ def test_fusion_planning_tool_budget_cap(monkeypatch):
     tools = [{"type": "function", "function": {"name": "read"}}]
     monkeypatch.setattr(providers, "_provider_response", mock_worker)
     run = fusion.create_fusion_run("brief", tools=tools)
+    run.main_tools_policy = frozenset({"plan"})
 
     # Round 1
     ev1 = fusion.advance_fusion_run(run.run_id)

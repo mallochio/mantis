@@ -114,8 +114,14 @@ reasoning_effort = "high"
 protocols = ["chat_completions"]
 
 # Fusion lead/sidekick configuration. These are worker slot IDs from [mantis.workers].
+# By default the main model only plans and reviews while the sidekick executes.
+# `main_tools` gates when the lead may use tools: none/plan/review/plan+review.
+# Each lane's reasoning effort comes from its worker slot: gpt-5_6-sol is
+# medium, gpt-5_6-luna is xhigh (the max effort GPT-5.6 accepts; "max" is
+# clamped to "xhigh" by providers._coerce_reasoning_effort).
 [fusion]
 main = "gpt-5_6-sol"
 sidekick = "gpt-5_6-luna"
-max_follow_ups = 10
+max_follow_ups = 2
+main_tools = "none"
 context_window = 262144

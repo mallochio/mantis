@@ -1048,6 +1048,10 @@ class FusionResponse(BaseModel):
     usage: dict[str, Any]
     activity: list[dict[str, Any]]
     request_id: str | None = None
+    usage_models: dict[str, Any] = Field(default_factory=dict)
+    cost: float | None = None
+    follow_up_count: int = 0
+    follow_up_capped: bool = False
 
 
 @app.post("/v1/fusion/delegate", dependencies=[Depends(_authorize)])

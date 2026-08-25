@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import json
+import pickle
 import uuid
+from pathlib import Path
 from typing import Any
 
 import api
 import fusion
 import providers
 import pytest
-import runs
 import serve_config
 from fastapi.testclient import TestClient
+
+import runs
 
 
 class FakeWorker:
@@ -221,6 +224,26 @@ def fake_worker(monkeypatch):
 
 def _headers():
     return {"Authorization": "Bearer test-key"}
+
+
+def _fusion_config_file(
+    tmp_path,
+    *,
+    main_tools: str = "plan+review",
+    max_follow_ups: int = 2,
+    main: str = "gpt-5_6-sol",
+    sidekick: str = "deepseek-v4-flash",
+):
+    path = tmp_path / "catalog.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "[fusion]\n"
+        f'main = "{main}"\n'
+        f'sidekick = "{sidekick}"\n'
+        f'main_tools = "{main_tools}"\n'
+        f"max_follow_ups = {max_follow_ups}\n"
+    )
+    return fusion.FusionConfig(path)
 
 
 SAMPLE_DELEGATE = {
@@ -987,7 +1010,8 @@ def test_fusion_file_persistence_retains_reasoning_metadata(file_client, fake_wo
     assert any("reasoning" in m or "reasoning_details" in m for m in assistant_msgs)
 
 
-def test_fusion_main_driver_can_call_tools_during_planning(client, monkeypatch):
+def test_fusion_main_driver_can_call_tools_during_planning(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(fusion, "_FUSION_CONFIG", _fusion_config_file(tmp_path))
     tools = [
         {
             "type": "function",
@@ -1224,7 +1248,7 @@ def test_fusion_retries_malformed_plan(monkeypatch):
     assert "Done." in (event["report"] or "")
 
 
-def test_fusion_rejects_unknown_planning_tools(monkeypatch):
+def test_fusion_rejects_unknown_planning_tools(monkeypatch, tmp_path):
     """If the main calls a tool not in the allowed set, Fusion forces it back to text."""
     ipython_call = [
         {
@@ -1244,16 +1268,18 @@ def test_fusion_rejects_unknown_planning_tools(monkeypatch):
     sidekick_outputs = [("Done.", None, DEFAULT_USAGE)]
     worker = SequenceWorker(main_outputs, sidekick_outputs)
     monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    config = _fusion_config_file(tmp_path)
+    monkeypatch.setattr(fusion, "_FUSION_CONFIG", config)
 
     run = fusion.FusionRun("unknown-tool-run", "do work", tools=[BASH_TOOL])
-    event = run.advance(coordinator=fusion.FusionCoordinator())
+    event = run.advance(coordinator=fusion.FusionCoordinator(config))
     assert event["status"] == "completed"
     assert "Done." in (event["report"] or "")
     # The retry should have been invoked with tools=None to stop hallucination.
     assert any(t is None for _s, _m, t in worker.calls)
 
 
-def test_fusion_enforces_planning_tool_budget(monkeypatch):
+def test_fusion_enforces_planning_tool_budget(monkeypatch, tmp_path):
     """After two planning tool rounds, the main must produce text or error."""
     bash_call_1 = [
         {
@@ -1284,16 +1310,18 @@ def test_fusion_enforces_planning_tool_budget(monkeypatch):
     sidekick_outputs = [("Done.", None, DEFAULT_USAGE)]
     worker = SequenceWorker(main_outputs, sidekick_outputs)
     monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    config = _fusion_config_file(tmp_path)
+    monkeypatch.setattr(fusion, "_FUSION_CONFIG", config)
 
     run = fusion.FusionRun("budget-run", "do work", tools=[BASH_TOOL])
-    event = run.advance(coordinator=fusion.FusionCoordinator())
+    event = run.advance(coordinator=fusion.FusionCoordinator(config))
     assert event["status"] == "awaiting_tools"
     assert run.planning_tool_rounds == 1
 
     event = run.advance(
         tool_results=[{"tool_call_id": "call_1", "content": "ok"}],
         request_id="req-1",
-        coordinator=fusion.FusionCoordinator(),
+        coordinator=fusion.FusionCoordinator(config),
     )
     assert event["status"] == "awaiting_tools"
     assert run.planning_tool_rounds == 2
@@ -1301,9 +1329,390 @@ def test_fusion_enforces_planning_tool_budget(monkeypatch):
     event = run.advance(
         tool_results=[{"tool_call_id": "call_2", "content": "ok"}],
         request_id="req-2",
-        coordinator=fusion.FusionCoordinator(),
+        coordinator=fusion.FusionCoordinator(config),
     )
     assert event["status"] == "error"
     assert run.status == "error"
     assert "plan was required" in (run.error or "")
 
+
+
+def test_fusion_default_lead_has_no_tools_and_sidekick_does(monkeypatch):
+    worker = SequenceWorker(
+        [
+            ("PLAN: delegate work\nBRIEF: implement and test", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
+        ],
+        [("Done.", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    config = fusion.FusionConfig(Path("config/catalog.toml"))
+    monkeypatch.setattr(fusion, "_FUSION_CONFIG", config)
+
+    run = fusion.FusionRun("default-tools", "do work", tools=[BASH_TOOL])
+    event = run.advance(coordinator=fusion.FusionCoordinator(config))
+
+    assert event["status"] == "completed"
+    main_calls = [call for call in worker.calls if call[1][0]["content"] == fusion.MAIN_PREAMBLE]
+    sidekick_calls = [
+        call for call in worker.calls if call[1][0]["content"] == fusion.SIDEKICK_PREAMBLE
+    ]
+    assert [call[2] for call in main_calls] == [None, None]
+    assert sidekick_calls[0][2] == [BASH_TOOL]
+
+
+def test_fusion_structured_brief_packet(monkeypatch):
+    worker = SequenceWorker(
+        [
+            ("PLAN: inspect then edit\nBRIEF: edit the target", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
+        ],
+        [("Done.", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    run = fusion.FusionRun("brief-packet", "fix the bug")
+    run.advance()
+
+    packet = run.sidekick_messages[1]["content"]
+    assert packet.startswith(fusion.FUSION_BRIEF_OPEN)
+    assert packet.endswith(fusion.FUSION_BRIEF_CLOSE)
+    assert "goal: fix the bug" in packet
+    assert "plan: inspect then edit" in packet
+    assert "brief: edit the target" in packet
+
+
+def test_fusion_follow_up_cap_and_event_telemetry(monkeypatch, tmp_path):
+    worker = SequenceWorker(
+        [
+            ("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE),
+            ("FOLLOW_UP: revise", None, DEFAULT_USAGE),
+        ],
+        [("report", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    config = _fusion_config_file(tmp_path, main_tools="none", max_follow_ups=1)
+    monkeypatch.setattr(fusion, "_FUSION_CONFIG", config)
+    run = fusion.FusionRun("capped", "goal")
+
+    event = run.advance(coordinator=fusion.FusionCoordinator(config))
+
+    assert event["status"] == "completed"
+    assert event["follow_up_capped"] is True
+    assert event["follow_up_count"] == 1
+    assert {"usage_models", "cost", "follow_up_count"} <= event.keys()
+    follow_ups = [m["content"] for m in run.sidekick_messages if m.get("role") == "user"][1:]
+    assert len(follow_ups) == 1  # only one follow-up was actually sent
+    assert follow_ups[0].startswith(fusion.FUSION_FOLLOW_UP_OPEN)
+    assert follow_ups[0].endswith(fusion.FUSION_FOLLOW_UP_CLOSE)
+
+
+def test_fusion_lane_cache_namespaces(monkeypatch):
+    """Lane namespaces are content-addressed: stable per lane, differ across lanes,
+    and identical for a second run with the same brief/tools (cross-run reuse)."""
+
+    def run_once(run_id: str) -> tuple[list[str], fusion.FusionRun]:
+        worker = SequenceWorker(
+            [
+                ("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE),
+                ("ACCEPT", None, DEFAULT_USAGE),
+            ],
+            [("Done.", None, DEFAULT_USAGE)],
+        )
+        namespaces: list[str] = []
+        run = fusion.FusionRun(run_id, "same goal", tools=[BASH_TOOL])
+
+        def capture(_coordinator, slot, messages, tools):
+            namespaces.append(run.cache_namespace)
+            return worker(slot, messages, tools)
+
+        monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", capture)
+        event = run.advance()
+        assert event["status"] == "completed", event
+        return namespaces, run
+
+    # 3 worker calls per run: planning (main), sidekick, review (main).
+    ns1, run1 = run_once("cache-lanes-a")
+    ns2, _run2 = run_once("cache-lanes-b")
+
+    assert ns1[0] == ns1[2]  # stable across calls within the main lane
+    assert ns1[0] != ns1[1]  # main and sidekick lanes differ
+    assert ns1 == ns2  # same brief/tools -> same namespaces despite different run ids
+    assert run1.cache_namespace == ns1[2]
+
+
+def test_fusion_records_tool_observations(monkeypatch):
+    worker = SequenceWorker(
+        [
+            ("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
+        ],
+        [("", BASH_CALL, DEFAULT_USAGE), ("Done.", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    run = fusion.FusionRun("tool-observation", "goal", tools=[BASH_TOOL])
+    assert run.advance()["status"] == "awaiting_tools"
+
+    event = run.advance([{"tool_call_id": "call_0", "content": "hello"}])
+
+    assert event["status"] == "completed"
+    assert run.tool_observations == [{"name": "bash", "is_error": False, "is_test": False}]
+
+
+def test_fusion_uses_slots_frozen_on_run(monkeypatch, tmp_path):
+    run_config = _fusion_config_file(
+        tmp_path / "run", main="run-main", sidekick="run-sidekick", main_tools="none"
+    )
+    coordinator_config = _fusion_config_file(
+        tmp_path / "coordinator", main="other-main", sidekick="other-sidekick", main_tools="none"
+    )
+    monkeypatch.setattr(fusion, "_FUSION_CONFIG", run_config)
+    worker = SequenceWorker(
+        [
+            ("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
+        ],
+        [("Done.", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    run = fusion.FusionRun("frozen-slots", "goal")
+
+    event = run.advance(coordinator=fusion.FusionCoordinator(coordinator_config))
+
+    assert event["status"] == "completed"
+    assert [slot for slot, _messages, _tools in worker.calls] == [
+        "run-main",
+        "run-sidekick",
+        "run-main",
+    ]
+
+
+def test_fusion_new_fields_survive_pickle(monkeypatch, tmp_path):
+    config = _fusion_config_file(tmp_path, main_tools="plan+review")
+    monkeypatch.setattr(fusion, "_FUSION_CONFIG", config)
+    run = fusion.FusionRun("pickled", "goal")
+    run.follow_up_capped = True
+    run.cache_namespace = "pickled:sidekick"
+
+    restored = pickle.loads(pickle.dumps(run))  # noqa: S301 - trusted local round-trip
+
+    assert restored.follow_up_capped is True
+    assert restored.main_tools_policy == frozenset({"plan", "review"})
+    assert restored.cache_namespace == "pickled:sidekick"
+
+
+def test_fusion_writes_learning_record_on_accept(monkeypatch, tmp_path):
+    monkeypatch.setenv("MANTIS_LEARNING", "1")
+    monkeypatch.setenv("MANTIS_LEARNING_DIR", str(tmp_path))
+    monkeypatch.setenv("MANTIS_LEARNING_INSTANCE", "fusion-test")
+    monkeypatch.setattr(fusion, "RUN_STORE", "memory")
+    worker = SequenceWorker(
+        [
+            ("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
+        ],
+        [("Done.", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    run = fusion.create_fusion_run("goal")
+
+    event = fusion.advance_fusion_run(run.run_id)
+
+    assert event["status"] == "completed"
+    record = json.loads(runs._learning_path().read_text().splitlines()[-1])
+    assert record["mode"] == "fusion"
+    assert record["terminated_by"] == "fusion_accept"
+    assert record["task"] == "goal"
+    assert record["pool"] == [run.main_slot, run.sidekick_slot]
+    assert record["turn_count"] > 0
+    assert record["steps"]
+    for step in record["steps"]:
+        assert step["role"] in ("main", "sidekick")
+        assert step["model"] in (run.main_slot, run.sidekick_slot)
+
+
+def test_fusion_writes_learning_record_on_error(monkeypatch, tmp_path):
+    monkeypatch.setenv("MANTIS_LEARNING", "1")
+    monkeypatch.setenv("MANTIS_LEARNING_DIR", str(tmp_path))
+    monkeypatch.setenv("MANTIS_LEARNING_INSTANCE", "fusion-test-error")
+    monkeypatch.setattr(fusion, "RUN_STORE", "memory")
+    # Main keeps emitting tool calls instead of the required PLAN/BRIEF text.
+    worker = SequenceWorker(
+        [("", BASH_CALL, DEFAULT_USAGE)],
+        [("Done.", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    run = fusion.create_fusion_run("goal", tools=[BASH_TOOL])
+
+    event = fusion.advance_fusion_run(run.run_id)
+
+    assert event["status"] == "error"
+    record = json.loads(runs._learning_path().read_text().splitlines()[-1])
+    assert record["mode"] == "fusion"
+    assert record["terminated_by"] == "fusion_error"
+
+
+def test_fusion_status_reuses_event_telemetry(monkeypatch):
+    monkeypatch.setattr(providers, "_price_map", lambda: {})
+    run = fusion.FusionRun("status-telemetry", "goal")
+    fusion._put_run(run)
+    status = fusion.fusion_run_status(run.run_id)
+    assert {"usage_models", "cost", "follow_up_count", "follow_up_capped"} <= status.keys()
+
+
+def test_fusion_cost_resolves_catalog_slot(monkeypatch):
+    prices = {"openai/gpt-5.6-sol": (0.001, 0.002)}
+    resolved = providers.ResolvedModelSpec(
+        adapter="openai",
+        model="gpt-5.6-sol",
+        effort=None,
+        base_url="http://test",
+        credential_env="TEST_KEY",
+        binding=None,
+        protocols=("chat_completions",),
+        slot="gpt-5_6-sol",
+    )
+    monkeypatch.setattr(providers, "_price_map", lambda: prices)
+    monkeypatch.setattr(providers, "_resolve_model_spec", lambda _model: resolved)
+    monkeypatch.setattr(providers, "_cache_read_prices", lambda: {})
+
+    usage = {"gpt-5_6-sol": {"prompt_tokens": 10, "completion_tokens": 5}}
+    assert providers._usage_cost(usage) == 0.02
+    breakdown = providers._cost_breakdown(usage)
+    assert breakdown["known"] is True
+    assert breakdown["total"] == 0.02
+    assert breakdown["models"][0]["model"] == "gpt-5_6-sol"
+    assert breakdown["models"][0]["cost"] == 0.02
+
+
+def test_fusion_price_suffix_collision_is_deterministic(monkeypatch):
+    def not_a_slot(_model):
+        raise RuntimeError("not a catalog slot")
+
+    prices = {
+        "zvendor/bare-model": (0.003, 0.004),
+        "avendor/bare-model": (0.001, 0.002),
+    }
+    monkeypatch.setattr(providers, "_price_map", lambda: prices)
+    monkeypatch.setattr(providers, "_resolve_model_spec", not_a_slot)
+    monkeypatch.setattr(providers, "_cache_read_prices", lambda: {})
+
+    usage = {"bare-model": {"prompt_tokens": 10, "completion_tokens": 5}}
+    # Two namespaced keys share the same bare suffix; the sorted-first key wins.
+    assert providers._usage_cost(usage) == 0.02
+
+
+def test_fusion_stray_planning_tool_calls_are_not_honored(monkeypatch):
+    """With main_tools="none", stray lead tool calls are forced back to text."""
+    worker = SequenceWorker(
+        [
+            ("", BASH_CALL, DEFAULT_USAGE),
+            ("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
+        ],
+        [("Done.", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    config = fusion.FusionConfig(Path("config/catalog.toml"))
+    assert config.main_tools() == "none"
+    monkeypatch.setattr(fusion, "_FUSION_CONFIG", config)
+
+    run = fusion.FusionRun("stray-tools", "do work", tools=[BASH_TOOL])
+    event = run.advance(coordinator=fusion.FusionCoordinator(config))
+
+    # The run never suspends for tool results; it completes via the reminder path.
+    assert event["status"] == "completed"
+    assert run.planning_tool_rounds == 0
+    # stray tool-call + forced retry + review
+    assert worker.main_idx == 3
+    main_tool_args = [
+        tools for (_slot, messages, tools) in worker.calls
+        if messages[0]["content"] == fusion.MAIN_PREAMBLE
+    ]
+    assert main_tool_args == [None, None, None]
+
+
+def test_fusion_review_can_call_tools_under_review_policy(monkeypatch, tmp_path):
+    config = _fusion_config_file(tmp_path, main_tools="review")
+    monkeypatch.setattr(fusion, "_FUSION_CONFIG", config)
+    review_tool_call = [
+        {
+            "id": "call_review",
+            "type": "function",
+            "function": {"name": "bash", "arguments": '{"command": "echo check"}'},
+        }
+    ]
+    worker = SequenceWorker(
+        [
+            ("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE),
+            ("", review_tool_call, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
+        ],
+        [("Done.", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    coordinator = fusion.FusionCoordinator(config)
+    run = fusion.FusionRun("review-tools", "goal", tools=[BASH_TOOL])
+
+    event = run.advance(coordinator=coordinator)
+    assert event["status"] == "awaiting_tools"
+    assert run.active_role == "main"
+    review_calls = [
+        tools for (_slot, messages, tools) in worker.calls
+        if messages[0]["content"] == fusion.MAIN_PREAMBLE and tools is not None
+    ]
+    assert review_calls == [[BASH_TOOL]]  # review got client tools; planning did not
+
+    event = run.advance(
+        tool_results=[{"tool_call_id": "call_review", "content": "check ok"}],
+        request_id="req-1",
+        coordinator=coordinator,
+    )
+    assert event["status"] == "completed"
+    assert "Done." in (event["report"] or "")
+
+
+def test_fusion_old_pickle_restores_legacy_defaults():
+    """Pickles from before the config gate keep the old lead-tool behavior."""
+    run = fusion.FusionRun("old-pickle", "goal")
+    state = run.__dict__.copy()
+    state.pop("lock", None)
+    state.pop("request_lock", None)
+    for key in ("main_tools_policy", "follow_up_capped", "query", "slot_models", "turns"):
+        state.pop(key, None)
+
+    restored = fusion.FusionRun.__new__(fusion.FusionRun)
+    restored.__setstate__(state)
+
+    assert restored.main_tools_policy == frozenset({"plan", "review"})
+    assert restored.follow_up_capped is False
+    assert restored.query == ""
+    assert restored.slot_models == []
+    assert restored.turns == []
+
+
+def test_fusion_api_events_expose_telemetry(client, fake_worker):
+    response = client.post(
+        "/v1/fusion/delegate",
+        headers=_headers(),
+        json=SAMPLE_DELEGATE,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert {"usage_models", "cost", "follow_up_count", "follow_up_capped"} <= body.keys()
+    run_id = body["run_id"]
+
+    response = client.post(
+        f"/v1/fusion/follow_up/{run_id}",
+        headers=_headers(),
+        json={
+            "request_id": uuid.uuid4().hex,
+            "tool_results": [{"tool_call_id": "call_bash_1", "content": "hello"}],
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "completed"
+    assert {"usage_models", "cost", "follow_up_count", "follow_up_capped"} <= body.keys()
+
+    status = client.get(f"/v1/fusion/runs/{run_id}", headers=_headers()).json()
+    assert {"usage_models", "cost", "follow_up_count", "follow_up_capped"} <= status.keys()
