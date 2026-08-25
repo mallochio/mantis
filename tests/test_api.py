@@ -898,17 +898,19 @@ def test_only_public_mantis_model_ids_are_accepted(client):
 
 
 def test_short_model_aliases_are_accepted(client):
-    # Short aliases route to the same modes. Base reaches Switchyard, which is
-    # not running in tests, so it returns the upstream 502 instead of 400.
+    # Short aliases route to the same modes. Base reaches Switchyard; that
+    # hop is 200 when a local server is up and 502/401 when it is not.
     for model in ("base", "trinity", "ultra"):
         response = client.post(
             "/v1/chat/completions",
             headers=_headers(),
             json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
         )
-        # This environment may reject the Switchyard request before routing.
-        assert response.status_code in (400, 401, 502), f"{model}: {response.status_code}"
+        assert response.status_code in (200, 400, 401, 502), f"{model}: {response.status_code}"
         body = response.json()
+        if response.status_code == 200:
+            assert "choices" in body
+            continue
         assert body["error"]["type"] in (
             "authentication_error",
             "invalid_request_error",

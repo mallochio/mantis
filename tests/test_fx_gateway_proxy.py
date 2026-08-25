@@ -68,6 +68,9 @@ def test_prompt_and_tools_become_openai_chat_body():
     assert body["model"] == "mantis/base"
     assert body["stream"] is False
     assert body["max_tokens"] == 2048
+    assert openai_chat_body({"prompt": [{"role": "user", "content": "hi"}]}, "mantis/base")[
+        "max_tokens"
+    ] == 4096
     assert body["messages"][0] == {"role": "system", "content": "You are a coding agent."}
     assert body["messages"][1] == {"role": "user", "content": "list files"}
     assert body["messages"][2]["tool_calls"][0]["function"]["name"] == "bash"
@@ -89,6 +92,67 @@ def test_user_tool_results_flatten_into_tool_messages():
     )
     assert messages[0] == {"role": "tool", "tool_call_id": "t1", "content": "boom"}
     assert messages[1] == {"role": "user", "content": "try again"}
+
+
+def test_structured_failed_command_is_visible_to_stage_router():
+    messages = openai_messages(
+        [
+            {
+                "role": "tool",
+                "content": [
+                    {
+                        "type": "tool-result",
+                        "toolCallId": "term_1",
+                        "toolName": "terminal",
+                        "output": {
+                            "type": "json",
+                            "value": {
+                                "exit_code": 1,
+                                "stdout": "",
+                                "stderr": "",
+                                "stdout_bytes": 0,
+                            },
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+    content = messages[0]["content"]
+    assert "exit_code" in content
+    assert "AssertionError" in content
+
+
+def test_pytest_assertion_output_is_not_double_tagged():
+    messages = openai_messages(
+        [
+            {
+                "role": "tool",
+                "content": [
+                    {
+                        "type": "tool-result",
+                        "toolCallId": "term_2",
+                        "result": "AssertionError: lists differ\n",
+                    }
+                ],
+            }
+        ]
+    )
+    assert messages[0]["content"].count("AssertionError") == 1
+
+
+def test_sse_falls_back_to_reasoning_when_content_is_empty():
+    events = sse_events_from_chat(
+        {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"content": None, "reasoning": "pong"},
+                }
+            ]
+        }
+    )
+    assert events[0] == {"type": "text-delta", "id": "answer_1", "delta": "pong"}
 
 
 def test_sse_emits_text_then_tool_call():

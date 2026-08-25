@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 import urllib.error
@@ -23,6 +24,17 @@ DEFAULT_MANTIS_URL = "http://127.0.0.1:8088/v1/chat/completions"
 DEFAULT_BIND = "127.0.0.1"
 DEFAULT_PORT = 8787
 SESSION_HEADER = "x-switchyard-session-id"
+# Switchyard 0.2.0's stage-router scorer ignores generic "failed"/"error" text.
+# These tokens are what DimensionCollector actually treats as WRONG signals.
+_STAGE_ERROR_TOKENS = (
+    "AssertionError",
+    "TimeoutError",
+    "MemoryError",
+    "ImportError",
+    "ModuleNotFoundError",
+    "SyntaxError",
+)
+_NONZERO_EXIT = re.compile(r"exit_code\s*=\s*(?!0\b)\d+")
 
 
 class ProxyError(RuntimeError):
@@ -35,26 +47,91 @@ def _json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _sdk_wrapped_value(value: Any) -> Any:
+    if isinstance(value, Mapping) and "value" in value:
+        wrapped_type = value.get("type")
+        if wrapped_type in (None, "text", "json", "error-text", "error-json", "content"):
+            return value["value"]
+    return value
+
+
+def _part_payload(part: Mapping[str, Any]) -> Any:
+    for key in ("output", "result", "content", "text", "value"):
+        if key not in part or part[key] is None:
+            continue
+        return _sdk_wrapped_value(part[key])
+    return None
+
+
 def _part_text(part: Mapping[str, Any]) -> str:
     part_type = part.get("type")
     if part_type in (None, "text"):
         text = part.get("text")
         if isinstance(text, str):
             return text
-    output = part.get("output")
-    if isinstance(output, str):
-        return output
-    result = part.get("result")
-    if result is not None:
-        return _json_text(result)
-    content = part.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
+    payload = _part_payload(part)
+    if payload is None:
+        return ""
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, list):
         return "".join(
-            _part_text(item) if isinstance(item, dict) else _json_text(item) for item in content
+            _part_text(item) if isinstance(item, dict) else _json_text(item) for item in payload
         )
-    return ""
+    return _json_text(payload)
+
+
+def _looks_like_failed_command(payload: Any) -> bool:
+    if isinstance(payload, Mapping):
+        code = payload.get("exit_code")
+        if isinstance(code, int) and code != 0:
+            return True
+        if isinstance(code, str) and code.isdigit() and int(code) != 0:
+            return True
+        status = payload.get("status")
+        if isinstance(status, str) and status.lower() in {"failure", "failed", "error"}:
+            return True
+        if payload.get("error"):
+            return True
+        for key in ("details", "value", "output", "result"):
+            nested = payload.get(key)
+            if nested is not payload and _looks_like_failed_command(nested):
+                return True
+        return False
+    if isinstance(payload, str):
+        if _NONZERO_EXIT.search(payload) or "tool_execution_failed" in payload:
+            return True
+        if "non-zero status" in payload.lower():
+            return True
+        try:
+            return _looks_like_failed_command(json.loads(payload))
+        except (ValueError, TypeError):
+            return False
+    return False
+
+
+def _tool_result_text(part: Mapping[str, Any] | str | None) -> str:
+    """Flatten a Gateway tool-result so Switchyard can score command failures."""
+    if isinstance(part, str):
+        text = part
+        payload: Any = part
+    elif isinstance(part, Mapping):
+        payload = _part_payload(part)
+        text = _part_text(part)
+        if not text:
+            raw = payload if payload is not None else part
+            text = raw if isinstance(raw, str) else _json_text(raw)
+        if payload is None:
+            payload = part
+    else:
+        text = ""
+        payload = None
+    if _looks_like_failed_command(payload) or _looks_like_failed_command(text):
+        text = text.strip()
+        if not any(token in text for token in _STAGE_ERROR_TOKENS):
+            suffix = "AssertionError: command exited with a non-zero status"
+            text = f"{text}\n{suffix}".strip()
+    return text
 
 
 def _content_text(content: Any) -> str:
@@ -105,11 +182,16 @@ def _tool_result_messages(message: Mapping[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(content, list):
         tool_call_id = message.get("toolCallId") or message.get("tool_call_id")
         if isinstance(tool_call_id, str):
+            payload = content if content is not None else message.get("result")
+            if isinstance(payload, (dict, str)):
+                text = _tool_result_text(payload)
+            else:
+                text = _tool_result_text(_content_text(payload))
             return [
                 {
                     "role": "tool",
                     "tool_call_id": tool_call_id,
-                    "content": _content_text(content) or _content_text(message.get("result")),
+                    "content": text,
                 }
             ]
         return []
@@ -124,7 +206,7 @@ def _tool_result_messages(message: Mapping[str, Any]) -> list[dict[str, Any]]:
             {
                 "role": "tool",
                 "tool_call_id": call_id,
-                "content": _part_text(item) or "",
+                "content": _tool_result_text(item),
             }
         )
     return results
@@ -191,11 +273,15 @@ def openai_messages(prompt: Any) -> list[dict[str, Any]]:
                 else:
                     call_id = raw.get("toolCallId") or raw.get("tool_call_id")
                     if isinstance(call_id, str):
+                        if isinstance(content, (dict, str)):
+                            payload = content
+                        else:
+                            payload = _content_text(content)
                         messages.append(
                             {
                                 "role": "tool",
                                 "tool_call_id": call_id,
-                                "content": _content_text(content),
+                                "content": _tool_result_text(payload),
                             }
                         )
             case _:
@@ -241,8 +327,9 @@ def openai_chat_body(payload: Mapping[str, Any], model: str) -> dict[str, Any]:
         body["tools"] = tools
         body["tool_choice"] = "auto"
     max_tokens = payload.get("maxOutputTokens") or payload.get("max_tokens")
-    if isinstance(max_tokens, int) and max_tokens > 0:
-        body["max_tokens"] = max_tokens
+    if not isinstance(max_tokens, int) or max_tokens <= 0:
+        max_tokens = 4096
+    body["max_tokens"] = max_tokens
     return body
 
 
@@ -273,6 +360,9 @@ def sse_events_from_chat(response: Mapping[str, Any]) -> list[dict[str, Any]]:
         raise ProxyError("mantis response missing message")
     events: list[dict[str, Any]] = []
     content = message.get("content")
+    if not (isinstance(content, str) and content):
+        reasoning = message.get("reasoning")
+        content = reasoning if isinstance(reasoning, str) else None
     if isinstance(content, str) and content:
         events.append({"type": "text-delta", "id": "answer_1", "delta": content})
     tool_calls = message.get("tool_calls")
@@ -415,6 +505,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 or upstream_headers.get("x-model-router-selected-model")
                 or ""
             )
+            tool_contents = [
+                str(message.get("content") or "")
+                for message in body.get("messages", [])
+                if isinstance(message, dict) and message.get("role") == "tool"
+            ]
             record = {
                 "selected_model": selected,
                 "prompt_tokens": (response.get("usage") or {}).get("prompt_tokens")
@@ -437,6 +532,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 )
                 if isinstance(response.get("choices"), list) and response["choices"]
                 else 0,
+                "tool_results": len(tool_contents),
+                "stage_error": any(
+                    any(token in text for token in _STAGE_ERROR_TOKENS) for text in tool_contents
+                ),
             }
             self.server.hop_log.append(record)
             if self.server.hop_log_path:
