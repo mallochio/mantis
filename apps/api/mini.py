@@ -164,7 +164,7 @@ class FuguRouter:
             # Reconstructing unchanged matrices with nine float32 SVDs is both
             # numerically pointless and a multi-GB transient memory spike.
             # Head-only deployments skip SVF entirely.
-            self.svf_keys = []
+            self.svf_keys: list[str] = []
         # head: last 10240 -> (10, 1024) [EXEC]
         self.head = (
             torch.from_numpy(vec[SVF_LEN:].copy())

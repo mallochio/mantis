@@ -167,15 +167,16 @@ Trinity, Ultra, and Fusion keep using `[mantis.workers]` and `[fusion]` in the s
 
 ## Routing and cost control
 
-`mantis/base` uses Switchyard's stage router. Turns start on the efficient catalog target and escalate to the capable target when tool-result signals (errors, spinning, exploration vs production) clear `confidence_threshold`. Pass `X-Route-Session` or `metadata.session_id` so session state can stick across a coding loop.
+`mantis/base` uses Switchyard's stage router. Turns start on the efficient catalog target and escalate to the capable target when tool-result signals (errors, spinning, exploration vs production) clear `confidence_threshold`. Pass `x-switchyard-session-id`, `X-Route-Session`, or `metadata.session_id` so session state can stick across a coding loop.
 
 See the [Switchyard stage-router docs](https://github.com/NVIDIA-NeMo/Switchyard/blob/main/docs/routing_algorithms/stage_router_routing.md) for signal details.
 
 ## Checks
 
 ```bash
-uv run pytest tests -q
 uv run ruff check .
+uv run mypy apps/api scripts --exclude outputs
+uv run pytest tests -q
 ./scripts/verify.sh
 ```
 

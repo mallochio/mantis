@@ -885,12 +885,12 @@ def _run_fusion_chat(
         event = fusion.advance_fusion_run(run.run_id)
 
     if event.get("run_id"):
-        run = fusion.get_run(event["run_id"])
-        if isinstance(run, fusion.FusionRun):
+        run_obj = fusion.get_run(event["run_id"])
+        if isinstance(run_obj, fusion.FusionRun):
             # Plans and delegation briefs are public orchestration output.
             # Only provider summaries are gated by the existing opt-in.
             event["reasoning_trace"] = fusion._orchestration_trace(
-                run, include_reasoning=return_reasoning
+                run_obj, include_reasoning=return_reasoning
             )
     return event
 

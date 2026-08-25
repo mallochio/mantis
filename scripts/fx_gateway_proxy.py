@@ -461,6 +461,7 @@ def _gateway_object(raw: bytes) -> dict[str, Any]:
 
 class GatewayHandler(BaseHTTPRequestHandler):
     server_version = "fx-mantis-gateway/1.0"
+    server: GatewayServer
 
     def log_message(self, format: str, *args: object) -> None:
         sys.stderr.write(f"{self.address_string()} - {format % args}\n")
