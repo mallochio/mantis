@@ -693,56 +693,33 @@ class FusionRun(NativeRun):
                         {"role": "user", "content": utils.system_reminder(reminder)}
                     )
 
-    def _call_main(
+    def _call_lane(
         self,
         coordinator: FusionCoordinator,
+        role: str,
         prompt: str | None = None,
         tools: list[dict[str, Any]] | None = None,
     ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+        """Call one lane's worker and record usage/activity for the turn."""
+        slot = self.main_slot if role == "main" else self.sidekick_slot
+        messages = self.main_messages if role == "main" else self.sidekick_messages
         if prompt is not None:
-            self.main_messages.append({"role": "user", "content": prompt})
-        self.cache_namespace = providers._prompt_cache_namespace(
-            self.main_messages, self.tools or None
-        )
-        message, usage = coordinator._call_worker(self.main_slot, self.main_messages, tools)
-        self.main_messages.append(message)
+            messages.append({"role": "user", "content": prompt})
+        self.cache_namespace = providers._prompt_cache_namespace(messages, self.tools or None)
+        message, usage = coordinator._call_worker(slot, messages, tools)
+        messages.append(message)
         text = str(message.get("content") or "")
         calls = message.get("tool_calls") or []
         if getattr(serve_config._history_context, "active_run", None) is not self:
-            self.add_usage(usage, model=self.main_slot)
+            self.add_usage(usage, model=slot)
         self.record_activity(
-            "main_turn",
-            role="main",
-            model=self.main_slot,
+            f"{role}_turn",
+            role=role,
+            model=slot,
             status="completed",
             summary=text[:200] if text else "tool-calls",
         )
-        self.turns.append({"role": "main", "model_name": self.main_slot})
-        return text, calls, usage
-
-    def _call_sidekick(
-        self,
-        coordinator: FusionCoordinator,
-    ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
-        self.cache_namespace = providers._prompt_cache_namespace(
-            self.sidekick_messages, self.tools or None
-        )
-        message, usage = coordinator._call_worker(
-            self.sidekick_slot, self.sidekick_messages, self.tools
-        )
-        self.sidekick_messages.append(message)
-        text = str(message.get("content") or "")
-        calls = message.get("tool_calls") or []
-        if getattr(serve_config._history_context, "active_run", None) is not self:
-            self.add_usage(usage, model=self.sidekick_slot)
-        self.record_activity(
-            "sidekick_turn",
-            role="sidekick",
-            model=self.sidekick_slot,
-            status="completed",
-            summary=text[:200] if text else "tool-calls",
-        )
-        self.turns.append({"role": "sidekick", "model_name": self.sidekick_slot})
+        self.turns.append({"role": role, "model_name": slot})
         return text, calls, usage
 
     def _parse_main_plan(self, text: str) -> tuple[str, str]:
@@ -902,8 +879,8 @@ class FusionRun(NativeRun):
                 and self.tools
                 else None
             )
-            main_text, main_calls, _ = self._call_main(
-                coordinator, tools=available_tools
+            main_text, main_calls, _ = self._call_lane(
+                coordinator, "main", tools=available_tools
             )
 
             # The main model may only call tools it was actually offered ("plan"
@@ -929,8 +906,8 @@ class FusionRun(NativeRun):
                         reminder = PLAN_UNKNOWN_TOOL_PROMPT.format(names=names)
                     else:
                         reminder = PLAN_TOOL_BUDGET_PROMPT
-                    main_text, main_calls, _ = self._call_main(
-                        coordinator, prompt=reminder, tools=None
+                    main_text, main_calls, _ = self._call_lane(
+                        coordinator, "main", prompt=reminder, tools=None
                     )
                     if main_calls:
                         call_names = {
@@ -950,8 +927,8 @@ class FusionRun(NativeRun):
             try:
                 self.plan, self.sidekick_brief = self._parse_main_plan(main_text)
             except ValueError:
-                main_text, main_calls, _ = self._call_main(
-                    coordinator, prompt=PLAN_REMINDER_PROMPT, tools=None
+                main_text, main_calls, _ = self._call_lane(
+                    coordinator, "main", prompt=PLAN_REMINDER_PROMPT, tools=None
                 )
                 if main_calls:
                     raise ValueError("main called tools instead of producing a plan") from None
@@ -971,59 +948,31 @@ class FusionRun(NativeRun):
         for _ in range(max_iterations * 4):  # generous step ceiling
             if self.status == "sidekick_pending":
                 self.active_role = "sidekick"
-                sidekick_text, sidekick_calls, _ = self._call_sidekick(coordinator)
+                sidekick_text, sidekick_calls, _ = self._call_lane(
+                    coordinator, "sidekick", tools=self.tools
+                )
                 if sidekick_calls:
                     self.pending_tool_calls = sidekick_calls
                     self.status = "awaiting_tools"
                     break
-                # Sidekick produced a report; ask the main to review.
-                self.status = "main_review"
-                self.active_role = "main"
-                tool_summary = self._summarize_sidekick_tool_history()
+                # Queue the report for the single review state. Keeping the prompt in
+                # main_messages also lets a tool-assisted review resume without a
+                # separate first-review branch.
                 remaining = coordinator.max_follow_ups - self.follow_up_count
                 review_prompt = (
                     f"{REVIEW_PROMPT}"
-                    f"Tool Activity by Sidekick:\n{tool_summary}\n\n"
+                    f"Tool Activity by Sidekick:\n{self._summarize_sidekick_tool_history()}\n\n"
                     f"Report:\n{sidekick_text}\n\n"
                     f"Follow-up budget remaining: {remaining} of {coordinator.max_follow_ups}."
                 )
-                review_text, review_calls, _ = self._call_main(
-                    coordinator,
-                    review_prompt,
-                    tools=self.tools if "review" in self.main_tools_policy else None,
-                )
-                if review_calls:
-                    self.pending_tool_calls = review_calls
-                    self.status = "awaiting_tools"
-                    break
-                accepted, feedback = self._parse_main_review(review_text)
-                if accepted:
-                    self.report = sidekick_text
-                    self.status = "completed"
-                    break
-                # Main requested a sidekick follow-up.
-                if self.follow_up_count >= coordinator.max_follow_ups:
-                    self.follow_up_capped = True
-                    self.report = sidekick_text
-                    self.status = "completed"
-                    break
-                self.follow_up_count += 1
-                self.sidekick_messages.append(
-                    {"role": "user", "content": _format_fusion_follow_up(feedback)}
-                )
-                self.record_activity(
-                    "follow_up",
-                    role="main",
-                    model=self.main_slot,
-                    status="completed",
-                    summary=feedback[:200],
-                )
-                self.status = "sidekick_pending"
+                self.main_messages.append({"role": "user", "content": review_prompt})
+                self.status = "main_review"
                 continue
             if self.status == "main_review":
                 self.active_role = "main"
-                review_text, review_calls, _ = self._call_main(
+                review_text, review_calls, _ = self._call_lane(
                     coordinator,
+                    "main",
                     tools=self.tools if "review" in self.main_tools_policy else None,
                 )
                 if review_calls:

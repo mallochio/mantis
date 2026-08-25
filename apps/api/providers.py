@@ -957,35 +957,33 @@ def _cache_read_prices() -> dict[str, float]:
     return _cache_read_price_cache or {}
 
 
-def _price_key(model: str) -> str:
-    """Resolve a usage key to a priced model id via catalog slots when needed."""
-    prices = _price_map()
+def _price_key(model: str, prices: dict[str, tuple[float, float]]) -> str | None:
+    """Resolve a usage key to one unambiguous priced model id."""
     if model in prices:
         return model
-    candidates = [model]
     try:
         resolved = _resolve_model_spec(model).model
     except (RuntimeError, ValueError):
         resolved = None
-    if resolved:
-        candidates.append(resolved)
-    # Price tables key namespaced ids ("vendor/model"); match a bare name by suffix,
-    # deterministically picking the sorted-first provider on collisions.
-    for candidate in candidates:
-        matches = [key for key in prices if key == candidate or key.endswith(f"/{candidate}")]
-        if matches:
-            return min(matches)
-    return model
+    for candidate in (model, resolved):
+        if not candidate:
+            continue
+        if candidate in prices:
+            return candidate
+        matches = [key for key in prices if key.endswith(f"/{candidate}")]
+        if len(matches) == 1:
+            return matches[0]
+    return None
 
 
 def _model_cost(
     model: str, tokens: dict[str, int], prices: dict[str, tuple[float, float]]
 ) -> float | None:
     """USD cost for one model's tokens, cache-aware; None when unpriced."""
-    key = _price_key(model)
-    price = prices.get(key)
-    if price is None:
+    key = _price_key(model, prices)
+    if key is None:
         return None
+    price = prices[key]
     prompt = int(tokens.get("prompt_tokens", 0))
     completion = int(tokens.get("completion_tokens", 0))
     cached = min(int(tokens.get("cached_tokens", 0)), prompt)

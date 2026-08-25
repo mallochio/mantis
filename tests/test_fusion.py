@@ -1584,7 +1584,13 @@ def test_fusion_cost_resolves_catalog_slot(monkeypatch):
     assert breakdown["models"][0]["cost"] == 0.02
 
 
-def test_fusion_price_suffix_collision_is_deterministic(monkeypatch):
+def test_fusion_price_suffix_collision_is_unpriced(monkeypatch):
+    """An ambiguous bare-suffix match is not attributed to a price.
+
+    Guessing among equally-suffixed namespaced ids could charge the wrong
+    provider, so an ambiguous key is reported as unpriced instead.
+    """
+
     def not_a_slot(_model):
         raise RuntimeError("not a catalog slot")
 
@@ -1597,8 +1603,8 @@ def test_fusion_price_suffix_collision_is_deterministic(monkeypatch):
     monkeypatch.setattr(providers, "_cache_read_prices", lambda: {})
 
     usage = {"bare-model": {"prompt_tokens": 10, "completion_tokens": 5}}
-    # Two namespaced keys share the same bare suffix; the sorted-first key wins.
-    assert providers._usage_cost(usage) == 0.02
+    # Two namespaced keys share the bare suffix, so no single price is chosen.
+    assert providers._usage_cost(usage) is None
 
 
 def test_fusion_stray_planning_tool_calls_are_not_honored(monkeypatch):
