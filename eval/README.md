@@ -25,7 +25,7 @@ Every routed request carries `X-Route-Session` and records route decision
 headers. `pi` (headless `--mode json`, from the `@earendil-works/pi-coding-agent`
 CLI) drives each task in a host worktree checked out at the instance's
 `base_commit`; its chat-completions calls go through a local header-recording
-proxy to Bifrost or the Mantis gateway (no litellm or mini-SWE-agent involved).
+proxy to Bifrost or Switchyard (no litellm or mini-SWE-agent involved).
 The submitted `git diff` is graded in a fresh SWE-rebench container; `resolved`
 is true only when every `FAIL_TO_PASS` test passes and every `PASS_TO_PASS`
 test remains passing. Gold patches are never used by an arm. Each arm selects

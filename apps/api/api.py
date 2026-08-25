@@ -592,8 +592,6 @@ def ready(response: Response) -> dict[str, Any]:
     if not os.environ.get("MANTIS_API_KEY"):
         raise HTTPException(503, "MANTIS_API_KEY is not configured")
     profile = os.environ.get("MANTIS_ENDPOINT_PROFILE", "direct")
-    if profile == "direct" and not os.environ.get("MANTIS_ROUTER_KEY"):
-        raise HTTPException(503, "MANTIS_ROUTER_KEY is not configured")
     if profile == "catalog":
         try:
             bindings = model_catalog.load_runtime_bindings()
@@ -658,7 +656,11 @@ _ROUTER_RESPONSE_HEADERS = (
     "x-route-model",
     "x-route-attempts",
     "x-route-fallback",
+    "x-model-router-selected-model",
+    "x-switchyard-session-id",
 )
+_SWITCHYARD_MODEL_HEADER = "x-model-router-selected-model"
+_SWITCHYARD_SESSION_HEADER = "x-switchyard-session-id"
 _SUPPORTED_PARAMETERS = [
     "tools",
     "tool_choice",
@@ -680,9 +682,9 @@ def _router_client() -> httpx.Client:
 def _session_from_body(body: ChatRequest) -> str | None:
     """Session identity carried in the request body (metadata.session_id/user).
 
-    The gateway accepts the same fields directly, but the proxy converts them
-    to the X-Route-Session header instead of forwarding the raw body fields,
-    so unknown top-level keys never reach a strict upstream provider.
+    Switchyard keys stage/escalation state on x-switchyard-session-id. The
+    proxy converts body session fields to that header instead of forwarding
+    unknown top-level keys to a strict upstream provider.
     """
     if isinstance(body.metadata, dict):
         for key in ("session_id", "sessionId"):
@@ -695,29 +697,35 @@ def _session_from_body(body: ChatRequest) -> str | None:
 
 
 def _router_headers(headers: dict[str, str], body: ChatRequest | None = None) -> dict[str, str]:
+    out: dict[str, str] = {}
     key = os.environ.get("MANTIS_ROUTER_KEY")
-    if not key:
-        raise HTTPException(503, "MANTIS_ROUTER_KEY is not configured")
-    out = {"Authorization": f"Bearer {key}"}
-    session = headers.get("x-route-session")
+    if key:
+        out["Authorization"] = f"Bearer {key}"
+    session = headers.get("x-route-session") or headers.get(_SWITCHYARD_SESSION_HEADER)
     if not session and body is not None:
         session = _session_from_body(body)
     if session:
         out["X-Route-Session"] = session
+        out["x-switchyard-session-id"] = session
     return out
 
 
 def _router_body(request: ChatRequest) -> dict[str, Any]:
     body = request.model_dump(exclude_none=True, exclude={"user", "metadata"})
-    return {**body, "model": "auto"}
+    route_id = os.environ.get("MANTIS_BASE_ROUTE_ID", "mantis-base")
+    return {**body, "model": route_id}
 
 
 def _router_response_headers(upstream: httpx.Response) -> dict[str, str]:
-    return {
+    mapped = {
         name: upstream.headers[name]
         for name in _ROUTER_RESPONSE_HEADERS
         if name in upstream.headers
     }
+    selected = upstream.headers.get(_SWITCHYARD_MODEL_HEADER)
+    if selected and "x-route-model" not in mapped:
+        mapped["x-route-model"] = selected
+    return mapped
 
 
 def _router_error(upstream: httpx.Response) -> JSONResponse:

@@ -3,7 +3,7 @@
 Mantis is a local AI model orchestration and routing platform with an OpenAI-compatible API. The supported runtime is a three-process loopback stack:
 
 ```text
-Bifrost :8080 → Mantis direct router :5500 → Mantis API :8088
+Bifrost :8080 → Switchyard :5500 → Mantis API :8088
 ```
 
 No service binds publicly by default. Provider credentials remain on this machine.
@@ -12,7 +12,7 @@ No service binds publicly by default. Provider credentials remain on this machin
 
 | Model | Mode | Use |
 |---|---|---|
-| `mantis/base` | Direct | Supra scores the request and chooses a cheap, middle, or expensive worker through Bifrost. |
+| `mantis/base` | Direct | NVIDIA NeMo Switchyard stage-router picks an efficient or capable model through Bifrost. |
 | `mantis/trinity` | Trinity | Multi-agent coordination over Worker, Thinker, and Verifier roles. |
 | `mantis/ultra` | Ultra | Conductor plans and executes a bounded workflow DAG over the worker pool. |
 | `mantis/fusion` | Fusion | Lead/sidekick orchestration with tool-use follow-ups and a review loop. |
@@ -24,16 +24,15 @@ Mantis never switches among these four modes automatically. Base and Fusion are 
 ```text
 mantis/
 ├── apps/
-│   ├── api/                    # Mantis API (:8088)
-│   └── gateway/                # Internal Supra router (:5500)
+│   └── api/                    # Mantis API (:8088)
 ├── artifacts/                  # Trinity router vector/head
 ├── config/
 │   ├── catalog.toml            # Shared model/provider routing catalog
-│   ├── bifrost.template.json   # Canonical Bifrost providers, keys, rules and complexity policy
+│   ├── bifrost.template.json   # Canonical Bifrost providers, keys, and fallback rules
 │   └── worker-costs.json       # Evaluation price tables
 ├── launch/host/
 │   ├── llm-stack.sh            # Full local stack controller
-│   └── lib/                    # Bifrost, gateway and API launchers
+│   └── lib/                    # Bifrost, Switchyard, and API launchers
 ├── scripts/                    # Development, retraining and verification
 ├── eval/                       # Router evaluations and SWE-rebench harnesses
 └── tests/                      # Test suite
@@ -45,22 +44,22 @@ mantis/
 
 - macOS or Linux with `zsh`, `curl`, and `lsof`
 - Node/npm (`npx` launches `@maximhq/bifrost`)
+- Rust with Cargo, then `cargo install --locked switchyard-server`
 - [`uv`](https://docs.astral.sh/uv/)
 - Python 3.13
 - Provider credentials exported in `~/.zshrc`
 
-Install the Python environments:
+Install the Python environment:
 
 ```bash
 cd ~/Personal/other/mantis
 uv sync --locked --no-dev
-cd apps/gateway && uv sync --dev
 ```
 
 Create private runtime directories and seed Bifrost from the tracked, secret-free template:
 
 ```bash
-install -d -m 700 ~/.local/share/bifrost/logs ~/.local/share/mantis/router ~/.local/share/llm-stack
+install -d -m 700 ~/.local/share/bifrost/logs ~/.local/share/mantis/switchyard ~/.local/share/llm-stack
 install -m 600 config/bifrost.template.json ~/.local/share/bifrost/config.json
 ln -sfn "$PWD/config/catalog.toml" ~/.config/ai-routing/catalog.toml
 ```
@@ -69,12 +68,10 @@ The Bifrost template references environment variables; never place secret values
 
 ```text
 MANTIS_API_KEY
-MANTIS_ROUTER_KEY
 BIFROST_API_KEY                 # must start with sk-bf-
 BIFROST_ENCRYPTION_KEY
 BIFROST_ADMIN_USERNAME
 BIFROST_ADMIN_PASSWORD
-BIFROST_COMPLEXITY_PILOT_KEY    # must start with sk-bf-
 ```
 
 Provider routes additionally require the matching Azure, AWS/Bedrock, Vertex ADC, OpenRouter, or OpenCode credentials. For Vertex, export `GOOGLE_APPLICATION_CREDENTIALS`, `VERTEXAI_PROJECT`, and `VERTEXAI_LOCATION`.
@@ -90,7 +87,7 @@ ln -sfn "$PWD/launch/host/llm-stack.sh" ~/Startup/llm-stack.sh
 Control the stack:
 
 ```bash
-# Normal mode: Bifrost + Supra + Mantis API; exposes Base and Fusion only.
+# Normal mode: Bifrost + Switchyard + Mantis API; exposes Base and Fusion only.
 ~/Startup/llm-stack.sh start
 
 # Experimental mode: additionally exposes Trinity and Ultra/Conductor.
@@ -104,7 +101,7 @@ Control the stack:
 ~/Startup/llm-stack.sh stop
 ```
 
-A bare StartupFolder invocation defaults to `start` in normal mode. The controller starts Bifrost, the gateway, and the API in dependency order and checks readiness. Trinity's Qwen coordinator remains lazy and is not loaded unless an experimental Trinity request is made; Ultra/Conductor also starts work only on an experimental request. Runtime state/logs live under `~/.local/share/bifrost` and `~/.local/share/mantis`.
+A bare StartupFolder invocation defaults to `start` in normal mode. The controller starts Bifrost, Switchyard, and the API in dependency order and checks readiness. Trinity's Qwen coordinator remains lazy and is not loaded unless an experimental Trinity request is made; Ultra/Conductor also starts work only on an experimental request. Runtime state/logs live under `~/.local/share/bifrost` and `~/.local/share/mantis`.
 
 You can also run only the Mantis API in the foreground for development:
 
@@ -112,7 +109,7 @@ You can also run only the Mantis API in the foreground for development:
 ./scripts/run_mantis_native.sh
 ```
 
-That command expects Bifrost and the internal gateway to be available separately.
+That command expects Bifrost and Switchyard to be available separately.
 
 ## Call Mantis
 
@@ -140,31 +137,7 @@ curl -fsS http://127.0.0.1:8088/v1/models \
   -H "Authorization: Bearer $MANTIS_API_KEY"
 ```
 
-## Bifrost complexity router
-
-The complexity ladder is scoped to virtual key `vk-interactive-complexity-pilot`; normal Mantis traffic continues to use the Supra router. Send direct pilot requests to local Bifrost with model `auto`:
-
-```bash
-curl http://127.0.0.1:8080/v1/chat/completions \
-  -H "Authorization: Bearer $BIFROST_COMPLEXITY_PILOT_KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "auto",
-    "messages": [{"role": "user", "content": "Fix the failing test in src/auth.py"}]
-  }'
-```
-
-| Tier | Primary | Fallback chain |
-|---|---|---|
-| SIMPLE | Vertex `google/gemini-3.7-flash` | OpenRouter Gemini 3.7 Flash |
-| MEDIUM | Azure `gpt-5.6-terra` | Bedrock Terra → OpenRouter Terra |
-| COMPLEX | Azure `gpt-5.6-sol` | Bedrock Sol → OpenRouter Sol |
-| REASONING | Bedrock `anthropic/claude-opus-5` | Vertex Claude Opus 5 → OpenRouter Claude Opus 5 |
-| Unclassified `auto` | Azure `gpt-5.6-terra` | Bedrock Terra → OpenRouter Terra |
-
-The analyzer uses coding/systems vocabulary, conservative multiword Reasoning triggers, and `.10 / .35 / .60` boundaries. The default priority-5 route prevents unclassified `auto` prompts from failing provider resolution.
-
-The private dashboard is available only on this machine at `http://127.0.0.1:8080`; log in with `BIFROST_ADMIN_USERNAME` and `BIFROST_ADMIN_PASSWORD`.
+The private Bifrost dashboard is available only on this machine at `http://127.0.0.1:8080`; log in with `BIFROST_ADMIN_USERNAME` and `BIFROST_ADMIN_PASSWORD`.
 
 ## Prime Agent
 
@@ -175,10 +148,9 @@ mantis/base
 mantis/trinity
 mantis/ultra
 mantis/fusion
-bifrost/auto
 ```
 
-All are configured with a 262,144-token context window. `mantis/trinity` and `mantis/ultra` return an experimental-mode error unless the stack was started with `--experimental`; Base, Fusion, and Bifrost Auto remain available normally. API keys should resolve from `MANTIS_API_KEY` and `BIFROST_COMPLEXITY_PILOT_KEY` at runtime rather than being embedded in `~/.prime/agent/models.json`.
+All are configured with a 262,144-token context window. `mantis/trinity` and `mantis/ultra` return an experimental-mode error unless the stack was started with `--experimental`; Base and Fusion remain available normally. Resolve API keys from `MANTIS_API_KEY` at runtime rather than embedding them in `~/.prime/agent/models.json`.
 
 Example headless task:
 
@@ -187,14 +159,19 @@ prime-agent --mode text --provider mantis --model base --no-session \
   -p 'Inspect this repository, implement the requested change, run tests, and fix failures.'
 ```
 
+## Switching models and providers
+
+`config/catalog.toml` is the only place that names Base models and the provider they ride on. Edit `[base.targets.efficient]` / `[base.targets.capable]` (or the `[providers.*]` they reference), then restart the stack. Launch regenerates Switchyard's `routes.toml` from that catalog; the API sends `base.route_id` (exported as `MANTIS_BASE_ROUTE_ID`). Application code does not hard-code upstream IDs.
+
+To change how Base decides, set `base.algorithm` to `stage_router` (default, tool-signal routing) or `escalation` (weak-first with a judge). Optional `[base.targets.judge]` selects the escalation judge model.
+
+Trinity, Ultra, and Fusion keep using `[mantis.workers]` and `[fusion]` in the same file.
+
 ## Routing and cost control
 
-`mantis/base` uses Supra to select one worker tier per request and a session ratchet to keep a warm prompt-cache prefix on one tier. It climbs freely but does not downgrade by default.
+`mantis/base` uses Switchyard's stage router. Turns start on the efficient catalog target and escalate to the capable target when tool-result signals (errors, spinning, exploration vs production) clear `confidence_threshold`. Pass `X-Route-Session` or `metadata.session_id` so session state can stick across a coding loop.
 
-- `MANTIS_ROUTER_DOWNGRADE_IDLE_S=N`: after `N` seconds of silence, the next turn can drop to the freshly scored tier.
-- `MANTIS_ROUTER_RESCORE_EVERY_N=N`: every `N` completed turns, release the ratchet and use the classifier's current tier.
-
-See [`apps/gateway/README.md`](apps/gateway/README.md) for routing behavior and internal protocol details.
+See the [Switchyard stage-router docs](https://github.com/NVIDIA-NeMo/Switchyard/blob/main/docs/routing_algorithms/stage_router_routing.md) for signal details.
 
 ## Checks
 

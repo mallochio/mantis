@@ -5,8 +5,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import os
-import sys
 import tomllib
 from pathlib import Path
 
@@ -112,37 +110,21 @@ def _shared_catalog(contract: str) -> str:
         'adapter = "openai-compatible"\n'
         'base_url = "https://generic.example.test/v1"\n'
         'credential_env = "GENERIC_KEY"\n\n'
-        "[gateway]\n"
-        'active_policy = "coding"\n\n'
-        "[gateway.targets.low]\n"
+        "[base]\n"
+        'revision = "fixture"\n'
+        'route_id = "mantis-base"\n'
+        'algorithm = "stage_router"\n'
+        'picker = "efficient_first"\n'
+        "confidence_threshold = 0.5\n\n"
+        "[base.targets.efficient]\n"
         'provider = "generic.openai"\n'
         'upstream_model = "vendor/low"\n'
         'reasoning_effort = "none"\n'
-        'protocols = ["chat_completions"]\n'
-        "rank = 0\n\n"
-        "[gateway.targets.mid]\n"
-        'provider = "modal.prod"\n'
-        'upstream_model = "vendor/mid"\n'
-        'protocols = ["chat_completions"]\n'
-        "rank = 1\n\n"
-        "[gateway.targets.work]\n"
-        'provider = "router"\n'
-        'upstream_model = "vendor/work"\n'
-        'protocols = ["chat_completions"]\n'
-        "rank = 2\n\n"
-        "[gateway.targets.responses]\n"
-        'provider = "router"\n'
-        'upstream_model = "openai/responses"\n'
-        'protocols = ["chat_completions", "responses"]\n'
-        "rank = 3\n\n"
-        "[gateway.targets.safe]\n"
+        'protocols = ["chat_completions"]\n\n'
+        "[base.targets.capable]\n"
         'provider = "router"\n'
         'upstream_model = "openai/safe"\n'
         'protocols = ["chat_completions", "responses"]\n'
-        "rank = 4\n\n"
-        "[gateway.policies.coding]\n"
-        'complexity_targets = ["low", "mid", "work", "responses", "safe"]\n'
-        'invalid_complexity_target = "safe"\n'
         "[mantis]\n"
         f"slot_order = {json.dumps(list(abi.slot_order))}\n"
         f'conductor = "{abi.conductor}"\n'
@@ -464,11 +446,7 @@ def test_router_provider_ids_and_identifier_grammar_accepted(tmp_path):
     }
 
 
-def test_shared_catalog_fixture_both_consumers_parse(tmp_path, monkeypatch):
-    router_home = Path.home() / ".local" / "share" / "mantis" / "router" / "server.py"
-    router_server = Path(os.environ.get("ROUTER_SERVER_PATH", str(router_home)))
-    if not router_server.is_file():
-        pytest.skip("router consumer (server.py) is not available on this machine")
+def test_shared_catalog_fixture_both_consumers_parse(tmp_path):
     path = _write_catalog(tmp_path, _shared_catalog(model_catalog.abi_contract(
         model_catalog.load_abi_manifest()
     )))
@@ -480,26 +458,13 @@ def test_shared_catalog_fixture_both_consumers_parse(tmp_path, monkeypatch):
         "modal",
         "openai-compatible",
     }
-    monkeypatch.setenv("AI_ROUTING_CONFIG", str(path))
-    monkeypatch.delenv("MANTIS_ROUTER_TARGETS_JSON", raising=False)
-    monkeypatch.delenv("MANTIS_ROUTER_SUPRA_TARGETS", raising=False)
-    monkeypatch.delenv("MANTIS_ROUTER_SUPRA_INVALID_TARGET", raising=False)
-    monkeypatch.delenv("MANTIS_ROUTER_TRAINING_LOG", raising=False)
-    monkeypatch.setenv("MANTIS_DATA_DIR", str(tmp_path / "router-data"))
-    for name in ("ROUTER_KEY", "CODE_KEY", "MODAL_KEY", "GENERIC_KEY"):
-        monkeypatch.setenv(name, "fixture-key")
-    sys.path.insert(0, str(router_server.parent))
-    try:
-        import importlib
-
-        try:
-            router = importlib.import_module("server")
-        except Exception as error:  # noqa: BLE001 - surface the router rejection
-            pytest.fail(f"router consumer rejected the shared catalog: {error}")
-        assert router.TARGET_CONFIG_SOURCE == "catalog"
-        assert set(router.BACKENDS) == {"low", "mid", "work", "responses", "safe"}
-    finally:
-        sys.path.remove(str(router_server.parent))
+    route = model_catalog.load_base_route(tomllib.loads(path.read_text()))
+    assert route.route_id == "mantis-base"
+    assert route.efficient.upstream_model == "vendor/low"
+    assert route.capable.upstream_model == "openai/safe"
+    assert catalog.base_route_id == "mantis-base"
+    rendered = model_catalog.render_mantis_environment(catalog)
+    assert rendered["MANTIS_BASE_ROUTE_ID"] == "mantis-base"
 
 
 def test_stable_slot_resolves_to_bound_endpoint_and_model(monkeypatch):

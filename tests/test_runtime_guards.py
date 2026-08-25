@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import json
-from typing import Any
-import pytest
-import utils
+
 import fusion
-import serve_config
 import providers
-from runs import TrinityRun, ConductorRun
+import pytest
+import serve_config
+import utils
 
 
 def test_prune_tool_result_small_content():
@@ -64,7 +63,12 @@ def test_fusion_usage_counted_only_once(monkeypatch):
     def fake_provider(spec, messages, max_tokens, temperature, tools=None):
         calls["n"] += 1
         run = getattr(serve_config._history_context, "active_run", None)
-        content = "PLAN: p\nBRIEF: b" if calls["n"] == 1 else ("Done" if calls["n"] == 2 else "ACCEPT")
+        if calls["n"] == 1:
+            content = "PLAN: p\nBRIEF: b"
+        elif calls["n"] == 2:
+            content = "Done"
+        else:
+            content = "ACCEPT"
         data = {
             "choices": [{"message": {"role": "assistant", "content": content}}],
             "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
@@ -138,7 +142,13 @@ def test_fusion_planning_tool_budget_cap(monkeypatch):
                         "message": {
                             "role": "assistant",
                             "content": "",
-                            "tool_calls": [{"id": f"call_{len(calls)}", "type": "function", "function": {"name": "read", "arguments": "{}"}}],
+                            "tool_calls": [
+                                {
+                                    "id": f"call_{len(calls)}",
+                                    "type": "function",
+                                    "function": {"name": "read", "arguments": "{}"},
+                                }
+                            ],
                         }
                     }],
                     "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
@@ -162,41 +172,15 @@ def test_fusion_planning_tool_budget_cap(monkeypatch):
     assert ev1["status"] == "awaiting_tools"
 
     # Round 2
-    ev2 = fusion.advance_fusion_run(run.run_id, tool_results=[{"tool_call_id": "call_1", "content": "res1"}])
+    ev2 = fusion.advance_fusion_run(
+        run.run_id, tool_results=[{"tool_call_id": "call_1", "content": "res1"}]
+    )
     assert ev2["status"] == "awaiting_tools"
 
     # Round 3 -> Tools capped, main must emit plan
-    ev3 = fusion.advance_fusion_run(run.run_id, tool_results=[{"tool_call_id": "call_2", "content": "res2"}])
+    fusion.advance_fusion_run(
+        run.run_id, tool_results=[{"tool_call_id": "call_2", "content": "res2"}]
+    )
     assert run.planning_tool_rounds == 2
     assert run.plan == "p"
-
-
-def test_gateway_consecutive_low_downgrade():
-    from server import _session_route, _session_note, _session_state, _session_lock
-
-    session_id = "test_sess_downgrade"
-    with _session_lock:
-        _session_state.pop(session_id, None)
-
-    # Note an initial expensive turn (complexity 5)
-    _session_note(session_id, "expensive", complexity=5)
-    target, reason = _session_route(session_id, "do some easy task", "cheap", complexity=1)
-    # Turn 1 of low complexity: hysteresis holds
-    assert reason == "downgrade_hysteresis"
-    assert target == "expensive"
-
-    # Note turn 1 as low complexity
-    _session_note(session_id, "expensive", complexity=1)
-
-    # Turn 2 of low complexity: hysteresis holds
-    target2, reason2 = _session_route(session_id, "do another easy task", "cheap", complexity=1)
-    assert reason2 == "downgrade_hysteresis"
-
-    # Note turn 2 as low complexity
-    _session_note(session_id, "expensive", complexity=1)
-
-    # Turn 3 of low complexity: consecutive_low >= 2 triggers downgrade!
-    target3, reason3 = _session_route(session_id, "third easy task", "cheap", complexity=1)
-    assert reason3 == "downgrade_consecutive_low"
-    assert target3 == "cheap"
 

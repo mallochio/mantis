@@ -2,7 +2,7 @@
 
 The agent driving each instance is `pi` in headless mode (`--mode json`,
 `-p`). pi is pointed at a local header-recording proxy that forwards chat
-completions to Bifrost / the Mantis gateway; the proxy records `x-route-*`
+completions to Bifrost / Switchyard; the proxy records `x-route-*`
 response headers, per-request usage, and enforces the arm/global budget
 ceiling by refusing to forward requests once a cap is reached.
 
@@ -55,7 +55,7 @@ DEFAULT_SHADOW_PRICES = REPO / "eval" / "prices" / "zen-2026-08-13.json"
 FIXED_ARM_FORBIDDEN_PREFIXES: tuple[str, ...] = ()
 ROUTE_HEADER_KEYS = (
     "x-route-decision", "x-route-reason", "x-route-model",
-    "x-route-sticky", "x-route-fallback",
+    "x-route-sticky", "x-route-fallback", "x-model-router-selected-model",
 )
 PI_TOOLS = "read,bash,edit,write"
 
@@ -284,7 +284,8 @@ def routed_request_tiers(
     tiers = []
     for event in row.get("route_trace", []):
         headers = event.get("route_headers", {})
-        tier = model_to_tier.get(headers.get("x-route-model"))
+        selected = headers.get("x-route-model") or headers.get("x-model-router-selected-model")
+        tier = model_to_tier.get(selected)
         if tier is None and headers.get("x-route-decision") in TIERS:
             tier = headers["x-route-decision"]
         if tier in TIERS:
@@ -509,7 +510,7 @@ def _sleep_with_jitter(seconds: float) -> float:
 
 
 def _is_retryable_response(resp: requests.Response, statuses: frozenset[int]) -> bool:
-    """Treat gateway rate-limit envelopes as retryable even when the gateway
+    """Treat Bifrost rate-limit envelopes as retryable even when the proxy
     surfaces them as a 400 body (Bifrost returns FreeUsageLimitError with a
     400 status rather than a 429)."""
     if resp.status_code in statuses:
@@ -788,7 +789,7 @@ def run_pi_agent(
     """Drive `pi` headless in a host worktree, then grade its patch.
 
     pi is pointed at a local proxy that forwards to `endpoint` (Bifrost or the
-    Mantis gateway), records `x-route-*` headers and usage, and stops
+    Mantis API / Switchyard), records `x-route-*` headers and usage, and stops
     forwarding once the arm cap or global budget is reached.
     """
     root = worktrees_root or DEFAULT_WORKTREES

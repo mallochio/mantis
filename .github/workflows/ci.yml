@@ -36,17 +36,3 @@ jobs:
         run: uv run pytest tests -q
       - name: Report Mantis coverage
         run: uv run coverage report --fail-under=90
-
-      - name: Run gateway tests
-        run: |
-          uv sync --directory apps/gateway --locked --all-groups
-          uv run --directory apps/gateway pytest tests -q
-      - name: Run gateway ruff
-        run: uv run --directory apps/gateway ruff check .
-      - name: Run gateway checks
-        working-directory: apps/gateway
-        run: bash checks.sh
-      - name: Report gateway coverage
-        run: |
-          uv run --directory apps/gateway coverage run --source=. -m pytest tests -q
-          uv run --directory apps/gateway coverage report --include='*'

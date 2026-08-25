@@ -1,1 +1,0 @@
-"""Lean gateway implementation modules."""

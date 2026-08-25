@@ -28,6 +28,7 @@ from model_catalog_schema import (
     _runtime_bindings,
     _slot_order,
     _string,
+    load_base_route,
 )
 
 __all__ = [
@@ -39,6 +40,7 @@ __all__ = [
     "catalog_path",
     "identity_fingerprint",
     "load_abi_manifest",
+    "load_base_route",
     "load_mantis_catalog",
     "load_runtime_bindings",
     "render_mantis_environment",
@@ -59,6 +61,7 @@ class MantisCatalog:
     conductor: str
     conductor_model: str = ""
     trained_slot_contract: str | None = None
+    base_route_id: str | None = None
 
 
 def identity_contract(catalog: MantisCatalog) -> dict[str, Any]:
@@ -140,7 +143,10 @@ def load_mantis_catalog(
     if conductor not in bindings.workers:
         raise CatalogError("mantis.conductor must name a stable slot ID")
     expected = _expected_contract(section.get("trained_slot_contract"), require_contract)
-    catalog = MantisCatalog(selected, bindings, slots, conductor, conductor_model, expected)
+    base_route_id = load_base_route(root).route_id if "base" in root else None
+    catalog = MantisCatalog(
+        selected, bindings, slots, conductor, conductor_model, expected, base_route_id
+    )
     abi = load_abi_manifest(manifest)
     mismatch = abi_mismatch(abi, catalog.slot_order, catalog.conductor, catalog.bindings.workers)
     if mismatch is not None:
@@ -175,13 +181,16 @@ def render_mantis_environment(catalog: MantisCatalog) -> dict[str, str]:
         }
         for name, binding in sorted(catalog.bindings.workers.items())
     }
-    return {
+    rendered = {
         "MANTIS_WORKER_MODELS": ",".join(catalog.slot_order),
         "MANTIS_CONDUCTOR_SLOT": catalog.conductor,
         "MANTIS_PROVIDER_BINDINGS": _json(providers),
         "MANTIS_WORKER_BINDINGS": _json(workers),
         "MANTIS_IDENTITY_CONTRACT": identity_fingerprint(catalog),
     }
+    if catalog.base_route_id:
+        rendered["MANTIS_BASE_ROUTE_ID"] = catalog.base_route_id
+    return rendered
 
 
 def resolve_provider_keys(

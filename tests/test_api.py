@@ -585,12 +585,10 @@ def test_ready_reports_only_sanitized_endpoint_metadata(client, monkeypatch):
     assert changed["endpoint_fingerprints"]["openrouter"] != first_fingerprint
 
 
-def test_ready_direct_requires_gateway_key(client, monkeypatch):
+def test_ready_direct_does_not_require_router_key(client, monkeypatch):
     monkeypatch.setenv("MANTIS_ENDPOINT_PROFILE", "direct")
     monkeypatch.delenv("MANTIS_ROUTER_KEY", raising=False)
-    response = client.get("/ready")
-    assert response.status_code == 503
-    assert response.json()["error"]["message"] == "MANTIS_ROUTER_KEY is not configured"
+    assert client.get("/ready").status_code == 200
 
 
 # --- catalog readiness: credentials and binding fingerprint -------------------
@@ -717,7 +715,10 @@ def test_basic_model_relays_router_response_and_session(client, monkeypatch):
         return __import__("httpx").Response(
             200,
             json={"id": "chatcmpl-router", "choices": [{"message": {"content": "ok"}}]},
-            headers={"x-route-decision": "middle", "x-route-reason": "strong_upgrade"},
+            headers={
+                "x-model-router-selected-model": "anthropic/claude-opus-5",
+                "x-route-reason": "stage_signal",
+            },
         )
 
     monkeypatch.setenv("MANTIS_ROUTER_KEY", "router-key")
@@ -729,11 +730,12 @@ def test_basic_model_relays_router_response_and_session(client, monkeypatch):
     )
     assert response.status_code == 200
     assert response.json()["id"] == "chatcmpl-router"
-    assert response.headers["x-route-decision"] == "middle"
-    assert response.headers["x-route-reason"] == "strong_upgrade"
-    assert seen["body"]["model"] == "auto"
+    assert response.headers["x-route-model"] == "anthropic/claude-opus-5"
+    assert response.headers["x-route-reason"] == "stage_signal"
+    assert seen["body"]["model"] == "mantis-base"
     assert seen["headers"]["authorization"] == "Bearer router-key"
     assert seen["headers"]["x-route-session"] == "pi-session"
+    assert seen["headers"]["x-switchyard-session-id"] == "pi-session"
 
 
 def test_basic_model_relays_body_session_identity_as_header(client, monkeypatch):
@@ -761,7 +763,8 @@ def test_basic_model_relays_body_session_identity_as_header(client, monkeypatch)
         },
     )
     assert response.status_code == 200
-    # Body session identity must reach the router as X-Route-Session...
+    # Body session identity must reach Switchyard as x-switchyard-session-id...
+    assert seen["headers"]["x-switchyard-session-id"] == "meta-session"
     assert seen["headers"]["x-route-session"] == "meta-session"
     # ...but must not leak into the upstream body where strict providers
     # reject unknown top-level fields.
@@ -792,7 +795,7 @@ def test_basic_model_relays_body_user_as_header_when_no_metadata(client, monkeyp
         },
     )
     assert response.status_code == 200
-    assert seen["headers"]["x-route-session"] == "user-session"
+    assert seen["headers"]["x-switchyard-session-id"] == "user-session"
 
 
 def test_basic_model_relays_router_stream(client, monkeypatch):
@@ -840,6 +843,48 @@ def test_basic_model_reports_router_connection_failure(client, monkeypatch):
     assert response.json()["error"]["type"] == "upstream_error"
 
 
+def test_basic_model_forwards_without_router_key(client, monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["headers"] = request.headers
+        return __import__("httpx").Response(
+            200,
+            json={"id": "chatcmpl-router", "choices": [{"message": {"content": "ok"}}]},
+        )
+
+    monkeypatch.delenv("MANTIS_ROUTER_KEY", raising=False)
+    monkeypatch.setattr(api, "_router_client", lambda: _router_client(handler))
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={"model": "mantis/base", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
+    assert "authorization" not in seen["headers"]
+
+
+def test_basic_model_uses_catalog_route_id(client, monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return __import__("httpx").Response(
+            200,
+            json={"id": "chatcmpl-router", "choices": [{"message": {"content": "ok"}}]},
+        )
+
+    monkeypatch.setenv("MANTIS_BASE_ROUTE_ID", "custom-base")
+    monkeypatch.setattr(api, "_router_client", lambda: _router_client(handler))
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={"model": "mantis/base", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
+    assert seen["body"]["model"] == "custom-base"
+
+
 def test_only_public_mantis_model_ids_are_accepted(client):
     for model in ("mantis-basic", "fugu", "conductor", "mantis-fugu"):
         response = client.post(
@@ -851,15 +896,15 @@ def test_only_public_mantis_model_ids_are_accepted(client):
 
 
 def test_short_model_aliases_are_accepted(client):
-    # Short aliases route to the same modes and reach the gateway, which is not
-    # running in tests, so they return the upstream 502 instead of 400.
+    # Short aliases route to the same modes. Base reaches Switchyard, which is
+    # not running in tests, so it returns the upstream 502 instead of 400.
     for model in ("base", "trinity", "ultra"):
         response = client.post(
             "/v1/chat/completions",
             headers=_headers(),
             json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
         )
-        # This environment may reject the gateway request before routing.
+        # This environment may reject the Switchyard request before routing.
         assert response.status_code in (400, 401, 502), f"{model}: {response.status_code}"
         body = response.json()
         assert body["error"]["type"] in (
