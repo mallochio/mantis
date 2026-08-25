@@ -1,0 +1,26 @@
+version = 1
+
+# Live smoke catalog for fx multi-turn coding against mantis/base.
+# Cheap: OpenRouter's free-model router. Capable: stealth/ox-alpha (also free).
+# Production Base stays on config/catalog.toml (Flash / Opus via Bifrost).
+# Launch Switchyard with AI_ROUTING_CONFIG pointing here.
+
+[providers.openrouter]
+adapter = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+credential_env = "OPENROUTER_API_KEY"
+protocols = ["chat_completions", "responses"]
+
+[base]
+revision = "switchyard-fx-smoke-openrouter-free"
+picker = "efficient_first"
+confidence_threshold = 0.5
+recent_turn_window = 3
+
+[base.targets.efficient]
+provider = "openrouter"
+upstream_model = "openrouter/free"
+
+[base.targets.capable]
+provider = "openrouter"
+upstream_model = "stealth/ox-alpha"

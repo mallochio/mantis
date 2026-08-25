@@ -136,7 +136,7 @@ exclude = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["scripts", "apps/api", "apps/gateway", "OpenFugu/openfugu", "OpenFugu"]
+pythonpath = ["scripts", "apps/api", "OpenFugu/openfugu", "OpenFugu"]
 addopts = "--cov=scripts --cov=apps/api --cov-report=term-missing --cov-report=xml --cov-fail-under=90"
 
 [tool.coverage.run]
@@ -149,6 +149,8 @@ omit = [
     "scripts/retrain_conductor.py",
     "scripts/verify.sh",
     "scripts/toolscale_data.py",
+    "scripts/fusion_headless.py",
+    "scripts/build_swerebench_manifest.py",
 ]
 
 [tool.coverage.report]

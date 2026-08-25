@@ -1,1 +1,0 @@
-../../../apps/gateway/llm-router.sh

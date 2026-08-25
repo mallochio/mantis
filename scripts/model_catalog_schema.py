@@ -1,7 +1,7 @@
-"""Shared, secret-free catalog schema for the Mantis and router consumers.
+"""Shared, secret-free catalog schema for Mantis workers and the Base route.
 
-The identifier grammar and the adapter/protocol table are identical to the
-Mantis router consumer so one catalog can feed both servers.
+Trinity/Ultra/Fusion read ``[mantis.workers]``. Switchyard Base reads ``[base]``.
+Both share the provider/adapter table; Base does not reuse the worker ABI.
 """
 
 from __future__ import annotations
@@ -10,10 +10,10 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
-# Identifier grammar shared with the router consumer.
+# Identifier grammar for catalog table keys and provider names.
 TARGET_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _CONTRACT = re.compile(r"[0-9a-f]{64}\Z")
@@ -29,6 +29,33 @@ ADAPTER_PROTOCOLS = {
     "anthropic": frozenset({"anthropic_messages"}),
 }
 ADAPTERS = frozenset(ADAPTER_PROTOCOLS)
+SWITCHYARD_FORMATS = frozenset({"openai_chat", "openai_responses", "anthropic_messages"})
+ADAPTER_SWITCHYARD_FORMAT = {
+    "openrouter": "openai_chat",
+    "opencode-go": "openai_chat",
+    "modal": "openai_chat",
+    "openai-compatible": "openai_chat",
+    "anthropic": "anthropic_messages",
+}
+BASE_TARGET_ROLES = ("efficient", "capable")
+BASE_SECTION_KEYS = frozenset(
+    {
+        "revision",
+        "picker",
+        "confidence_threshold",
+        "recent_turn_window",
+        "targets",
+    }
+)
+BASE_TARGET_FIELDS = frozenset(
+    {
+        "provider",
+        "upstream_model",
+        "reasoning_effort",
+        "max_tokens",
+        "format",
+    }
+)
 
 
 class CatalogError(ValueError):
@@ -57,6 +84,27 @@ class WorkerBinding:
 class RuntimeBindings:
     providers: dict[str, ProviderBinding]
     workers: dict[str, WorkerBinding]
+
+
+@dataclass(frozen=True)
+class BaseTarget:
+    role: Literal["efficient", "capable"]
+    provider: str
+    upstream_model: str
+    reasoning_effort: str | None
+    max_tokens: int | None
+    wire_format: str
+
+
+@dataclass(frozen=True)
+class BaseRoute:
+    revision: str
+    picker: Literal["efficient_first", "capable_first"]
+    confidence_threshold: float
+    recent_turn_window: int
+    efficient: BaseTarget
+    capable: BaseTarget
+    providers: dict[str, ProviderBinding]
 
 
 def _json(value: Any) -> str:
@@ -135,34 +183,43 @@ def _provider(value: Any, label: str) -> ProviderBinding:
     )
 
 
+def _model_name(value: Any, label: str) -> str:
+    name = _string(value, label)
+    if any(char in name for char in ",|\r\n"):
+        raise CatalogError(f"{label} contains a reserved character")
+    return name
+
+
+def _reasoning_effort(value: Any, label: str) -> str | None:
+    if value is None:
+        return None
+    effort = _string(value, label)
+    if effort not in EFFORTS:
+        raise CatalogError(f"{label} is unsupported")
+    return None if effort == "none" else effort
+
+
+def _max_tokens(value: Any, label: str) -> int | None:
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise CatalogError(f"{label} must be a positive integer")
+    return value
+
+
 def _worker(value: Any, label: str) -> WorkerBinding:
     table = _mapping(value, label)
-    upstream_model = _string(table.get("upstream_model"), f"{label}.upstream_model")
-    if any(char in upstream_model for char in ",|\r\n"):
-        raise CatalogError(f"{label}.upstream_model contains a reserved character")
-    model_identity = table.get("model_identity", upstream_model)
-    model_identity = _string(model_identity, f"{label}.model_identity")
-    if any(char in model_identity for char in ",|\r\n"):
-        raise CatalogError(f"{label}.model_identity contains a reserved character")
-    effort = table.get("reasoning_effort")
-    if effort is not None:
-        effort = _string(effort, f"{label}.reasoning_effort")
-        if effort not in EFFORTS:
-            raise CatalogError(f"{label}.reasoning_effort is unsupported")
-        if effort == "none":
-            effort = None
-    max_tokens = table.get("max_tokens")
-    if max_tokens is not None and (
-        not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0
-    ):
-        raise CatalogError(f"{label}.max_tokens must be a positive integer")
+    upstream_model = _model_name(table.get("upstream_model"), f"{label}.upstream_model")
+    model_identity = _model_name(
+        table.get("model_identity", upstream_model), f"{label}.model_identity"
+    )
     return WorkerBinding(
         _identifier(table.get("provider"), f"{label}.provider"),
         upstream_model,
         model_identity,
-        effort,
+        _reasoning_effort(table.get("reasoning_effort"), f"{label}.reasoning_effort"),
         _protocols(table.get("protocols"), f"{label}.protocols", required=True),
-        max_tokens,
+        _max_tokens(table.get("max_tokens"), f"{label}.max_tokens"),
     )
 
 
@@ -195,3 +252,120 @@ def _slot_order(value: Any) -> tuple[str, ...]:
     if len(set(slots)) != len(slots):
         raise CatalogError("mantis.slot_order must not contain duplicates")
     return slots
+
+
+def _positive_int(value: Any, label: str, default: int | None = None) -> int:
+    if value is None and default is not None:
+        return default
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise CatalogError(f"{label} must be a positive integer")
+    return value
+
+
+def _unit_interval(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CatalogError(f"{label} must be a number in [0, 1]")
+    number = float(value)
+    if number < 0.0 or number > 1.0:
+        raise CatalogError(f"{label} must be a number in [0, 1]")
+    return number
+
+
+def _switchyard_format(provider: ProviderBinding, raw: Any, label: str) -> str:
+    default = ADAPTER_SWITCHYARD_FORMAT[provider.adapter]
+    if raw is None:
+        return default
+    fmt = _string(raw, label)
+    if fmt not in SWITCHYARD_FORMATS:
+        raise CatalogError(f"{label} is unsupported")
+    if fmt == "anthropic_messages" and provider.adapter != "anthropic":
+        raise CatalogError(f"{label} requires the anthropic adapter")
+    if fmt != "anthropic_messages" and provider.adapter == "anthropic":
+        raise CatalogError(f"{label} must be anthropic_messages for the anthropic adapter")
+    return fmt
+
+
+def _base_target(
+    value: Any,
+    role: Literal["efficient", "capable"],
+    providers: Mapping[str, ProviderBinding],
+) -> BaseTarget:
+    label = f"base.targets.{role}"
+    table = _mapping(value, label)
+    unknown = sorted(set(table) - BASE_TARGET_FIELDS)
+    if unknown:
+        raise CatalogError(f"{label} contains unknown keys: {', '.join(unknown)}")
+    provider_name = _identifier(table.get("provider"), f"{label}.provider")
+    if provider_name not in providers:
+        raise CatalogError(f"{label} references unknown provider {provider_name}")
+    provider = providers[provider_name]
+    return BaseTarget(
+        role,
+        provider_name,
+        _model_name(table.get("upstream_model"), f"{label}.upstream_model"),
+        _reasoning_effort(table.get("reasoning_effort"), f"{label}.reasoning_effort"),
+        _max_tokens(table.get("max_tokens"), f"{label}.max_tokens"),
+        _switchyard_format(provider, table.get("format"), f"{label}.format"),
+    )
+
+
+def _load_named_providers(providers_raw: Any, names: set[str]) -> dict[str, ProviderBinding]:
+    provider_table = _mapping(providers_raw, "providers")
+    providers: dict[str, ProviderBinding] = {}
+    for name in sorted(names):
+        if name not in provider_table:
+            raise CatalogError(f"base target references unknown provider {name}")
+        providers[name] = _provider(provider_table[name], f"providers.{name}")
+    return providers
+
+
+def load_base_route(root: Mapping[str, Any]) -> BaseRoute:
+    """Parse the catalog [base] stage-router used to generate Switchyard config."""
+    if root.get("version") != 1:
+        raise CatalogError("catalog version must be 1 when base is configured")
+    section = _mapping(root.get("base"), "base")
+    unknown_section = sorted(set(section) - BASE_SECTION_KEYS)
+    if unknown_section:
+        raise CatalogError(f"base contains unknown keys: {', '.join(unknown_section)}")
+    picker = _string(section.get("picker", "efficient_first"), "base.picker")
+    targets = _mapping(section.get("targets"), "base.targets")
+    unknown_targets = sorted(set(targets) - set(BASE_TARGET_ROLES))
+    if unknown_targets:
+        raise CatalogError(
+            f"base.targets contains unknown roles: {', '.join(unknown_targets)}"
+        )
+    missing = [role for role in BASE_TARGET_ROLES if role not in targets]
+    if missing:
+        raise CatalogError("base.targets must define efficient and capable")
+    provider_names = {
+        _identifier(
+            _mapping(targets[role], f"base.targets.{role}").get("provider"),
+            f"base.targets.{role}.provider",
+        )
+        for role in BASE_TARGET_ROLES
+    }
+    providers = _load_named_providers(root.get("providers"), provider_names)
+    efficient = _base_target(targets["efficient"], "efficient", providers)
+    capable = _base_target(targets["capable"], "capable", providers)
+    if (
+        efficient.upstream_model == capable.upstream_model
+        and efficient.provider == capable.provider
+    ):
+        raise CatalogError("base.targets.efficient and capable must be distinct models")
+    typed_picker: Literal["efficient_first", "capable_first"]
+    match picker:
+        case "efficient_first":
+            typed_picker = "efficient_first"
+        case "capable_first":
+            typed_picker = "capable_first"
+        case _:
+            raise CatalogError("base.picker must be efficient_first or capable_first")
+    return BaseRoute(
+        _string(section.get("revision", "unspecified"), "base.revision"),
+        typed_picker,
+        _unit_interval(section.get("confidence_threshold", 0.5), "base.confidence_threshold"),
+        _positive_int(section.get("recent_turn_window", 3), "base.recent_turn_window", 3),
+        efficient,
+        capable,
+        providers,
+    )

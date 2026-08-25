@@ -71,8 +71,11 @@ class HistoryWorker:
     the messages list handed to the underlying worker. This makes multi-turn
     coding sessions work without modifying the upstream Coordinator code."""
 
+    conductor_model: str | None
+
     def __init__(self, worker: Any) -> None:
         self._worker = worker
+        self.conductor_model = None
 
     def _combine(self, messages: Any) -> Any:
         history = getattr(serve_config._history_context, "history", None) or []

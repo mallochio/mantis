@@ -14,3 +14,4 @@ Third-party components used at runtime include (but are not limited to):
   git submodule.
 - Qwen3-0.6B and associated adapted router heads from Hugging Face.
 - Bifrost for external model routing.
+- NVIDIA NeMo Switchyard for `mantis/base` model selection.

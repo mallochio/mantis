@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
+import base_proxy
 import fusion
 import httpx
 import model_catalog
@@ -145,9 +146,9 @@ class ChatRequest(BaseModel):
     reasoning: ReasoningOptions | None = None
     reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] | None = None
     web_search_options: dict[str, Any] | None = None
-    # Session identity accepted from the body so conversations can reach the
-    # router's session ratchet. Never forwarded upstream: unknown top-level
-    # fields can be rejected by strict providers. See _router_body/_router_headers.
+    # Session identity accepted from the body so conversations can reach
+    # Switchyard. Never forwarded upstream: unknown top-level fields can be
+    # rejected by strict providers. See base_proxy.router_body.
     user: str | None = None
     metadata: dict[str, Any] | None = None
 
@@ -592,8 +593,6 @@ def ready(response: Response) -> dict[str, Any]:
     if not os.environ.get("MANTIS_API_KEY"):
         raise HTTPException(503, "MANTIS_API_KEY is not configured")
     profile = os.environ.get("MANTIS_ENDPOINT_PROFILE", "direct")
-    if profile == "direct" and not os.environ.get("MANTIS_ROUTER_KEY"):
-        raise HTTPException(503, "MANTIS_ROUTER_KEY is not configured")
     if profile == "catalog":
         try:
             bindings = model_catalog.load_runtime_bindings()
@@ -651,14 +650,6 @@ _MODEL_ALIASES = {
     "mantis-fusion": "mantis/fusion",
     "fusion": "mantis/fusion",
 }
-_ROUTER_RESPONSE_HEADERS = (
-    "x-route-decision",
-    "x-route-reason",
-    "x-route-sticky",
-    "x-route-model",
-    "x-route-attempts",
-    "x-route-fallback",
-)
 _SUPPORTED_PARAMETERS = [
     "tools",
     "tool_choice",
@@ -674,72 +665,7 @@ _SUPPORTED_PARAMETERS = [
 
 
 def _router_client() -> httpx.Client:
-    return httpx.Client(timeout=float(os.environ.get("MANTIS_ROUTER_TIMEOUT_S", "300")))
-
-
-def _session_from_body(body: ChatRequest) -> str | None:
-    """Session identity carried in the request body (metadata.session_id/user).
-
-    The gateway accepts the same fields directly, but the proxy converts them
-    to the X-Route-Session header instead of forwarding the raw body fields,
-    so unknown top-level keys never reach a strict upstream provider.
-    """
-    if isinstance(body.metadata, dict):
-        for key in ("session_id", "sessionId"):
-            value = body.metadata.get(key)
-            if isinstance(value, str) and value:
-                return value
-    if isinstance(body.user, str) and body.user:
-        return body.user
-    return None
-
-
-def _router_headers(headers: dict[str, str], body: ChatRequest | None = None) -> dict[str, str]:
-    key = os.environ.get("MANTIS_ROUTER_KEY")
-    if not key:
-        raise HTTPException(503, "MANTIS_ROUTER_KEY is not configured")
-    out = {"Authorization": f"Bearer {key}"}
-    session = headers.get("x-route-session")
-    if not session and body is not None:
-        session = _session_from_body(body)
-    if session:
-        out["X-Route-Session"] = session
-    return out
-
-
-def _router_body(request: ChatRequest) -> dict[str, Any]:
-    body = request.model_dump(exclude_none=True, exclude={"user", "metadata"})
-    return {**body, "model": "auto"}
-
-
-def _router_response_headers(upstream: httpx.Response) -> dict[str, str]:
-    return {
-        name: upstream.headers[name]
-        for name in _ROUTER_RESPONSE_HEADERS
-        if name in upstream.headers
-    }
-
-
-def _router_error(upstream: httpx.Response) -> JSONResponse:
-    try:
-        body = upstream.json()
-    except (ValueError, httpx.ResponseNotRead):
-        body = {
-            "error": {
-                "message": "router returned an invalid response",
-                "type": "upstream_error",
-            }
-        }
-    return JSONResponse(body, status_code=upstream.status_code)
-
-
-def _router_stream(client: httpx.Client, stream: Any, upstream: httpx.Response) -> Iterator[bytes]:
-    try:
-        yield from upstream.iter_bytes()
-    finally:
-        stream.__exit__(None, None, None)
-        client.close()
-        _capacity.release()
+    return base_proxy.router_client()
 
 
 _FUSION_TOOL_ID_PREFIX = "f"
@@ -959,12 +885,12 @@ def _run_fusion_chat(
         event = fusion.advance_fusion_run(run.run_id)
 
     if event.get("run_id"):
-        run = fusion.get_run(event["run_id"])
-        if isinstance(run, fusion.FusionRun):
+        run_obj = fusion.get_run(event["run_id"])
+        if isinstance(run_obj, fusion.FusionRun):
             # Plans and delegation briefs are public orchestration output.
             # Only provider summaries are gated by the existing opt-in.
             event["reasoning_trace"] = fusion._orchestration_trace(
-                run, include_reasoning=return_reasoning
+                run_obj, include_reasoning=return_reasoning
             )
     return event
 
@@ -1050,42 +976,17 @@ def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Respons
     if request.model == _BASIC_MODEL:
         handed_off = False
         try:
-            client = _router_client()
-            url = (
-                os.environ.get("MANTIS_ROUTER_URL", "http://127.0.0.1:5500/v1")
-                + "/chat/completions"
-            )
-            if request.stream:
-                stream = client.stream(
-                    "POST",
-                    url,
-                    headers=_router_headers(headers, request),
-                    json=_router_body(request),
-                )
-                upstream = stream.__enter__()
-                if upstream.is_error:
-                    error = _router_error(upstream)
-                    stream.__exit__(None, None, None)
-                    client.close()
-                    return error
-                handed_off = True
-                return StreamingResponse(
-                    _router_stream(client, stream, upstream),
-                    media_type="text/event-stream",
-                    headers={"X-Request-Id": request_id, **_router_response_headers(upstream)},
-                )
-            with client:
-                upstream = client.post(
-                    url, headers=_router_headers(headers, request), json=_router_body(request)
-                )
-            if upstream.is_error:
-                return _router_error(upstream)
-            return JSONResponse(
-                upstream.json(),
-                headers={"X-Request-Id": request_id, **_router_response_headers(upstream)},
+            response, handed_off = base_proxy.forward(
+                request,
+                headers,
+                request_id,
+                _router_client,
+                on_close=_capacity.release,
             )
         except httpx.HTTPError as error:
             return _error(502, f"router unavailable: {error}", "upstream_error")
+        else:
+            return response
         finally:
             if not handed_off:
                 _capacity.release()

@@ -171,7 +171,6 @@ mantis.egg-info/
 
 # Author-local agent instructions
 /AGENTS.md
-/apps/gateway/AGENTS.md
 
 # Personal, project-specific Poolside settings (do not commit; the shared
 # .poolside/settings.yaml remains trackable).

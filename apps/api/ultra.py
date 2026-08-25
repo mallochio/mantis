@@ -116,7 +116,9 @@ def _parse_json_workflow(text: str) -> tuple[list, list, list] | None:
     model_ids = data.get("model_id", data.get("model_ids"))
     subtasks = data.get("subtasks", data.get("subtask"))
     access = data.get("access_list", data.get("access"))
-    if not (isinstance(model_ids, list) and isinstance(subtasks, list) and isinstance(access, list)):
+    if not (
+        isinstance(model_ids, list) and isinstance(subtasks, list) and isinstance(access, list)
+    ):
         return None
     if not (model_ids and subtasks and access):
         return None

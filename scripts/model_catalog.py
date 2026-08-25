@@ -28,6 +28,7 @@ from model_catalog_schema import (
     _runtime_bindings,
     _slot_order,
     _string,
+    load_base_route,
 )
 
 __all__ = [
@@ -39,6 +40,7 @@ __all__ = [
     "catalog_path",
     "identity_fingerprint",
     "load_abi_manifest",
+    "load_base_route",
     "load_mantis_catalog",
     "load_runtime_bindings",
     "render_mantis_environment",

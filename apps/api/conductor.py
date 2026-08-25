@@ -42,20 +42,22 @@ from ultra import ConductorExecutor, conductor_prompt, parse_workflow
 def _load_mantis_catalog() -> model_catalog.MantisCatalog | None:
     try:
         return model_catalog.load_mantis_catalog(require_contract=False)
-    except Exception:
+    except (model_catalog.CatalogError, OSError, ValueError):
         return None
 
 
-def _resolve_conductor_model(worker) -> str:
+def _resolve_conductor_model(worker: Any) -> str:
     """Pick the model used for the Conductor planning call.
 
     Prefer an explicit conductor_model attached to the worker (set from the
     shared catalog), then the first configured slot, then a safe default.
     """
-    if getattr(worker, "conductor_model", None):
-        return worker.conductor_model
-    if getattr(worker, "slot_models", None):
-        return worker.slot_models[0]
+    conductor_model = getattr(worker, "conductor_model", None)
+    if isinstance(conductor_model, str) and conductor_model:
+        return conductor_model
+    slot_models = getattr(worker, "slot_models", None)
+    if isinstance(slot_models, list) and slot_models and isinstance(slot_models[0], str):
+        return str(slot_models[0])
     return "openai/gpt-4o-mini"
 
 
