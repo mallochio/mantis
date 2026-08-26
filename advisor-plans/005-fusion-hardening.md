@@ -29,10 +29,11 @@
   `apps/api/api.py` bypass `_capacity`, while chat-completions Fusion uses normal
   admission. Add Fusion admission limits and typed HTTP errors for validation,
   capacity, and provider/transient failures.
-- **Follow-up contract:** The threaded `message` argument remains unused, and
-  native follow-up currently accepts only tool results. Either implement and
-  document textual follow-up or remove the dead argument and make state errors
-  explicit.
+- **Follow-up contract:** Chat textual follow-up is wired via `advance(..., message=)`
+  and `X-Mantis-Run-Id` / encoded tool-call resume. Native `/v1/fusion/follow_up`
+  remains tool-results-only; document or extend native textual follow-up only when
+  callers need it. The threaded `message` argument is no longer unused on the
+  chat path.
 - **At-least-once behavior:** Provider-boundary crash recovery can repeat calls;
   document this clearly and add recovery tests before attempting stronger
   journaling.

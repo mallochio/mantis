@@ -1370,15 +1370,27 @@ def test_fusion_structured_brief_packet(monkeypatch):
         [("Done.", None, DEFAULT_USAGE)],
     )
     monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
-    run = fusion.FusionRun("brief-packet", "fix the bug")
+    run = fusion.FusionRun(
+        "brief-packet",
+        "latest ask",
+        messages=[
+            {"role": "user", "content": "fix the bug"},
+            {"role": "assistant", "content": "ack"},
+            {"role": "user", "content": "latest ask"},
+        ],
+        delegation_mode="forced",
+    )
     run.advance()
 
     packet = run.sidekick_messages[1]["content"]
     assert packet.startswith(fusion.FUSION_BRIEF_OPEN)
     assert packet.endswith(fusion.FUSION_BRIEF_CLOSE)
     assert "goal: fix the bug" in packet
+    assert "latest_user: latest ask" in packet
     assert "plan: inspect then edit" in packet
     assert "brief: edit the target" in packet
+    assert run.goal == "fix the bug"
+    assert run.latest_user == "latest ask"
 
 
 def test_fusion_follow_up_cap_and_event_telemetry(monkeypatch, tmp_path):
@@ -1722,3 +1734,281 @@ def test_fusion_api_events_expose_telemetry(client, fake_worker):
 
     status = client.get(f"/v1/fusion/runs/{run_id}", headers=_headers()).json()
     assert {"usage_models", "cost", "follow_up_count", "follow_up_capped"} <= status.keys()
+
+
+def test_fusion_available_answer_skips_sidekick(monkeypatch):
+    worker = SequenceWorker(
+        [("ANSWER: the third word is are", None, DEFAULT_USAGE)],
+        [("should not run", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    run = fusion.FusionRun(
+        "answer-run", "what is the third word?", delegation_mode="available"
+    )
+    event = run.advance(coordinator=fusion.FusionCoordinator())
+    assert event["status"] == "completed"
+    assert event["report"] == "the third word is are"
+    assert worker.sidekick_idx == 0
+    assert run.completed_via == "answer"
+
+
+def test_fusion_forced_rejects_answer_then_plans(monkeypatch):
+    worker = SequenceWorker(
+        [
+            ("ANSWER: nope", None, DEFAULT_USAGE),
+            ("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
+        ],
+        [("Done.", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    run = fusion.FusionRun("forced-answer", "do work", delegation_mode="forced")
+    event = run.advance(coordinator=fusion.FusionCoordinator())
+    assert event["status"] == "completed"
+    assert "Done." in (event["report"] or "")
+    assert worker.sidekick_idx >= 1
+
+
+def test_fusion_message_resume_answers_without_sidekick(monkeypatch):
+    worker = SequenceWorker(
+        [
+            ("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
+            ("ANSWER: resumed clarification", None, DEFAULT_USAGE),
+        ],
+        [("Done.", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    run = fusion.FusionRun("resume-msg", "goal", delegation_mode="available")
+    assert run.advance()["status"] == "completed"
+    sidekick_before = worker.sidekick_idx
+    event = run.advance(message="what did you just do?")
+    assert event["status"] == "completed"
+    assert event["report"] == "resumed clarification"
+    assert worker.sidekick_idx == sidekick_before
+
+
+def test_fusion_chat_resume_via_run_id_header(client, monkeypatch):
+    worker = SequenceWorker(
+        [
+            ("ANSWER: first", None, DEFAULT_USAGE),
+            ("ANSWER: second", None, DEFAULT_USAGE),
+        ],
+        [("unused", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    first = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "mantis/fusion",
+            "messages": [{"role": "user", "content": "say first"}],
+        },
+    )
+    assert first.status_code == 200
+    run_id = first.headers.get("X-Mantis-Run-Id")
+    assert run_id
+    assert first.json()["choices"][0]["message"]["content"] == "first"
+
+    second = client.post(
+        "/v1/chat/completions",
+        headers={**_headers(), "X-Mantis-Run-Id": run_id},
+        json={
+            "model": "mantis/fusion",
+            "messages": [
+                {"role": "user", "content": "say first"},
+                {"role": "assistant", "content": "first"},
+                {"role": "user", "content": "say second"},
+            ],
+        },
+    )
+    assert second.status_code == 200
+    assert second.headers.get("X-Mantis-Run-Id") == run_id
+    assert second.json()["choices"][0]["message"]["content"] == "second"
+    assert worker.sidekick_idx == 0
+
+
+def test_fusion_chat_resume_via_encoded_tool_call_id(client, monkeypatch):
+    worker = SequenceWorker(
+        [
+            ("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
+            ("ANSWER: from history", None, DEFAULT_USAGE),
+        ],
+        [("", BASH_CALL, DEFAULT_USAGE), ("Done.", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    tools = [BASH_TOOL]
+    first = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "mantis/fusion",
+            "messages": [{"role": "user", "content": "do work"}],
+            "tools": tools,
+        },
+    )
+    assert first.status_code == 200
+    tool_call = first.json()["choices"][0]["message"]["tool_calls"][0]
+    run_id = first.headers["X-Mantis-Run-Id"]
+
+    second = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "mantis/fusion",
+            "messages": [
+                {"role": "user", "content": "do work"},
+                first.json()["choices"][0]["message"],
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": "ok",
+                },
+            ],
+            "tools": tools,
+        },
+    )
+    assert second.status_code == 200
+    assert "Done." in second.json()["choices"][0]["message"]["content"]
+
+    third = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "mantis/fusion",
+            "messages": [
+                {"role": "user", "content": "do work"},
+                first.json()["choices"][0]["message"],
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": "ok",
+                },
+                second.json()["choices"][0]["message"],
+                {"role": "user", "content": "remind me"},
+            ],
+            "tools": tools,
+        },
+    )
+    assert third.status_code == 200
+    assert third.headers.get("X-Mantis-Run-Id") == run_id
+    assert third.json()["choices"][0]["message"]["content"] == "from history"
+
+
+def test_fusion_chat_missing_run_id_starts_new_available_run(client, monkeypatch):
+    worker = SequenceWorker(
+        [("ANSWER: fresh", None, DEFAULT_USAGE)],
+        [("unused", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    response = client.post(
+        "/v1/chat/completions",
+        headers={**_headers(), "X-Mantis-Run-Id": "does-not-exist"},
+        json={
+            "model": "mantis/fusion",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "fresh"
+    assert response.headers.get("X-Mantis-Run-Id")
+    assert response.headers.get("X-Mantis-Run-Id") != "does-not-exist"
+
+
+def test_fusion_sidekick_escalate_to_main_answer(monkeypatch):
+    worker = SequenceWorker(
+        [
+            ("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE),
+            ("ANSWER: escalated and answered", None, DEFAULT_USAGE),
+        ],
+        [("ESCALATE_TO_MAIN: brief is ambiguous", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    run = fusion.FusionRun("escalate", "goal", delegation_mode="available")
+    event = run.advance()
+    assert event["status"] == "completed"
+    assert event["report"] == "escalated and answered"
+    assert run.follow_up_count == 1
+    assert run.completed_via == "answer"
+
+
+def test_fusion_sidekick_tool_round_cap_escalates(monkeypatch, tmp_path):
+    bash_calls = [
+        (
+            "",
+            [
+                {
+                    "id": f"call_{i}",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{}"},
+                }
+            ],
+            DEFAULT_USAGE,
+        )
+        for i in range(3)
+    ]
+    worker = SequenceWorker(
+        [
+            ("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE),
+            ("ANSWER: capped", None, DEFAULT_USAGE),
+        ],
+        [*bash_calls, ("ESCALATE_TO_MAIN: over budget", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    path = tmp_path / "catalog.toml"
+    path.write_text(
+        "[fusion]\n"
+        'main = "gpt-5_6-sol"\n'
+        'sidekick = "gpt-5_6-luna"\n'
+        'main_tools = "none"\n'
+        "max_follow_ups = 2\n"
+        "sidekick_max_tool_rounds = 2\n"
+    )
+    config = fusion.FusionConfig(path)
+    monkeypatch.setattr(fusion, "_FUSION_CONFIG", config)
+    coordinator = fusion.FusionCoordinator(config)
+    run = fusion.FusionRun(
+        "cap-run", "goal", tools=[BASH_TOOL], delegation_mode="forced"
+    )
+
+    event = run.advance(coordinator=coordinator)
+    assert event["status"] == "awaiting_tools"
+    event = run.advance(
+        tool_results=[{"tool_call_id": "call_0", "content": "ok"}],
+        request_id="r1",
+        coordinator=coordinator,
+    )
+    assert event["status"] == "awaiting_tools"
+    event = run.advance(
+        tool_results=[{"tool_call_id": "call_1", "content": "ok"}],
+        request_id="r2",
+        coordinator=coordinator,
+    )
+    assert event["status"] == "completed"
+    assert event["report"] == "capped"
+    assert run.sidekick_tool_rounds == 2
+
+
+def test_fusion_old_pickle_restores_continuity_defaults():
+    run = fusion.FusionRun("old-continuity", "goal")
+    state = run.__dict__.copy()
+    state.pop("lock", None)
+    state.pop("request_lock", None)
+    for key in (
+        "delegation_mode",
+        "goal",
+        "latest_user",
+        "sidekick_tool_rounds",
+        "completed_via",
+    ):
+        state.pop(key, None)
+
+    restored = fusion.FusionRun.__new__(fusion.FusionRun)
+    restored.__setstate__(state)
+
+    assert restored.delegation_mode == "forced"
+    assert restored.goal == "goal"
+    assert restored.latest_user == "goal"
+    assert restored.sidekick_tool_rounds == 0
+    assert restored.completed_via == ""

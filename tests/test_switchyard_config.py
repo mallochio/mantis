@@ -63,8 +63,8 @@ def test_shipped_catalog_renders_stage_router():
     assert parsed["routes"]["mantis_base"]["type"] == "stage_router"
     assert parsed["routes"]["mantis_base"]["id"] == SWITCHYARD_ROUTE_ID
     assert parsed["routes"]["mantis_base"]["picker"] == "efficient_first"
-    assert parsed["targets"]["efficient"]["id"] == "google/gemini-3.7-flash"
-    assert parsed["targets"]["capable"]["id"] == "anthropic/claude-opus-5"
+    assert parsed["targets"]["efficient"]["id"] == "xai/grok-4.6"
+    assert parsed["targets"]["capable"]["id"] == "kimi-k3"
     assert parsed["llm_clients"]["bifrost"]["api_key_env"] == "BIFROST_API_KEY"
     assert parsed["llm_clients"]["bifrost"]["base_url"] == "http://127.0.0.1:8080/v1"
 

@@ -706,6 +706,7 @@ def _build_fusion_chat_response(
 ) -> JSONResponse:
     status = event.get("status")
     messages = [msg.model_dump(exclude_none=True) for msg in request.messages]
+    run_id = str(event.get("run_id") or "")
     if status == "completed":
         content = event.get("report") or ""
         message: dict[str, Any] = {
@@ -715,7 +716,6 @@ def _build_fusion_chat_response(
         finish = "stop"
         completion_text = content
     elif status == "awaiting_tools":
-        run_id = event["run_id"]
         pending = event.get("pending_tool_calls") or []
         tool_calls = [
             {
@@ -741,6 +741,9 @@ def _build_fusion_chat_response(
     if reasoning_trace:
         message["reasoning"] = reasoning_trace
     usage = utils._request_usage(messages, completion_text)
+    headers = {"X-Request-Id": request_id}
+    if run_id:
+        headers["X-Mantis-Run-Id"] = run_id
     return JSONResponse(
         {
             "id": request_id,
@@ -756,16 +759,16 @@ def _build_fusion_chat_response(
             ],
             "usage": usage,
         },
-        headers={"X-Request-Id": request_id},
+        headers=headers,
     )
 
 
-def _stream_fusion_chat(
+def _iter_fusion_chat_event(
     request: ChatRequest,
     request_id: str,
-    return_reasoning: bool = False,
+    event: dict[str, Any],
 ) -> Iterator[bytes]:
-    """Yield SSE chunks for a Fusion chat completion."""
+    """Yield SSE chunks for an already-computed Fusion chat event."""
     base = {
         "id": request_id,
         "object": "chat.completion.chunk",
@@ -773,7 +776,6 @@ def _stream_fusion_chat(
         "model": "mantis/fusion",
     }
     try:
-        event = _run_fusion_chat(request, return_reasoning=return_reasoning)
         status = event.get("status")
 
         def _chunk(delta: dict[str, Any], finish: str | None) -> bytes:
@@ -836,12 +838,61 @@ def _stream_fusion_chat(
     yield b"data: [DONE]\n\n"
 
 
+def _fusion_run_id_from_headers(headers: dict[str, str] | None) -> str | None:
+    if not headers:
+        return None
+    for key in ("x-mantis-run-id", "X-Mantis-Run-Id"):
+        value = headers.get(key, "").strip()
+        if value:
+            return value
+    # Starlette lowercases header names; also accept mixed maps.
+    for name, value in headers.items():
+        if name.lower() == "x-mantis-run-id" and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def _fusion_run_id_from_messages(messages: list[Any]) -> str | None:
+    """Infer the latest Fusion run id from encoded tool call ids in history."""
+    found: str | None = None
+    for msg in messages:
+        role = getattr(msg, "role", None) or (msg.get("role") if isinstance(msg, dict) else None)
+        if role == "tool":
+            tool_call_id = getattr(msg, "tool_call_id", None)
+            if tool_call_id is None and isinstance(msg, dict):
+                tool_call_id = msg.get("tool_call_id")
+            if not tool_call_id:
+                continue
+            try:
+                found, _ = _decode_fusion_tool_call_id(str(tool_call_id))
+            except ValueError:
+                continue
+        elif role == "assistant":
+            tool_calls = getattr(msg, "tool_calls", None)
+            if tool_calls is None and isinstance(msg, dict):
+                tool_calls = msg.get("tool_calls")
+            for call in tool_calls or []:
+                call_id = (
+                    call.get("id")
+                    if isinstance(call, dict)
+                    else getattr(call, "id", None)
+                )
+                if not call_id:
+                    continue
+                try:
+                    found, _ = _decode_fusion_tool_call_id(str(call_id))
+                except ValueError:
+                    continue
+    return found
+
+
 def _run_fusion_chat(
     request: ChatRequest,
     return_reasoning: bool = False,
+    headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Resume or start a Fusion run from an OpenAI-style chat request."""
-    # Find a trailing block of tool messages; if present, this is a follow-up.
+    # Find a trailing block of tool messages; if present, this is a tool follow-up.
     tool_results: list[dict[str, Any]] = []
     run_id: str | None = None
     i = len(request.messages) - 1
@@ -871,7 +922,6 @@ def _run_fusion_chat(
             tool_results=tool_results,
         )
     else:
-        # Initial call: the brief is the last user message.
         brief = ""
         for msg in reversed(request.messages):
             if msg.role == "user":
@@ -879,10 +929,20 @@ def _run_fusion_chat(
                 break
         if not brief:
             raise ValueError("mantis/fusion requires at least one user message")
-        tools = [tool.model_dump() for tool in (request.tools or [])]
-        messages = [msg.model_dump(exclude_none=True) for msg in request.messages]
-        run = fusion.create_fusion_run(brief, tools, messages=messages)
-        event = fusion.advance_fusion_run(run.run_id)
+
+        resume_id = _fusion_run_id_from_headers(headers) or _fusion_run_id_from_messages(
+            request.messages
+        )
+        resumed = fusion.try_get_fusion_run(resume_id) if resume_id else None
+        if resumed is not None and resumed.status != "awaiting_tools":
+            event = fusion.advance_fusion_run(resumed.run_id, message=brief)
+        else:
+            tools = [tool.model_dump() for tool in (request.tools or [])]
+            messages = [msg.model_dump(exclude_none=True) for msg in request.messages]
+            run = fusion.create_fusion_run(
+                brief, tools, messages=messages, delegation_mode="available"
+            )
+            event = fusion.advance_fusion_run(run.run_id)
 
     if event.get("run_id"):
         run_obj = fusion.get_run(event["run_id"])
@@ -958,19 +1018,26 @@ def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Respons
         return _error(429, "Mantis is at capacity", "rate_limit_error")
     if request.model == "mantis/fusion":
         return_reasoning = _fusion_return_reasoning(headers)
+        try:
+            event = _run_fusion_chat(
+                request, return_reasoning=return_reasoning, headers=headers
+            )
+        except Exception as exc:  # noqa: BLE001 - chat adapter error boundary
+            _capacity.release()
+            return _error(500, f"fusion chat failed: {exc}", "upstream_error")
+        run_headers = {"X-Request-Id": request_id}
+        if event.get("run_id"):
+            run_headers["X-Mantis-Run-Id"] = str(event["run_id"])
         if request.stream:
             return StreamingResponse(
-                _stream_fusion_chat(request, request_id, return_reasoning=return_reasoning),
+                _iter_fusion_chat_event(request, request_id, event),
                 media_type="text/event-stream",
-                headers={"X-Request-Id": request_id},
+                headers=run_headers,
             )
         try:
-            event = _run_fusion_chat(request, return_reasoning=return_reasoning)
             return _build_fusion_chat_response(
                 request_id, "mantis/fusion", event, request
             )
-        except Exception as exc:  # noqa: BLE001 - chat adapter error boundary
-            return _error(500, f"fusion chat failed: {exc}", "upstream_error")
         finally:
             _capacity.release()
     if request.model == _BASIC_MODEL:

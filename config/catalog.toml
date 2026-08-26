@@ -16,25 +16,24 @@ protocols = ["anthropic_messages"]
 [base]
 # Switchyard stage-router for mantis/base. Swap these models or their
 # providers without changing application code; launch regenerates routes.toml.
-revision = "switchyard-2026-08-25-qwen-gpt-sol-high"
+revision = "switchyard-2026-08-26-grok-kimi"
 picker = "efficient_first"
 confidence_threshold = 0.5
 recent_turn_window = 3
 
 [base.targets.efficient]
 provider = "bifrost"
-# qwen3.8 through Bifrost (Qwen/Qwen3.8-2.4T-A95B on Modal, 1M context).
+# grok-4.6 on Vertex (xAI): 500k context, $2/$6 per 1M in/out, high reasoning.
 reasoning_effort = "high"
-max_tokens = 262144
-upstream_model = "qwen3-8-2-4t-a95b"
+max_tokens = 128000
+upstream_model = "xai/grok-4.6"
 
 [base.targets.capable]
 provider = "bifrost"
-# gpt-5.6-sol (models.dev azure/openai): max output 128000,
-# cost $5/$30 per 1M in/out — the most capable tier.
-reasoning_effort = "high"
+# kimi-k3 (Modal/Kimi): 1M context, $3/$15/$0.30 per MTok — the expensive/capable tier.
+reasoning_effort = "max"
 max_tokens = 128000
-upstream_model = "gpt-5.6-sol"
+upstream_model = "kimi-k3"
 
 
 [mantis]
@@ -113,15 +112,10 @@ model_identity = "gemini-3.1-pro-preview"
 reasoning_effort = "high"
 protocols = ["chat_completions"]
 
-# Fusion lead/sidekick configuration. These are worker slot IDs from [mantis.workers].
-# By default the main model only plans and reviews while the sidekick executes.
-# `main_tools` gates when the lead may use tools: none/plan/review/plan+review.
-# Each lane's reasoning effort comes from its worker slot: gpt-5_6-sol is
-# medium, gpt-5_6-luna is xhigh (the max effort GPT-5.6 accepts; "max" is
-# clamped to "xhigh" by providers._coerce_reasoning_effort).
 [fusion]
 main = "gpt-5_6-sol"
 sidekick = "gpt-5_6-luna"
 max_follow_ups = 2
+sidekick_max_tool_rounds = 16
 main_tools = "none"
 context_window = 262144

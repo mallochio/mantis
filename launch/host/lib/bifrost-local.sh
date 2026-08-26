@@ -86,7 +86,26 @@ fi
 
 # Prefer the npx wrapper (keeps the cached binary current); if the registry is
 # unreachable, fall back to the newest already-cached binary.
-if command -v npx >/dev/null 2>&1; then
+# If BIFROST_VERSION is set, use the exact cached binary (or npx tag) to support
+# pre-release/bespoke binaries (e.g. 2.0.0) not yet on the public npm registry.
+BIFROST_VERSION="${BIFROST_VERSION:-}"
+if [ -n "$BIFROST_VERSION" ]; then
+  # Cached binaries live in a `v` prefixed directory (v1.6.11, v2.0.0).
+  CACHED_DIR="$HOME/Library/Caches/bifrost/$BIFROST_VERSION"
+  if [ ! -d "$CACHED_DIR" ] && [ -d "$HOME/Library/Caches/bifrost/v$BIFROST_VERSION" ]; then
+    CACHED_DIR="$HOME/Library/Caches/bifrost/v$BIFROST_VERSION"
+  fi
+  CACHED_BIN="$CACHED_DIR/bin/bifrost-http-0"
+  if [ -x "$CACHED_BIN" ]; then
+    LAUNCH=("$CACHED_BIN")
+  elif command -v npx >/dev/null 2>&1; then
+    NPM_VERSION="${BIFROST_VERSION#v}"
+    LAUNCH=(npx -y "@maximhq/bifrost@$NPM_VERSION")
+  else
+    echo "ERROR: BIFROST_VERSION=$BIFROST_VERSION but no cached binary or npx is available" >&2
+    exit 1
+  fi
+elif command -v npx >/dev/null 2>&1; then
   LAUNCH=(npx -y @maximhq/bifrost)
 else
   CACHED_BIN=$(ls -1t "$HOME/Library/Caches/bifrost"/*/bin/bifrost-http-* 2>/dev/null | head -n1 || true)
@@ -98,9 +117,11 @@ else
   fi
 fi
 
-nohup "${LAUNCH[@]}" -app-dir "$DATA_DIR" -host "$HOST" -port "$PORT" -log-style pretty \
-  </dev/null >> "$LOG_DIR/server.out" 2>> "$LOG_DIR/server.err" &
-echo $! > "$DATA_DIR/server.pid"
+# shellcheck source=detach.sh
+source "$SCRIPT_DIR/detach.sh"
+detach_cmd "$DATA_DIR/server.pid" "$LOG_DIR/server.out" "$LOG_DIR/server.err" \
+  "${LAUNCH[@]}" -app-dir "$DATA_DIR" -host "$HOST" -port "$PORT" -log-style pretty \
+  >/dev/null
 
 for _ in $(seq 1 300); do  # 60s — first boot downloads the binary
   if curl -fsS --max-time 2 "http://$HOST:$PORT/health" >/dev/null 2>&1; then
