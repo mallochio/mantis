@@ -238,14 +238,20 @@ def anthropic_to_chat(response: dict[str, Any]) -> dict[str, Any]:
         message["tool_calls"] = calls
         message["_anthropic_tool_ids"] = tool_ids
     usage = response.get("usage") or {}
-    return {
-        "choices": [{"message": message}],
-        "usage": {
-            "prompt_tokens": usage.get("input_tokens", 0),
-            "completion_tokens": usage.get("output_tokens", 0),
-            "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
-        },
+    prompt_tokens = usage.get("input_tokens", 0)
+    completion_tokens = usage.get("output_tokens", 0)
+    # Anthropic reports cache reads as cache_read_input_tokens; surface it in the
+    # OpenAI-compatible prompt_tokens_details.cached_tokens field so Mantis cost
+    # accounting and cache-hit metrics work for Claude on Vertex / Bedrock.
+    cached = usage.get("cache_read_input_tokens")
+    usage_out: dict[str, Any] = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
     }
+    if isinstance(cached, int):
+        usage_out["prompt_tokens_details"] = {"cached_tokens": cached}
+    return {"choices": [{"message": message}], "usage": usage_out}
 
 
 def assemble_anthropic_stream(events: Any) -> dict[str, Any]:

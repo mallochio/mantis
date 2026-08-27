@@ -182,3 +182,34 @@ def test_stream_assembly_retains_thinking_signature_and_tool_input():
     }
     assert message["tool_calls"][0]["function"]["arguments"] == '{"path": "x"}'
     assert result["usage"]["total_tokens"] == 9
+
+
+def test_native_to_chat_preserves_cached_tokens():
+    chat = anthropic_to_chat(
+        {
+            "content": [{"type": "text", "text": "answer"}],
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_read_input_tokens": 80,
+                "cache_creation_input_tokens": 10,
+            },
+        }
+    )
+    assert chat["usage"]["prompt_tokens"] == 100
+    assert chat["usage"]["completion_tokens"] == 20
+    assert chat["usage"]["total_tokens"] == 120
+    assert chat["usage"]["prompt_tokens_details"]["cached_tokens"] == 80
+
+
+def test_native_to_chat_omits_details_when_no_cache_read():
+    chat = anthropic_to_chat(
+        {
+            "content": [{"type": "text", "text": "answer"}],
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+            },
+        }
+    )
+    assert "prompt_tokens_details" not in chat["usage"]

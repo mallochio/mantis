@@ -23,17 +23,15 @@ recent_turn_window = 3
 
 [base.targets.efficient]
 provider = "bifrost"
-# grok-4.6 on Vertex (xAI): 500k context, $2/$6 per 1M in/out, high reasoning.
 reasoning_effort = "high"
 max_tokens = 128000
 upstream_model = "xai/grok-4.6"
 
 [base.targets.capable]
 provider = "bifrost"
-# kimi-k3 (Modal/Kimi): 1M context, $3/$15/$0.30 per MTok — the expensive/capable tier.
-reasoning_effort = "max"
+reasoning_effort = "high"
 max_tokens = 128000
-upstream_model = "kimi-k3"
+upstream_model = "gpt-5.6-sol"
 
 
 [mantis]

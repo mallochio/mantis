@@ -19,6 +19,9 @@ REPO_ROOT="$(cd "$STARTUP_DIR/../.." && pwd)"
 
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$HOME/.local/bin:$PATH"
 
+# Clear any inherited BIFROST_VERSION so .zshrc remains the single source of
+# truth for whether a specific version is pinned.
+unset BIFROST_VERSION
 if [ -f "$HOME/.zshrc" ]; then
   while IFS='=' read -r name value; do
     [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && export "$name=$value"

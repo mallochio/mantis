@@ -31,6 +31,9 @@ export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$HOME/.local/bin:$PATH"
 
 # StartupFolder/launchd does not read shell startup files. Import exported env
 # from zsh so ~/.zshrc remains the single place for Bifrost/backend config.
+# Clear any inherited BIFROST_VERSION so .zshrc controls whether a version is
+# pinned (commented out means "use the latest stable from npm").
+unset BIFROST_VERSION
 if [ -f "$HOME/.zshrc" ]; then
   while IFS='=' read -r name value; do
     [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && export "$name=$value"
@@ -73,7 +76,12 @@ if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   for pid in $(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null); do
     kill -9 "$pid" 2>/dev/null || true
   done
-  pgrep -f 'bifrost-http|@maximhq/bifrost' 2>/dev/null | while IFS= read -r pid; do
+  # macOS pgrep uses BRE by default, so the alternation "a|b" is literal.
+  # Collect matching PIDs from both patterns without tripping set -e/pipefail.
+  {
+    pgrep -f 'bifrost-http' 2>/dev/null || true
+    pgrep -f '@maximhq/bifrost' 2>/dev/null || true
+  } | while IFS= read -r pid; do
     kill -9 "$pid" 2>/dev/null || true
   done
   for _ in $(seq 1 50); do
