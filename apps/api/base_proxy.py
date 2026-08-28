@@ -263,6 +263,10 @@ def _router_stream(
 ) -> Iterator[bytes]:
     try:
         yield from upstream.iter_bytes()
+    except httpx.HTTPError as exc:
+        # Upstream hung up mid-stream; stop the response cleanly instead of
+        # letting the transport error crash the whole ASGI server.
+        logger.warning("upstream stream closed early: %s", exc)
     finally:
         try:
             stream.__exit__(None, None, None)
