@@ -111,8 +111,10 @@ protocols = ["chat_completions"]
 
 [fusion]
 main = "gpt-5_6-sol"
-sidekick = "gpt-5_6-luna"
+sidekick = ["gpt-5_6-luna", "gpt-5_6-sol"]
+fallback_on_escalate = true
 max_follow_ups = 2
 sidekick_max_tool_rounds = 16
 main_tools = "none"
 context_window = 262144
+max_output_tokens = 4096

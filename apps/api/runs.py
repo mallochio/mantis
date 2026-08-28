@@ -437,6 +437,7 @@ class NativeRun:
         summary: str | None = None,
         attempt: int | None = None,
         detail: str | None = None,
+        lane: str | None = None,
     ) -> None:
         entry: dict[str, Any] = {
             "type": activity_type,
@@ -445,6 +446,8 @@ class NativeRun:
             "status": status,
             "summary": summary or providers._activity_summary(activity_type, role),
         }
+        if lane is not None:
+            entry["lane"] = lane
         if detail is not None:
             entry["error"] = detail
         if duration_ms is not None:
@@ -885,9 +888,7 @@ class TrinityRun(NativeRun):
             )
             if call_info and isinstance(call_info.get("function"), dict):
                 fn = call_info["function"]
-                reminder = self.repeat_guard.observe(
-                    fn.get("name", ""), fn.get("arguments", "{}")
-                )
+                reminder = self.repeat_guard.observe(fn.get("name", ""), fn.get("arguments", "{}"))
                 if reminder:
                     pending["messages"].append({"role": "system", "content": reminder})
         self._expected_ids = set()
@@ -1040,9 +1041,7 @@ class ConductorRun(NativeRun):
         return messages
 
     def _run_planner(self) -> dict[str, Any]:
-        event = self._run_model(
-            "Planner", self.conductor_model, self._planner_messages()
-        )
+        event = self._run_model("Planner", self.conductor_model, self._planner_messages())
         if event.get("type") != "error" or self._planner_repair_attempted:
             return event
         self._planner_repair_attempted = True
@@ -1275,9 +1274,7 @@ class ConductorRun(NativeRun):
             )
             if call_info and isinstance(call_info.get("function"), dict):
                 fn = call_info["function"]
-                reminder = self.repeat_guard.observe(
-                    fn.get("name", ""), fn.get("arguments", "{}")
-                )
+                reminder = self.repeat_guard.observe(fn.get("name", ""), fn.get("arguments", "{}"))
                 if reminder:
                     pending["messages"].append({"role": "system", "content": reminder})
         self._expected_ids = set()

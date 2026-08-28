@@ -25,6 +25,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi import Request as HttpRequest
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
+from fusion_types import FusionRunBudget, FusionToolOptions, FusionWorkerProfile
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
@@ -146,6 +147,10 @@ class ChatRequest(BaseModel):
     reasoning: ReasoningOptions | None = None
     reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] | None = None
     web_search_options: dict[str, Any] | None = None
+    # Fusion-specific orchestration controls.
+    worker_profiles: list[FusionWorkerProfile] | None = None
+    budget: FusionRunBudget | None = None
+    tool_options: FusionToolOptions | None = None
     # Session identity accepted from the body so conversations can reach
     # Switchyard. Never forwarded upstream: unknown top-level fields can be
     # rejected by strict providers. See base_proxy.router_body.
@@ -691,10 +696,7 @@ def _content_to_str(content: str | list[TextPart | ImagePart] | None) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return " ".join(
-            part.text if isinstance(part, TextPart) else str(part)
-            for part in content
-        )
+        return " ".join(part.text if isinstance(part, TextPart) else str(part) for part in content)
     return str(content)
 
 
@@ -784,9 +786,7 @@ def _iter_fusion_chat_event(
                 + json.dumps(
                     {
                         **base,
-                        "choices": [
-                            {"index": 0, "delta": delta, "finish_reason": finish}
-                        ],
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
                     }
                 )
                 + "\n\n"
@@ -826,9 +826,7 @@ def _iter_fusion_chat_event(
             yield _chunk({"role": "assistant"}, None)
             yield _chunk({"content": msg}, "stop")
             completion_text = msg
-        include_usage = bool(
-            request.stream_options and request.stream_options.include_usage
-        )
+        include_usage = bool(request.stream_options and request.stream_options.include_usage)
         if include_usage:
             messages = [msg.model_dump(exclude_none=True) for msg in request.messages]
             usage = utils._request_usage(messages, completion_text)
@@ -872,11 +870,7 @@ def _fusion_run_id_from_messages(messages: list[Any]) -> str | None:
             if tool_calls is None and isinstance(msg, dict):
                 tool_calls = msg.get("tool_calls")
             for call in tool_calls or []:
-                call_id = (
-                    call.get("id")
-                    if isinstance(call, dict)
-                    else getattr(call, "id", None)
-                )
+                call_id = call.get("id") if isinstance(call, dict) else getattr(call, "id", None)
                 if not call_id:
                     continue
                 try:
@@ -940,7 +934,13 @@ def _run_fusion_chat(
             tools = [tool.model_dump() for tool in (request.tools or [])]
             messages = [msg.model_dump(exclude_none=True) for msg in request.messages]
             run = fusion.create_fusion_run(
-                brief, tools, messages=messages, delegation_mode="available"
+                brief,
+                tools,
+                messages=messages,
+                delegation_mode="available",
+                worker_profiles=request.worker_profiles,
+                budget=request.budget,
+                tool_options=request.tool_options,
             )
             event = fusion.advance_fusion_run(run.run_id)
 
@@ -1019,9 +1019,7 @@ def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Respons
     if request.model == "mantis/fusion":
         return_reasoning = _fusion_return_reasoning(headers)
         try:
-            event = _run_fusion_chat(
-                request, return_reasoning=return_reasoning, headers=headers
-            )
+            event = _run_fusion_chat(request, return_reasoning=return_reasoning, headers=headers)
         except Exception as exc:  # noqa: BLE001 - chat adapter error boundary
             _capacity.release()
             return _error(500, f"fusion chat failed: {exc}", "upstream_error")
@@ -1035,9 +1033,7 @@ def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Respons
                 headers=run_headers,
             )
         try:
-            return _build_fusion_chat_response(
-                request_id, "mantis/fusion", event, request
-            )
+            return _build_fusion_chat_response(request_id, "mantis/fusion", event, request)
         finally:
             _capacity.release()
     if request.model == _BASIC_MODEL:
@@ -1079,6 +1075,9 @@ class FusionDelegateRequest(BaseModel):
 
     brief: str = Field(min_length=1)
     tools: list[FunctionTool] | None = None
+    worker_profiles: list[FusionWorkerProfile] | None = None
+    budget: FusionRunBudget | None = None
+    tool_options: FusionToolOptions | None = None
 
 
 class FusionToolResult(BaseModel):
@@ -1109,7 +1108,9 @@ class FusionResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     run_id: str
-    status: Literal["main_planning", "sidekick_pending", "awaiting_tools", "main_review", "completed", "error"]
+    status: Literal[
+        "main_planning", "sidekick_pending", "awaiting_tools", "main_review", "completed", "error"
+    ]
     report: str | None
     pending_tool_calls: list[dict[str, Any]] | None
     usage: dict[str, Any]
@@ -1127,7 +1128,13 @@ def fusion_delegate(request: FusionDelegateRequest) -> JSONResponse:
         return _error(429, "Mantis is at capacity", "rate_limit_error")
     try:
         tools = [tool.model_dump() for tool in (request.tools or [])]
-        run = fusion.create_fusion_run(request.brief, tools)
+        run = fusion.create_fusion_run(
+            request.brief,
+            tools,
+            worker_profiles=request.worker_profiles,
+            budget=request.budget,
+            tool_options=request.tool_options,
+        )
         event = fusion.advance_fusion_run(run.run_id)
         return JSONResponse(FusionResponse(**event).model_dump())
     finally:

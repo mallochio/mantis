@@ -12,9 +12,11 @@ import api
 import fusion
 import providers
 import pytest
-import runs
 import serve_config
+import utils
 from fastapi.testclient import TestClient
+
+import runs
 
 
 class FakeWorker:
@@ -326,9 +328,7 @@ def test_fusion_idempotent_follow_up(client, fake_worker):
     request_id = uuid.uuid4().hex
     payload = {
         "request_id": request_id,
-        "tool_results": [
-            {"tool_call_id": "call_bash_1", "content": "hello"}
-        ],
+        "tool_results": [{"tool_call_id": "call_bash_1", "content": "hello"}],
     }
     first = client.post(f"/v1/fusion/follow_up/{run_id}", headers=_headers(), json=payload)
     assert first.status_code == 200
@@ -350,9 +350,7 @@ def test_fusion_missing_tool_result(client, fake_worker):
         headers=_headers(),
         json={
             "request_id": uuid.uuid4().hex,
-            "tool_results": [
-                {"tool_call_id": "wrong_id", "content": "hello"}
-            ],
+            "tool_results": [{"tool_call_id": "wrong_id", "content": "hello"}],
         },
     )
     assert response.status_code == 200
@@ -430,9 +428,7 @@ def test_fusion_file_persistence_round_trip(file_client, fake_worker, tmp_path):
         headers=_headers(),
         json={
             "request_id": uuid.uuid4().hex,
-            "tool_results": [
-                {"tool_call_id": "call_bash_1", "content": "hello"}
-            ],
+            "tool_results": [{"tool_call_id": "call_bash_1", "content": "hello"}],
         },
     )
     assert response.status_code == 200
@@ -489,9 +485,7 @@ def test_fusion_trim_keeps_frozen_prefix_when_budget_allows():
         {"role": "user", "content": "client history"},
         {"role": "assistant", "content": "ack"},
     ]
-    first = coordinator._trim_messages(
-        [*prefix, {"role": "user", "content": "plan now"}], 100_000
-    )
+    first = coordinator._trim_messages([*prefix, {"role": "user", "content": "plan now"}], 100_000)
     second = coordinator._trim_messages(
         [
             *prefix,
@@ -892,18 +886,22 @@ def test_fusion_trace_excludes_opaque_metadata(client, fake_worker, monkeypatch)
 
     def worker_with_opaque_metadata(slot, messages, tools):
         message, usage = fake_worker(slot, messages, tools)
-        message["reasoning_details"] = [{
-            "type": "reasoning",
-            "id": opaque_values["provider_id"],
-            "summary": [{"type": "summary_text", "text": "Safe summary."}],
-            "signature": opaque_values["signature"],
-            "encrypted_content": opaque_values["encrypted"],
-        }]
-        message["_anthropic_content"] = [{
-            "type": "thinking",
-            "thinking": "Safe textual thinking.",
-            "signature": opaque_values["signature"],
-        }]
+        message["reasoning_details"] = [
+            {
+                "type": "reasoning",
+                "id": opaque_values["provider_id"],
+                "summary": [{"type": "summary_text", "text": "Safe summary."}],
+                "signature": opaque_values["signature"],
+                "encrypted_content": opaque_values["encrypted"],
+            }
+        ]
+        message["_anthropic_content"] = [
+            {
+                "type": "thinking",
+                "thinking": "Safe textual thinking.",
+                "signature": opaque_values["signature"],
+            }
+        ]
         message["_anthropic_tool_ids"] = {"call": opaque_values["provider_id"]}
         return message, usage
 
@@ -1039,40 +1037,48 @@ def test_fusion_main_driver_can_call_tools_during_planning(client, monkeypatch, 
             if not has_tool_result:
                 # Main calls a tool during planning
                 return {
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "",
-                            "tool_calls": [{
-                                "id": "call_read_1",
-                                "type": "function",
-                                "function": {
-                                    "name": "read_file",
-                                    "arguments": '{"path": "config.py"}',
-                                },
-                            }],
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_read_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "read_file",
+                                            "arguments": '{"path": "config.py"}',
+                                        },
+                                    }
+                                ],
+                            }
                         }
-                    }],
+                    ],
                     "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
                 }
             # After tool result, emit plan and brief
             return {
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "PLAN: inspected config, now edit\nBRIEF: edit config.py",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "PLAN: inspected config, now edit\nBRIEF: edit config.py",
+                        }
                     }
-                }],
+                ],
                 "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
             }
         # Sidekick completes task
         return {
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "Done editing config.py.",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "Done editing config.py.",
+                    }
                 }
-            }],
+            ],
             "usage": {"prompt_tokens": 15, "completion_tokens": 10, "total_tokens": 25},
         }
 
@@ -1137,19 +1143,19 @@ def test_fusion_review_receives_sidekick_tool_activity(client, monkeypatch):
             is_review = any(fusion.REVIEW_PROMPT in m.get("content", "") for m in messages)
             if not is_review:
                 return {
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "PLAN: test\nBRIEF: run tests",
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "PLAN: test\nBRIEF: run tests",
+                            }
                         }
-                    }],
+                    ],
                     "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
                 }
             # Record the review prompt
             review_prompts.extend(
-                m["content"]
-                for m in messages
-                if fusion.REVIEW_PROMPT in m.get("content", "")
+                m["content"] for m in messages if fusion.REVIEW_PROMPT in m.get("content", "")
             )
             return {
                 "choices": [{"message": {"role": "assistant", "content": "ACCEPT"}}],
@@ -1159,20 +1165,24 @@ def test_fusion_review_receives_sidekick_tool_activity(client, monkeypatch):
         has_tool_res = any(m.get("role") == "tool" for m in messages)
         if not has_tool_res:
             return {
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [{
-                            "id": "call_t1",
-                            "type": "function",
-                            "function": {
-                                "name": "run_test",
-                                "arguments": "{}",
-                            },
-                        }],
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_t1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "run_test",
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ],
+                        }
                     }
-                }],
+                ],
                 "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
             }
         return {
@@ -1219,8 +1229,7 @@ def test_fusion_retries_malformed_plan(monkeypatch):
     main_outputs = [
         ("I will inspect the codebase and then make a plan.", None, DEFAULT_USAGE),
         (
-            "PLAN: inspect and extract abstractions\n"
-            "BRIEF: implement the first two targets",
+            "PLAN: inspect and extract abstractions\nBRIEF: implement the first two targets",
             None,
             DEFAULT_USAGE,
         ),
@@ -1333,7 +1342,6 @@ def test_fusion_enforces_planning_tool_budget(monkeypatch, tmp_path):
     assert event["status"] == "error"
     assert run.status == "error"
     assert "plan was required" in (run.error or "")
-
 
 
 def test_fusion_default_lead_has_no_tools_and_sidekick_does(monkeypatch):
@@ -1642,7 +1650,8 @@ def test_fusion_stray_planning_tool_calls_are_not_honored(monkeypatch):
     # stray tool-call + forced retry + review
     assert worker.main_idx == 3
     main_tool_args = [
-        tools for (_slot, messages, tools) in worker.calls
+        tools
+        for (_slot, messages, tools) in worker.calls
         if messages[0]["content"] == fusion.MAIN_PREAMBLE
     ]
     assert main_tool_args == [None, None, None]
@@ -1674,7 +1683,8 @@ def test_fusion_review_can_call_tools_under_review_policy(monkeypatch, tmp_path)
     assert event["status"] == "awaiting_tools"
     assert run.active_role == "main"
     review_calls = [
-        tools for (_slot, messages, tools) in worker.calls
+        tools
+        for (_slot, messages, tools) in worker.calls
         if messages[0]["content"] == fusion.MAIN_PREAMBLE and tools is not None
     ]
     assert review_calls == [[BASH_TOOL]]  # review got client tools; planning did not
@@ -1741,9 +1751,7 @@ def test_fusion_available_answer_skips_sidekick(monkeypatch):
         [("should not run", None, DEFAULT_USAGE)],
     )
     monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
-    run = fusion.FusionRun(
-        "answer-run", "what is the third word?", delegation_mode="available"
-    )
+    run = fusion.FusionRun("answer-run", "what is the third word?", delegation_mode="available")
     event = run.advance(coordinator=fusion.FusionCoordinator())
     assert event["status"] == "completed"
     assert event["report"] == "the third word is are"
@@ -1967,9 +1975,7 @@ def test_fusion_sidekick_tool_round_cap_escalates(monkeypatch, tmp_path):
     config = fusion.FusionConfig(path)
     monkeypatch.setattr(fusion, "_FUSION_CONFIG", config)
     coordinator = fusion.FusionCoordinator(config)
-    run = fusion.FusionRun(
-        "cap-run", "goal", tools=[BASH_TOOL], delegation_mode="forced"
-    )
+    run = fusion.FusionRun("cap-run", "goal", tools=[BASH_TOOL], delegation_mode="forced")
 
     event = run.advance(coordinator=coordinator)
     assert event["status"] == "awaiting_tools"
@@ -2011,3 +2017,104 @@ def test_fusion_old_pickle_restores_continuity_defaults():
     assert restored.latest_user == "goal"
     assert restored.sidekick_tool_rounds == 0
     assert restored.completed_via == ""
+
+
+def test_adaptive_router_escalates_through_sidekick_pool(monkeypatch, tmp_path):
+    path = tmp_path / "catalog.toml"
+    path.write_text(
+        "[fusion]\n"
+        'main = "run-main"\n'
+        'sidekick = ["run-s1", "run-s2"]\n'
+        "fallback_on_escalate = true\n"
+        'main_tools = "none"\n'
+        "max_follow_ups = 2\n"
+    )
+    config = fusion.FusionConfig(path)
+    worker = SequenceWorker(
+        [
+            ("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE),
+            ("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
+        ],
+        [
+            ("ESCALATE_TO_MAIN: retry", None, DEFAULT_USAGE),
+            ("done", None, DEFAULT_USAGE),
+        ],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    monkeypatch.setattr(fusion, "_FUSION_CONFIG", config)
+    coordinator = fusion.FusionCoordinator(config)
+    run = fusion.FusionRun("router", "goal", delegation_mode="forced")
+
+    event = run.advance(coordinator=coordinator)
+
+    assert event["status"] == "completed"
+    sidekick_slots = [call[0] for call in worker.calls if call[0].startswith("run-s")]
+    assert sidekick_slots == ["run-s1", "run-s2"]
+
+
+def test_fusion_structured_plan_with_worker_profile(monkeypatch):
+    plan_json = json.dumps(
+        {
+            "complexity": 0.5,
+            "main_task": "verify script",
+            "sidekick_assignments": [{"task": "write a python utility", "profile": "coder"}],
+        }
+    )
+    worker = SequenceWorker(
+        [(plan_json, None, DEFAULT_USAGE), ("ACCEPT", None, DEFAULT_USAGE)],
+        [("I wrote the script.", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    run = fusion.FusionRun(
+        "struct",
+        "goal",
+        worker_profiles=[
+            fusion.FusionWorkerProfile(
+                name="coder",
+                model="deepseek-v4-flash",
+                instructions="You are a focused python coder.",
+            )
+        ],
+    )
+
+    event = run.advance()
+
+    assert event["status"] == "completed"
+    assert "wrote the script" in event["report"].lower()
+    sidekick_calls = [call for call in worker.calls if call[0] == "deepseek-v4-flash"]
+    assert sidekick_calls
+
+
+def test_fusion_run_budget_enforces_max_turns(monkeypatch):
+    worker = SequenceWorker(
+        [
+            ("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
+        ],
+        [("done", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    run = fusion.FusionRun(
+        "budget",
+        "goal",
+        delegation_mode="forced",
+        budget=fusion.FusionRunBudget(max_turns=0),
+    )
+
+    event = run.advance()
+
+    assert event["status"] == "error"
+    assert "turn budget" in event["report"].lower()
+
+
+def test_filter_tools_by_options_uses_bundles():
+    tools = [
+        {"type": "function", "function": {"name": "bash"}},
+        {"type": "function", "function": {"name": "edit_file"}},
+        {"type": "function", "function": {"name": "python"}},
+    ]
+    options = fusion.FusionToolOptions(enabled=["shell", "files"])
+    filtered = utils._filter_tools_by_options(tools, options)
+    names = {t["function"]["name"] for t in filtered}
+    assert names == {"bash", "edit_file"}

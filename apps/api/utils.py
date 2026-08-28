@@ -33,7 +33,6 @@ if not (_HERE / "mini.py").exists():
         sys.path.insert(0, str(_OPENFUGU))
 
 import providers
-import runs
 import serve_config
 from mini import (
     DEFAULT_SLOT_LABELS,
@@ -45,6 +44,8 @@ from serve_config import (
     MODEL_MODES,
     RUN_MAX_MSG_BYTES,
 )
+
+import runs
 
 
 def _split_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
@@ -503,6 +504,70 @@ def _configured_slot_models(override: Any = None) -> list[str]:
     if len(models) != len(value) or not models:
         raise ValueError("slot_models must be a non-empty list of model names")
     return models
+
+
+# Capability bundles map to common tool-name prefixes or tags.
+_BUNDLE_TOOLS: dict[str, set[str]] = {
+    "files": {"list_files", "read_file", "search_files", "write_file", "edit_file"},
+    "shell": {"bash", "shell", "sh", "execute_command"},
+    "code": {"execute_code", "ipython", "python", "exec", "run_code"},
+    "browser": {"search_web", "fetch_web_page", "browser_agent", "computer_use"},
+}
+
+
+def _filter_tools_by_options(tools: list[dict[str, Any]], options: Any) -> list[dict[str, Any]]:
+    """Return the subset of tools allowed by the given tool options."""
+    if not options:
+        return list(tools or [])
+    enabled = getattr(options, "enabled", None)
+    if not enabled:
+        return list(tools or [])
+    allowed_names: set[str] = set()
+    for capability in enabled:
+        if capability in _BUNDLE_TOOLS:
+            allowed_names.update(_BUNDLE_TOOLS[capability])
+        else:
+            allowed_names.add(str(capability))
+    return [t for t in (tools or []) if str(t.get("function", {}).get("name", "")) in allowed_names]
+
+
+def _load_skill_profile(name: str) -> Any | None:
+    """Load a Mantis skill as a Fusion worker profile, if present."""
+    for root in (
+        Path.home() / ".agents" / "skills",
+        Path.home() / ".devin" / "skills",
+        Path(__file__).resolve().parent.parent.parent / ".agents" / "skills",
+    ):
+        path = root / name / "SKILL.md"
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text()
+            lines = text.splitlines()
+            title = lines[0].lstrip("# ").strip() if lines else name
+            description = ""
+            instructions = ""
+            for i, line in enumerate(lines[1:], start=2):
+                if line.lower().startswith("## description"):
+                    description = "\n".join(
+                        ln.strip() for ln in lines[i:] if ln.strip() and not ln.startswith("##")
+                    ).split("\n\n")[0]
+                elif line.lower().startswith("## instructions") or line.lower().startswith(
+                    "## prompt"
+                ):
+                    instructions = "\n".join(
+                        ln.strip() for ln in lines[i:] if ln.strip() and not ln.startswith("##")
+                    ).split("\n\n")[0]
+            from fusion_types import FusionWorkerProfile
+
+            return FusionWorkerProfile(
+                name=name,
+                description=description or title,
+                instructions=instructions or text[:4000],
+            )
+        except OSError:
+            continue
+    return None
 
 
 __all__ = [k for k in globals() if not k.startswith("__")]

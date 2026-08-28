@@ -8,7 +8,7 @@ import re
 import threading
 import tomllib
 import uuid
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any, cast
 
@@ -16,6 +16,17 @@ import model_catalog
 import providers
 import serve_config
 import utils
+from fusion_budget import FusionBudgetGuard
+from fusion_router import FusionRouter
+from fusion_types import (
+    FusionPlan,
+    FusionRoutingConfig,
+    FusionRunBudget,
+    FusionSidekickAssignment,
+    FusionToolOptions,
+    FusionWorkerProfile,
+)
+
 from runs import (
     RUN_STORE,
     NativeRun,
@@ -87,9 +98,7 @@ def _format_fusion_follow_up(feedback: str) -> str:
     return f"{FUSION_FOLLOW_UP_OPEN}\n{feedback}\n{FUSION_FOLLOW_UP_CLOSE}"
 
 
-def _user_message_texts(
-    messages: list[dict[str, Any]] | None, brief: str
-) -> tuple[str, str]:
+def _user_message_texts(messages: list[dict[str, Any]] | None, brief: str) -> tuple[str, str]:
     """Return (first_user, last_user) texts for stable goal and latest_user."""
     users: list[str] = []
     for message in messages or []:
@@ -106,6 +115,7 @@ def _user_message_texts(
         return users[0], users[-1]
     brief_text = brief.strip() or brief
     return brief_text, brief_text
+
 
 REVIEW_PROMPT = (
     "The sidekick produced the following report. Review it. If it is satisfactory, "
@@ -165,6 +175,45 @@ PLAN_UNKNOWN_TOOL_PROMPT = (
     "Stop calling tools and reply with exactly two sections: "
     "'PLAN:' and 'BRIEF:'. No other text or tool calls."
 )
+
+PLAN_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "fusion_plan",
+        "schema": {
+            "type": "object",
+            "required": ["complexity", "main_task", "sidekick_assignments"],
+            "properties": {
+                "complexity": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "description": "Estimated difficulty of the user request.",
+                },
+                "main_task": {
+                    "type": "string",
+                    "description": "Concise summary of what the main engineer will verify.",
+                },
+                "sidekick_assignments": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["task"],
+                        "properties": {
+                            "task": {"type": "string"},
+                            "profile": {"type": "string"},
+                        },
+                    },
+                },
+                "verification_commands": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            },
+        },
+        "strict": True,
+    },
+}
 
 
 class FusionConfig:
@@ -229,6 +278,29 @@ class FusionConfig:
             return int(raw)
         except (TypeError, ValueError):
             return 4096
+
+    def main_routing(self) -> FusionRoutingConfig:
+        return FusionRoutingConfig.model_validate(
+            {k: v for k, v in (self._load() or {}).items() if k in FusionRoutingConfig.model_fields}
+        )
+
+    def main_router(self) -> FusionRouter:
+        return FusionRouter.from_config(self.main_routing(), "main")
+
+    def sidekick_router(self) -> FusionRouter:
+        return FusionRouter.from_config(self.main_routing(), "sidekick")
+
+    def worker_profiles(self) -> list[FusionWorkerProfile]:
+        raw = self._load().get("worker_profiles") or []
+        if not isinstance(raw, list):
+            return []
+        return [FusionWorkerProfile.model_validate(item) for item in raw]
+
+    def default_budget(self) -> FusionRunBudget:
+        return FusionRunBudget.model_validate(self._load().get("budget") or {})
+
+    def tool_options(self) -> FusionToolOptions:
+        return FusionToolOptions.model_validate(self._load().get("tool_options") or {})
 
 
 _FUSION_CONFIG = FusionConfig()
@@ -318,13 +390,15 @@ def _orchestration_trace(run: FusionRun, include_reasoning: bool = False) -> str
     if run.plan:
         lines.extend(["", "Plan:", run.plan])
     if run.sidekick_brief:
-        lines.extend([
-            "",
-            f"Delegated to sidekick · {_model_label(sidekick_slot)}",
-            "",
-            "Brief:",
-            run.sidekick_brief,
-        ])
+        lines.extend(
+            [
+                "",
+                f"Delegated to sidekick · {_model_label(sidekick_slot)}",
+                "",
+                "Brief:",
+                run.sidekick_brief,
+            ]
+        )
     tool_count = sum(
         len(msg.get("tool_calls") or [])
         for msg in run.sidekick_messages
@@ -354,12 +428,21 @@ class FusionCoordinator:
 
     def __init__(self, config: FusionConfig | None = None) -> None:
         self.config = config or _fusion_config()
-        self.main_slot = self.config.main_slot()
-        self.sidekick_slot = self.config.sidekick_slot()
+        self.main_router = self.config.main_router()
+        self.sidekick_router = self.config.sidekick_router()
+        self.main_slot = self.select("main", 0, 0)
+        self.sidekick_slot = self.select("sidekick", 0, 0)
         self.max_follow_ups = self.config.max_follow_ups()
         self.sidekick_max_tool_rounds = self.config.sidekick_max_tool_rounds()
         self.context_window = self.config.context_window()
         self.max_output_tokens = self.config.max_output_tokens()
+        self.worker_profiles = {p.name: p for p in self.config.worker_profiles()}
+        self.default_tool_options = self.config.tool_options()
+        self.default_budget = self.config.default_budget()
+
+    def select(self, role: str, turn_index: int, escalation_count: int) -> str:
+        router = self.main_router if role == "main" else self.sidekick_router
+        return router.select(turn_index, escalation_count)
 
     @staticmethod
     def _estimate_message_tokens(message: dict[str, Any]) -> int:
@@ -448,9 +531,7 @@ class FusionCoordinator:
         )
         if self._token_sum(pruned) <= max_input_tokens:
             return pruned
-        return self._prune_tool_messages(
-            pruned, max_chars=2048, head_chars=1024, tail_chars=256
-        )
+        return self._prune_tool_messages(pruned, max_chars=2048, head_chars=1024, tail_chars=256)
 
     def _drop_old_groups(
         self, messages: list[dict[str, Any]], max_input_tokens: int
@@ -651,6 +732,168 @@ class FusionCoordinator:
         return msg, usage
 
 
+class SidekickLane:
+    """One resumable sidekick worker lane for the structured Fusion path."""
+
+    def __init__(
+        self,
+        lane_id: str,
+        run: FusionRun,
+        coordinator: FusionCoordinator,
+        assignment: FusionSidekickAssignment,
+        profile: FusionWorkerProfile,
+    ) -> None:
+        self.lane_id = lane_id
+        self.run = run
+        self.coordinator = coordinator
+        self.assignment = assignment
+        self.profile = profile
+        self.tool_rounds = 0
+        self.pending_tool_calls: list[dict[str, Any]] = []
+        self.report: str | None = None
+        self.error: str | None = None
+        self.complete = False
+        self.messages = self._build_messages()
+
+    def _build_messages(self) -> list[dict[str, Any]]:
+        system = SIDEKICK_PREAMBLE
+        if self.profile.instructions:
+            system += "\n\n" + self.profile.instructions
+        plan = self.run.structured_plan.main_task if self.run.structured_plan else ""
+        brief = _format_fusion_brief(
+            self.run.goal,
+            self.run.latest_user,
+            plan,
+            self.assignment.task,
+        )
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": brief},
+        ]
+
+    def _tools_for_lane(self) -> list[dict[str, Any]] | None:
+        tools = list(self.run.tools or [])
+        if self.profile.tools:
+            names = set(self.profile.tools)
+            tools = [t for t in tools if str(t.get("function", {}).get("name", "")) in names]
+        return tools or None
+
+    def _select_slot(self) -> str:
+        if self.profile.model:
+            router = FusionRouter(
+                FusionRoutingConfig(sidekick=self.profile.model),
+                "sidekick",
+                self.coordinator.sidekick_router.base_route,
+            )
+            return router.select(self.run.follow_up_count, self.run.follow_up_count)
+        return self.run.sidekick_router.select(self.run.follow_up_count, self.run.follow_up_count)
+
+    def step(self, tool_results: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        if self.error:
+            return self._status()
+        if self.complete:
+            return self._status(status="completed")
+        if tool_results:
+            self._append_tool_results(tool_results)
+            self.pending_tool_calls = []
+        if self.tool_rounds >= self.coordinator.sidekick_max_tool_rounds:
+            self.report = "ESCALATE_TO_MAIN: sidekick exceeded tool budget"
+            self.complete = True
+            return self._status(status="completed", report=self.report)
+
+        slot = self._select_slot()
+        tools = self._tools_for_lane()
+        message, usage = self.coordinator._call_worker(slot, self.messages, tools)
+        if self.run.budget is not None:
+            self.run.budget.consume_tokens(usage)
+            self.run.budget.consume_turn()
+        self.run.add_usage(usage, model=slot)
+        self.run.record_activity(
+            "sidekick_lane_turn",
+            lane=self.lane_id,
+            role="sidekick",
+            model=slot,
+            status="completed",
+        )
+        providers._emit_progress(
+            {
+                "type": "task.completed",
+                "role": "sidekick",
+                "lane": self.lane_id,
+                "model": slot,
+                "task": self.assignment.task,
+            }
+        )
+
+        text = str(message.get("content") or "")
+        calls = message.get("tool_calls") or []
+        self.messages.append(message)
+        if calls:
+            self.tool_rounds += 1
+            for call in calls:
+                call["id"] = f"{self.lane_id}:{call['id']}"
+            self.pending_tool_calls = calls
+            return self._status(status="awaiting_tools", pending=calls)
+
+        escalate = self._parse_escalate(text)
+        if escalate is not None:
+            self.report = escalate
+            self.complete = True
+            return self._status(status="completed", report=escalate)
+
+        self.report = text
+        self.complete = True
+        return self._status(status="completed", report=text)
+
+    def _parse_escalate(self, text: str) -> str | None:
+        match = re.match(
+            r"^\s*ESCALATE_TO_MAIN:\s*(.*)\s*$",
+            text.strip(),
+            re.DOTALL | re.IGNORECASE,
+        )
+        if not match:
+            return None
+        return match.group(1).strip() or "sidekick requested escalation"
+
+    def _append_tool_results(self, tool_results: list[dict[str, Any]]) -> None:
+        pending = {"asst": {"tool_calls": [dict(call) for call in self.pending_tool_calls]}}
+        self.run.record_tool_results(pending, tool_results)
+        for result in tool_results:
+            raw_content = str(result.get("content", ""))
+            self.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": result["tool_call_id"],
+                    "content": raw_content[: utils.RUN_MAX_MSG_BYTES],
+                    "is_error": bool(result.get("is_error", False)),
+                }
+            )
+
+    def _status(
+        self,
+        status: str | None = None,
+        pending: list[dict[str, Any]] | None = None,
+        report: str | None = None,
+    ) -> dict[str, Any]:
+        if status is None:
+            status = "error" if self.error else "completed" if self.complete else "in_progress"
+        return {
+            "lane_id": self.lane_id,
+            "status": status,
+            "pending_tool_calls": pending or [],
+            "report": report or self.report,
+            "error": self.error,
+        }
+
+    def apply_follow_up(self, feedback: str) -> None:
+        """Reset a completed lane so it can revise with feedback."""
+        if not self.complete or self.error:
+            return
+        self.complete = False
+        self.report = None
+        self.messages.append({"role": "user", "content": _format_fusion_follow_up(feedback)})
+
+
 class FusionRun(NativeRun):
     """A resumable lead/sidekick run whose roles are bound by the catalog."""
 
@@ -661,12 +904,18 @@ class FusionRun(NativeRun):
         tools: list[dict[str, Any]] | None = None,
         messages: list[dict[str, Any]] | None = None,
         delegation_mode: str = "forced",
+        worker_profiles: list[FusionWorkerProfile] | None = None,
+        budget: FusionRunBudget | None = None,
+        tool_options: FusionToolOptions | None = None,
     ) -> None:
         super().__init__(run_id)
         self.kind = "fusion"
         self.brief = brief
         mode = delegation_mode if delegation_mode in DELEGATION_MODES else "forced"
         self.delegation_mode = mode
+        self.worker_profiles = {p.name: p for p in (worker_profiles or [])}
+        self.budget = FusionBudgetGuard(**budget.model_dump()) if budget is not None else None
+        self.tool_options = tool_options or FusionToolOptions()
         goal, latest_user = _user_message_texts(messages, brief)
         self.goal = goal
         self.latest_user = latest_user
@@ -677,6 +926,8 @@ class FusionRun(NativeRun):
         # if the catalog is changed while a run is in progress.
         self.main_slot = coordinator.main_slot
         self.sidekick_slot = coordinator.sidekick_slot
+        self.main_router = coordinator.main_router
+        self.sidekick_router = coordinator.sidekick_router
         self.slot_models = [self.main_slot, self.sidekick_slot]
         policy = coordinator.config.main_tools()
         self.main_tools_policy = frozenset(
@@ -710,6 +961,15 @@ class FusionRun(NativeRun):
         self.completed_via: str = ""
         self._resume_allows_answer = False
         self.turns: list[dict[str, Any]] = []
+        self.structured = (
+            bool(self.worker_profiles)
+            or bool(self.tool_options.enabled)
+            or self.budget is not None
+            or bool(coordinator.worker_profiles)
+        )
+        self.structured_plan: FusionPlan | None = None
+        self.sidekick_lanes: list[SidekickLane] = []
+        self.sidekick_reports: list[str] = []
         self.status = "main_planning"
 
     def __setstate__(self, state: dict[str, Any]) -> None:
@@ -731,11 +991,20 @@ class FusionRun(NativeRun):
             "active_role": "main",
             "main_slot": "gpt-5_6-sol",
             "sidekick_slot": "gpt-5_6-luna",
+            "main_router": None,
+            "sidekick_router": None,
             "delegation_mode": "forced",
             "goal": getattr(self, "brief", "") or "",
             "latest_user": getattr(self, "brief", "") or "",
             "completed_via": "",
             "_resume_allows_answer": False,
+            "worker_profiles": {},
+            "budget": None,
+            "tool_options": FusionToolOptions(),
+            "structured": False,
+            "structured_plan": None,
+            "sidekick_lanes": [],
+            "sidekick_reports": [],
         }.items():
             if not hasattr(self, key):
                 setattr(self, key, default)
@@ -752,7 +1021,7 @@ class FusionRun(NativeRun):
                 {
                     "role": "tool",
                     "tool_call_id": result["tool_call_id"],
-                    "content": raw_content[:utils.RUN_MAX_MSG_BYTES],
+                    "content": raw_content[: utils.RUN_MAX_MSG_BYTES],
                     "is_error": bool(result.get("is_error", False)),
                 }
             )
@@ -769,9 +1038,7 @@ class FusionRun(NativeRun):
                 fn = call_info["function"]
                 reminder = self.repeat_guard.observe(fn.get("name", ""), fn.get("arguments", "{}"))
                 if reminder:
-                    target.append(
-                        {"role": "user", "content": utils.system_reminder(reminder)}
-                    )
+                    target.append({"role": "user", "content": utils.system_reminder(reminder)})
 
     def _call_lane(
         self,
@@ -779,15 +1046,38 @@ class FusionRun(NativeRun):
         role: str,
         prompt: str | None = None,
         tools: list[dict[str, Any]] | None = None,
+        *,
+        turn_index: int = 0,
+        escalation_count: int | None = None,
+        slot_override: str | None = None,
     ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
         """Call one lane's worker and record usage/activity for the turn."""
-        slot = self.main_slot if role == "main" else self.sidekick_slot
+        esc = self.follow_up_count if escalation_count is None else escalation_count
+        if slot_override is not None:
+            slot = slot_override
+        elif role == "main":
+            slot = (
+                self.main_router.select(turn_index, esc)
+                if self.main_router is not None
+                else self.main_slot
+            )
+        else:
+            slot = (
+                self.sidekick_router.select(turn_index, esc)
+                if self.sidekick_router is not None
+                else self.sidekick_slot
+            )
         messages = self.main_messages if role == "main" else self.sidekick_messages
         if prompt is not None:
             messages.append({"role": "user", "content": prompt})
         self.cache_namespace = providers._prompt_cache_namespace(messages, self.tools or None)
+        if self.budget is not None:
+            self.budget.check_timeout()
         message, usage = coordinator._call_worker(slot, messages, tools)
         messages.append(message)
+        if self.budget is not None:
+            self.budget.consume_tokens(usage)
+            self.budget.consume_turn()
         text = str(message.get("content") or "")
         calls = message.get("tool_calls") or []
         if getattr(serve_config._history_context, "active_run", None) is not self:
@@ -800,6 +1090,15 @@ class FusionRun(NativeRun):
             summary=text[:200] if text else "tool-calls",
         )
         self.turns.append({"role": role, "model_name": slot})
+        providers._emit_progress(
+            {
+                "type": f"{role}_turn",
+                "role": role,
+                "model": slot,
+                "status": "completed",
+                "summary": text[:200] if text else "tool-calls",
+            }
+        )
         return text, calls, usage
 
     def _parse_main_answer(self, text: str) -> str | None:
@@ -873,9 +1172,7 @@ class FusionRun(NativeRun):
         allow_answer: bool | None = None,
     ) -> None:
         """Parse ANSWER or PLAN/BRIEF from main; may issue one reminder retry."""
-        answer_ok = (
-            self.delegation_mode == "available" if allow_answer is None else allow_answer
-        )
+        answer_ok = self.delegation_mode == "available" if allow_answer is None else allow_answer
         answer = self._parse_main_answer(main_text)
         if answer is not None:
             if not answer_ok:
@@ -901,11 +1198,7 @@ class FusionRun(NativeRun):
         except ValueError:
             if not allow_retry:
                 raise
-            reminder = (
-                AVAILABLE_REMINDER_PROMPT
-                if answer_ok
-                else PLAN_REMINDER_PROMPT
-            )
+            reminder = AVAILABLE_REMINDER_PROMPT if answer_ok else PLAN_REMINDER_PROMPT
             main_text, main_calls, _ = self._call_lane(
                 coordinator, "main", prompt=reminder, tools=None
             )
@@ -977,6 +1270,71 @@ class FusionRun(NativeRun):
             self.request_events[request_id] = event
         return event
 
+    def _resolve_profile(
+        self,
+        name: str | None,
+        coordinator: FusionCoordinator,
+    ) -> FusionWorkerProfile:
+        """Return a worker profile by name, falling back to catalog or skills."""
+        if not name:
+            return FusionWorkerProfile(name="default")
+        if name in self.worker_profiles:
+            return self.worker_profiles[name]
+        if name in coordinator.worker_profiles:
+            return coordinator.worker_profiles[name]
+        skill = utils._load_skill_profile(name)
+        if skill is not None:
+            return skill
+        return FusionWorkerProfile(name=name)
+
+    def _filter_tools(self) -> list[dict[str, Any]]:
+        """Apply tool_options and profile filtering to the tool list."""
+        tools = utils._filter_tools_by_options(self.tools, self.tool_options)
+        return tools
+
+    def _parse_plan_text(self, text: str) -> FusionPlan | None:
+        """Parse a structured FusionPlan from JSON or legacy PLAN:/BRIEF: text."""
+        with suppress(ValueError, json.JSONDecodeError):
+            return FusionPlan.model_validate_json(text)
+        answer = self._parse_main_answer(text)
+        if answer is not None:
+            return FusionPlan(
+                complexity=0.0,
+                main_task=answer,
+                sidekick_assignments=[],
+            )
+        try:
+            plan, brief = self._parse_main_plan(text)
+            return FusionPlan(
+                complexity=0.5,
+                main_task=plan,
+                sidekick_assignments=[FusionSidekickAssignment(task=brief)],
+            )
+        except ValueError:
+            return None
+
+    def _distribute_tool_results(
+        self, tool_results: list[dict[str, Any]]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Map each tool result to the sidekick lane it belongs to."""
+        by_lane: dict[str, list[dict[str, Any]]] = {}
+        for result in tool_results:
+            tc_id = str(result.get("tool_call_id", ""))
+            prefix = tc_id.split(":", 1)[0] if ":" in tc_id else ""
+            by_lane.setdefault(prefix, []).append(result)
+        return by_lane
+
+    def _advance(
+        self,
+        tool_results: list[dict[str, Any]],
+        request_id: str | None,
+        message: str | None,
+        coordinator: FusionCoordinator,
+    ) -> dict[str, Any]:
+        if self.structured:
+            return self._advance_structured(tool_results, request_id, message, coordinator)
+        return self._advance_legacy(tool_results, request_id, message, coordinator)
+
     def advance(
         self,
         tool_results: list[dict[str, Any]] | None = None,
@@ -1016,7 +1374,7 @@ class FusionRun(NativeRun):
         summary_header = f"Total tool invocations: {total_calls} (Errors: {error_count})\n"
         return summary_header + "\n".join(lines)
 
-    def _advance(
+    def _advance_legacy(
         self,
         tool_results: list[dict[str, Any]],
         request_id: str | None,
@@ -1058,28 +1416,20 @@ class FusionRun(NativeRun):
             self.active_role = "main"
             available_tools = (
                 self.tools
-                if "plan" in self.main_tools_policy
-                and self.planning_tool_rounds < 2
-                and self.tools
+                if "plan" in self.main_tools_policy and self.planning_tool_rounds < 2 and self.tools
                 else None
             )
-            main_text, main_calls, _ = self._call_lane(
-                coordinator, "main", tools=available_tools
-            )
+            main_text, main_calls, _ = self._call_lane(coordinator, "main", tools=available_tools)
 
             # The main model may only call tools it was actually offered ("plan"
             # policy, max two rounds). Stray calls when no tools were offered,
             # unknown tools, or budget exhaustion force it back to text.
             if main_calls:
                 allowed_names = {
-                    t.get("function", {}).get("name")
-                    for t in self.tools
-                    if t.get("function")
+                    t.get("function", {}).get("name") for t in self.tools if t.get("function")
                 }
                 unknown = [
-                    c
-                    for c in main_calls
-                    if c.get("function", {}).get("name") not in allowed_names
+                    c for c in main_calls if c.get("function", {}).get("name") not in allowed_names
                 ]
                 if unknown or available_tools is None or self.planning_tool_rounds >= 2:
                     if unknown:
@@ -1122,9 +1472,7 @@ class FusionRun(NativeRun):
         for _ in range(max_iterations * 4):  # generous step ceiling
             if self.status == "sidekick_pending":
                 self.active_role = "sidekick"
-                at_tool_budget = (
-                    self.sidekick_tool_rounds >= coordinator.sidekick_max_tool_rounds
-                )
+                at_tool_budget = self.sidekick_tool_rounds >= coordinator.sidekick_max_tool_rounds
                 tools_allowed = None if at_tool_budget else self.tools
                 sidekick_text, sidekick_calls, _ = self._call_lane(
                     coordinator, "sidekick", tools=tools_allowed
@@ -1165,9 +1513,7 @@ class FusionRun(NativeRun):
                         }
                     )
                     self.active_role = "main"
-                    esc_text, esc_calls, _ = self._call_lane(
-                        coordinator, "main", tools=None
-                    )
+                    esc_text, esc_calls, _ = self._call_lane(coordinator, "main", tools=None)
                     if esc_calls:
                         raise ValueError("main called tools during escalation handling")
                     self._handle_main_planning_text(
@@ -1224,6 +1570,178 @@ class FusionRun(NativeRun):
                 )
                 self.status = "sidekick_pending"
                 continue
+            if self.status in ("completed", "awaiting_tools", "error"):
+                break
+
+        return self._ok_event(request_id)
+
+    def _advance_structured(
+        self,
+        tool_results: list[dict[str, Any]],
+        request_id: str | None,
+        message: str | None,
+        coordinator: FusionCoordinator,
+    ) -> dict[str, Any]:
+        """Run the structured main/sidekick swarm state machine."""
+        if self.cancelled:
+            raise RuntimeError("run is cancelled")
+
+        if message is not None and tool_results:
+            raise ValueError("cannot combine message follow-up with tool_results")
+
+        if message is not None:
+            if self.status == "awaiting_tools":
+                raise ValueError("message follow-up is invalid while awaiting_tools")
+            if self.status == "error":
+                raise ValueError("cannot follow up an errored fusion run")
+            self.latest_user = message
+            self.main_messages.append({"role": "user", "content": message})
+            self.structured_plan = None
+            self.sidekick_lanes = []
+            self.sidekick_reports = []
+            self.pending_tool_calls = []
+            self.follow_up_count = 0
+            self.status = "main_planning"
+            self._resume_allows_answer = True
+
+        if self.budget is not None:
+            self.budget.check_timeout()
+
+        # Apply client tool results to the lanes that requested them.
+        if self.status == "awaiting_tools":
+            by_lane = self._distribute_tool_results(tool_results)
+            for lane in self.sidekick_lanes:
+                lane_tool_results = by_lane.get(lane.lane_id, [])
+                if lane_tool_results:
+                    lane.step(lane_tool_results)
+            # Also allow main-lane tool results if main is reviewing with tools.
+            if self.active_role == "main" and self.pending_tool_calls:
+                validated = self._validate_tool_results(tool_results)
+                self._append_tool_results(validated)
+                self.pending_tool_calls = []
+                self.status = "main_review"
+            else:
+                self.pending_tool_calls = []
+                self.status = "sidekick_pending"
+        elif tool_results:
+            raise ValueError("tool_results are only valid when status is awaiting_tools")
+
+        # Main planning with a structured JSON plan.
+        if self.status == "main_planning":
+            self.active_role = "main"
+            self.active_response_format = PLAN_RESPONSE_FORMAT
+            try:
+                main_text, main_calls, _ = self._call_lane(coordinator, "main", tools=None)
+            finally:
+                self.active_response_format = None
+
+            if main_calls:
+                raise ValueError("main emitted tool calls in structured planning mode")
+
+            plan = self._parse_plan_text(main_text)
+            if plan is None:
+                raise ValueError("main did not produce a valid FusionPlan")
+            self.structured_plan = plan
+
+            providers._emit_progress(
+                {
+                    "type": "plan.completed",
+                    "role": "main",
+                    "complexity": plan.complexity,
+                    "assignments": len(plan.sidekick_assignments),
+                }
+            )
+
+            if not plan.sidekick_assignments:
+                self.report = plan.main_task
+                self.completed_via = "answer"
+                self.status = "completed"
+                return self._ok_event(request_id)
+
+            self.tools = self._filter_tools()
+            for i, assignment in enumerate(plan.sidekick_assignments):
+                profile = self._resolve_profile(assignment.profile, coordinator)
+                lane = SidekickLane(
+                    f"lane{i}",
+                    self,
+                    coordinator,
+                    assignment,
+                    profile,
+                )
+                self.sidekick_lanes.append(lane)
+            self.status = "sidekick_pending"
+
+        max_iterations = max(1, coordinator.max_follow_ups + 1)
+        for _ in range(max_iterations * 4):
+            if self.budget is not None:
+                self.budget.check_timeout()
+
+            if self.status == "sidekick_pending":
+                self.active_role = "sidekick"
+                all_pending: list[dict[str, Any]] = []
+                for lane in self.sidekick_lanes:
+                    if lane.complete or lane.error or lane.pending_tool_calls:
+                        continue
+                    status = lane.step()
+                    if status["status"] == "awaiting_tools":
+                        all_pending.extend(lane.pending_tool_calls)
+
+                if all_pending:
+                    self.pending_tool_calls = all_pending
+                    self.status = "awaiting_tools"
+                    return self._ok_event(request_id)
+
+                self.sidekick_reports = [
+                    lane.report for lane in self.sidekick_lanes if lane.complete and not lane.error
+                ]
+                self.sidekick_messages = [
+                    {"role": "user", "content": self.structured_plan.main_task}
+                ]
+                self.status = "main_review"
+                continue
+
+            if self.status == "main_review":
+                self.active_role = "main"
+                reports = "\n\n".join(
+                    f"Report {i}:\n{report}"
+                    for i, report in enumerate(self.sidekick_reports)
+                    if report
+                )
+                review_prompt = f"{REVIEW_PROMPT}{reports}"
+                review_text, review_calls, _ = self._call_lane(
+                    coordinator,
+                    "main",
+                    prompt=review_prompt,
+                    tools=self.tools if "review" in self.main_tools_policy else None,
+                )
+
+                if review_calls:
+                    for call in review_calls:
+                        call["id"] = f"main:{call['id']}"
+                    self.pending_tool_calls = review_calls
+                    self.status = "awaiting_tools"
+                    return self._ok_event(request_id)
+
+                accepted, feedback = self._parse_main_review(review_text)
+                if accepted:
+                    self.report = next((r for r in self.sidekick_reports if r), review_text)
+                    self.completed_via = "accept"
+                    self.status = "completed"
+                    return self._ok_event(request_id)
+
+                if self.follow_up_count >= coordinator.max_follow_ups:
+                    self.follow_up_capped = True
+                    self.report = next((r for r in self.sidekick_reports if r), review_text)
+                    self.completed_via = "capped"
+                    self.status = "completed"
+                    return self._ok_event(request_id)
+
+                self.follow_up_count += 1
+                for lane in self.sidekick_lanes:
+                    lane.apply_follow_up(feedback)
+                self.status = "sidekick_pending"
+                continue
+
             if self.status in ("completed", "awaiting_tools", "error"):
                 break
 
@@ -1319,10 +1837,20 @@ def create_fusion_run(
     tools: list[dict[str, Any]] | None = None,
     messages: list[dict[str, Any]] | None = None,
     delegation_mode: str = "forced",
+    worker_profiles: list[FusionWorkerProfile] | None = None,
+    budget: FusionRunBudget | None = None,
+    tool_options: FusionToolOptions | None = None,
 ) -> FusionRun:
     run_id = uuid.uuid4().hex
     run = FusionRun(
-        run_id, brief, tools, messages=messages, delegation_mode=delegation_mode
+        run_id,
+        brief,
+        tools,
+        messages=messages,
+        delegation_mode=delegation_mode,
+        worker_profiles=worker_profiles,
+        budget=budget,
+        tool_options=tool_options,
     )
     _put_run(run)
     return run
