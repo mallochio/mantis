@@ -601,6 +601,32 @@ class TrinityRun(NativeRun):
         self._expected_ids: set[str] = set()
         self._tool_rounds = 0
         self.repeat_guard = utils.RepeatToolGuard()
+        # Prompt-cache prefixes only match when the same model sees the same
+        # system/history/tools bytes. Pin the Worker and critic slots for the
+        # whole run so the router's per-step sampling does not hop models.
+        self.worker_slot: int | None = None
+        self.critic_slot: int | None = self._resolve_critic_slot()
+
+    def _resolve_critic_slot(self) -> int | None:
+        """Return a stable slot index for Thinker/Verifier, or None to pin on first use.
+
+        Prefer the catalog's conductor slot (Luna by default), then any slot
+        whose id contains ``luna``. ``None`` defers to the first critic sample.
+        """
+        try:
+            catalog = _load_mantis_catalog()
+        except (model_catalog.CatalogError, OSError, ValueError):
+            catalog = None
+        preferred: list[str] = []
+        if catalog is not None and catalog.conductor in self.slot_models:
+            preferred.append(catalog.conductor)
+        env_conductor = os.environ.get("MANTIS_CONDUCTOR_SLOT")
+        if env_conductor and env_conductor in self.slot_models:
+            preferred.append(env_conductor)
+        preferred.extend(slot for slot in self.slot_models if "luna" in slot.lower())
+        for slot in preferred:
+            return self.slot_models.index(slot)
+        return None
 
     def _model_name(self, agent_id: int) -> str:
         return str(self.slot_models[agent_id % len(self.slot_models)])
@@ -624,7 +650,16 @@ class TrinityRun(NativeRun):
             role = "Worker"  # nothing to verify yet [FC]
         if role == "Thinker" and self.last_response is None:
             role = "Worker"  # a Thinker with no response to reason about is noise
-        return role, int(r["agent_id"])
+        agent_id = int(r["agent_id"])
+        if role == "Worker":
+            if self.worker_slot is None:
+                self.worker_slot = agent_id
+            agent_id = self.worker_slot
+        elif role in ("Thinker", "Verifier"):
+            if self.critic_slot is None:
+                self.critic_slot = agent_id
+            agent_id = self.critic_slot
+        return role, agent_id
 
     def _role_prompt(self, role: str) -> str:
         if role == "Thinker":
@@ -751,7 +786,10 @@ class TrinityRun(NativeRun):
             summary=providers._running_summary(role),
         )
         try:
-            text, calls = utils._model_completion(model, messages, self.tools)
+            # Critic roles do not use tools; sending the tool schema on their
+            # requests breaks the cacheable prefix and wastes tokens.
+            role_tools = self.tools if role == "Worker" else None
+            text, calls = utils._model_completion(model, messages, role_tools)
             calls = self.own_tool_calls(calls)
             duration_ms = (time.monotonic() - started) * 1000.0
         except Exception as error:
