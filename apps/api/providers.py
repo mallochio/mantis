@@ -238,6 +238,15 @@ def _coerce_reasoning_effort(model: str, effort: str | None) -> str | None:
         if effort in ("high", "max"):
             return effort
         return None
+    # Kimi-K3 (Moonshot) supports max/high/xhigh/low; medium and none are not.
+    if name.startswith("kimi-") or name.startswith("moonshot"):
+        if effort in ("max", "high", "xhigh", "low"):
+            return effort
+        if effort == "medium":
+            return "high"
+        if effort in ("none", "minimal"):
+            return "low"
+        return None
     # OpenAI-family reasoning models accept none through xhigh; `max` is invalid
     # on GPT-5.6 and is clamped to the highest supported level.
     if name.startswith("gpt-5.6-") or name.startswith("o1") or name.startswith("o3"):

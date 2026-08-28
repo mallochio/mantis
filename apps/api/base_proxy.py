@@ -6,6 +6,7 @@ this module forwards the chat body without rewriting ``model``.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -83,6 +84,27 @@ def _with_openai_cache_breakpoints(messages: list[dict[str, Any]]) -> list[dict[
     return out
 
 
+def _catalog_path() -> Path:
+    configured = os.environ.get("AI_ROUTING_CONFIG") or os.environ.get("MANTIS_CATALOG_PATH")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".config" / "ai-routing" / "catalog.toml"
+
+
+@lru_cache(maxsize=1)
+def _load_base_route() -> Any | None:
+    """Load and cache the parsed [base] route from the active catalog."""
+    try:
+        with open(_catalog_path(), "rb") as f:
+            root = tomllib.load(f)
+        from model_catalog_schema import load_base_route
+
+        return load_base_route(root)
+    except Exception as error:  # noqa: BLE001 - catalog may fail in many ways
+        logger.debug("base route not loaded: %s", error)
+    return None
+
+
 @lru_cache(maxsize=1)
 def _base_route_family() -> str | None:
     """Determine the prompt-cache family for the current [base] route.
@@ -93,24 +115,28 @@ def _base_route_family() -> str | None:
     case we avoid cache markers rather than risk sending Anthropic blocks to
     xAI or dropping cache controls on a Claude call.
     """
+    route = _load_base_route()
+    if route is None:
+        return None
     try:
-        configured = os.environ.get("AI_ROUTING_CONFIG") or os.environ.get("MANTIS_CATALOG_PATH")
-        if configured:
-            path = Path(configured).expanduser()
-        else:
-            path = Path.home() / ".config" / "ai-routing" / "catalog.toml"
-        with open(path, "rb") as f:
-            root = tomllib.load(f)
-        from model_catalog_schema import load_base_route
-
-        route = load_base_route(root)
         models = (route.efficient.upstream_model, route.capable.upstream_model)
         families = {_model_cache_family(m) for m in models}
         if len(families) == 1 and None not in families:
             return families.pop()
-    except (OSError, KeyError, ValueError, TypeError, Exception) as error:
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
         logger.debug("base route cache family not loaded: %s", error)
     return None
+
+
+def _base_efficient_model() -> str | None:
+    """Return the upstream model id for the current [base] efficient target."""
+    route = _load_base_route()
+    if route is None:
+        return None
+    try:
+        return route.efficient.upstream_model
+    except AttributeError:
+        return None
 
 
 class BaseChatRequest(Protocol):
@@ -118,9 +144,7 @@ class BaseChatRequest(Protocol):
     user: str | None
     stream: bool
 
-    def model_dump(
-        self, *, exclude_none: bool, exclude: set[str]
-    ) -> dict[str, Any]: ...
+    def model_dump(self, *, exclude_none: bool, exclude: set[str]) -> dict[str, Any]: ...
 
 
 def router_client() -> httpx.Client:
@@ -163,6 +187,68 @@ def router_headers(headers: dict[str, str], body: BaseChatRequest) -> dict[str, 
     return out
 
 
+def _normalize_reasoning(body: dict[str, Any]) -> dict[str, Any]:
+    """Convert a structured ``reasoning`` object into ``reasoning_effort``.
+
+    Clients such as Prime Agent send ``reasoning: {"effort": "low"}``.
+    Switchyard's stage router only understands the flat ``reasoning_effort``
+    string, so leaving the object in the body causes an "Invalid request
+    payload" 400. Map ``reasoning.effort`` to ``reasoning_effort`` and drop
+    the object. The top-level ``max_tokens`` already governs output length,
+    so ``reasoning.max_tokens`` and ``reasoning.exclude`` are ignored here.
+    """
+    reasoning = body.pop("reasoning", None)
+    if not isinstance(reasoning, dict):
+        return body
+    effort = reasoning.get("effort")
+    if effort and "reasoning_effort" not in body:
+        body["reasoning_effort"] = effort
+    return body
+
+
+def _coerce_base_reasoning(body: dict[str, Any]) -> dict[str, Any]:
+    """Coerce the request's reasoning effort to a value the efficient target accepts.
+
+    The base stage router can pick either the efficient or capable target.
+    The efficient target is the most restrictive, so we coerce the requested
+    level using that model's vocabulary. For example, ``kimi-k3`` does not
+    accept ``medium`` or ``none``; we map them to ``high`` and ``low`` so the
+    request does not fail with a 400 the moment efficient is selected.
+    """
+    effort = body.get("reasoning_effort")
+    if effort is None:
+        return body
+    efficient = _base_efficient_model()
+    if efficient is None:
+        return body
+    try:
+        from providers import _coerce_reasoning_effort
+
+        coerced = _coerce_reasoning_effort(efficient, effort)
+    except Exception:  # noqa: BLE001 - coercion is best-effort, keep original body on failure
+        return body
+    if coerced is None:
+        body.pop("reasoning_effort", None)
+    else:
+        body["reasoning_effort"] = coerced
+    return body
+
+
+def _coerce_max_completion_tokens(body: dict[str, Any]) -> dict[str, Any]:
+    """Normalize ``max_completion_tokens`` to ``max_tokens`` for Switchyard.
+
+    Some clients send ``max_completion_tokens`` (OpenAI o1/o3 style) while
+    the Switchyard extra_body supplies ``max_tokens``. Sending both to a
+    provider can produce a 400, so we collapse the client value into the
+    standard ``max_tokens`` key and let the request override the catalog.
+    """
+    if "max_completion_tokens" in body:
+        value = body.pop("max_completion_tokens")
+        if "max_tokens" not in body and value is not None:
+            body["max_tokens"] = value
+    return body
+
+
 def _apply_base_cache_markers(body: dict[str, Any]) -> dict[str, Any]:
     """Add provider-native prompt-cache markers to the outgoing chat body.
 
@@ -182,6 +268,9 @@ def _apply_base_cache_markers(body: dict[str, Any]) -> dict[str, Any]:
 
 def router_body(request: BaseChatRequest) -> dict[str, Any]:
     body = request.model_dump(exclude_none=True, exclude={"user", "metadata"})
+    body = _normalize_reasoning(body)
+    body = _coerce_base_reasoning(body)
+    body = _coerce_max_completion_tokens(body)
     return _apply_base_cache_markers(body)
 
 
@@ -214,10 +303,8 @@ def router_error(upstream: httpx.Response) -> JSONResponse:
         )
     except (ValueError, httpx.ResponseNotRead):
         text = ""
-        try:
+        with contextlib.suppress(Exception):
             text = upstream.text
-        except Exception:
-            pass
         logger.warning(
             "router returned non-json error status=%s content_type=%s body=%r",
             upstream.status_code,

@@ -7,10 +7,13 @@ import httpx
 
 
 def test_session_id_prefers_switchyard_header():
-    assert base_proxy.session_id(
-        {"x-switchyard-session-id": "switch", "x-route-session": "route"},
-        type("R", (), {"metadata": None, "user": None}),
-    ) == "switch"
+    assert (
+        base_proxy.session_id(
+            {"x-switchyard-session-id": "switch", "x-route-session": "route"},
+            type("R", (), {"metadata": None, "user": None}),
+        )
+        == "switch"
+    )
 
 
 def test_session_id_falls_back_to_metadata():
@@ -73,3 +76,88 @@ def test_router_error_parses_sse_error_stream():
     assert result.status_code == 400
     body = result.body.decode()
     assert "model did not respond" in body
+
+
+def _make_request(data: dict) -> object:
+    class Request:
+        def model_dump(self, *, exclude_none, exclude):
+            excluded = {*exclude}
+            return {k: v for k, v in data.items() if k not in excluded}
+
+    return Request()
+
+
+def test_router_body_normalizes_reasoning_object():
+    body = base_proxy.router_body(
+        _make_request(
+            {
+                "model": "mantis/base",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": False,
+                "reasoning": {"effort": "low", "max_tokens": 1000},
+                "user": "u",
+                "metadata": {"session_id": "s"},
+            }
+        )
+    )
+    assert body["reasoning_effort"] == "low"
+    assert "reasoning" not in body
+    assert "user" not in body
+    assert "metadata" not in body
+
+
+def test_router_body_preserves_existing_reasoning_effort():
+    body = base_proxy.router_body(
+        _make_request(
+            {
+                "model": "mantis/base",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning": {"effort": "low"},
+                "reasoning_effort": "high",
+            }
+        )
+    )
+    assert body["reasoning_effort"] == "high"
+    assert "reasoning" not in body
+
+
+def test_router_body_without_reasoning_unchanged():
+    body = base_proxy.router_body(
+        _make_request(
+            {
+                "model": "mantis/base",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "high",
+            }
+        )
+    )
+    assert body["reasoning_effort"] == "high"
+    assert "reasoning" not in body
+
+
+def test_router_body_coerces_medium_reasoning():
+    body = base_proxy.router_body(
+        _make_request(
+            {
+                "model": "mantis/base",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning": {"effort": "medium"},
+            }
+        )
+    )
+    assert body["reasoning_effort"] == "high"
+    assert "reasoning" not in body
+
+
+def test_router_body_renames_max_completion_tokens():
+    body = base_proxy.router_body(
+        _make_request(
+            {
+                "model": "mantis/base",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_completion_tokens": 32000,
+            }
+        )
+    )
+    assert body.get("max_tokens") == 32000
+    assert "max_completion_tokens" not in body
