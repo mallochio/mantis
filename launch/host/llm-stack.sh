@@ -33,7 +33,7 @@ ROUTER_URL="http://127.0.0.1:5500/health"
 MANTIS_LOCAL_READY="http://127.0.0.1:8088/ready"
 BIFROST_PIDFILE="$HOME/.local/share/bifrost/server.pid"
 SWITCHYARD_PIDFILE="$HOME/.local/share/mantis/switchyard/server.pid"
-CATALOG="$HOME/.config/ai-routing/catalog.toml"
+CATALOG="${AI_ROUTING_CONFIG:-$HOME/.config/ai-routing/catalog.toml}"
 
 step() { printf '\n\033[1;36m== %s ==\033[0m\n' "$1"; }
 ok()   { printf '  \033[1;32mok\033[0m    %s\n' "$1"; }
@@ -200,6 +200,49 @@ cmd_stop() {
   ok "bifrost stopped"
 }
 
+print_model_config() {
+  local output
+  output="$(
+    cd "$REPO_ROOT" && CATALOG="$CATALOG" uv run --no-sync python - 2>/dev/null <<'PY'
+import os, sys, tomllib
+
+catalog = os.environ.get("CATALOG", os.path.expanduser("~/.config/ai-routing/catalog.toml"))
+if not os.path.exists(catalog):
+    sys.exit(0)
+
+with open(catalog, "rb") as f:
+    data = tomllib.load(f)
+
+base = data.get("base") or {}
+targets = base.get("targets") or {}
+eff = targets.get("efficient") or {}
+cap = targets.get("capable") or {}
+fusion = data.get("fusion") or {}
+mantis = data.get("mantis") or {}
+workers = mantis.get("workers") or {}
+
+eff_model = eff.get("upstream_model", "?")
+cap_model = cap.get("upstream_model", "?")
+eff_effort = eff.get("reasoning_effort") or "none"
+cap_effort = cap.get("reasoning_effort") or "none"
+eff_tokens = eff.get("max_tokens") or "default"
+cap_tokens = cap.get("max_tokens") or "default"
+picker = base.get("picker") or "efficient_first"
+
+main_slot = fusion.get("main", "?")
+side_slot = fusion.get("sidekick", "?")
+main_eff = (workers.get(main_slot) or {}).get("reasoning_effort") or "none"
+side_eff = (workers.get(side_slot) or {}).get("reasoning_effort") or "none"
+
+print(f"  Base:          {picker}")
+print(f"    efficient:   {eff_model} (reasoning={eff_effort}, max_tokens={eff_tokens})")
+print(f"    capable:     {cap_model} (reasoning={cap_effort}, max_tokens={cap_tokens})")
+print(f"  Fusion:        main={main_slot} (reasoning={main_eff}), sidekick={side_slot} (reasoning={side_eff})")
+PY
+  )" || output=""
+  [ -n "$output" ] && printf '\n\033[1mMantis routing models\033[0m\n%s\n' "$output"
+}
+
 cmd_status() {
   printf '\n\033[1mLLM Stack Status\033[0m\n'
   printf '  %-14s %-7s %-8s %s\n' SERVICE PORT PID STATE
@@ -221,7 +264,8 @@ cmd_status() {
 
   local active_url="${MANTIS_URL:-http://127.0.0.1:8088/v1}"
   printf '\n  Active Environment MANTIS_URL: %s\n' "$active_url"
-  printf '  Routing target: \033[1;33mLocal Loopback\033[0m\n\n'
+  printf '  Routing target: \033[1;33mLocal Loopback\033[0m\n'
+  print_model_config
 }
 
 command="${1:-start}"
