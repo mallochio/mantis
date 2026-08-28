@@ -25,10 +25,13 @@ if [[ -f "$PIDFILE" ]]; then
 fi
 
 # Login zsh is the canonical source for locally stored provider credentials.
-# exec makes the recorded PID the Mantis process rather than an extra shell.
+# Detach into a new session so IDE/agent shell teardown cannot SIGKILL Mantis.
 echo '[mantis] starting portable host process (catalog mode)...'
-nohup zsh -ic "cd '$REPO' && exec ./scripts/run_mantis_native.sh" >>"$LOGFILE" 2>&1 &
-echo $! >"$PIDFILE"
+# shellcheck source=detach.sh
+source "$(cd "$(dirname "$0")" && pwd)/detach.sh"
+detach_cmd "$PIDFILE" "$LOGFILE" "$LOGFILE" \
+  /bin/zsh -ic "cd '$REPO' && exec ./scripts/run_mantis_native.sh" \
+  >/dev/null
 
 echo '[mantis] checking local readiness...'
 for _ in $(seq 1 180); do

@@ -6,16 +6,111 @@ this module forwards the chat body without rewriting ``model``.
 
 from __future__ import annotations
 
+import json
+import logging
 import os
+import tomllib
 from collections.abc import Callable, Iterator
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
 from fastapi.responses import JSONResponse, StreamingResponse
 
+logger = logging.getLogger("mantis.base_proxy")
+
 SWITCHYARD_SESSION_HEADER = "x-switchyard-session-id"
 SWITCHYARD_SELECTED_MODEL_HEADER = "x-model-router-selected-model"
+GROK_CONV_HEADER = "x-grok-conv-id"
 DEFAULT_ROUTER_URL = "http://127.0.0.1:5500/v1"
+
+
+def _model_cache_family(model: str) -> str | None:
+    """Return the prompt-cache dialect for an upstream model id."""
+    name = model.rsplit("/", 1)[-1].lower()
+    if name.startswith("claude-"):
+        return "anthropic"
+    if name.startswith("gpt-5.6-") or name.startswith("o3") or name.startswith("o4"):
+        return "openai"
+    return None
+
+
+def _with_cache_breakpoints(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Mark the stable prefix for prompt caching (Anthropic models).
+
+    Adds ``cache_control: {type: ephemeral}`` to the last block of the first
+    system message and to the message just before the final user/turn, so the
+    reusable system+history prefix is cached and only the new tail is billed.
+    """
+    if not isinstance(messages, list) or len(messages) < 2:
+        return messages
+    out = [dict(message) for message in messages]
+
+    def _mark(message: dict[str, Any]) -> None:
+        content = message.get("content")
+        if content is None:
+            return
+        if isinstance(content, list):
+            blocks = list(content)
+        else:
+            blocks = [{"type": "text", "text": str(content)}]
+        if blocks and isinstance(blocks[-1], dict) and "cache_control" not in blocks[-1]:
+            blocks[-1] = {**blocks[-1], "cache_control": {"type": "ephemeral"}}
+            message["content"] = blocks
+
+    if out and out[0].get("role") == "system":
+        _mark(out[0])
+    if len(out) >= 3:
+        _mark(out[-2])
+    return out
+
+
+def _with_openai_cache_breakpoints(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Mark stable layers for OpenAI GPT-5.6+ explicit prompt caching."""
+    out: list[dict[str, Any]] = []
+    last_system_index = -1
+    for i, message in enumerate(messages):
+        if message.get("role") == "system":
+            last_system_index = i
+    for i, message in enumerate(messages):
+        msg = dict(message)
+        if i == last_system_index:
+            msg["prompt_cache_breakpoint"] = {"mode": "explicit"}
+        if i == len(messages) - 2 and len(messages) >= 2:
+            msg["prompt_cache_breakpoint"] = {"mode": "explicit"}
+        out.append(msg)
+    return out
+
+
+@lru_cache(maxsize=1)
+def _base_route_family() -> str | None:
+    """Determine the prompt-cache family for the current [base] route.
+
+    Returns ``anthropic`` or ``openai`` when both base targets are the same
+    family, or ``None`` when the catalog cannot be read or the targets are
+    mixed/unknown (e.g., Grok and Claude in the same route).  In the mixed
+    case we avoid cache markers rather than risk sending Anthropic blocks to
+    xAI or dropping cache controls on a Claude call.
+    """
+    try:
+        configured = os.environ.get("AI_ROUTING_CONFIG") or os.environ.get("MANTIS_CATALOG_PATH")
+        if configured:
+            path = Path(configured).expanduser()
+        else:
+            path = Path.home() / ".config" / "ai-routing" / "catalog.toml"
+        with open(path, "rb") as f:
+            root = tomllib.load(f)
+        from model_catalog_schema import load_base_route
+
+        route = load_base_route(root)
+        models = (route.efficient.upstream_model, route.capable.upstream_model)
+        families = {_model_cache_family(m) for m in models}
+        if len(families) == 1 and None not in families:
+            return families.pop()
+    except (OSError, KeyError, ValueError, TypeError, Exception) as error:
+        logger.debug("base route cache family not loaded: %s", error)
+    return None
 
 
 class BaseChatRequest(Protocol):
@@ -60,11 +155,34 @@ def router_headers(headers: dict[str, str], body: BaseChatRequest) -> dict[str, 
     session = session_id(headers, body)
     if session:
         out[SWITCHYARD_SESSION_HEADER] = session
+        # xAI Grok routes prompt-cache state by conversation; pinning the same
+        # conversation to the same server makes cache hits reliable. Other
+        # providers ignore the custom header, so it is safe to forward whenever
+        # we have a stable session identity.
+        out[GROK_CONV_HEADER] = session
     return out
 
 
+def _apply_base_cache_markers(body: dict[str, Any]) -> dict[str, Any]:
+    """Add provider-native prompt-cache markers to the outgoing chat body.
+
+    The markers are chosen from the catalog [base] route so switching
+    ``catalog.toml`` between Grok and Anthropic does not require code changes.
+    """
+    family = _base_route_family()
+    messages = body.get("messages")
+    if not family or not isinstance(messages, list) or len(messages) < 2:
+        return body
+    if family == "anthropic":
+        body["messages"] = _with_cache_breakpoints(messages)
+    elif family == "openai":
+        body["messages"] = _with_openai_cache_breakpoints(messages)
+    return body
+
+
 def router_body(request: BaseChatRequest) -> dict[str, Any]:
-    return request.model_dump(exclude_none=True, exclude={"user", "metadata"})
+    body = request.model_dump(exclude_none=True, exclude={"user", "metadata"})
+    return _apply_base_cache_markers(body)
 
 
 def router_response_headers(upstream: httpx.Response) -> dict[str, str]:
@@ -79,13 +197,59 @@ def router_response_headers(upstream: httpx.Response) -> dict[str, str]:
 
 
 def router_error(upstream: httpx.Response) -> JSONResponse:
+    """Return an OpenAI-compatible error from a failed router response.
+
+    Switchyard usually returns JSON, but streaming or low-level failures may
+    produce an SSE error stream or a plain text body. We log the raw response
+    and attempt to surface the most useful message.
+    """
     try:
         body = upstream.json()
+        if isinstance(body, dict) and "error" in body:
+            return JSONResponse(body, status_code=upstream.status_code)
+        # Router returned JSON but not an error object; wrap it.
+        return JSONResponse(
+            {"error": {"message": json.dumps(body), "type": "upstream_error"}},
+            status_code=upstream.status_code,
+        )
     except (ValueError, httpx.ResponseNotRead):
+        text = ""
+        try:
+            text = upstream.text
+        except Exception:
+            pass
+        logger.warning(
+            "router returned non-json error status=%s content_type=%s body=%r",
+            upstream.status_code,
+            upstream.headers.get("content-type"),
+            text[:1000],
+        )
+        message = text.strip() if text.strip() else f"router returned status {upstream.status_code}"
+
+        # Some providers (e.g. Bifrost) return an SSE error stream for a failed
+        # chat request. Look for an ``error`` field in the first data line.
+        if message.startswith("data:"):
+            for line in message.splitlines():
+                if not line.startswith("data:"):
+                    continue
+                payload = line.removeprefix("data:").strip()
+                if payload == "[DONE]":
+                    continue
+                try:
+                    data = json.loads(payload)
+                except ValueError:
+                    continue
+                if isinstance(data, dict) and isinstance(data.get("error"), dict):
+                    return JSONResponse(data, status_code=upstream.status_code)
+                if isinstance(data, dict) and data.get("error"):
+                    message = str(data["error"])
+                    break
+
         body = {
             "error": {
-                "message": "router returned an invalid response",
+                "message": message[:500],
                 "type": "upstream_error",
+                "status_code": upstream.status_code,
             }
         }
     return JSONResponse(body, status_code=upstream.status_code)

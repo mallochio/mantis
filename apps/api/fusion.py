@@ -40,34 +40,45 @@ FUSION_STATUS = frozenset(
 
 MAIN_PREAMBLE = (
     "You are the lead engineer on a software task. Plan the work, delegate execution to "
-    "a sidekick, and review the sidekick's output. When given a brief or conversation, "
-    "respond with exactly two sections: 'PLAN:' containing the high-level plan, and "
-    "'BRIEF:' containing a self-contained brief for the sidekick. The brief must state "
+    "a sidekick, and review the sidekick's output. "
+    "When you can fully resolve the user request without code changes or tool use "
+    "(clarifications, trivia, nothing-to-do, or answers already in context), reply with "
+    "exactly one section: 'ANSWER:' followed by the user-facing reply and nothing else. "
+    "Otherwise respond with exactly two sections: 'PLAN:' containing the high-level plan, "
+    "and 'BRIEF:' containing a self-contained brief for the sidekick. The brief must state "
     "the goal, the files to touch, hard constraints and edge cases, and the exact "
     "verification commands to run; require the sidekick to report the changes made, "
     "the commands it ran, and their results. When reviewing a sidekick report, reply "
     "exactly 'ACCEPT' if the report is satisfactory. Otherwise reply 'FOLLOW_UP:' "
-    "followed by concise, specific feedback."
+    "followed by concise, specific feedback. After an escalation from the sidekick, "
+    "reply with 'ANSWER:' or a new 'PLAN:' and 'BRIEF:'."
 )
 
 SIDEKICK_PREAMBLE = (
     "You are a fast, cheap coding sidekick. Implement, test, and lint according to "
-    "the brief you are given. Do not redesign the work; if the brief is impossible, "
-    "report the blocker instead. You may use the provided tools. When finished, "
-    "return a concise final report listing the changes made, the verification "
-    "commands you ran with their real output, and any remaining issues."
+    "the brief you are given. Treat 'goal:' as the stable task anchor and 'latest_user:' "
+    "as the current narrowing ask; obey 'brief:' for what to do. Do not redesign the "
+    "work. If the brief is impossible, needs frontier judgment, or you are over budget, "
+    "reply with exactly 'ESCALATE_TO_MAIN:' followed by a concise reason and stop. "
+    "You may use the provided tools. When finished successfully, return a concise final "
+    "report listing the changes made, the verification commands you ran with their real "
+    "output, and any remaining issues."
 )
 
 FUSION_BRIEF_OPEN = "<fusion-brief>"
 FUSION_BRIEF_CLOSE = "</fusion-brief>"
 FUSION_FOLLOW_UP_OPEN = "<fusion-follow-up>"
 FUSION_FOLLOW_UP_CLOSE = "</fusion-follow-up>"
+DELEGATION_MODES = frozenset({"available", "forced"})
 
 
-def _format_fusion_brief(goal: str, plan: str, brief: str) -> str:
+def _format_fusion_brief(goal: str, latest_user: str, plan: str, brief: str) -> str:
     return (
         f"{FUSION_BRIEF_OPEN}\n"
-        f"goal: {goal}\nplan: {plan}\nbrief: {brief}\n"
+        f"goal: {goal}\n"
+        f"latest_user: {latest_user}\n"
+        f"plan: {plan}\n"
+        f"brief: {brief}\n"
         f"{FUSION_BRIEF_CLOSE}"
     )
 
@@ -75,10 +86,37 @@ def _format_fusion_brief(goal: str, plan: str, brief: str) -> str:
 def _format_fusion_follow_up(feedback: str) -> str:
     return f"{FUSION_FOLLOW_UP_OPEN}\n{feedback}\n{FUSION_FOLLOW_UP_CLOSE}"
 
+
+def _user_message_texts(
+    messages: list[dict[str, Any]] | None, brief: str
+) -> tuple[str, str]:
+    """Return (first_user, last_user) texts for stable goal and latest_user."""
+    users: list[str] = []
+    for message in messages or []:
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            users.append(content.strip())
+        elif content is not None:
+            text = str(content).strip()
+            if text:
+                users.append(text)
+    if users:
+        return users[0], users[-1]
+    brief_text = brief.strip() or brief
+    return brief_text, brief_text
+
 REVIEW_PROMPT = (
     "The sidekick produced the following report. Review it. If it is satisfactory, "
     "reply exactly 'ACCEPT'. Otherwise reply 'FOLLOW_UP:' followed by concise feedback "
     "so the sidekick can revise.\n\nReport:\n"
+)
+
+ESCALATE_PROMPT = (
+    "The sidekick escalated back to you. Reply with exactly 'ANSWER:' and a "
+    "user-facing reply, or with 'PLAN:' and 'BRIEF:' to redelegate. "
+    "Do not call tools.\n\nEscalation:\n"
 )
 
 PLAN_REMINDER_PROMPT = (
@@ -89,10 +127,29 @@ PLAN_REMINDER_PROMPT = (
     "Do not include commentary, markdown, or tool calls."
 )
 
+AVAILABLE_REMINDER_PROMPT = (
+    "Your previous response was not valid. Reply with exactly 'ANSWER:' followed by "
+    "a user-facing reply, or with exactly two sections 'PLAN:' and 'BRIEF:'. "
+    "Do not include commentary, markdown, or tool calls."
+)
+
+FORCED_ANSWER_REMINDER_PROMPT = (
+    "Direct ANSWER is not allowed for this forced-delegation run. "
+    "Reply with exactly two sections and nothing else: "
+    "'PLAN:' containing the high-level plan, and "
+    "'BRIEF:' containing a self-contained brief for the sidekick."
+)
+
 PLAN_TOOL_BUDGET_PROMPT = (
     "You have already used the allowed planning tool budget. "
     "Stop calling tools and reply with exactly two sections: "
     "'PLAN:' and 'BRIEF:'. No other text or tool calls."
+)
+
+SIDEKICK_TOOL_BUDGET_PROMPT = (
+    "You have used the allowed sidekick tool budget. "
+    "Stop calling tools. Either finish with a concise final report, or reply with "
+    "exactly 'ESCALATE_TO_MAIN:' followed by a concise reason."
 )
 
 COMPACTION_INSTRUCTION = (
@@ -148,6 +205,14 @@ class FusionConfig:
             return int(raw)
         except (TypeError, ValueError):
             return 3
+
+    def sidekick_max_tool_rounds(self) -> int:
+        raw = self._load().get("sidekick_max_tool_rounds") or "16"
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 16
+        return max(1, value)
 
     def context_window(self) -> int:
         raw = self._load().get("context_window") or os.environ.get(
@@ -292,6 +357,7 @@ class FusionCoordinator:
         self.main_slot = self.config.main_slot()
         self.sidekick_slot = self.config.sidekick_slot()
         self.max_follow_ups = self.config.max_follow_ups()
+        self.sidekick_max_tool_rounds = self.config.sidekick_max_tool_rounds()
         self.context_window = self.config.context_window()
         self.max_output_tokens = self.config.max_output_tokens()
 
@@ -594,12 +660,18 @@ class FusionRun(NativeRun):
         brief: str = "",
         tools: list[dict[str, Any]] | None = None,
         messages: list[dict[str, Any]] | None = None,
+        delegation_mode: str = "forced",
     ) -> None:
         super().__init__(run_id)
         self.kind = "fusion"
         self.brief = brief
+        mode = delegation_mode if delegation_mode in DELEGATION_MODES else "forced"
+        self.delegation_mode = mode
+        goal, latest_user = _user_message_texts(messages, brief)
+        self.goal = goal
+        self.latest_user = latest_user
         # Feeds the learning record's task/task_hash (redacted by runs.py).
-        self.query = brief
+        self.query = goal
         coordinator = FusionCoordinator()
         # Keep the slots with the run so status/trace responses remain stable
         # if the catalog is changed while a run is in progress.
@@ -627,6 +699,7 @@ class FusionRun(NativeRun):
         self.active_role: str = "main"
         self.pending_tool_calls: list[dict[str, Any]] = []
         self.planning_tool_rounds = 0
+        self.sidekick_tool_rounds = 0
         self.repeat_guard = utils.RepeatToolGuard()
         self.report: str | None = None
         self.plan: str = ""
@@ -634,6 +707,8 @@ class FusionRun(NativeRun):
         self.error: str | None = None
         self.follow_up_count = 0
         self.follow_up_capped = False
+        self.completed_via: str = ""
+        self._resume_allows_answer = False
         self.turns: list[dict[str, Any]] = []
         self.status = "main_planning"
 
@@ -652,9 +727,15 @@ class FusionRun(NativeRun):
             "slot_models": [],
             "turns": [],
             "planning_tool_rounds": 0,
+            "sidekick_tool_rounds": 0,
             "active_role": "main",
             "main_slot": "gpt-5_6-sol",
             "sidekick_slot": "gpt-5_6-luna",
+            "delegation_mode": "forced",
+            "goal": getattr(self, "brief", "") or "",
+            "latest_user": getattr(self, "brief", "") or "",
+            "completed_via": "",
+            "_resume_allows_answer": False,
         }.items():
             if not hasattr(self, key):
                 setattr(self, key, default)
@@ -721,6 +802,13 @@ class FusionRun(NativeRun):
         self.turns.append({"role": role, "model_name": slot})
         return text, calls, usage
 
+    def _parse_main_answer(self, text: str) -> str | None:
+        match = re.match(r"^\s*ANSWER:\s*(.*)\s*$", text.strip(), re.DOTALL | re.IGNORECASE)
+        if not match:
+            return None
+        answer = match.group(1).strip()
+        return answer or None
+
     def _parse_main_plan(self, text: str) -> tuple[str, str]:
         plan_match = re.search(r"PLAN:(.*?)(?:BRIEF:|$)", text, re.DOTALL)
         brief_match = re.search(r"BRIEF:(.*)", text, re.DOTALL)
@@ -731,6 +819,15 @@ class FusionRun(NativeRun):
         if not plan or not sidekick_brief:
             raise ValueError("main produced empty PLAN or BRIEF")
         return plan, sidekick_brief
+
+    def _parse_sidekick_escalate(self, text: str) -> str | None:
+        match = re.match(
+            r"^\s*ESCALATE_TO_MAIN:\s*(.*)\s*$", text.strip(), re.DOTALL | re.IGNORECASE
+        )
+        if not match:
+            return None
+        reason = match.group(1).strip()
+        return reason or "sidekick requested escalation"
 
     def _parse_main_review(self, text: str) -> tuple[bool, str]:
         stripped = text.strip()
@@ -749,6 +846,79 @@ class FusionRun(NativeRun):
             "main review did not output a valid decision "
             f"('ACCEPT' or 'FOLLOW_UP: <feedback>'), got: {stripped[:120]!r}"
         )
+
+    def _queue_sidekick_brief(self) -> None:
+        self.sidekick_messages.append(
+            {
+                "role": "user",
+                "content": _format_fusion_brief(
+                    self.goal, self.latest_user, self.plan, self.sidekick_brief
+                ),
+            }
+        )
+        self.sidekick_tool_rounds = 0
+        self.status = "sidekick_pending"
+
+    def _complete_answer(self, answer: str) -> None:
+        self.report = answer
+        self.completed_via = "answer"
+        self.status = "completed"
+
+    def _handle_main_planning_text(
+        self,
+        coordinator: FusionCoordinator,
+        main_text: str,
+        *,
+        allow_retry: bool,
+        allow_answer: bool | None = None,
+    ) -> None:
+        """Parse ANSWER or PLAN/BRIEF from main; may issue one reminder retry."""
+        answer_ok = (
+            self.delegation_mode == "available" if allow_answer is None else allow_answer
+        )
+        answer = self._parse_main_answer(main_text)
+        if answer is not None:
+            if not answer_ok:
+                if not allow_retry:
+                    raise ValueError("main emitted ANSWER on a forced-delegation run")
+                main_text, main_calls, _ = self._call_lane(
+                    coordinator, "main", prompt=FORCED_ANSWER_REMINDER_PROMPT, tools=None
+                )
+                if main_calls:
+                    raise ValueError("main called tools instead of producing a plan")
+                self._handle_main_planning_text(
+                    coordinator,
+                    main_text,
+                    allow_retry=False,
+                    allow_answer=False,
+                )
+                return
+            self._complete_answer(answer)
+            return
+
+        try:
+            self.plan, self.sidekick_brief = self._parse_main_plan(main_text)
+        except ValueError:
+            if not allow_retry:
+                raise
+            reminder = (
+                AVAILABLE_REMINDER_PROMPT
+                if answer_ok
+                else PLAN_REMINDER_PROMPT
+            )
+            main_text, main_calls, _ = self._call_lane(
+                coordinator, "main", prompt=reminder, tools=None
+            )
+            if main_calls:
+                raise ValueError("main called tools instead of producing a plan") from None
+            self._handle_main_planning_text(
+                coordinator,
+                main_text,
+                allow_retry=False,
+                allow_answer=answer_ok,
+            )
+            return
+        self._queue_sidekick_brief()
 
     def _validate_tool_results(self, tool_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         expected_ids = {str(tc.get("id")) for tc in self.pending_tool_calls if tc.get("id")}
@@ -856,6 +1026,21 @@ class FusionRun(NativeRun):
         if self.cancelled:
             raise RuntimeError("run is cancelled")
 
+        if message is not None and tool_results:
+            raise ValueError("cannot combine message follow-up with tool_results")
+
+        if message is not None:
+            if self.status == "awaiting_tools":
+                raise ValueError("message follow-up is invalid while awaiting_tools")
+            if self.status == "error":
+                raise ValueError("cannot follow up an errored fusion run")
+            self.latest_user = message
+            self.main_messages.append({"role": "user", "content": message})
+            self.pending_tool_calls = []
+            self.planning_tool_rounds = 0
+            self.status = "main_planning"
+            self._resume_allows_answer = True
+
         # Apply client tool results only when awaiting tools.
         if self.status == "awaiting_tools":
             validated = self._validate_tool_results(tool_results)
@@ -868,7 +1053,7 @@ class FusionRun(NativeRun):
         elif tool_results:
             raise ValueError("tool_results are only valid when status is awaiting_tools")
 
-        # Main planning on a fresh run or resumed planning.
+        # Main planning on a fresh run, textual resume, or resumed planning.
         if self.status == "main_planning":
             self.active_role = "main"
             available_tools = (
@@ -884,7 +1069,7 @@ class FusionRun(NativeRun):
 
             # The main model may only call tools it was actually offered ("plan"
             # policy, max two rounds). Stray calls when no tools were offered,
-            # unknown tools, or budget exhaustion force it back to PLAN/BRIEF text.
+            # unknown tools, or budget exhaustion force it back to text.
             if main_calls:
                 allowed_names = {
                     t.get("function", {}).get("name")
@@ -922,38 +1107,79 @@ class FusionRun(NativeRun):
                     self.status = "awaiting_tools"
                     return self._ok_event(request_id)
 
-            # Parse the plan, with one retry on malformed output.
-            try:
-                self.plan, self.sidekick_brief = self._parse_main_plan(main_text)
-            except ValueError:
-                main_text, main_calls, _ = self._call_lane(
-                    coordinator, "main", prompt=PLAN_REMINDER_PROMPT, tools=None
-                )
-                if main_calls:
-                    raise ValueError("main called tools instead of producing a plan") from None
-                self.plan, self.sidekick_brief = self._parse_main_plan(main_text)
-            self.sidekick_messages.append(
-                {
-                    "role": "user",
-                    "content": _format_fusion_brief(
-                        self.brief, self.plan, self.sidekick_brief
-                    ),
-                }
+            self._handle_main_planning_text(
+                coordinator,
+                main_text,
+                allow_retry=True,
+                allow_answer=True if self._resume_allows_answer else None,
             )
-            self.status = "sidekick_pending"
+            self._resume_allows_answer = False
+            if self.status == "completed":
+                return self._ok_event(request_id)
 
         # Bounded sidekick-main loop.
         max_iterations = max(1, coordinator.max_follow_ups + 1)
         for _ in range(max_iterations * 4):  # generous step ceiling
             if self.status == "sidekick_pending":
                 self.active_role = "sidekick"
+                at_tool_budget = (
+                    self.sidekick_tool_rounds >= coordinator.sidekick_max_tool_rounds
+                )
+                tools_allowed = None if at_tool_budget else self.tools
                 sidekick_text, sidekick_calls, _ = self._call_lane(
-                    coordinator, "sidekick", tools=self.tools
+                    coordinator, "sidekick", tools=tools_allowed
                 )
                 if sidekick_calls:
-                    self.pending_tool_calls = sidekick_calls
-                    self.status = "awaiting_tools"
-                    break
+                    if at_tool_budget:
+                        sidekick_text, sidekick_calls, _ = self._call_lane(
+                            coordinator,
+                            "sidekick",
+                            prompt=SIDEKICK_TOOL_BUDGET_PROMPT,
+                            tools=None,
+                        )
+                        if sidekick_calls:
+                            sidekick_text = (
+                                "ESCALATE_TO_MAIN: sidekick kept calling tools "
+                                "after the tool budget was exhausted"
+                            )
+                            sidekick_calls = []
+                    else:
+                        self.sidekick_tool_rounds += 1
+                        self.pending_tool_calls = sidekick_calls
+                        self.status = "awaiting_tools"
+                        break
+
+                escalate_reason = self._parse_sidekick_escalate(sidekick_text)
+                if escalate_reason is not None:
+                    if self.follow_up_count >= coordinator.max_follow_ups:
+                        self.follow_up_capped = True
+                        self.report = self.report or sidekick_text
+                        self.completed_via = "capped"
+                        self.status = "completed"
+                        break
+                    self.follow_up_count += 1
+                    self.main_messages.append(
+                        {
+                            "role": "user",
+                            "content": f"{ESCALATE_PROMPT}{escalate_reason}",
+                        }
+                    )
+                    self.active_role = "main"
+                    esc_text, esc_calls, _ = self._call_lane(
+                        coordinator, "main", tools=None
+                    )
+                    if esc_calls:
+                        raise ValueError("main called tools during escalation handling")
+                    self._handle_main_planning_text(
+                        coordinator,
+                        esc_text,
+                        allow_retry=True,
+                        allow_answer=True,
+                    )
+                    if self.status == "completed":
+                        break
+                    continue
+
                 # Queue the report for the single review state. Keeping the prompt in
                 # main_messages also lets a tool-assisted review resume without a
                 # separate first-review branch.
@@ -982,12 +1208,14 @@ class FusionRun(NativeRun):
                 if accepted:
                     last_sidekick_text = self.sidekick_messages[-1].get("content", "")
                     self.report = self.report or last_sidekick_text
+                    self.completed_via = "accept"
                     self.status = "completed"
                     break
                 if self.follow_up_count >= coordinator.max_follow_ups:
                     self.follow_up_capped = True
                     last_sidekick_text = self.sidekick_messages[-1].get("content", "")
                     self.report = self.report or last_sidekick_text
+                    self.completed_via = "capped"
                     self.status = "completed"
                     break
                 self.follow_up_count += 1
@@ -1062,13 +1290,14 @@ def advance_fusion_run(
             event = run.advance_idempotent(tool_results, request_id, message, coordinator)
             if event.get("status") in ("completed", "error"):
                 status = str(event["status"])
-                terminated_by = (
-                    "fusion_error"
-                    if status == "error"
-                    else "fusion_capped"
-                    if run.follow_up_capped
-                    else "fusion_accept"
-                )
+                if status == "error":
+                    terminated_by = "fusion_error"
+                elif run.follow_up_capped:
+                    terminated_by = "fusion_capped"
+                elif run.completed_via == "answer":
+                    terminated_by = "fusion_answer"
+                else:
+                    terminated_by = "fusion_accept"
                 _write_learning_record(
                     run,
                     {
@@ -1089,10 +1318,26 @@ def create_fusion_run(
     brief: str,
     tools: list[dict[str, Any]] | None = None,
     messages: list[dict[str, Any]] | None = None,
+    delegation_mode: str = "forced",
 ) -> FusionRun:
     run_id = uuid.uuid4().hex
-    run = FusionRun(run_id, brief, tools, messages=messages)
+    run = FusionRun(
+        run_id, brief, tools, messages=messages, delegation_mode=delegation_mode
+    )
     _put_run(run)
+    return run
+
+
+def try_get_fusion_run(run_id: str) -> FusionRun | None:
+    """Return a non-error FusionRun if present; otherwise None."""
+    try:
+        run = get_run(run_id)
+    except KeyError:
+        return None
+    if not isinstance(run, FusionRun):
+        return None
+    if run.status == "error":
+        return None
     return run
 
 

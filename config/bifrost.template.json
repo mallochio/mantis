@@ -240,6 +240,19 @@
           "responses"
         ],
         "pricing_patch": "{\"input_cost_per_token\": 2e-06, \"output_cost_per_token\": 6e-06, \"cache_read_input_token_cost\": 2e-07}"
+      },
+      {
+        "id": "po-grok-4-6-vertex",
+        "name": "Grok 4.6 Vertex pricing ($2/$6/$0.50 per MTok, 500k context)",
+        "scope_kind": "provider",
+        "provider_id": "vertex",
+        "match_type": "exact",
+        "pattern": "xai/grok-4.6",
+        "request_types": [
+          "chat_completion",
+          "responses"
+        ],
+        "pricing_patch": "{\"input_cost_per_token\": 2e-06, \"output_cost_per_token\": 6e-06, \"cache_read_input_token_cost\": 5e-07}"
       }
     ],
     "routing_rules": [
@@ -446,6 +459,24 @@
         "enabled": true,
         "scope": "global",
         "priority": 21
+      },
+      {
+        "id": "rule-grok-4-6-fallback",
+        "name": "Grok 4.6 (Vertex -> OpenRouter fallback)",
+        "cel_expression": "model == \"xai/grok-4.6\" || model == \"grok-4.6\" || model == \"vertex/xai/grok-4.6\"",
+        "targets": [
+          {
+            "provider": "vertex",
+            "model": "xai/grok-4.6",
+            "weight": 1.0
+          }
+        ],
+        "fallbacks": [
+          "openrouter"
+        ],
+        "enabled": true,
+        "scope": "global",
+        "priority": 22
       }
     ]
   },
@@ -523,6 +554,7 @@
             "google/gemini-3.7-flash",
             "google/gemini-3.1-pro-preview",
             "google/gemini-3.5-flash-lite",
+            "xai/grok-4.6",
             "claude-sonnet-5",
             "claude-opus-5",
             "claude-fable-5"

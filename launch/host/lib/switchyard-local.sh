@@ -56,7 +56,13 @@ if [ "$HOST" != "127.0.0.1" ] && [ "$HOST" != "::1" ] && [ "$HOST" != "localhost
 fi
 
 export PYTHONPATH="$REPO_ROOT/scripts${PYTHONPATH:+:$PYTHONPATH}"
-if ! uv run --no-sync python "$REPO_ROOT/scripts/switchyard_config.py" render --catalog "$CATALOG" --output "$CONFIG_OUT"; then
+# uv must run inside the repo so it uses the project environment; callers often
+# invoke this script via ~/Startup with cwd outside the project.
+if ! (
+  cd "$REPO_ROOT" &&
+    uv run --no-sync python scripts/switchyard_config.py render \
+      --catalog "$CATALOG" --output "$CONFIG_OUT"
+); then
   echo "ERROR: failed to render Switchyard config from $CATALOG" >&2
   exit 1
 fi
@@ -80,9 +86,11 @@ if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
 fi
 rm -f "$LOG_DIR/server.pid"
 
-nohup "$SWITCHYARD_BIN" --config "$CONFIG_OUT" --host "$HOST" --port "$PORT" \
-  </dev/null >> "$LOG_DIR/server.out" 2>> "$LOG_DIR/server.err" &
-echo $! > "$LOG_DIR/server.pid"
+# shellcheck source=detach.sh
+source "$LIB_DIR/detach.sh"
+detach_cmd "$LOG_DIR/server.pid" "$LOG_DIR/server.out" "$LOG_DIR/server.err" \
+  "$SWITCHYARD_BIN" --config "$CONFIG_OUT" --host "$HOST" --port "$PORT" \
+  >/dev/null
 
 for _ in $(seq 1 150); do
   if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then

@@ -15,7 +15,7 @@ No service binds publicly by default. Provider credentials remain on this machin
 | `mantis/base` | Direct | NVIDIA NeMo Switchyard stage-router picks an efficient or capable model through Bifrost. |
 | `mantis/trinity` | Trinity | Multi-agent coordination over Worker, Thinker, and Verifier roles. |
 | `mantis/ultra` | Ultra | Conductor plans and executes a bounded workflow DAG over the worker pool. |
-| `mantis/fusion` | Fusion | Lead/sidekick orchestration with tool-use follow-ups and a review loop. |
+| `mantis/fusion` | Fusion | Lead/sidekick orchestration with tool-use follow-ups and a review loop. Chat uses available mode (main may `ANSWER` without a sidekick); native `/v1/fusion/delegate` stays forced. Resume chat turns with `X-Mantis-Run-Id` or prior Fusion-encoded tool call ids. |
 
 Mantis never switches among these four modes automatically. Base and Fusion are available in normal mode; Trinity and Ultra are experimental and require starting the stack with `--experimental`.
 

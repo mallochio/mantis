@@ -19,6 +19,9 @@ REPO_ROOT="$(cd "$STARTUP_DIR/../.." && pwd)"
 
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$HOME/.local/bin:$PATH"
 
+# Clear any inherited BIFROST_VERSION so .zshrc remains the single source of
+# truth for whether a specific version is pinned.
+unset BIFROST_VERSION
 if [ -f "$HOME/.zshrc" ]; then
   while IFS='=' read -r name value; do
     [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && export "$name=$value"
@@ -102,9 +105,14 @@ wait_ready() {
 
 start_one() {
   local no="$1" name="$2" script="$3" url="$4" timeout_s="$5" pat="${6:-}"
+  local out
   step "$no starting $name"
   if [ ! -x "$script" ]; then fail "component script missing: $script"; return 1; fi
-  "$script" >/dev/null 2>&1 || { fail "$script failed"; return 1; }
+  if ! out="$("$script" 2>&1)"; then
+    fail "$script failed"
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
   wait_ready "$name" "$url" "$timeout_s" "$pat" || return 1
 }
 

@@ -31,6 +31,9 @@ export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$HOME/.local/bin:$PATH"
 
 # StartupFolder/launchd does not read shell startup files. Import exported env
 # from zsh so ~/.zshrc remains the single place for Bifrost/backend config.
+# Clear any inherited BIFROST_VERSION so .zshrc controls whether a version is
+# pinned (commented out means "use the latest stable from npm").
+unset BIFROST_VERSION
 if [ -f "$HOME/.zshrc" ]; then
   while IFS='=' read -r name value; do
     [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && export "$name=$value"
@@ -73,7 +76,12 @@ if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   for pid in $(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null); do
     kill -9 "$pid" 2>/dev/null || true
   done
-  pgrep -f 'bifrost-http|@maximhq/bifrost' 2>/dev/null | while IFS= read -r pid; do
+  # macOS pgrep uses BRE by default, so the alternation "a|b" is literal.
+  # Collect matching PIDs from both patterns without tripping set -e/pipefail.
+  {
+    pgrep -f 'bifrost-http' 2>/dev/null || true
+    pgrep -f '@maximhq/bifrost' 2>/dev/null || true
+  } | while IFS= read -r pid; do
     kill -9 "$pid" 2>/dev/null || true
   done
   for _ in $(seq 1 50); do
@@ -86,7 +94,26 @@ fi
 
 # Prefer the npx wrapper (keeps the cached binary current); if the registry is
 # unreachable, fall back to the newest already-cached binary.
-if command -v npx >/dev/null 2>&1; then
+# If BIFROST_VERSION is set, use the exact cached binary (or npx tag) to support
+# pre-release/bespoke binaries (e.g. 2.0.0) not yet on the public npm registry.
+BIFROST_VERSION="${BIFROST_VERSION:-}"
+if [ -n "$BIFROST_VERSION" ]; then
+  # Cached binaries live in a `v` prefixed directory (v1.6.11, v2.0.0).
+  CACHED_DIR="$HOME/Library/Caches/bifrost/$BIFROST_VERSION"
+  if [ ! -d "$CACHED_DIR" ] && [ -d "$HOME/Library/Caches/bifrost/v$BIFROST_VERSION" ]; then
+    CACHED_DIR="$HOME/Library/Caches/bifrost/v$BIFROST_VERSION"
+  fi
+  CACHED_BIN="$CACHED_DIR/bin/bifrost-http-0"
+  if [ -x "$CACHED_BIN" ]; then
+    LAUNCH=("$CACHED_BIN")
+  elif command -v npx >/dev/null 2>&1; then
+    NPM_VERSION="${BIFROST_VERSION#v}"
+    LAUNCH=(npx -y "@maximhq/bifrost@$NPM_VERSION")
+  else
+    echo "ERROR: BIFROST_VERSION=$BIFROST_VERSION but no cached binary or npx is available" >&2
+    exit 1
+  fi
+elif command -v npx >/dev/null 2>&1; then
   LAUNCH=(npx -y @maximhq/bifrost)
 else
   CACHED_BIN=$(ls -1t "$HOME/Library/Caches/bifrost"/*/bin/bifrost-http-* 2>/dev/null | head -n1 || true)
@@ -98,9 +125,11 @@ else
   fi
 fi
 
-nohup "${LAUNCH[@]}" -app-dir "$DATA_DIR" -host "$HOST" -port "$PORT" -log-style pretty \
-  </dev/null >> "$LOG_DIR/server.out" 2>> "$LOG_DIR/server.err" &
-echo $! > "$DATA_DIR/server.pid"
+# shellcheck source=detach.sh
+source "$SCRIPT_DIR/detach.sh"
+detach_cmd "$DATA_DIR/server.pid" "$LOG_DIR/server.out" "$LOG_DIR/server.err" \
+  "${LAUNCH[@]}" -app-dir "$DATA_DIR" -host "$HOST" -port "$PORT" -log-style pretty \
+  >/dev/null
 
 for _ in $(seq 1 300); do  # 60s — first boot downloads the binary
   if curl -fsS --max-time 2 "http://$HOST:$PORT/health" >/dev/null 2>&1; then
