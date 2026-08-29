@@ -694,13 +694,17 @@ def _stream_completion(
     *,
     responses_api: bool = False,
     anthropic_messages: bool = False,
+    timeout_s: float | None = None,
 ) -> dict:
     """POST with SSE streaming; returns the canonical Chat-shaped result."""
     stream_body = dict(body)
     stream_body["stream"] = True
     if not responses_api:
         stream_body["stream_options"] = {"include_usage": True}
-    with client.stream("POST", url, headers=headers, json=stream_body) as response:
+    request_options = {"timeout": timeout_s} if timeout_s is not None else {}
+    with client.stream(
+        "POST", url, headers=headers, json=stream_body, **request_options
+    ) as response:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError:
@@ -748,6 +752,7 @@ def _provider_response(
     max_tokens: int,
     temperature: float,
     tools: list[dict[str, Any]] | None = None,
+    timeout_s: float | None = None,
 ) -> dict[str, Any]:
     run = getattr(serve_config._history_context, "active_run", None)
     tool_choice = getattr(run, "active_tool_choice", None)
@@ -756,10 +761,15 @@ def _provider_response(
     normalized_messages = _normalize_upstream_tool_ids(messages)
     failures: list[str] = []
     bindings = _runtime_bindings()
+    deadline = time.monotonic() + timeout_s if timeout_s is not None else None
     for index, attempt in enumerate(_failover_attempts(spec, bindings)):
         _check_client_connected()
         if index:
-            time.sleep(_FAILOVER_DELAY)
+            delay = _FAILOVER_DELAY
+            if deadline is not None:
+                delay = min(delay, max(0.0, deadline - time.monotonic()))
+            if delay:
+                time.sleep(delay)
         try:
             resolved = _resolve_model_spec(attempt, bindings)
             # Failover switches model/effort/endpoint per spec; messages, tools,
@@ -816,6 +826,9 @@ def _provider_response(
             }
         )
         try:
+            attempt_timeout = None if deadline is None else deadline - time.monotonic()
+            if attempt_timeout is not None and attempt_timeout <= 0:
+                raise httpx.TimeoutException("Fusion provider deadline exceeded")
             if _upstream_streaming_enabled():
                 data = _stream_completion(
                     serve_config._provider_client,
@@ -824,9 +837,15 @@ def _provider_response(
                     body,
                     responses_api=responses_api,
                     anthropic_messages=anthropic_messages,
+                    timeout_s=attempt_timeout,
                 )
             else:
-                response = serve_config._provider_client.post(url, headers=headers, json=body)
+                request_options = (
+                    {"timeout": attempt_timeout} if attempt_timeout is not None else {}
+                )
+                response = serve_config._provider_client.post(
+                    url, headers=headers, json=body, **request_options
+                )
                 response.raise_for_status()
                 data = response.json()
                 if anthropic_messages:

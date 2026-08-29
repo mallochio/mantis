@@ -71,11 +71,15 @@ class FusionBudgetGuard:
                     f"token budget exceeded: {self._tokens} > {self.max_tokens}"
                 )
 
-    def check_timeout(self) -> None:
+    def remaining_timeout_s(self) -> float | None:
         if self.timeout_ms is None:
-            return
-        elapsed_ms = int((time.monotonic() - self._started) * 1000)
-        if elapsed_ms > self.timeout_ms:
+            return None
+        remaining = self.timeout_ms / 1000 - (time.monotonic() - self._started)
+        if remaining <= 0:
             raise FusionBudgetExceededError(
-                f"wall-time budget exceeded: {elapsed_ms}ms > {self.timeout_ms}ms"
+                f"wall-time budget exceeded: {self.timeout_ms}ms elapsed"
             )
+        return remaining
+
+    def check_timeout(self) -> None:
+        self.remaining_timeout_s()

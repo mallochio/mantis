@@ -94,6 +94,22 @@ Tracks execution of `fusion-kyle-parity.md`. Updated after every stage.
   into the project venv. Entire suite: **521 passed**, one upstream Starlette
   deprecation warning.
 
+
+## Parity closure — compaction routing and in-flight deadlines — DONE
+
+- `FusionRouter.select_at_compaction` matches Kyle's cache-boundary policy:
+  normal turns retain the route; low-complexity main work may move to pool
+  slot 2; sidekick failures may promote to slot 2 only after compaction.
+- Successful model compaction marks the calling lane. The new route applies to
+  the next turn, not the current call. Structured main rerouting waits until
+  the just-produced plan's complexity is parsed.
+- `FusionBudgetGuard.remaining_timeout_s()` is passed to httpx streaming and
+  buffered provider calls. Failover attempts share one absolute deadline, so
+  retries cannot multiply the wall-time budget. Parallel lane threads now
+  inherit `active_run`, so the budget applies there too.
+- Targeted routing/failover/deadline tests: 112 passed. Complete suite after
+  closure: **527 passed**.
+
 ## Final verification — prime-agent harness multi-step coding (base + fusion) — DONE
 
 Environment:
@@ -122,8 +138,10 @@ Fusion session:
   encoded Fusion run/tool IDs resumed correctly;
 - file content exactly `FUSION_ROUTER_OK\n`; final exactly
   `FUSION_SESSION_DONE`.
+- repeated both Base and Fusion after parity-closure changes on a fresh
+  production-style launch: each again made 3 turns and passed exactly.
 
 Final gates:
-- all tests, including optional training files: **521 passed**;
+- all tests, including optional training files: **527 passed**;
 - ruff on every touched Python file: clean;
 - one existing Starlette/httpx deprecation warning only.

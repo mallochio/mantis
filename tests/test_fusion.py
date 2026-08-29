@@ -2381,3 +2381,95 @@ def test_provider_stream_assembly_emits_output_and_reasoning_deltas(monkeypatch)
         {"type": "provider.output.delta", "delta": "lo"},
         {"type": "provider.reasoning.delta", "delta": "think"},
     ]
+
+
+def test_fusion_budget_remaining_timeout():
+    guard = fusion.FusionBudgetGuard(timeout_ms=1000)
+    remaining = guard.remaining_timeout_s()
+    assert remaining is not None and 0 < remaining <= 1
+    guard._started -= 2
+    with pytest.raises(RuntimeError, match="wall-time"):
+        guard.remaining_timeout_s()
+
+
+def test_fusion_router_reroutes_only_at_compaction():
+    config = fusion.FusionRoutingConfig(
+        main=["main-strong", "main-cheap"],
+        sidekick=["side-cheap", "side-strong"],
+    )
+    main = fusion.FusionRouter(config, "main")
+    sidekick = fusion.FusionRouter(config, "sidekick")
+    assert main.select_at_compaction(0.5, "main-strong") == "main-cheap"
+    assert main.select_at_compaction(0.9, "main-strong") == "main-strong"
+    assert sidekick.select_at_compaction(0.5, "side-cheap", 0) == "side-cheap"
+    assert sidekick.select_at_compaction(0.5, "side-cheap", 1) == "side-strong"
+
+
+def test_fusion_run_records_compaction_reroute():
+    config = fusion.FusionRoutingConfig(
+        main=["main-strong", "main-cheap"],
+        sidekick=["side-cheap", "side-strong"],
+    )
+    run = fusion.FusionRun(
+        "reroute",
+        "goal",
+        budget=fusion.FusionRunBudget(max_turns=10),
+    )
+    run.main_router = fusion.FusionRouter(config, "main")
+    run.sidekick_router = fusion.FusionRouter(config, "sidekick")
+    run.main_slot = "main-strong"
+    run.sidekick_slot = "side-cheap"
+    run.structured_plan = fusion.FusionPlan(complexity=0.5, main_task="verify")
+
+    run._reroute_after_compaction("main", "main-strong")
+    run.follow_up_count = 1
+    run._reroute_after_compaction("sidekick", "side-cheap")
+
+    assert run.main_compaction_slot == "main-cheap"
+    assert run.sidekick_compaction_slot == "side-strong"
+    assert [entry["type"] for entry in run._activity[-2:]] == [
+        "fusion_reroute",
+        "fusion_reroute",
+    ]
+
+
+def test_fit_messages_marks_successful_compaction(monkeypatch):
+    coordinator = fusion.FusionCoordinator()
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "x" * 2000},
+    ]
+    compacted = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "summary"},
+    ]
+    monkeypatch.setattr(coordinator, "_compact_replay", lambda *_args: compacted)
+    serve_config._history_context.fusion_compacted = False
+
+    fitted = coordinator._fit_messages("slot", messages, None, 100)
+
+    assert fitted == compacted
+    assert serve_config._history_context.fusion_compacted is True
+
+
+def test_main_compaction_reroute_waits_for_plan_complexity():
+    config = fusion.FusionRoutingConfig(
+        main=["main-strong", "main-cheap"], sidekick="side"
+    )
+    run = fusion.FusionRun(
+        "deferred-reroute",
+        "goal",
+        budget=fusion.FusionRunBudget(max_turns=10),
+    )
+    run.main_router = fusion.FusionRouter(config, "main")
+    run.main_slot = "main-strong"
+
+    run._reroute_after_compaction("main", "main-strong")
+    assert run.main_compaction_pending == "main-strong"
+    assert run.main_compaction_slot is None
+
+    run.structured_plan = fusion.FusionPlan(complexity=0.4, main_task="verify")
+    previous = run.main_compaction_pending
+    run.main_compaction_pending = None
+    run._reroute_after_compaction("main", previous)
+    assert run.main_compaction_slot == "main-cheap"

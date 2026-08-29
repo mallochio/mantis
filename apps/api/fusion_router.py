@@ -67,6 +67,28 @@ class FusionRouter:
             index = min(escalation_count, len(pool) - 1)
         return self._resolve(pool[index], turn_index + escalation_count)
 
+    def select_at_compaction(
+        self,
+        complexity: float,
+        previous: str,
+        failure_count: int = 0,
+    ) -> str:
+        """Reroute only where compaction already forces a cache miss."""
+        pool: str | list[str] = self.config.main if self.role == "main" else self.config.sidekick
+        if isinstance(pool, str):
+            return self._resolve(pool, failure_count)
+        if not pool:
+            raise ValueError(f"fusion {self.role} pool is empty")
+        if self.role == "main":
+            if complexity < 0.85 and len(pool) > 1:
+                index = 1
+            else:
+                resolved = [self._resolve(candidate, 0) for candidate in pool]
+                index = resolved.index(previous) if previous in resolved else 0
+        else:
+            index = min(1 if failure_count > 0 else 0, len(pool) - 1)
+        return self._resolve(pool[index], failure_count)
+
     def _resolve(self, value: Any, offset: int) -> str:
         spec = str(value).strip()
         if not spec:

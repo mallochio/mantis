@@ -700,6 +700,7 @@ class FusionCoordinator:
             return pruned
         compacted = self._compact_replay(slot, pruned, tools, max_input_tokens)
         if compacted is not None and self._token_sum(compacted) <= max_input_tokens:
+            serve_config._history_context.fusion_compacted = True
             return compacted
         return self._drop_old_groups(compacted or pruned, max_input_tokens)
 
@@ -737,8 +738,17 @@ class FusionCoordinator:
         model_cap = self._output_tokens_for(slot)
         output_tokens = min(self.max_output_tokens, model_cap)
         input_budget = max(0, self.context_window - output_tokens)
+        serve_config._history_context.fusion_compacted = False
         fitted = self._fit_messages(slot, messages, tools, input_budget)
-        data = providers._provider_response(slot, fitted, output_tokens, 0.7, tools)
+        run = getattr(serve_config._history_context, "active_run", None)
+        budget = getattr(run, "budget", None)
+        timeout_s = budget.remaining_timeout_s() if budget is not None else None
+        if timeout_s is None:
+            data = providers._provider_response(slot, fitted, output_tokens, 0.7, tools)
+        else:
+            data = providers._provider_response(
+                slot, fitted, output_tokens, 0.7, tools, timeout_s=timeout_s
+            )
         msg = dict(data["choices"][0]["message"])
         msg.setdefault("role", "assistant")
         msg["content"] = str(msg.get("content") or "")
@@ -817,6 +827,8 @@ class SidekickLane:
                 self.coordinator.sidekick_router.base_route,
             )
             return router.select(self.run.follow_up_count, self.run.follow_up_count)
+        if self.run.sidekick_compaction_slot is not None:
+            return self.run.sidekick_compaction_slot
         return self.run.sidekick_router.select(self.run.follow_up_count, self.run.follow_up_count)
 
     def step(self, tool_results: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -835,6 +847,11 @@ class SidekickLane:
         slot = self._select_slot()
         tools = self._tools_for_lane()
         message, usage = self.coordinator._call_worker(slot, self.messages, tools)
+        if (
+            self.profile.model is None
+            and getattr(serve_config._history_context, "fusion_compacted", False)
+        ):
+            self.run._reroute_after_compaction("sidekick", slot)
         if self.run.budget is not None:
             self.run.budget.consume_tokens(usage)
             self.run.budget.consume_turn()
@@ -959,6 +976,9 @@ class FusionRun(NativeRun):
         self.sidekick_slot = coordinator.sidekick_slot
         self.main_router = coordinator.main_router
         self.sidekick_router = coordinator.sidekick_router
+        self.main_compaction_slot: str | None = None
+        self.sidekick_compaction_slot: str | None = None
+        self.main_compaction_pending: str | None = None
         self.slot_models = [self.main_slot, self.sidekick_slot]
         policy = coordinator.config.main_tools()
         self.main_tools_policy = frozenset(
@@ -1028,6 +1048,9 @@ class FusionRun(NativeRun):
             "sidekick_slot": "gpt-5_6-luna",
             "main_router": None,
             "sidekick_router": None,
+            "main_compaction_slot": None,
+            "sidekick_compaction_slot": None,
+            "main_compaction_pending": None,
             "delegation_mode": "forced",
             "goal": getattr(self, "brief", "") or "",
             "latest_user": getattr(self, "brief", "") or "",
@@ -1091,13 +1114,13 @@ class FusionRun(NativeRun):
         if slot_override is not None:
             slot = slot_override
         elif role == "main":
-            slot = (
+            slot = self.main_compaction_slot or (
                 self.main_router.select(turn_index, esc)
                 if self.main_router is not None
                 else self.main_slot
             )
         else:
-            slot = (
+            slot = self.sidekick_compaction_slot or (
                 self.sidekick_router.select(turn_index, esc)
                 if self.sidekick_router is not None
                 else self.sidekick_slot
@@ -1109,6 +1132,8 @@ class FusionRun(NativeRun):
         if self.budget is not None:
             self.budget.check_timeout()
         message, usage = coordinator._call_worker(slot, messages, tools)
+        if getattr(serve_config._history_context, "fusion_compacted", False):
+            self._reroute_after_compaction(role, slot)
         messages.append(message)
         if self.budget is not None:
             self.budget.consume_tokens(usage)
@@ -1135,6 +1160,32 @@ class FusionRun(NativeRun):
             }
         )
         return text, calls, usage
+
+    def _reroute_after_compaction(self, role: str, previous: str) -> None:
+        if role == "main" and self.structured and self.structured_plan is None:
+            self.main_compaction_pending = previous
+            return
+        router = self.main_router if role == "main" else self.sidekick_router
+        if router is None:
+            return
+        complexity = self.structured_plan.complexity if self.structured_plan else 1.0
+        selected = router.select_at_compaction(complexity, previous, self.follow_up_count)
+        if selected == previous:
+            return
+        if role == "main":
+            self.main_compaction_slot = selected
+            self.main_slot = selected
+        else:
+            self.sidekick_compaction_slot = selected
+            self.sidekick_slot = selected
+        if selected not in self.slot_models:
+            self.slot_models.append(selected)
+        self.record_activity(
+            "fusion_reroute",
+            role=role,
+            model=selected,
+            summary=f"Rerouted {role} after context compaction",
+        )
 
     def _parse_main_answer(self, text: str) -> str | None:
         match = re.match(r"^\s*ANSWER:\s*(.*)\s*$", text.strip(), re.DOTALL | re.IGNORECASE)
@@ -1710,6 +1761,10 @@ class FusionRun(NativeRun):
             if plan is None:
                 raise ValueError("main did not produce a valid FusionPlan")
             self.structured_plan = plan
+            if self.main_compaction_pending is not None:
+                previous = self.main_compaction_pending
+                self.main_compaction_pending = None
+                self._reroute_after_compaction("main", previous)
 
             providers._emit_progress(
                 {
@@ -1761,10 +1816,17 @@ class FusionRun(NativeRun):
                 # _history_context is thread-local, so hand the sink to lane
                 # threads or their progress events vanish.
                 sink = getattr(serve_config._history_context, "event_sink", None)
+                active_run = getattr(serve_config._history_context, "active_run", None)
 
-                def _step(lane: SidekickLane, event_sink: Any = sink) -> dict[str, Any]:
+                def _step(
+                    lane: SidekickLane,
+                    event_sink: Any = sink,
+                    run_context: Any = active_run,
+                ) -> dict[str, Any]:
                     if event_sink is not None:
                         serve_config._history_context.event_sink = event_sink
+                    if run_context is not None:
+                        serve_config._history_context.active_run = run_context
                     return lane.step()
 
                 if runnable:

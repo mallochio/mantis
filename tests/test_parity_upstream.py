@@ -139,9 +139,13 @@ class _StreamingClient:
     def __init__(self, responses: list[_StreamResponse]) -> None:
         self._responses = list(responses)
         self.posted: list[dict[str, Any]] = []
+        self.options: list[dict[str, Any]] = []
 
-    def stream(self, _method: str, _url: str, headers=None, json=None) -> _StreamResponse:
+    def stream(
+        self, _method: str, _url: str, headers=None, json=None, **options
+    ) -> _StreamResponse:
         self.posted.append(json)
+        self.options.append(options)
         return self._responses.pop(0)
 
 
@@ -167,6 +171,19 @@ def test_stream_completion_posts_stream_flags_and_assembles(monkeypatch):
     assert posted["stream"] is True
     assert posted["stream_options"] == {"include_usage": True}
     assert posted["model"] == "m"
+    assert client.options == [{}]
+
+
+def test_stream_completion_passes_explicit_timeout():
+    client = _StreamingClient([_sse({"choices": [{"delta": {"content": "ok"}}]})])
+    serve._stream_completion(
+        client,
+        "https://provider.test/chat/completions",
+        {},
+        {"model": "m"},
+        timeout_s=1.25,
+    )
+    assert client.options == [{"timeout": 1.25}]
 
 
 def test_provider_response_uses_responses_stream_for_openai(monkeypatch):
