@@ -1616,7 +1616,8 @@ class FusionRun(NativeRun):
                     lane.step(lane_tool_results)
             # Also allow main-lane tool results if main is reviewing with tools.
             if self.active_role == "main" and self.pending_tool_calls:
-                validated = self._validate_tool_results(tool_results)
+                main_results = by_lane.get("main", []) + by_lane.get("", [])
+                validated = self._validate_tool_results(main_results)
                 self._append_tool_results(validated)
                 self.pending_tool_calls = []
                 self.status = "main_review"
