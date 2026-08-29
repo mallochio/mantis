@@ -94,4 +94,36 @@ Tracks execution of `fusion-kyle-parity.md`. Updated after every stage.
   into the project venv. Entire suite: **521 passed**, one upstream Starlette
   deprecation warning.
 
-## Final verification — prime-agent harness multi-step coding (base + fusion) — PENDING
+## Final verification — prime-agent harness multi-step coding (base + fusion) — DONE
+
+Environment:
+- current checkout served on isolated `127.0.0.1:8090` through
+  `scripts/run_mantis_native.sh` (catalog render included), reusing healthy
+  Bifrost `:8080` and Switchyard `:5500`;
+- real `/opt/homebrew/bin/prime-agent`, isolated
+  `PRIME_AGENT_CODING_AGENT_DIR`, custom OpenAI-compatible provider;
+- only the real built-in `ipython` tool enabled.
+
+Base session:
+- prompt required create `base_probe.txt`, then a separate read-back tool call,
+  then exact `BASE_SESSION_DONE`;
+- Prime Agent made 3 `/v1/chat/completions` turns;
+- file content exactly `BASE_ROUTER_OK\n`; final exactly
+  `BASE_SESSION_DONE`.
+
+Fusion session:
+- first production-equivalent run uncovered a strict-provider bug: lead emitted
+  a stray planning tool call while planning tools were disabled; Fusion retried
+  with a reminder but left the assistant call unpaired, so Azure rejected the
+  transcript.
+- fix: append synthetic error tool results for every rejected planning call
+  before retry. Regression test asserts assistant-call → tool-result order.
+- replay through real Prime Agent made 3 completion turns / 2 client tool calls;
+  encoded Fusion run/tool IDs resumed correctly;
+- file content exactly `FUSION_ROUTER_OK\n`; final exactly
+  `FUSION_SESSION_DONE`.
+
+Final gates:
+- all tests, including optional training files: **521 passed**;
+- ruff on every touched Python file: clean;
+- one existing Starlette/httpx deprecation warning only.

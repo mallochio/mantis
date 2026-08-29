@@ -1658,6 +1658,15 @@ def test_fusion_stray_planning_tool_calls_are_not_honored(monkeypatch):
         if messages[0]["content"] == fusion.MAIN_PREAMBLE
     ]
     assert main_tool_args == [None, None, None]
+    stray_index = next(
+        i for i, message in enumerate(run.main_messages) if message.get("tool_calls")
+    )
+    assert run.main_messages[stray_index + 1] == {
+        "role": "tool",
+        "tool_call_id": "call_0",
+        "content": "Tool unavailable during Fusion planning.",
+        "is_error": True,
+    }
 
 
 def test_fusion_review_can_call_tools_under_review_policy(monkeypatch, tmp_path):

@@ -1495,6 +1495,18 @@ class FusionRun(NativeRun):
                         reminder = PLAN_UNKNOWN_TOOL_PROMPT.format(names=names)
                     else:
                         reminder = PLAN_TOOL_BUDGET_PROMPT
+                    # The rejected assistant tool-call message is already in
+                    # history. Pair every call before retrying or strict
+                    # providers reject the transcript as malformed.
+                    for call in main_calls:
+                        self.main_messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": str(call.get("id", "")),
+                                "content": "Tool unavailable during Fusion planning.",
+                                "is_error": True,
+                            }
+                        )
                     main_text, main_calls, _ = self._call_lane(
                         coordinator, "main", prompt=reminder, tools=None
                     )
