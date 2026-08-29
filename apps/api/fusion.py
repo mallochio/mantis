@@ -28,6 +28,7 @@ from fusion_types import (
     FusionToolOptions,
     FusionWorkerProfile,
 )
+
 from runs import (
     RUN_STORE,
     NativeRun,
@@ -78,10 +79,10 @@ SIDEKICK_PREAMBLE = (
 )
 
 STRUCTURED_PLANNING_SUFFIX = (
-    " You plan with structured output. Delegate all execution work, including "
-    "the hardest integration task, to sidekick lanes; reserve main for planning "
-    "and review. Assign the 'frontier' profile (the strongest model) to the task "
-    "that needs it."
+    " You plan with structured output. The main agent will execute the core "
+    "integration task with tools; delegate bounded research, tests, and mechanical "
+    "edits to sidekick lanes. Assign the 'frontier' profile (the strongest model) "
+    "to a sidekick task that needs it."
 )
 
 
@@ -212,7 +213,13 @@ PLAN_RESPONSE_FORMAT = {
         "name": "fusion_plan",
         "schema": {
             "type": "object",
-            "required": ["complexity", "main_task", "sidekick_assignments"],
+            "required": [
+                "complexity",
+                "main_task",
+                "sidekick_assignments",
+                "verification_commands",
+            ],
+            "additionalProperties": False,
             "properties": {
                 "complexity": {
                     "type": "number",
@@ -222,16 +229,23 @@ PLAN_RESPONSE_FORMAT = {
                 },
                 "main_task": {
                     "type": "string",
-                    "description": "Concise summary of what the main engineer will verify.",
+                    "description": "The core integration task the main agent will execute.",
                 },
                 "sidekick_assignments": {
                     "type": "array",
                     "items": {
                         "type": "object",
-                        "required": ["task"],
+                        "required": ["task", "profile"],
+                        "additionalProperties": False,
                         "properties": {
                             "task": {"type": "string"},
-                            "profile": {"type": "string"},
+                            "profile": {
+                                "type": "string",
+                                "description": (
+                                    "Sidekick profile name; use an empty "
+                                    "string for the default profile."
+                                ),
+                            },
                         },
                     },
                 },
@@ -252,6 +266,14 @@ class FusionConfig:
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or model_catalog.catalog_path()[0]
         self._raw: dict[str, Any] | None = None
+        self._lock = threading.Lock()
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {"path": self.path, "_raw": self._raw}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.path = state["path"]
+        self._raw = state.get("_raw")
         self._lock = threading.Lock()
 
     def _load(self) -> dict[str, Any]:
@@ -294,13 +316,27 @@ class FusionConfig:
         return max(1, value)
 
     def context_window(self) -> int:
-        raw = self._load().get("context_window") or os.environ.get(
-            "MANTIS_CONTEXT_LENGTH", "262144"
-        )
+        raw = self._load().get("context_window") or self._load().get(
+            "context_token_limit"
+        ) or os.environ.get("MANTIS_CONTEXT_LENGTH", "262144")
         try:
             return int(raw)
         except (TypeError, ValueError):
             return 262144
+
+    def context_message_limit(self) -> int:
+        raw = self._load().get("context_message_limit")
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 24
+
+    def context_token_limit(self) -> int:
+        return self.context_window()
+
+    def compaction_mode(self) -> str:
+        raw = str(self._load().get("compaction_mode") or "summary").strip().lower()
+        return raw if raw in {"summary", "replay"} else "summary"
 
     def max_output_tokens(self) -> int:
         raw = self._load().get("max_output_tokens") or "4096"
@@ -465,6 +501,9 @@ class FusionCoordinator:
         self.max_follow_ups = self.config.max_follow_ups()
         self.sidekick_max_tool_rounds = self.config.sidekick_max_tool_rounds()
         self.context_window = self.config.context_window()
+        self.context_message_limit = self.config.context_message_limit()
+        self.context_token_limit = self.config.context_token_limit()
+        self.compaction_mode = self.config.compaction_mode()
         self.max_output_tokens = self.config.max_output_tokens()
         self.worker_profiles = {p.name: p for p in self.config.worker_profiles()}
         self.default_tool_options = self.config.tool_options()
@@ -687,6 +726,62 @@ class FusionCoordinator:
             *self._flatten_groups(tail_groups),
         ]
 
+    def _compact_summary(
+        self,
+        slot: str,
+        messages: list[dict[str, Any]],
+        max_input_tokens: int,
+    ) -> list[dict[str, Any]] | None:
+        """Summarize the entire role context and replace it with system + summary.
+
+        Matches the reference `SessionStore.compact`: the model sees the full
+        context plus a compaction instruction and returns a brief that becomes a
+        single user message after the original system preamble.
+        """
+        if not messages:
+            return None
+        system = messages[0]
+        instruction = {"role": "user", "content": COMPACTION_INSTRUCTION}
+        replay = [system, *messages[1:], instruction]
+        if self._token_sum(replay) > max_input_tokens:
+            return None
+        run = getattr(serve_config._history_context, "active_run", None)
+        previous_choice = getattr(run, "active_tool_choice", None) if run is not None else None
+        if run is not None:
+            run.active_tool_choice = "none"
+        try:
+            data = providers._provider_response(
+                slot,
+                replay,
+                min(COMPACTION_MAX_OUTPUT_TOKENS, self._output_tokens_for(slot)),
+                0.7,
+                None,
+            )
+        except (RuntimeError, TypeError, KeyError, IndexError):
+            return None
+        finally:
+            if run is not None:
+                run.active_tool_choice = previous_choice
+        message = (data.get("choices") or [{}])[0].get("message") or {}
+        if message.get("tool_calls"):
+            return None
+        text = str(message.get("content") or "").strip()
+        if not text:
+            return None
+        summary = text
+        match = re.search(
+            r"<compacted-summary>\s*([\s\S]*?)\s*</compacted-summary>", text, re.IGNORECASE
+        )
+        if match:
+            summary = match.group(1).strip() or text
+        return [
+            system,
+            {
+                "role": "user",
+                "content": f"<compacted-summary>\n{summary}\n</compacted-summary>",
+            },
+        ]
+
     def _fit_messages(
         self,
         slot: str,
@@ -695,7 +790,24 @@ class FusionCoordinator:
         max_input_tokens: int,
     ) -> list[dict[str, Any]]:
         pruned = self._prune_for_budget(messages, max_input_tokens)
-        if self._token_sum(pruned) <= max_input_tokens:
+        token_sum = self._token_sum(pruned)
+
+        # Primary trigger: message-count limit, matching the reference behavior.
+        if len(messages) > self.context_message_limit:
+            if self.compaction_mode == "summary":
+                compacted = self._compact_summary(slot, messages, max_input_tokens)
+                if compacted is not None:
+                    serve_config._history_context.fusion_compacted = True
+                    return compacted
+                # Fall back to replay/drop if the summarizer could not run.
+            compacted = self._compact_replay(slot, pruned, tools, max_input_tokens)
+            if compacted is not None and self._token_sum(compacted) <= max_input_tokens:
+                serve_config._history_context.fusion_compacted = True
+                return compacted
+            return self._drop_old_groups(compacted or pruned, max_input_tokens)
+
+        # Secondary trigger: token budget exceeded (safety net).
+        if token_sum <= max_input_tokens:
             return pruned
         compacted = self._compact_replay(slot, pruned, tools, max_input_tokens)
         if compacted is not None and self._token_sum(compacted) <= max_input_tokens:
@@ -772,8 +884,17 @@ class FusionCoordinator:
         return msg, usage
 
 
-class SidekickLane:
-    """One resumable sidekick worker lane for the structured Fusion path."""
+MAIN_EXEC_PREAMBLE = (
+    "You are the authoritative coding agent. Make careful, integrated changes, "
+    "verify them, and complete the assigned main task independently using the "
+    "available tools. Do not delegate the work to a sidekick. Do not output a plan; "
+    "when the task is finished, output a concise final report describing what was "
+    "done and the verified result."
+)
+
+
+class ExecutionLane:
+    """One resumable execution lane for the structured Fusion path."""
 
     def __init__(
         self,
@@ -782,12 +903,17 @@ class SidekickLane:
         coordinator: FusionCoordinator,
         assignment: FusionSidekickAssignment,
         profile: FusionWorkerProfile,
+        *,
+        role: str = "sidekick",
+        shared_messages: list[dict[str, Any]] | None = None,
     ) -> None:
         self.lane_id = lane_id
         self.run = run
         self.coordinator = coordinator
         self.assignment = assignment
         self.profile = profile
+        self.role = role
+        self.shared_messages = shared_messages
         self.tool_rounds = 0
         self.pending_tool_calls: list[dict[str, Any]] = []
         self.report: str | None = None
@@ -796,6 +922,18 @@ class SidekickLane:
         self.messages = self._build_messages()
 
     def _build_messages(self) -> list[dict[str, Any]]:
+        if self.role == "main":
+            instructions = MAIN_EXEC_PREAMBLE
+            if self.profile.instructions:
+                instructions += "\n\n" + self.profile.instructions
+            messages = self.shared_messages or self.run.main_messages
+            self.shared_messages = messages
+            if messages and messages[0].get("role") == "system":
+                messages[0]["content"] = instructions
+            else:
+                messages.insert(0, {"role": "system", "content": instructions})
+            messages.append({"role": "user", "content": f"Task: {self.assignment.task}"})
+            return messages
         system = SIDEKICK_PREAMBLE
         if self.profile.instructions:
             system += "\n\n" + self.profile.instructions
@@ -820,15 +958,29 @@ class SidekickLane:
 
     def _select_slot(self) -> str:
         if self.profile.model:
-            router = FusionRouter(
-                FusionRoutingConfig(sidekick=self.profile.model),
-                "sidekick",
-                self.coordinator.sidekick_router.base_route,
-            )
+            config: FusionRoutingConfig
+            base_route: Any
+            if self.role == "main":
+                config = FusionRoutingConfig(main=self.profile.model)
+                base_route = self.coordinator.main_router.base_route
+            else:
+                config = FusionRoutingConfig(sidekick=self.profile.model)
+                base_route = self.coordinator.sidekick_router.base_route
+            router = FusionRouter(config, self.role, base_route)
             return router.select(self.run.follow_up_count, self.run.follow_up_count)
-        if self.run.sidekick_compaction_slot is not None:
-            return self.run.sidekick_compaction_slot
-        return self.run.sidekick_router.select(self.run.follow_up_count, self.run.follow_up_count)
+        compaction_slot = (
+            self.run.main_compaction_slot
+            if self.role == "main"
+            else self.run.sidekick_compaction_slot
+        )
+        if compaction_slot is not None:
+            return compaction_slot
+        router = (
+            self.coordinator.main_router
+            if self.role == "main"
+            else self.coordinator.sidekick_router
+        )
+        return router.select(self.run.follow_up_count, self.run.follow_up_count)
 
     def step(self, tool_results: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         if self.error:
@@ -839,7 +991,11 @@ class SidekickLane:
             self._append_tool_results(tool_results)
             self.pending_tool_calls = []
         if self.tool_rounds >= self.coordinator.sidekick_max_tool_rounds:
-            self.report = "ESCALATE_TO_MAIN: sidekick exceeded tool budget"
+            self.report = (
+                "ESCALATE_TO_MAIN: sidekick exceeded tool budget"
+                if self.role == "sidekick"
+                else "tool budget exceeded"
+            )
             self.complete = True
             return self._status(status="completed", report=self.report)
 
@@ -850,22 +1006,22 @@ class SidekickLane:
             self.profile.model is None
             and getattr(serve_config._history_context, "fusion_compacted", False)
         ):
-            self.run._reroute_after_compaction("sidekick", slot)
+            self.run._reroute_after_compaction(self.role, slot)
         if self.run.budget is not None:
             self.run.budget.consume_tokens(usage)
             self.run.budget.consume_turn()
         self.run.add_usage(usage, model=slot)
         self.run.record_activity(
-            "sidekick_lane_turn",
+            "execution_lane_turn",
             lane=self.lane_id,
-            role="sidekick",
+            role=self.role,
             model=slot,
             status="completed",
         )
         providers._emit_progress(
             {
                 "type": "task.completed",
-                "role": "sidekick",
+                "role": self.role,
                 "lane": self.lane_id,
                 "model": slot,
                 "task": self.assignment.task,
@@ -1022,7 +1178,8 @@ class FusionRun(NativeRun):
         self._resume_allows_answer = False
         self.turns: list[dict[str, Any]] = []
         self.structured_plan: FusionPlan | None = None
-        self.sidekick_lanes: list[SidekickLane] = []
+        self.main_lane: ExecutionLane | None = None
+        self.sidekick_lanes: list[ExecutionLane] = []
         self.sidekick_reports: list[str] = []
         self.status = "main_planning"
 
@@ -1060,6 +1217,7 @@ class FusionRun(NativeRun):
             "tool_options": FusionToolOptions(),
             "structured": False,
             "structured_plan": None,
+            "main_lane": None,
             "sidekick_lanes": [],
             "sidekick_reports": [],
         }.items():
@@ -1125,6 +1283,10 @@ class FusionRun(NativeRun):
                 else self.sidekick_slot
             )
         messages = self.main_messages if role == "main" else self.sidekick_messages
+        if role == "main" and messages and messages[0].get("role") == "system":
+            messages[0]["content"] = _main_preamble(
+                self.structured, self.worker_profiles, coordinator.worker_profiles
+            )
         if prompt is not None:
             messages.append({"role": "user", "content": prompt})
         self.cache_namespace = providers._prompt_cache_namespace(messages, self.tools or None)
@@ -1714,6 +1876,7 @@ class FusionRun(NativeRun):
             self.latest_user = message
             self.main_messages.append({"role": "user", "content": message})
             self.structured_plan = None
+            self.main_lane = None
             self.sidekick_lanes = []
             self.sidekick_reports = []
             self.pending_tool_calls = []
@@ -1727,13 +1890,21 @@ class FusionRun(NativeRun):
         # Apply client tool results to the lanes that requested them.
         if self.status == "awaiting_tools":
             by_lane = self._distribute_tool_results(tool_results)
+            if self.main_lane is not None:
+                main_exec_results = by_lane.get(self.main_lane.lane_id, [])
+                if main_exec_results:
+                    self.main_lane.step(main_exec_results)
             for lane in self.sidekick_lanes:
                 lane_tool_results = by_lane.get(lane.lane_id, [])
                 if lane_tool_results:
                     lane.step(lane_tool_results)
             # Also allow main-lane tool results if main is reviewing with tools.
             if self.active_role == "main" and self.pending_tool_calls:
-                main_results = by_lane.get("main", []) + by_lane.get("", [])
+                main_results = (
+                    by_lane.get("main", [])
+                    + by_lane.get("main_exec", [])
+                    + by_lane.get("", [])
+                )
                 validated = self._validate_tool_results(main_results)
                 self._append_tool_results(validated)
                 self.pending_tool_calls = []
@@ -1774,21 +1945,26 @@ class FusionRun(NativeRun):
                 }
             )
 
-            if not plan.sidekick_assignments:
-                self.report = plan.main_task
-                self.completed_via = "answer"
-                self.status = "completed"
-                return self._ok_event(request_id)
-
             self.tools = self._filter_tools()
+            main_profile = FusionWorkerProfile(name="main")
+            self.main_lane = ExecutionLane(
+                "main_exec",
+                self,
+                coordinator,
+                FusionSidekickAssignment(task=plan.main_task),
+                main_profile,
+                role="main",
+                shared_messages=self.main_messages,
+            )
             for i, assignment in enumerate(plan.sidekick_assignments):
                 profile = self._resolve_profile(assignment.profile, coordinator)
-                lane = SidekickLane(
+                lane = ExecutionLane(
                     f"lane{i}",
                     self,
                     coordinator,
                     assignment,
                     profile,
+                    role="sidekick",
                 )
                 self.sidekick_lanes.append(lane)
             self.status = "sidekick_pending"
@@ -1796,8 +1972,11 @@ class FusionRun(NativeRun):
         max_iterations = max(1, coordinator.max_follow_ups + 1)
         # Server-executed tool rounds consume loop iterations, so the ceiling
         # must cover a lane's full tool budget, not just client round-trips.
+        execution_lanes = (
+            ([self.main_lane] if self.main_lane is not None else []) + self.sidekick_lanes
+        )
         step_ceiling = max_iterations * 4 + coordinator.sidekick_max_tool_rounds * max(
-            1, len(self.sidekick_lanes)
+            1, len(execution_lanes)
         )
         for _ in range(step_ceiling):
             if self.budget is not None:
@@ -1808,8 +1987,11 @@ class FusionRun(NativeRun):
                 all_pending: list[dict[str, Any]] = []
                 runnable = [
                     lane
-                    for lane in self.sidekick_lanes
-                    if not lane.complete and not lane.error and not lane.pending_tool_calls
+                    for lane in execution_lanes
+                    if lane is not None
+                    and not lane.complete
+                    and not lane.error
+                    and not lane.pending_tool_calls
                 ]
                 # ponytail: one pool per batch; keep it until profiling justifies a persistent pool.
                 # _history_context is thread-local, so hand the sink to lane
@@ -1818,7 +2000,7 @@ class FusionRun(NativeRun):
                 active_run = getattr(serve_config._history_context, "active_run", None)
 
                 def _step(
-                    lane: SidekickLane,
+                    lane: ExecutionLane,
                     event_sink: Any = sink,
                     run_context: Any = active_run,
                 ) -> dict[str, Any]:
@@ -1834,8 +2016,8 @@ class FusionRun(NativeRun):
                 # Collect from every lane, not just freshly stepped ones: a lane
                 # stepped inline via server-side execution may already hold its
                 # next batch of pending calls.
-                for lane in self.sidekick_lanes:
-                    if lane.pending_tool_calls:
+                for lane in execution_lanes:
+                    if lane is not None and lane.pending_tool_calls:
                         all_pending.extend(lane.pending_tool_calls)
 
                 if all_pending:
@@ -1843,7 +2025,9 @@ class FusionRun(NativeRun):
                         by_lane = self._distribute_tool_results(
                             self._server_tool_results(all_pending)
                         )
-                        for lane in self.sidekick_lanes:
+                        for lane in execution_lanes:
+                            if lane is None:
+                                continue
                             results = by_lane.get(lane.lane_id, [])
                             if results:
                                 lane.step(results)
@@ -1867,17 +2051,26 @@ class FusionRun(NativeRun):
 
             if self.status == "main_review":
                 self.active_role = "main"
-                reports = "\n\n".join(
-                    f"Report {i}:\n{report}"
-                    for i, report in enumerate(self.sidekick_reports)
-                    if report
+                main_result = (
+                    self.main_lane.report
+                    if self.main_lane is not None
+                    and self.main_lane.complete
+                    and not self.main_lane.error
+                    else None
                 )
+                report_parts = []
+                if main_result:
+                    report_parts.append(f"Main result:\n{main_result}")
+                for i, report in enumerate(self.sidekick_reports, start=1):
+                    if report:
+                        report_parts.append(f"Sidekick {i}:\n{report}")
+                reports = "\n\n".join(report_parts)
                 review_prompt = f"{REVIEW_PROMPT}{reports}"
                 review_text, review_calls, _ = self._call_lane(
                     coordinator,
                     "main",
                     prompt=review_prompt,
-                    tools=self.tools if "review" in self.main_tools_policy else None,
+                    tools=self.tools,
                 )
 
                 if review_calls:
@@ -1889,14 +2082,18 @@ class FusionRun(NativeRun):
 
                 accepted, feedback = self._parse_main_review(review_text)
                 if accepted:
-                    self.report = next((r for r in self.sidekick_reports if r), review_text)
+                    self.report = main_result or next(
+                        (r for r in self.sidekick_reports if r), review_text
+                    )
                     self.completed_via = "accept"
                     self.status = "completed"
                     return self._ok_event(request_id)
 
                 if self.follow_up_count >= coordinator.max_follow_ups:
                     self.follow_up_capped = True
-                    self.report = next((r for r in self.sidekick_reports if r), review_text)
+                    self.report = main_result or next(
+                        (r for r in self.sidekick_reports if r), review_text
+                    )
                     self.completed_via = "capped"
                     self.status = "completed"
                     return self._ok_event(request_id)

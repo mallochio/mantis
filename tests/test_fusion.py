@@ -14,11 +14,12 @@ import api
 import fusion
 import providers
 import pytest
-import runs
 import serve_config
 import tool_exec
 import utils
 from fastapi.testclient import TestClient
+
+import runs
 
 
 class FakeWorker:
@@ -58,7 +59,9 @@ class FakeWorker:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         self.calls.append((slot, messages, tools))
         first_content = messages[0].get("content", "")
-        if first_content.startswith(fusion.MAIN_PREAMBLE):
+        if first_content.startswith(
+            (fusion.MAIN_PREAMBLE, fusion.MAIN_EXEC_PREAMBLE)
+        ):
             return self._main_response(messages)
         return self._sidekick_response(messages, tools)
 
@@ -191,7 +194,9 @@ class SequenceWorker:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         self.calls.append((slot, messages, tools))
         first_content = messages[0].get("content", "")
-        if first_content.startswith(fusion.MAIN_PREAMBLE):
+        if first_content.startswith(
+            (fusion.MAIN_PREAMBLE, fusion.MAIN_EXEC_PREAMBLE)
+        ):
             content, tool_calls, usage = self._next(self.main_outputs, self.main_idx)
             self.main_idx += 1
         else:
@@ -577,6 +582,81 @@ def test_fusion_compaction_replays_same_slot_and_keeps_system(monkeypatch):
     assert compact["tools"] == tools
     assert compact["messages"][0]["content"] == "system prompt"
     assert compact["messages"][-1]["content"] == fusion.COMPACTION_INSTRUCTION
+
+
+def test_fusion_context_message_limit_triggers_summary_compaction(monkeypatch):
+    coordinator = fusion.FusionCoordinator()
+    # Force the message-count path; token budget is generous so it is not the trigger.
+    coordinator.context_message_limit = 4
+    coordinator.compaction_mode = "summary"
+    monkeypatch.setattr(coordinator, "_output_tokens_for", lambda _slot: 256)
+    calls: list[dict[str, Any]] = []
+
+    def fake_provider(spec, messages, max_tokens, temperature, tools=None):
+        calls.append({"spec": spec, "messages": messages, "tools": tools})
+        last = messages[-1]["content"] if messages else ""
+        if last == fusion.COMPACTION_INSTRUCTION:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "<compacted-summary>inspected files</compacted-summary>",
+                        }
+                    }
+                ],
+                "usage": {},
+            }
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}], "usage": {}}
+
+    monkeypatch.setattr(providers, "_provider_response", fake_provider)
+    messages = [{"role": "system", "content": "system prompt"}]
+    messages.extend({"role": "user", "content": f"{index}"} for index in range(5))
+    fitted = coordinator._fit_messages("gpt-5_6-sol", messages, None, 100_000)
+    assert fitted[0]["content"] == "system prompt"
+    assert fitted[1]["content"].startswith("<compacted-summary>")
+    assert "inspected files" in fitted[1]["content"]
+    assert len(fitted) == 2
+    assert len(calls) == 1
+    compact = calls[0]
+    assert compact["tools"] is None
+
+
+def test_fusion_summary_compaction_replaces_context(monkeypatch):
+    coordinator = fusion.FusionCoordinator()
+    coordinator.context_message_limit = 4
+    coordinator.compaction_mode = "summary"
+    monkeypatch.setattr(coordinator, "_output_tokens_for", lambda _slot: 256)
+
+    def fake_provider(spec, messages, max_tokens, temperature, tools=None):
+        if messages and messages[-1]["content"] == fusion.COMPACTION_INSTRUCTION:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "<compacted-summary>summary text</compacted-summary>",
+                        }
+                    }
+                ],
+                "usage": {},
+            }
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}], "usage": {}}
+
+    monkeypatch.setattr(providers, "_provider_response", fake_provider)
+    messages = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "c"},
+        {"role": "assistant", "content": "d"},
+        {"role": "user", "content": "e"},
+    ]
+    fitted = coordinator._fit_messages("gpt-5_6-sol", messages, None, 100_000)
+    assert len(fitted) == 2
+    assert fitted[0]["role"] == "system"
+    assert fitted[1]["role"] == "user"
+    assert "summary text" in fitted[1]["content"]
 
 
 def test_fusion_trimmer_keeps_tool_call_result_pairs():
@@ -2073,7 +2153,11 @@ def test_fusion_structured_plan_with_worker_profile(monkeypatch):
         }
     )
     worker = SequenceWorker(
-        [(plan_json, None, DEFAULT_USAGE), ("ACCEPT", None, DEFAULT_USAGE)],
+        [
+            (plan_json, None, DEFAULT_USAGE),
+            ("verified by main", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
+        ],
         [("I wrote the script.", None, DEFAULT_USAGE)],
     )
     monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
@@ -2092,9 +2176,82 @@ def test_fusion_structured_plan_with_worker_profile(monkeypatch):
     event = run.advance()
 
     assert event["status"] == "completed"
-    assert "wrote the script" in event["report"].lower()
+    assert "verified by main" in event["report"].lower()
     sidekick_calls = [call for call in worker.calls if call[0] == "deepseek-v4-flash"]
     assert sidekick_calls
+
+
+def test_fusion_main_lane_executes_with_tools(monkeypatch):
+    plan_json = json.dumps(
+        {
+            "complexity": 0.5,
+            "main_task": "inspect the environment",
+            "sidekick_assignments": [],
+        }
+    )
+    worker = SequenceWorker(
+        [
+            (plan_json, None, DEFAULT_USAGE),
+            ("main result", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
+        ],
+        [],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    run = fusion.FusionRun(
+        "main-lane",
+        "goal",
+        tools=[BASH_TOOL],
+        budget=fusion.FusionRunBudget(max_turns=10),
+    )
+
+    event = run.advance()
+
+    assert event["status"] == "completed"
+    # Calls: 0=planning, 1=main execution, 2=review.
+    assert len(worker.calls) == 3
+    main_exec_call = worker.calls[1]
+    assert main_exec_call[1][0].get("content", "").startswith(fusion.MAIN_PREAMBLE)
+    assert main_exec_call[2] is not None
+    assert main_exec_call[2][0]["function"]["name"] == "bash"
+    assert "main result" in event["report"]
+
+
+def test_fusion_synthesis_receives_main_and_sidekick_reports(monkeypatch):
+    plan_json = json.dumps(
+        {
+            "complexity": 0.5,
+            "main_task": "verify integration",
+            "sidekick_assignments": [{"task": "write tests"}],
+        }
+    )
+    worker = SequenceWorker(
+        [
+            (plan_json, None, DEFAULT_USAGE),
+            ("main result", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
+        ],
+        [("sidekick result", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    run = fusion.FusionRun(
+        "synthesis",
+        "goal",
+        budget=fusion.FusionRunBudget(max_turns=10),
+    )
+
+    event = run.advance()
+
+    assert event["status"] == "completed"
+    # Calls: 0=planning, 1=main execution, 2=sidekick, 3=review.
+    assert len(worker.calls) == 4
+    review_call = worker.calls[3]
+    assert review_call[1][0].get("content", "").startswith(fusion.MAIN_PREAMBLE)
+    review_content = "\n".join(
+        str(msg.get("content", "")) for msg in review_call[1]
+    )
+    assert "Main result:" in review_content
+    assert "sidekick result" in review_content
 
 
 def test_fusion_run_budget_enforces_max_turns(monkeypatch):
@@ -2131,8 +2288,41 @@ def test_filter_tools_by_options_uses_bundles():
     assert names == {"bash", "edit_file"}
 
 
+def test_fusion_filter_tools_intersects_client_tools_with_enabled():
+    run = fusion.FusionRun(
+        "tool-auth",
+        "goal",
+        tools=[
+            {"type": "function", "function": {"name": "bash"}},
+            {"type": "function", "function": {"name": "read_file"}},
+            {"type": "function", "function": {"name": "unknown"}},
+        ],
+        tool_options=fusion.FusionToolOptions(enabled=["files"]),
+    )
+    filtered = run._filter_tools()
+    names = {t["function"]["name"] for t in filtered}
+    assert names == {"read_file"}
+
+
+def test_fusion_filter_tools_generates_server_schemas_for_enabled():
+    run = fusion.FusionRun(
+        "tool-auth-server",
+        "goal",
+        tool_options=fusion.FusionToolOptions(enabled=["files"], server_execution=True),
+    )
+    filtered = run._filter_tools()
+    names = {t["function"]["name"] for t in filtered}
+    assert names == {
+        "list_files",
+        "read_file",
+        "search_files",
+        "write_file",
+        "edit_file",
+    }
+
+
 def test_fusion_structured_lanes_step_in_parallel(monkeypatch):
-    """Two sidekick lanes must rendezvous; sequential stepping breaks the barrier."""
+    """Main and sidekick lanes must rendezvous; sequential stepping breaks the barrier."""
     plan_json = json.dumps(
         {
             "complexity": 0.5,
@@ -2140,11 +2330,22 @@ def test_fusion_structured_lanes_step_in_parallel(monkeypatch):
             "sidekick_assignments": [{"task": "task a"}, {"task": "task b"}],
         }
     )
-    barrier = threading.Barrier(2)
+    # Main execution lane plus two sidekick lanes run concurrently.
+    barrier = threading.Barrier(3)
     usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
 
     def worker(_self, slot, messages, tools):
         first = messages[0].get("content", "")
+        user_messages = [msg for msg in messages if msg.get("role") == "user"]
+        is_main_exec = first.startswith(fusion.MAIN_PREAMBLE) and (
+            user_messages
+            and str(user_messages[-1].get("content", "")).startswith(
+                fusion.MAIN_EXEC_PREAMBLE
+            )
+        )
+        if is_main_exec:
+            barrier.wait(timeout=5)
+            return ({"role": "assistant", "content": "main done"}, dict(usage))
         if first.startswith(fusion.MAIN_PREAMBLE):
             is_review = any(
                 msg.get("role") == "user" and fusion.REVIEW_PROMPT in msg.get("content", "")
@@ -2166,7 +2367,8 @@ def test_fusion_structured_lanes_step_in_parallel(monkeypatch):
 
     assert event["status"] == "completed", event
     assert len(run.sidekick_reports) == 2
-    assert event["usage"]["total_tokens"] == 8
+    # planning + main execution + 2 sidekicks + review = 5 calls
+    assert event["usage"]["total_tokens"] == 10
 
 
 def test_fusion_budget_guard_pickle_roundtrip():
@@ -2186,7 +2388,7 @@ def test_fusion_structured_preamble_delegates_and_legacy_unchanged():
     )
     preamble = structured_run.main_messages[0]["content"]
     assert preamble.startswith(fusion.MAIN_PREAMBLE)
-    assert "Delegate all execution work" in preamble
+    assert "The main agent will execute" in preamble
     assert "frontier" in preamble
 
     legacy_run = fusion.FusionRun("p-legacy", "goal", delegation_mode="forced")
@@ -2205,7 +2407,11 @@ def test_fusion_frontier_profile_uses_main_slot(monkeypatch):
         }
     )
     worker = SequenceWorker(
-        [(plan_json, None, DEFAULT_USAGE), ("ACCEPT", None, DEFAULT_USAGE)],
+        [
+            (plan_json, None, DEFAULT_USAGE),
+            ("main done", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
+        ],
         [("hard done", None, DEFAULT_USAGE), ("rename done", None, DEFAULT_USAGE)],
     )
     monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
@@ -2221,7 +2427,7 @@ def test_fusion_frontier_profile_uses_main_slot(monkeypatch):
     lane_slots = [
         call[0]
         for call in worker.calls
-        if not call[1][0].get("content", "").startswith(fusion.MAIN_PREAMBLE)
+        if call[1][0].get("content", "").startswith(fusion.SIDEKICK_PREAMBLE)
     ]
     assert run.main_slot in lane_slots
     assert len(lane_slots) == 2
@@ -2286,7 +2492,11 @@ def test_fusion_server_side_execution_completes_without_client(monkeypatch, tmp_
         }
     )
     worker = SequenceWorker(
-        [(plan_json, None, DEFAULT_USAGE), ("ACCEPT", None, DEFAULT_USAGE)],
+        [
+            (plan_json, None, DEFAULT_USAGE),
+            ("main verified", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
+        ],
         [
             (
                 "",
@@ -2322,7 +2532,7 @@ def test_fusion_server_side_execution_completes_without_client(monkeypatch, tmp_
 
     assert event["status"] == "completed", event
     assert event["pending_tool_calls"] is None
-    assert "script written" in event["report"]
+    assert "main verified" in event["report"]
     assert (tmp_path / "server-exec" / "script.py").read_text() == "print(40 + 2)"
 
 

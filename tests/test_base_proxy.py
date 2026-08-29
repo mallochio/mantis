@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base_proxy
 import httpx
+import providers
 
 
 def test_session_id_prefers_switchyard_header():
@@ -145,7 +146,9 @@ def test_router_body_coerces_medium_reasoning():
             }
         )
     )
-    assert body["reasoning_effort"] == "high"
+    efficient = base_proxy._base_efficient_model() or ""
+    expected = providers._coerce_reasoning_effort(efficient, "medium")
+    assert body["reasoning_effort"] == expected
     assert "reasoning" not in body
 
 
