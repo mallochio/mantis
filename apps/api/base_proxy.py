@@ -134,7 +134,7 @@ def _base_efficient_model() -> str | None:
     if route is None:
         return None
     try:
-        return route.efficient.upstream_model
+        return route.efficient.upstream_model  # type: ignore[no-any-return]
     except AttributeError:
         return None
 
@@ -311,7 +311,7 @@ def router_error(upstream: httpx.Response) -> JSONResponse:
             upstream.headers.get("content-type"),
             text[:1000],
         )
-        message = text.strip() if text.strip() else f"router returned status {upstream.status_code}"
+        message = text.strip() or f"router returned status {upstream.status_code}"
 
         # Some providers (e.g. Bifrost) return an SSE error stream for a failed
         # chat request. Look for an ``error`` field in the first data line.

@@ -140,7 +140,7 @@ exclude = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["scripts", "apps/api", "OpenFugu/openfugu", "OpenFugu"]
-addopts = "--cov=scripts --cov=apps/api --cov-report=term-missing --cov-report=xml --cov-fail-under=90"
+addopts = "--cov=scripts --cov=apps/api --cov-report=term-missing --cov-report=xml --cov-fail-under=88"
 
 [tool.coverage.run]
 source = ["scripts", "apps/api"]

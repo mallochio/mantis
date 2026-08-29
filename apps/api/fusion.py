@@ -28,7 +28,6 @@ from fusion_types import (
     FusionToolOptions,
     FusionWorkerProfile,
 )
-
 from runs import (
     RUN_STORE,
     NativeRun,
@@ -311,7 +310,7 @@ class FusionConfig:
             return 4096
 
     def main_routing(self) -> FusionRoutingConfig:
-        return FusionRoutingConfig.model_validate(
+        return FusionRoutingConfig.model_validate(  # type: ignore[no-any-return]
             {k: v for k, v in (self._load() or {}).items() if k in FusionRoutingConfig.model_fields}
         )
 
@@ -328,10 +327,10 @@ class FusionConfig:
         return [FusionWorkerProfile.model_validate(item) for item in raw]
 
     def default_budget(self) -> FusionRunBudget:
-        return FusionRunBudget.model_validate(self._load().get("budget") or {})
+        return FusionRunBudget.model_validate(self._load().get("budget") or {})  # type: ignore[no-any-return]
 
     def tool_options(self) -> FusionToolOptions:
-        return FusionToolOptions.model_validate(self._load().get("tool_options") or {})
+        return FusionToolOptions.model_validate(self._load().get("tool_options") or {})  # type: ignore[no-any-return]
 
 
 _FUSION_CONFIG = FusionConfig()
@@ -1030,7 +1029,7 @@ class FusionRun(NativeRun):
     def __setstate__(self, state: dict[str, Any]) -> None:
         super().__setstate__(state)
         # Ensure new fields are present for forward compatibility.
-        for key, default in {
+        for key, default_value in {  # type: ignore[var-annotated]
             "plan": "",
             "sidekick_brief": "",
             "follow_up_count": 0,
@@ -1065,7 +1064,7 @@ class FusionRun(NativeRun):
             "sidekick_reports": [],
         }.items():
             if not hasattr(self, key):
-                setattr(self, key, default)
+                setattr(self, key, default_value)
         if not hasattr(self, "repeat_guard"):
             self.repeat_guard = utils.RepeatToolGuard()
 
@@ -1373,7 +1372,7 @@ class FusionRun(NativeRun):
             return FusionWorkerProfile(name="frontier", model=self.main_slot)
         skill = utils._load_skill_profile(name)
         if skill is not None:
-            return skill
+            return skill  # type: ignore[no-any-return]
         return FusionWorkerProfile(name=name)
 
     def _filter_tools(self) -> list[dict[str, Any]]:
@@ -1401,7 +1400,7 @@ class FusionRun(NativeRun):
     def _parse_plan_text(self, text: str) -> FusionPlan | None:
         """Parse a structured FusionPlan from JSON or legacy PLAN:/BRIEF: text."""
         with suppress(ValueError, json.JSONDecodeError):
-            return FusionPlan.model_validate_json(text)
+            return FusionPlan.model_validate_json(text)  # type: ignore[no-any-return]
         answer = self._parse_main_answer(text)
         if answer is not None:
             return FusionPlan(
@@ -1855,8 +1854,11 @@ class FusionRun(NativeRun):
                     return self._ok_event(request_id)
 
                 self.sidekick_reports = [
-                    lane.report for lane in self.sidekick_lanes if lane.complete and not lane.error
+                    lane.report
+                    for lane in self.sidekick_lanes
+                    if lane.complete and not lane.error and lane.report is not None
                 ]
+                assert self.structured_plan is not None
                 self.sidekick_messages = [
                     {"role": "user", "content": self.structured_plan.main_task}
                 ]
