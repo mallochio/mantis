@@ -686,6 +686,38 @@ def _assemble_streamed_completion(chunks: Any) -> dict[str, Any]:
     return {"choices": [{"message": message}], "usage": usage}
 
 
+def _emit_native_stream_delta(
+    event: dict[str, Any] | None,
+    *,
+    responses_api: bool,
+    anthropic_messages: bool,
+) -> None:
+    if not event:
+        return
+    if responses_api:
+        event_type = str(event.get("type", ""))
+        delta = event.get("delta")
+        if isinstance(delta, str) and event_type in {
+            "response.output_text.delta",
+            "response.content_part.delta",
+        }:
+            _emit_progress({"type": "provider.output.delta", "delta": delta})
+        elif isinstance(delta, str) and "reasoning" in event_type and event_type.endswith(
+            ".delta"
+        ):
+            _emit_progress({"type": "provider.reasoning.delta", "delta": delta})
+    elif anthropic_messages and event.get("type") == "content_block_delta":
+        delta = event.get("delta") or {}
+        if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
+            _emit_progress({"type": "provider.output.delta", "delta": delta["text"]})
+        elif delta.get("type") == "thinking_delta" and isinstance(
+            delta.get("thinking"), str
+        ):
+            _emit_progress(
+                {"type": "provider.reasoning.delta", "delta": delta["thinking"]}
+            )
+
+
 def _stream_completion(
     client: Any,
     url: str,
@@ -717,7 +749,13 @@ def _stream_completion(
         def chunks() -> Any:
             for line in response.iter_lines():
                 _check_client_connected()
-                yield _parse_sse_line(line)
+                event = _parse_sse_line(line)
+                _emit_native_stream_delta(
+                    event,
+                    responses_api=responses_api,
+                    anthropic_messages=anthropic_messages,
+                )
+                yield event
 
         if anthropic_messages:
             return assemble_anthropic_stream(chunks())

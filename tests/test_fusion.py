@@ -2473,3 +2473,25 @@ def test_main_compaction_reroute_waits_for_plan_complexity():
     run.main_compaction_pending = None
     run._reroute_after_compaction("main", previous)
     assert run.main_compaction_slot == "main-cheap"
+
+
+def test_native_protocol_stream_deltas_emit_progress(monkeypatch):
+    events: list[dict[str, Any]] = []
+    monkeypatch.setattr(providers, "_emit_progress", events.append)
+    providers._emit_native_stream_delta(
+        {"type": "response.output_text.delta", "delta": "response"},
+        responses_api=True,
+        anthropic_messages=False,
+    )
+    providers._emit_native_stream_delta(
+        {
+            "type": "content_block_delta",
+            "delta": {"type": "thinking_delta", "thinking": "anthropic"},
+        },
+        responses_api=False,
+        anthropic_messages=True,
+    )
+    assert events == [
+        {"type": "provider.output.delta", "delta": "response"},
+        {"type": "provider.reasoning.delta", "delta": "anthropic"},
+    ]

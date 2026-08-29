@@ -70,11 +70,12 @@ Tracks execution of `fusion-kyle-parity.md`. Updated after every stage.
 
 ## Phase 4 — Streaming deltas — DONE
 
-- `providers._assemble_streamed_completion` now tees
-  `provider.output.delta` / `provider.reasoning.delta` into the existing
-  progress event stream (sink-gated, upstream-streamed calls only). No new
-  endpoint or protocol: SSE clients see deltas through the same channel as
-  other progress events.
+- Provider stream assembly now tees `provider.output.delta` /
+  `provider.reasoning.delta` into the existing progress event stream for all
+  three supported protocols: OpenAI Chat, OpenAI Responses, and Anthropic
+  Messages (sink-gated, upstream-streamed calls only). No new endpoint or
+  protocol: SSE clients see deltas through the same channel as other progress
+  events.
 - Audit catch fixed: `api._stream.emit` sequence increment was non-atomic;
   parallel lanes + delta volume could duplicate/lose sequence numbers. Now
   guarded by a lock.
@@ -108,7 +109,7 @@ Tracks execution of `fusion-kyle-parity.md`. Updated after every stage.
   retries cannot multiply the wall-time budget. Parallel lane threads now
   inherit `active_run`, so the budget applies there too.
 - Targeted routing/failover/deadline tests: 112 passed. Complete suite after
-  closure: **527 passed**.
+  closure: **528 passed**.
 
 ## Final verification — prime-agent harness multi-step coding (base + fusion) — DONE
 
@@ -142,6 +143,6 @@ Fusion session:
   production-style launch: each again made 3 turns and passed exactly.
 
 Final gates:
-- all tests, including optional training files: **527 passed**;
+- all tests, including optional training files: **528 passed**;
 - ruff on every touched Python file: clean;
 - one existing Starlette/httpx deprecation warning only.
