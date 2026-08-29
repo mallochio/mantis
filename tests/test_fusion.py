@@ -57,7 +57,7 @@ class FakeWorker:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         self.calls.append((slot, messages, tools))
         first_content = messages[0].get("content", "")
-        if first_content == fusion.MAIN_PREAMBLE:
+        if first_content.startswith(fusion.MAIN_PREAMBLE):
             return self._main_response(messages)
         return self._sidekick_response(messages, tools)
 
@@ -190,7 +190,7 @@ class SequenceWorker:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         self.calls.append((slot, messages, tools))
         first_content = messages[0].get("content", "")
-        if first_content == fusion.MAIN_PREAMBLE:
+        if first_content.startswith(fusion.MAIN_PREAMBLE):
             content, tool_calls, usage = self._next(self.main_outputs, self.main_idx)
             self.main_idx += 1
         else:
@@ -1024,7 +1024,7 @@ def test_fusion_main_driver_can_call_tools_during_planning(client, monkeypatch, 
     def mock_worker(slot, messages, max_tokens=4096, temperature=0.7, worker_tools=None):
         calls.append((slot, messages, worker_tools))
         first_content = messages[0].get("content", "")
-        if first_content == fusion.MAIN_PREAMBLE:
+        if first_content.startswith(fusion.MAIN_PREAMBLE):
             is_review = any(
                 m.get("role") == "user" and fusion.REVIEW_PROMPT in m.get("content", "")
                 for m in messages
@@ -1140,7 +1140,7 @@ def test_fusion_review_receives_sidekick_tool_activity(client, monkeypatch):
 
     def mock_worker(slot, messages, max_tokens=4096, temperature=0.7, worker_tools=None):
         first_content = messages[0].get("content", "")
-        if first_content == fusion.MAIN_PREAMBLE:
+        if first_content.startswith(fusion.MAIN_PREAMBLE):
             is_review = any(fusion.REVIEW_PROMPT in m.get("content", "") for m in messages)
             if not is_review:
                 return {
@@ -2135,7 +2135,7 @@ def test_fusion_structured_lanes_step_in_parallel(monkeypatch):
 
     def worker(_self, slot, messages, tools):
         first = messages[0].get("content", "")
-        if first == fusion.MAIN_PREAMBLE:
+        if first.startswith(fusion.MAIN_PREAMBLE):
             is_review = any(
                 msg.get("role") == "user" and fusion.REVIEW_PROMPT in msg.get("content", "")
                 for msg in messages
@@ -2166,3 +2166,52 @@ def test_fusion_budget_guard_pickle_roundtrip():
     assert restored.turns == 1
     restored.consume_turn()
     assert restored.turns == 2
+
+
+def test_fusion_structured_preamble_delegates_and_legacy_unchanged():
+    structured_run = fusion.FusionRun(
+        "p-struct",
+        "goal",
+        budget=fusion.FusionRunBudget(max_turns=5),
+    )
+    preamble = structured_run.main_messages[0]["content"]
+    assert preamble.startswith(fusion.MAIN_PREAMBLE)
+    assert "Delegate all execution work" in preamble
+    assert "frontier" in preamble
+
+    legacy_run = fusion.FusionRun("p-legacy", "goal", delegation_mode="forced")
+    assert legacy_run.main_messages[0]["content"] == fusion.MAIN_PREAMBLE
+
+
+def test_fusion_frontier_profile_uses_main_slot(monkeypatch):
+    plan_json = json.dumps(
+        {
+            "complexity": 0.9,
+            "main_task": "verify integration",
+            "sidekick_assignments": [
+                {"task": "hard integration task", "profile": "frontier"},
+                {"task": "mechanical rename"},
+            ],
+        }
+    )
+    worker = SequenceWorker(
+        [(plan_json, None, DEFAULT_USAGE), ("ACCEPT", None, DEFAULT_USAGE)],
+        [("hard done", None, DEFAULT_USAGE), ("rename done", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    run = fusion.FusionRun(
+        "frontier",
+        "goal",
+        budget=fusion.FusionRunBudget(max_turns=10),
+    )
+
+    event = run.advance()
+
+    assert event["status"] == "completed"
+    lane_slots = [
+        call[0]
+        for call in worker.calls
+        if not call[1][0].get("content", "").startswith(fusion.MAIN_PREAMBLE)
+    ]
+    assert run.main_slot in lane_slots
+    assert len(lane_slots) == 2

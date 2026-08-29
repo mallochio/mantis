@@ -77,6 +77,35 @@ SIDEKICK_PREAMBLE = (
     "output, and any remaining issues."
 )
 
+STRUCTURED_PLANNING_SUFFIX = (
+    " You plan with structured output. Delegate all execution work, including "
+    "the hardest integration task, to sidekick lanes; reserve main for planning "
+    "and review. Assign the 'frontier' profile (the strongest model) to the task "
+    "that needs it."
+)
+
+
+def _main_preamble(
+    structured: bool,
+    run_profiles: dict[str, FusionWorkerProfile],
+    catalog_profiles: dict[str, FusionWorkerProfile],
+) -> str:
+    if not structured:
+        return MAIN_PREAMBLE
+    suffix = STRUCTURED_PLANNING_SUFFIX
+    profiles = {**catalog_profiles, **run_profiles}
+    if profiles:
+        roster = "\n".join(
+            f"- {p.name}: {p.description or (p.instructions.splitlines() or ['custom worker'])[0]}"
+            for p in profiles.values()
+        )
+        suffix += (
+            "\nAvailable sidekick profiles (assign only when the specialization "
+            "fits):\n" + roster
+        )
+    return MAIN_PREAMBLE + suffix
+
+
 FUSION_BRIEF_OPEN = "<fusion-brief>"
 FUSION_BRIEF_CLOSE = "</fusion-brief>"
 FUSION_FOLLOW_UP_OPEN = "<fusion-follow-up>"
@@ -935,14 +964,23 @@ class FusionRun(NativeRun):
             {"plan", "review"} if policy == "plan+review" else {policy} - {"none"}
         )
         self.tools = utils._convert_tools(tools)
+        self.structured = (
+            bool(self.worker_profiles)
+            or bool(self.tool_options.enabled)
+            or self.budget is not None
+            or bool(coordinator.worker_profiles)
+        )
+        preamble = _main_preamble(
+            self.structured, self.worker_profiles, coordinator.worker_profiles
+        )
         if messages:
             self.main_messages: list[dict[str, Any]] = [
-                {"role": "system", "content": MAIN_PREAMBLE},
+                {"role": "system", "content": preamble},
                 *messages,
             ]
         else:
             self.main_messages = [
-                {"role": "system", "content": MAIN_PREAMBLE},
+                {"role": "system", "content": preamble},
                 {"role": "user", "content": brief},
             ]
         self.sidekick_messages: list[dict[str, Any]] = [
@@ -962,12 +1000,6 @@ class FusionRun(NativeRun):
         self.completed_via: str = ""
         self._resume_allows_answer = False
         self.turns: list[dict[str, Any]] = []
-        self.structured = (
-            bool(self.worker_profiles)
-            or bool(self.tool_options.enabled)
-            or self.budget is not None
-            or bool(coordinator.worker_profiles)
-        )
         self.structured_plan: FusionPlan | None = None
         self.sidekick_lanes: list[SidekickLane] = []
         self.sidekick_reports: list[str] = []
@@ -1283,6 +1315,9 @@ class FusionRun(NativeRun):
             return self.worker_profiles[name]
         if name in coordinator.worker_profiles:
             return coordinator.worker_profiles[name]
+        if name == "frontier":
+            # Built-in main-lane equivalent: the strongest slot as a lane.
+            return FusionWorkerProfile(name="frontier", model=self.main_slot)
         skill = utils._load_skill_profile(name)
         if skill is not None:
             return skill
