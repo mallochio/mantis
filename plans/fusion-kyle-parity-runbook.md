@@ -146,3 +146,12 @@ Final gates:
 - all tests, including optional training files: **528 passed**;
 - ruff on every touched Python file: clean;
 - one existing Starlette/httpx deprecation warning only.
+
+
+## Remote integration — DONE
+
+- Fetched GitHub after another machine pushed Dependabot PR #7
+  (`transformers` uv-group bump).
+- Rebased all parity commits onto merge `43b2859` with no conflicts.
+- Post-rebase bounded suite: 196 + 113 + 219 = **528 passed**.
+- Pushed clean `main` through `05187f2`; local and `origin/main` synchronized.
