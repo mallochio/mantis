@@ -81,4 +81,17 @@ Tracks execution of `fusion-kyle-parity.md`. Updated after every stage.
 - Test: assembly emits both delta types and assembles identical content.
   95 fusion+upstream tests green; 277 gate green (incl. parity streaming).
 
+## Full-suite audit — DONE
+
+- Broad run initially stalled at `test_parity_websearch`.
+- `faulthandler_timeout` proved a Phase 1 self-deadlock: legacy
+  `NativeRun.advance()` holds `self.lock`, then provider accounting called
+  `add_usage()`, which tried to reacquire it. Fusion-only gates did not expose
+  this legacy path.
+- Fixed with a dedicated picklable `usage_lock`; no `RLock` or wider lock
+  semantic change.
+- Installed already-declared optional test dependencies (`datasets`, `boto3`)
+  into the project venv. Entire suite: **521 passed**, one upstream Starlette
+  deprecation warning.
+
 ## Final verification — prime-agent harness multi-step coding (base + fusion) — PENDING

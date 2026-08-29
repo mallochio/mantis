@@ -380,6 +380,7 @@ class NativeRun:
         self.terminated_by: str | None = None
         self.kind = "run"
         self.lock = threading.Lock()
+        self.usage_lock = threading.Lock()
         self.request_lock = threading.Lock()
         self.request_events: dict[str, dict[str, Any]] = {}
         self.tool_observations: list[dict[str, Any]] = []
@@ -462,18 +463,21 @@ class NativeRun:
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
         state.pop("lock", None)
+        state.pop("usage_lock", None)
         state.pop("request_lock", None)
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
         self.lock = threading.Lock()
+        self.usage_lock = threading.Lock()
         self.request_lock = threading.Lock()
         self.request_events = getattr(self, "request_events", {})
 
     def add_usage(self, usage: Any, model: str | None = None) -> None:
         # Compound dict updates race when parallel Fusion lanes report usage.
-        with self.lock:
+        # Use a dedicated lock: some NativeRun.advance paths already hold self.lock.
+        with self.usage_lock:
             self._add_usage(usage, model)
 
     def _add_usage(self, usage: Any, model: str | None = None) -> None:
