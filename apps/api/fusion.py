@@ -16,6 +16,7 @@ from typing import Any, cast
 import model_catalog
 import providers
 import serve_config
+import tool_exec
 import utils
 from fusion_budget import FusionBudgetGuard
 from fusion_router import FusionRouter
@@ -967,6 +968,7 @@ class FusionRun(NativeRun):
         self.structured = (
             bool(self.worker_profiles)
             or bool(self.tool_options.enabled)
+            or self.tool_options.server_execution
             or self.budget is not None
             or bool(coordinator.worker_profiles)
         )
@@ -1326,7 +1328,24 @@ class FusionRun(NativeRun):
     def _filter_tools(self) -> list[dict[str, Any]]:
         """Apply tool_options and profile filtering to the tool list."""
         tools = utils._filter_tools_by_options(self.tools, self.tool_options)
+        if self.tool_options.server_execution:
+            present = {str(t.get("function", {}).get("name", "")) for t in tools}
+            tools.extend(
+                schema
+                for schema in tool_exec.server_tool_schemas(self.tool_options.enabled)
+                if schema["function"]["name"] not in present
+            )
         return tools
+
+    def _can_execute_server_side(self, calls: list[dict[str, Any]]) -> bool:
+        return bool(calls) and self.tool_options.server_execution and all(
+            str((call.get("function") or {}).get("name", "")) in tool_exec.SERVER_TOOL_NAMES
+            for call in calls
+        )
+
+    def _server_tool_results(self, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        workspace = tool_exec.workspace_for(self.run_id)
+        return tool_exec.execute_calls(calls, workspace)
 
     def _parse_plan_text(self, text: str) -> FusionPlan | None:
         """Parse a structured FusionPlan from JSON or legacy PLAN:/BRIEF: text."""
@@ -1709,7 +1728,12 @@ class FusionRun(NativeRun):
             self.status = "sidekick_pending"
 
         max_iterations = max(1, coordinator.max_follow_ups + 1)
-        for _ in range(max_iterations * 4):
+        # Server-executed tool rounds consume loop iterations, so the ceiling
+        # must cover a lane's full tool budget, not just client round-trips.
+        step_ceiling = max_iterations * 4 + coordinator.sidekick_max_tool_rounds * max(
+            1, len(self.sidekick_lanes)
+        )
+        for _ in range(step_ceiling):
             if self.budget is not None:
                 self.budget.check_timeout()
 
@@ -1731,13 +1755,27 @@ class FusionRun(NativeRun):
                         serve_config._history_context.event_sink = event_sink
                     return lane.step()
 
-                with ThreadPoolExecutor(max_workers=max(1, len(runnable))) as executor:
-                    statuses = list(executor.map(_step, runnable))
-                for lane, status in zip(runnable, statuses, strict=True):
-                    if status["status"] == "awaiting_tools":
+                if runnable:
+                    with ThreadPoolExecutor(max_workers=len(runnable)) as executor:
+                        list(executor.map(_step, runnable))
+                # Collect from every lane, not just freshly stepped ones: a lane
+                # stepped inline via server-side execution may already hold its
+                # next batch of pending calls.
+                for lane in self.sidekick_lanes:
+                    if lane.pending_tool_calls:
                         all_pending.extend(lane.pending_tool_calls)
 
                 if all_pending:
+                    if self._can_execute_server_side(all_pending):
+                        by_lane = self._distribute_tool_results(
+                            self._server_tool_results(all_pending)
+                        )
+                        for lane in self.sidekick_lanes:
+                            results = by_lane.get(lane.lane_id, [])
+                            if results:
+                                lane.step(results)
+                        self.status = "sidekick_pending"
+                        continue
                     self.pending_tool_calls = all_pending
                     self.status = "awaiting_tools"
                     return self._ok_event(request_id)

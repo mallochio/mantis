@@ -37,6 +37,7 @@ class FusionToolOptions(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     enabled: list[str] = Field(default_factory=list)
+    server_execution: bool = False
 
 
 class FusionSidekickAssignment(BaseModel):

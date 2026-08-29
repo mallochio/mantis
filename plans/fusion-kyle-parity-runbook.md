@@ -42,7 +42,31 @@ Tracks execution of `fusion-kyle-parity.md`. Updated after every stage.
 - Tests: preamble structured-vs-legacy, frontier profile uses main slot.
   66 fusion tests green; 242 gate green.
 
-## Phase 3 — Server-side tool execution — PENDING
+## Phase 3 — Server-side tool execution — DONE
+
+- New `apps/api/tool_exec.py` (~230 lines, stdlib only): files/shell/code tools
+  against a per-run workspace (`MANTIS_FUSION_WORKSPACE_ROOT`, default
+  `.mantis/fusion`), path containment, scrubbed env, subprocess timeout,
+  output capped at `RUN_MAX_MSG_BYTES`. Canonical schemas per bundle; alias
+  names (`sh`, `python`, `exec`, ...) still execute.
+- `FusionToolOptions.server_execution` (also flips the run to structured).
+  `_filter_tools` offers server schemas for enabled bundles when the client
+  did not declare them.
+- Wiring in `_advance_structured`: when every pending call is server-known,
+  execute inline (parallel via `ThreadPoolExecutor`, order-preserving) and
+  feed results back into the lanes; mixed/unknown batches keep the client
+  contract byte-for-byte.
+- Audit catches fixed en route:
+  - pending-collection now scans ALL lanes (a lane stepped inline holds its
+    next batch; the old runnable-only collection would have dropped it);
+  - loop ceiling raised by `sidekick_max_tool_rounds * lanes` since
+    server-executed rounds consume iterations;
+  - ruff S604: `/bin/sh -c` argv instead of `shell=True`.
+- ponytail ceiling recorded in code: cwd jail + scrubbed env is not
+  tenant-grade isolation; container backend when untrusted callers opt in.
+- Tests: tool unit coverage, escape/unknown rejection, parallel+ordered
+  execution, end-to-end server run with no client round-trip, mixed-batch
+  suspension. 71 fusion tests green; 247 gate green.
 
 ## Phase 4 — Streaming deltas — PENDING
 

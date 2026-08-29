@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import pickle
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ import fusion
 import providers
 import pytest
 import serve_config
+import tool_exec
 import utils
 from fastapi.testclient import TestClient
 
@@ -2215,3 +2217,138 @@ def test_fusion_frontier_profile_uses_main_slot(monkeypatch):
     ]
     assert run.main_slot in lane_slots
     assert len(lane_slots) == 2
+
+
+def _tool_call(call_id: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(arguments)},
+    }
+
+
+def test_tool_exec_file_and_shell_tools(tmp_path):
+    workspace = tool_exec.workspace_for("t", root=tmp_path)
+    assert (
+        tool_exec.execute(
+            "write_file", {"path": "a.py", "content": "print('hi')"}, workspace
+        )
+        == "ok"
+    )
+    assert tool_exec.execute("read_file", {"path": "a.py"}, workspace) == "print('hi')"
+    assert "a.py" in tool_exec.execute("list_files", {}, workspace)
+    assert "print" in tool_exec.execute("search_files", {"query": "print"}, workspace)
+    assert "hello" in tool_exec.execute("bash", {"command": "echo hello"}, workspace)
+    assert "2" in tool_exec.execute("run_code", {"code": "print(1 + 1)"}, workspace)
+    tool_exec.execute(
+        "edit_file", {"path": "a.py", "old_text": "hi", "new_text": "bye"}, workspace
+    )
+    assert "bye" in tool_exec.execute("read_file", {"path": "a.py"}, workspace)
+
+
+def test_tool_exec_rejects_escape_and_unknown(tmp_path):
+    workspace = tool_exec.workspace_for("t2", root=tmp_path)
+    with pytest.raises(ValueError, match="escapes"):
+        tool_exec.execute("read_file", {"path": "../secret"}, workspace)
+    results = tool_exec.execute_calls([_tool_call("x", "unknown_tool", {})], workspace)
+    assert results[0]["is_error"]
+
+
+def test_tool_exec_calls_parallel_and_ordered(tmp_path):
+    workspace = tool_exec.workspace_for("parallel", root=tmp_path)
+    calls = [
+        _tool_call("a", "bash", {"command": "sleep 0.5; printf A"}),
+        _tool_call("b", "bash", {"command": "sleep 0.5; printf B"}),
+    ]
+    start = time.monotonic()
+    results = tool_exec.execute_calls(calls, workspace)
+    elapsed = time.monotonic() - start
+    assert [result["tool_call_id"] for result in results] == ["a", "b"]
+    assert [result["content"] for result in results] == ["A", "B"]
+    assert elapsed < 0.9
+
+
+def test_fusion_server_side_execution_completes_without_client(monkeypatch, tmp_path):
+    monkeypatch.setenv("MANTIS_FUSION_WORKSPACE_ROOT", str(tmp_path))
+    plan_json = json.dumps(
+        {
+            "complexity": 0.5,
+            "main_task": "verify script",
+            "sidekick_assignments": [{"task": "write and run a script"}],
+        }
+    )
+    worker = SequenceWorker(
+        [(plan_json, None, DEFAULT_USAGE), ("ACCEPT", None, DEFAULT_USAGE)],
+        [
+            (
+                "",
+                [
+                    _tool_call(
+                        "w1", "write_file", {"path": "script.py", "content": "print(40 + 2)"}
+                    )
+                ],
+                DEFAULT_USAGE,
+            ),
+            (
+                "",
+                [
+                    _tool_call(
+                        "r1",
+                        "run_code",
+                        {"code": "import pathlib; print(pathlib.Path('script.py').read_text())"},
+                    )
+                ],
+                DEFAULT_USAGE,
+            ),
+            ("script written and verified", None, DEFAULT_USAGE),
+        ],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    run = fusion.FusionRun(
+        "server-exec",
+        "goal",
+        tool_options=fusion.FusionToolOptions(enabled=["files", "code"], server_execution=True),
+    )
+
+    event = run.advance()
+
+    assert event["status"] == "completed", event
+    assert event["pending_tool_calls"] is None
+    assert "script written" in event["report"]
+    assert (tmp_path / "server-exec" / "script.py").read_text() == "print(40 + 2)"
+
+
+def test_fusion_server_execution_mixed_batch_suspends(monkeypatch, tmp_path):
+    monkeypatch.setenv("MANTIS_FUSION_WORKSPACE_ROOT", str(tmp_path))
+    plan_json = json.dumps(
+        {
+            "complexity": 0.5,
+            "main_task": "verify",
+            "sidekick_assignments": [{"task": "use a client tool too"}],
+        }
+    )
+    worker = SequenceWorker(
+        [(plan_json, None, DEFAULT_USAGE), ("ACCEPT", None, DEFAULT_USAGE)],
+        [
+            (
+                "",
+                [
+                    _tool_call("w1", "write_file", {"path": "a.txt", "content": "x"}),
+                    _tool_call("c1", "client_tool", {}),
+                ],
+                DEFAULT_USAGE,
+            ),
+            ("done", None, DEFAULT_USAGE),
+        ],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    run = fusion.FusionRun(
+        "mixed",
+        "goal",
+        tool_options=fusion.FusionToolOptions(enabled=["files"], server_execution=True),
+    )
+
+    event = run.advance()
+
+    assert event["status"] == "awaiting_tools"
+    assert len(event["pending_tool_calls"]) == 2
