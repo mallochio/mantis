@@ -472,6 +472,11 @@ class NativeRun:
         self.request_events = getattr(self, "request_events", {})
 
     def add_usage(self, usage: Any, model: str | None = None) -> None:
+        # Compound dict updates race when parallel Fusion lanes report usage.
+        with self.lock:
+            self._add_usage(usage, model)
+
+    def _add_usage(self, usage: Any, model: str | None = None) -> None:
         if not isinstance(usage, dict):
             return
         for key in ("prompt_tokens", "completion_tokens", "total_tokens"):

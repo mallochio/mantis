@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import pickle
+import threading
 import uuid
 from pathlib import Path
 from typing import Any
@@ -2118,3 +2119,50 @@ def test_filter_tools_by_options_uses_bundles():
     filtered = utils._filter_tools_by_options(tools, options)
     names = {t["function"]["name"] for t in filtered}
     assert names == {"bash", "edit_file"}
+
+
+def test_fusion_structured_lanes_step_in_parallel(monkeypatch):
+    """Two sidekick lanes must rendezvous; sequential stepping breaks the barrier."""
+    plan_json = json.dumps(
+        {
+            "complexity": 0.5,
+            "main_task": "verify both",
+            "sidekick_assignments": [{"task": "task a"}, {"task": "task b"}],
+        }
+    )
+    barrier = threading.Barrier(2)
+    usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+
+    def worker(_self, slot, messages, tools):
+        first = messages[0].get("content", "")
+        if first == fusion.MAIN_PREAMBLE:
+            is_review = any(
+                msg.get("role") == "user" and fusion.REVIEW_PROMPT in msg.get("content", "")
+                for msg in messages
+            )
+            text = "ACCEPT" if is_review else plan_json
+            return ({"role": "assistant", "content": text}, dict(usage))
+        barrier.wait(timeout=5)
+        return ({"role": "assistant", "content": "done"}, dict(usage))
+
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    run = fusion.FusionRun(
+        "par",
+        "goal",
+        budget=fusion.FusionRunBudget(max_turns=10),
+    )
+
+    event = run.advance()
+
+    assert event["status"] == "completed", event
+    assert len(run.sidekick_reports) == 2
+    assert event["usage"]["total_tokens"] == 8
+
+
+def test_fusion_budget_guard_pickle_roundtrip():
+    guard = fusion.FusionBudgetGuard(max_turns=3, max_tokens=100, timeout_ms=1000)
+    guard.consume_turn()
+    restored = pickle.loads(pickle.dumps(guard))  # noqa: S301
+    assert restored.turns == 1
+    restored.consume_turn()
+    assert restored.turns == 2

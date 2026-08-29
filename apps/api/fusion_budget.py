@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any
 
@@ -25,6 +26,16 @@ class FusionBudgetGuard:
         self._tokens = 0
         self._turns = 0
         self._started = time.monotonic()
+        self._lock = threading.Lock()
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state.pop("_lock", None)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
 
     @property
     def tokens(self) -> int:
@@ -35,11 +46,12 @@ class FusionBudgetGuard:
         return self._turns
 
     def consume_turn(self) -> None:
-        self._turns += 1
-        if self.max_turns is not None and self._turns > self.max_turns:
-            raise FusionBudgetExceededError(
-                f"turn budget exceeded: {self._turns} > {self.max_turns}"
-            )
+        with self._lock:
+            self._turns += 1
+            if self.max_turns is not None and self._turns > self.max_turns:
+                raise FusionBudgetExceededError(
+                    f"turn budget exceeded: {self._turns} > {self.max_turns}"
+                )
 
     def consume_tokens(self, usage: dict[str, Any]) -> None:
         total = 0
@@ -52,11 +64,12 @@ class FusionBudgetGuard:
                 total = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
         if not isinstance(total, int):
             total = 0
-        self._tokens += total
-        if self.max_tokens is not None and self._tokens > self.max_tokens:
-            raise FusionBudgetExceededError(
-                f"token budget exceeded: {self._tokens} > {self.max_tokens}"
-            )
+        with self._lock:
+            self._tokens += total
+            if self.max_tokens is not None and self._tokens > self.max_tokens:
+                raise FusionBudgetExceededError(
+                    f"token budget exceeded: {self._tokens} > {self.max_tokens}"
+                )
 
     def check_timeout(self) -> None:
         if self.timeout_ms is None:

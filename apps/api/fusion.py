@@ -8,6 +8,7 @@ import re
 import threading
 import tomllib
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any, cast
@@ -1680,10 +1681,24 @@ class FusionRun(NativeRun):
             if self.status == "sidekick_pending":
                 self.active_role = "sidekick"
                 all_pending: list[dict[str, Any]] = []
-                for lane in self.sidekick_lanes:
-                    if lane.complete or lane.error or lane.pending_tool_calls:
-                        continue
-                    status = lane.step()
+                runnable = [
+                    lane
+                    for lane in self.sidekick_lanes
+                    if not lane.complete and not lane.error and not lane.pending_tool_calls
+                ]
+                # ponytail: one pool per batch; keep it until profiling justifies a persistent pool.
+                # _history_context is thread-local, so hand the sink to lane
+                # threads or their progress events vanish.
+                sink = getattr(serve_config._history_context, "event_sink", None)
+
+                def _step(lane: SidekickLane, event_sink: Any = sink) -> dict[str, Any]:
+                    if event_sink is not None:
+                        serve_config._history_context.event_sink = event_sink
+                    return lane.step()
+
+                with ThreadPoolExecutor(max_workers=max(1, len(runnable))) as executor:
+                    statuses = list(executor.map(_step, runnable))
+                for lane, status in zip(runnable, statuses, strict=True):
                     if status["status"] == "awaiting_tools":
                         all_pending.extend(lane.pending_tool_calls)
 
