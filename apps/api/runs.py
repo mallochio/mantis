@@ -478,6 +478,16 @@ class NativeRun:
             value = usage.get(key)
             if isinstance(value, int) and value >= 0:
                 self.usage[key] += value
+        prompt_details = usage.get("prompt_tokens_details")
+        if isinstance(prompt_details, dict):
+            self.usage["prompt_tokens_details"] = {
+                **self.usage.get("prompt_tokens_details", {}),
+                **{
+                    key: self.usage.get("prompt_tokens_details", {}).get(key, 0) + value
+                    for key, value in prompt_details.items()
+                    if isinstance(value, int) and value >= 0
+                },
+            }
         details = usage.get("completion_tokens_details")
         if isinstance(details, dict):
             target = self.usage.setdefault("completion_tokens_details", {})

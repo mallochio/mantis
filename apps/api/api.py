@@ -742,7 +742,7 @@ def _build_fusion_chat_response(
     reasoning_trace = event.get("reasoning_trace")
     if reasoning_trace:
         message["reasoning"] = reasoning_trace
-    usage = utils._request_usage(messages, completion_text)
+    usage = event.get("usage") or utils._request_usage(messages, completion_text)
     headers = {"X-Request-Id": request_id}
     if run_id:
         headers["X-Mantis-Run-Id"] = run_id
@@ -828,8 +828,10 @@ def _iter_fusion_chat_event(
             completion_text = msg
         include_usage = bool(request.stream_options and request.stream_options.include_usage)
         if include_usage:
-            messages = [msg.model_dump(exclude_none=True) for msg in request.messages]
-            usage = utils._request_usage(messages, completion_text)
+            usage = event.get("usage") or utils._request_usage(
+                [msg.model_dump(exclude_none=True) for msg in request.messages],
+                completion_text,
+            )
             yield f"data: {json.dumps({**base, 'choices': [], 'usage': usage})}\n\n".encode()
     finally:
         _capacity.release()

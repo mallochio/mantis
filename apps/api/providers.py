@@ -362,7 +362,9 @@ def _with_cache_breakpoints(messages: list[dict[str, Any]]) -> list[dict[str, An
 
 
 def _apply_chat_prompt_cache(
-    model: str, messages: list[dict[str, Any]]
+    model: str,
+    messages: list[dict[str, Any]],
+    provider: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return (messages, extra body fields) for the model's cache dialect.
 
@@ -374,7 +376,14 @@ def _apply_chat_prompt_cache(
     family = _model_cache_family(model)
     if family == "anthropic" and _cache_breakpoints_enabled():
         return _with_cache_breakpoints(messages), extra
-    if family == "openai" and _openai_cache_breakpoints_enabled():
+    # Bifrost and Switchyard use session-based prompt caching via session_id /
+    # prompt_cache_key; explicit OpenAI breakpoints are not supported and can
+    # suppress the cache hit accounting that those gateways provide.
+    if (
+        family == "openai"
+        and _openai_cache_breakpoints_enabled()
+        and provider not in {"bifrost", "switchyard"}
+    ):
         extra["prompt_cache_options"] = {"mode": "explicit", "ttl": "30m"}
         return _with_openai_cache_breakpoints(messages), extra
     return messages, extra
@@ -570,7 +579,9 @@ def _build_request(
         path = "responses"
     else:
         body = {"model": model, "messages": sanitized_messages, "max_tokens": max_tokens}
-        cached_messages, cache_extra = _apply_chat_prompt_cache(model, sanitized_messages)
+        cached_messages, cache_extra = _apply_chat_prompt_cache(
+            model, sanitized_messages, resolved.binding or provider
+        )
         body["messages"] = cached_messages
         body.update(cache_extra)
         if coerced_effort:
@@ -763,13 +774,16 @@ def _provider_response(
             failures.append(str(error))
             continue
         provider, model = resolved.adapter, resolved.model
+        provider_name = resolved.binding or provider
         responses_api = uses_responses_api(provider, model, resolved.protocols)
         anthropic_messages = _uses_anthropic_messages(resolved)
         # Session stickiness pins OpenRouter to one model+provider per
         # conversation to maximize prompt-cache hits. Apply it to all OpenRouter
         # backends (native Responses for "openai/*" and Chat Completions for
-        # every other OpenRouter model), not just the Responses path.
-        if provider == "openrouter" and _cache_retention_enabled():
+        # every other OpenRouter model), not just the Responses path. Also pass
+        # the cache key through Bifrost and Switchyard when they act as
+        # OpenRouter-compatible proxies.
+        if provider_name in {"openrouter", "bifrost", "switchyard"} and _cache_retention_enabled():
             namespace = getattr(run, "cache_namespace", None) or _prompt_cache_namespace(
                 messages, tools
             )
