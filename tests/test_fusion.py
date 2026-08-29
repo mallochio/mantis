@@ -2352,3 +2352,23 @@ def test_fusion_server_execution_mixed_batch_suspends(monkeypatch, tmp_path):
 
     assert event["status"] == "awaiting_tools"
     assert len(event["pending_tool_calls"]) == 2
+
+
+def test_provider_stream_assembly_emits_output_and_reasoning_deltas(monkeypatch):
+    events: list[dict[str, Any]] = []
+    monkeypatch.setattr(providers, "_emit_progress", events.append)
+    chunks = [
+        {"choices": [{"delta": {"role": "assistant", "content": "hel"}}]},
+        {"choices": [{"delta": {"content": "lo", "reasoning": "think"}}]},
+        {"usage": {"prompt_tokens": 1, "completion_tokens": 2}},
+    ]
+
+    result = providers._assemble_streamed_completion(chunks)
+
+    assert result["choices"][0]["message"]["content"] == "hello"
+    assert result["choices"][0]["message"]["reasoning"] == "think"
+    assert events == [
+        {"type": "provider.output.delta", "delta": "hel"},
+        {"type": "provider.output.delta", "delta": "lo"},
+        {"type": "provider.reasoning.delta", "delta": "think"},
+    ]

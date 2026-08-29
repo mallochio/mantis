@@ -68,6 +68,17 @@ Tracks execution of `fusion-kyle-parity.md`. Updated after every stage.
   execution, end-to-end server run with no client round-trip, mixed-batch
   suspension. 71 fusion tests green; 247 gate green.
 
-## Phase 4 — Streaming deltas — PENDING
+## Phase 4 — Streaming deltas — DONE
+
+- `providers._assemble_streamed_completion` now tees
+  `provider.output.delta` / `provider.reasoning.delta` into the existing
+  progress event stream (sink-gated, upstream-streamed calls only). No new
+  endpoint or protocol: SSE clients see deltas through the same channel as
+  other progress events.
+- Audit catch fixed: `api._stream.emit` sequence increment was non-atomic;
+  parallel lanes + delta volume could duplicate/lose sequence numbers. Now
+  guarded by a lock.
+- Test: assembly emits both delta types and assembles identical content.
+  95 fusion+upstream tests green; 277 gate green (incl. parity streaming).
 
 ## Final verification — prime-agent harness multi-step coding (base + fusion) — PENDING

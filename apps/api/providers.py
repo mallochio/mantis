@@ -648,6 +648,11 @@ def _assemble_streamed_completion(chunks: Any) -> dict[str, Any]:
                 message["role"] = delta["role"]
             if delta.get("content"):
                 message["content"] = (message.get("content") or "") + delta["content"]
+                _emit_progress({"type": "provider.output.delta", "delta": delta["content"]})
+            if delta.get("reasoning"):
+                _emit_progress(
+                    {"type": "provider.reasoning.delta", "delta": delta["reasoning"]}
+                )
             for key in ("reasoning", "reasoning_details", "annotations", "citations"):
                 part = delta.get(key)
                 if isinstance(part, str):

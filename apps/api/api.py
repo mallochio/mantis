@@ -440,6 +440,7 @@ def _stream(
     cancelled = threading.Event()
     started = time.monotonic()
     sequence = 0
+    sequence_lock = threading.Lock()
     stream_id = completion_id or "chatcmpl-" + uuid.uuid4().hex[:24]
     base = {
         "id": stream_id,
@@ -452,13 +453,15 @@ def _stream(
         nonlocal sequence
         if cancelled.is_set():
             return
-        event = {
-            "version": 1,
-            "sequence": sequence,
-            "elapsed_ms": round((time.monotonic() - started) * 1000.0, 1),
-            **raw,
-        }
-        sequence += 1
+        # Parallel Fusion lanes emit concurrently; keep sequence unique.
+        with sequence_lock:
+            event = {
+                "version": 1,
+                "sequence": sequence,
+                "elapsed_ms": round((time.monotonic() - started) * 1000.0, 1),
+                **raw,
+            }
+            sequence += 1
         results.put(("event", event))
 
     def complete() -> None:
