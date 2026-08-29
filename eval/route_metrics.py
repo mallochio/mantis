@@ -95,44 +95,42 @@ def _regret(
     return 0.0, 0.0
 
 
-def compute_metrics(
-    rows: list[dict[str, Any]], *, oracle: dict[str, str | None] | None = None
-) -> dict[str, Any]:
-    """Compute oracle accuracy, regret, frontier, and endpoint interpolation."""
-    oracle = oracle or oracle_labels(rows)
-    by_arm: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    by_instance: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
-    for row in rows:
-        by_arm[row["arm"]].append(row)
-        by_instance[row["instance_id"]][row["arm"]] = row
+def _tier_cost(row: dict[str, Any] | None) -> float | None:
+    cost = (row or {}).get("cost_usd")
+    return float(cost) if cost is not None else None
 
-    tier_rows = [
-        row for row in rows if row.get("arm") in TIERS or row.get("arm", "").endswith("-only")
-    ]
+
+def _tier_quality(row: dict[str, Any] | None) -> float:
+    return float((row or {}).get("quality", 0) or 0)
+
+
+def _tier_maps(
+    rows: list[dict[str, Any]],
+) -> tuple[dict[str, dict[str, float | None]], dict[str, dict[str, float]]]:
+    """Per-instance cost and quality maps for tier arms (tier or <tier>-only)."""
     tier_by_instance: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
-    for row in tier_rows:
-        tier = row.get("tier") or row["arm"].removesuffix("-only")
-        tier_by_instance[row["instance_id"]][tier] = row
+    for row in rows:
+        if row.get("arm") in TIERS or row.get("arm", "").endswith("-only"):
+            tier = row.get("tier") or row["arm"].removesuffix("-only")
+            tier_by_instance[row["instance_id"]][tier] = row
     tier_costs = {
-        instance: {
-            tier: (
-                float(value["cost_usd"])
-                if (value := tier_by_instance[instance].get(tier, {})).get("cost_usd")
-                is not None
-                else None
-            )
-            for tier in TIERS
-        }
+        instance: {tier: _tier_cost(tier_by_instance[instance].get(tier)) for tier in TIERS}
         for instance in tier_by_instance
     }
     tier_quality = {
-        instance: {
-            tier: float(tier_by_instance[instance].get(tier, {}).get("quality", 0) or 0)
-            for tier in TIERS
-        }
+        instance: {tier: _tier_quality(tier_by_instance[instance].get(tier)) for tier in TIERS}
         for instance in tier_by_instance
     }
+    return tier_costs, tier_quality
 
+
+def _accuracy_and_regret(
+    by_arm: dict[str, list[dict[str, Any]]],
+    oracle: dict[str, str | None],
+    tier_costs: dict[str, dict[str, float | None]],
+    tier_quality: dict[str, dict[str, float]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Oracle accuracy plus under/over-routing regret totals per arm."""
     accuracy: dict[str, Any] = {}
     regrets: dict[str, Any] = {}
     for arm, arm_rows in by_arm.items():
@@ -147,9 +145,10 @@ def compute_metrics(
         }
         comparable = [instance for instance in chosen if oracle.get(instance) is not None]
         correct = sum(chosen[i] == oracle[i] for i in comparable)
-        under_quality = over_quality = 0.0
-        under_cost: float | None = 0.0
-        over_cost: float | None = 0.0
+        totals = {
+            "under_routing": {"quality_lost": 0.0, "dollars_wasted": 0.0},
+            "over_routing": {"quality_lost": 0.0, "dollars_wasted": 0.0},
+        }
         for instance in comparable:
             oracle_tier = oracle[instance]
             assert oracle_tier is not None
@@ -159,50 +158,38 @@ def compute_metrics(
                 tier_costs.get(instance, {}),
                 tier_quality.get(instance, {}),
             )
-            if TIERS.index(chosen[instance]) < TIERS.index(oracle[instance]):
-                under_quality += max(
-                    0.0,
-                    tier_quality.get(instance, {}).get(oracle_tier, 0.0)
-                    - float(arm_rows_by_instance[instance].get("quality", 0.0)),
-                )
-                under_cost = (
-                    under_cost + wasted
-                    if under_cost is not None and wasted is not None
-                    else None
-                )
-            elif TIERS.index(chosen[instance]) > TIERS.index(oracle_tier):
-                over_quality += max(
-                    0.0,
-                    tier_quality.get(instance, {}).get(oracle_tier, 0.0)
-                    - float(arm_rows_by_instance[instance].get("quality", 0.0)),
-                )
-                over_cost = (
-                    over_cost + wasted
-                    if over_cost is not None and wasted is not None
-                    else None
-                )
+            chosen_rank, oracle_rank = TIERS.index(chosen[instance]), TIERS.index(oracle_tier)
+            if chosen_rank == oracle_rank:
+                continue
+            direction = "under_routing" if chosen_rank < oracle_rank else "over_routing"
+            bucket = totals[direction]
+            bucket["quality_lost"] += max(
+                0.0,
+                tier_quality.get(instance, {}).get(oracle_tier, 0.0)
+                - float(arm_rows_by_instance[instance].get("quality", 0.0)),
+            )
+            bucket["dollars_wasted"] = (
+                bucket["dollars_wasted"] + wasted
+                if bucket["dollars_wasted"] is not None and wasted is not None
+                else None
+            )
         accuracy[arm] = {
             "correct": correct,
             "eligible": len(comparable),
             "accuracy": correct / len(comparable) if comparable else None,
         }
         regrets[arm] = {
-            "under_routing": {
-                "quality_lost": under_quality,
-                "dollars_wasted": under_cost,
-            },
-            "over_routing": {
-                "quality_lost": over_quality,
-                "dollars_wasted": over_cost,
-            },
+            "under_routing": dict(totals["under_routing"]),
+            "over_routing": dict(totals["over_routing"]),
         }
+    return accuracy, regrets
 
-    arms = {arm: _arm_summary(arm_rows) for arm, arm_rows in by_arm.items()}
-    frontier = [{"arm": arm, **summary} for arm, summary in arms.items()]
-    interpolation = None
+
+def _cheap_expensive_interpolation(arms: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    """Router quality vs linear interpolation between the cheap and expensive baselines."""
     cheap, expensive = arms.get("cheap-only"), arms.get("expensive-only")
     router = arms.get("mantis-direct")
-    if (
+    if not (
         cheap
         and expensive
         and router
@@ -212,30 +199,46 @@ def compute_metrics(
         and cheap["cost_usd"] is not None
         and expensive["cost_usd"] is not None
     ):
-        span = expensive["cost_usd"] - cheap["cost_usd"]
-        fraction = (router["cost_usd"] - cheap["cost_usd"]) / span if span else None
-        expected = (
-            cheap["quality_mean"] + fraction * (expensive["quality_mean"] - cheap["quality_mean"])
-            if fraction is not None
-            else None
-        )
-        interpolation = {
-            "router_cost_usd": router["cost_usd"],
-            "router_quality": router["quality_mean"],
-            "interpolated_quality": expected,
-            "beats_interpolation": (
-                router["quality_mean"] is not None
-                and expected is not None
-                and router["quality_mean"] > expected
-            ),
-        }
+        return None
+    span = expensive["cost_usd"] - cheap["cost_usd"]
+    fraction = (router["cost_usd"] - cheap["cost_usd"]) / span if span else None
+    expected = (
+        cheap["quality_mean"] + fraction * (expensive["quality_mean"] - cheap["quality_mean"])
+        if fraction is not None
+        else None
+    )
+    return {
+        "router_cost_usd": router["cost_usd"],
+        "router_quality": router["quality_mean"],
+        "interpolated_quality": expected,
+        "beats_interpolation": (
+            router["quality_mean"] is not None
+            and expected is not None
+            and router["quality_mean"] > expected
+        ),
+    }
+
+
+def compute_metrics(
+    rows: list[dict[str, Any]], *, oracle: dict[str, str | None] | None = None
+) -> dict[str, Any]:
+    """Compute oracle accuracy, regret, frontier, and endpoint interpolation."""
+    oracle = oracle or oracle_labels(rows)
+    by_arm: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_arm[row["arm"]].append(row)
+
+    tier_costs, tier_quality = _tier_maps(rows)
+    accuracy, regrets = _accuracy_and_regret(by_arm, oracle, tier_costs, tier_quality)
+
+    arms = {arm: _arm_summary(arm_rows) for arm, arm_rows in by_arm.items()}
     return {
         "oracle": oracle,
         "accuracy": accuracy,
         "regret": regrets,
         "arms": arms,
-        "frontier": frontier,
-        "cheap_expensive_interpolation": interpolation,
+        "frontier": [{"arm": arm, **summary} for arm, summary in arms.items()],
+        "cheap_expensive_interpolation": _cheap_expensive_interpolation(arms),
     }
 
 
