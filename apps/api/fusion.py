@@ -28,7 +28,6 @@ from fusion_types import (
     FusionToolOptions,
     FusionWorkerProfile,
 )
-
 from runs import (
     RUN_STORE,
     NativeRun,
@@ -327,7 +326,7 @@ class FusionConfig:
     def context_message_limit(self) -> int:
         raw = self._load().get("context_message_limit")
         try:
-            return int(raw)
+            return int(raw)  # type: ignore[arg-type]  # None falls through to TypeError → default
         except (TypeError, ValueError):
             return 24
 
