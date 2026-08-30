@@ -29,7 +29,6 @@ from fusion_types import (
     FusionToolOptions,
     FusionWorkerProfile,
 )
-
 from runs import (
     RUN_STORE,
     NativeRun,
@@ -508,7 +507,8 @@ class FusionCoordinator:
             default=str,
         )
         try:
-            return max(1, litellm.token_counter(model="gpt-4o", text=payload))
+            counted = litellm.token_counter(model="gpt-4o", text=payload)
+            return max(1, int(counted))
         except Exception:  # noqa: BLE001 - counting must never break a call
             return max(1, len(payload) // 4)
 
