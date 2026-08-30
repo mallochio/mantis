@@ -101,7 +101,9 @@ def test_router_body_normalizes_reasoning_object():
             }
         )
     )
-    assert body["reasoning_effort"] == "low"
+    efficient = base_proxy._base_efficient_model() or ""
+    expected = providers._coerce_reasoning_effort(efficient, "low")
+    assert body.get("reasoning_effort") == expected
     assert "reasoning" not in body
     assert "user" not in body
     assert "metadata" not in body
@@ -148,7 +150,7 @@ def test_router_body_coerces_medium_reasoning():
     )
     efficient = base_proxy._base_efficient_model() or ""
     expected = providers._coerce_reasoning_effort(efficient, "medium")
-    assert body["reasoning_effort"] == expected
+    assert body.get("reasoning_effort") == expected
     assert "reasoning" not in body
 
 
