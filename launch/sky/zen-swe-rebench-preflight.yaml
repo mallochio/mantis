@@ -1,11 +1,10 @@
-# Zen-only SWE-rebench Phase 0 preflight (worker-hosted private Bifrost).
+# Zen-only SWE-rebench Phase 0 preflight (LiteLLM direct providers).
 #
 # Launch from the repo root (secrets come from the shell, never committed):
 #   source ~/.zshrc
 #   sky launch -y launch/sky/zen-swe-rebench-preflight.yaml \
 #     --env OPENCODE_API_KEY="$OPENCODE_API_KEY" \
-#     --env BIFROST_API_KEY="$BIFROST_API_KEY" \
-#     --env BIFROST_ENCRYPTION_KEY="$BIFROST_ENCRYPTION_KEY"
+#     --env OPENROUTER_API_KEY="$OPENROUTER_API_KEY"
 #
 # No `workdir`, no storage mounts, and no managed-jobs controller: SkyPilot
 # rsyncs the local file_mounts straight to the VM, so no GCS bucket is ever

@@ -38,4 +38,4 @@ jobs:
       - name: Run Mantis tests
         run: uv run pytest tests -q
       - name: Report Mantis coverage
-        run: uv run coverage report --fail-under=77  # ponytail: litellm cutover removed ~585 LOC bespoke, coverage 77% baseline; raise when new litellm tests added
+        run: uv run coverage report --fail-under=85  # ponytail: 85% after cleanup + litellm multiturn tests

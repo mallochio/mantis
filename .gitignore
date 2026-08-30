@@ -1,5 +1,3 @@
-# Based on GitHub's Python.gitignore and Node.gitignore templates.
-
 # Python bytecode / native extensions
 __pycache__/
 *.py[codz]
@@ -7,145 +5,65 @@ __pycache__/
 *.so
 
 # Python packaging
-.Python
 build/
-develop-eggs/
 dist/
-downloads/
-eggs/
-.eggs/
-lib/
-!launch/host/lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
 *.egg-info/
-.installed.cfg
 *.egg
 MANIFEST
-*.manifest
-*.spec
-pip-log.txt
-pip-delete-this-directory.txt
 
-# Python tests, coverage, and tooling
+# Tests, coverage, tooling
 htmlcov/
-.tox/
-.nox/
 .coverage
 .coverage.*
-.cache/
-nosetests.xml
 coverage.xml
 *.cover
-*.py.cover
-*.lcov
-cover/
-.hypothesis/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
-.dmypy.json
-dmypy.json
-.pyre/
-.pytype/
-.pybuilder/
-.pyright/
-.pytype/
-cython_debug/
+.hypothesis/
+.hypothesis/
+.pytest_cache/
 .ipynb_checkpoints/
 
-# Python environments and local package managers
-.envrc
-.venv/
-.venv*/
-venv/
-venv*/
-env/
-env*/
-ENV/
-env.bak/
-venv.bak/
-.smoke-venv/
-.venv-fetch/
-.pdm-python
-.pdm-build/
-.pixi/*
-!.pixi/config.toml
-__pypackages__/
-
-# Node.js / TypeScript
-node_modules/
-jspm_packages/
-web_modules/
-.npm/
-.pnpm-store/
-.pnp.*
-.yarn/*
-!.yarn/patches
-!.yarn/plugins
-!.yarn/releases
-!.yarn/sdks
-!.yarn/versions
-*.tsbuildinfo
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-lerna-debug.log*
-.pnpm-debug.log*
-.nyc_output/
-coverage/
-.parcel-cache/
-.next/
-.nuxt/
-.output/
-.svelte-kit/
-.vite/
-*.tgz
-
-# Environment variables and secrets
+# Environments
 .env
 .env.*
 !.env.example
-.pypirc
-.streamlit/secrets.toml
+.venv/
+venv/
+env/
+ENV/
+.pdm-python
+__pypackages__/
 
-# Editors and OS files
+# Editors / OS
 .idea/
 .vscode/*
 !.vscode/settings.json
 !.vscode/tasks.json
 !.vscode/launch.json
 !.vscode/extensions.json
-!.vscode/*.code-snippets
 *.swp
 *.swo
 *~
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
 ehthumbs.db
 Thumbs.db
 
-# Project logs, scratch data, and generated outputs
+# Project logs, scratch, outputs
 *.log
-runs/logs/
 outputs/
-/tmp/
+runs/logs/
+.tmp/
 .scratch/
 *.bak
 
-# Derived eval projections (regenerate with eval/score.py / eval/report_luna.py)
-eval/results-scored.jsonl
-eval/results-luna-scored.jsonl
+# Eval raw runs (regenerate; keep fixtures/manifests)
+eval/results*.jsonl
+eval/results*.json
 eval/runs/
 
-# Model weights and binary artifacts (baseline head is intentionally tracked)
+# Model weights (keep router_head.safetensors)
 *.safetensors
 *.bin
 *.pt
@@ -154,24 +72,11 @@ eval/runs/
 *.npy
 !artifacts/router_head.safetensors
 
-# External cloned dependencies
-llm-router/
-
-# Local Bifrost configuration contains the gateway encryption key. Track the
-# shared catalog only; keep this local file outside the repository.
-config/bifrost.json
-
 # Generated / runtime — do not commit
-coverage.xml
+mantis.egg-info/
 mantis.log
 model_iter_60.npy
-routing_catalog/build/
-routing_catalog/*.egg-info/
-mantis.egg-info/
 
-# Author-local agent instructions
+# Personal agent instructions
 /AGENTS.md
-
-# Personal, project-specific Poolside settings (do not commit; the shared
-# .poolside/settings.yaml remains trackable).
 .poolside/settings.local.yaml
