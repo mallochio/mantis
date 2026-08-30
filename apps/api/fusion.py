@@ -13,6 +13,7 @@ from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any, cast
 
+import litellm
 import model_catalog
 import providers
 import serve_config
@@ -28,6 +29,7 @@ from fusion_types import (
     FusionToolOptions,
     FusionWorkerProfile,
 )
+
 from runs import (
     RUN_STORE,
     NativeRun,
@@ -100,8 +102,7 @@ def _main_preamble(
             for p in profiles.values()
         )
         suffix += (
-            "\nAvailable sidekick profiles (assign only when the specialization "
-            "fits):\n" + roster
+            "\nAvailable sidekick profiles (assign only when the specialization fits):\n" + roster
         )
     return MAIN_PREAMBLE + suffix
 
@@ -191,14 +192,6 @@ SIDEKICK_TOOL_BUDGET_PROMPT = (
     "Stop calling tools. Either finish with a concise final report, or reply with "
     "exactly 'ESCALATE_TO_MAIN:' followed by a concise reason."
 )
-
-COMPACTION_INSTRUCTION = (
-    "Condense the conversation above into a checkpoint another model can resume from. "
-    "Output exactly one <compacted-summary> block with terse bullets for: goal, "
-    "files touched, decisions, and remaining work. Do not call tools."
-)
-COMPACTION_RETAIN_RATIO = 0.16
-COMPACTION_MAX_OUTPUT_TOKENS = 1024
 
 PLAN_UNKNOWN_TOOL_PROMPT = (
     "You tried to call tools that are not available for planning: {names}. "
@@ -315,27 +308,15 @@ class FusionConfig:
         return max(1, value)
 
     def context_window(self) -> int:
-        raw = self._load().get("context_window") or self._load().get(
-            "context_token_limit"
-        ) or os.environ.get("MANTIS_CONTEXT_LENGTH", "262144")
+        raw = (
+            self._load().get("context_window")
+            or self._load().get("context_token_limit")
+            or os.environ.get("MANTIS_CONTEXT_LENGTH", "262144")
+        )
         try:
             return int(raw)
         except (TypeError, ValueError):
             return 262144
-
-    def context_message_limit(self) -> int:
-        raw = self._load().get("context_message_limit")
-        try:
-            return int(raw)  # type: ignore[arg-type]  # None falls through to TypeError → default
-        except (TypeError, ValueError):
-            return 24
-
-    def context_token_limit(self) -> int:
-        return self.context_window()
-
-    def compaction_mode(self) -> str:
-        raw = str(self._load().get("compaction_mode") or "summary").strip().lower()
-        return raw if raw in {"summary", "replay"} else "summary"
 
     def max_output_tokens(self) -> int:
         raw = self._load().get("max_output_tokens") or "4096"
@@ -500,9 +481,6 @@ class FusionCoordinator:
         self.max_follow_ups = self.config.max_follow_ups()
         self.sidekick_max_tool_rounds = self.config.sidekick_max_tool_rounds()
         self.context_window = self.config.context_window()
-        self.context_message_limit = self.config.context_message_limit()
-        self.context_token_limit = self.config.context_token_limit()
-        self.compaction_mode = self.config.compaction_mode()
         self.max_output_tokens = self.config.max_output_tokens()
         self.worker_profiles = {p.name: p for p in self.config.worker_profiles()}
         self.default_tool_options = self.config.tool_options()
@@ -512,31 +490,33 @@ class FusionCoordinator:
         router = self.main_router if role == "main" else self.sidekick_router
         return router.select(turn_index, escalation_count)
 
-    @staticmethod
-    def _estimate_message_tokens(message: dict[str, Any]) -> int:
-        """Approximate token count for a single chat message.
+    # JSON includes replay-only reasoning metadata and tool schemas that
+    # LiteLLM's chat-message counter intentionally ignores. Tokenize the full
+    # request shape so the context guard measures what Mantis actually stores
+    # and replays, without maintaining another tokenizer implementation here.
+    def _token_sum(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> int:
+        if not messages:
+            return 0
+        payload = json.dumps(
+            {"messages": messages, "tools": tools or []},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        try:
+            return max(1, litellm.token_counter(model="gpt-4o", text=payload))
+        except Exception:  # noqa: BLE001 - counting must never break a call
+            return max(1, len(payload) // 4)
 
-        This is a fast, dependency-free estimate (roughly 4 characters per
-        token) used for context-window trimming before a provider call.
-        """
-        text = ""
-        content = message.get("content")
-        if isinstance(content, str):
-            text += content
-        elif content is not None:
-            text += json.dumps(content)
-        for tc in message.get("tool_calls", []):
-            fn = tc.get("function", {})
-            text += str(fn.get("name", ""))
-            text += str(fn.get("arguments", ""))
-        for key in ("tool_call_id", "name"):
-            value = message.get(key)
-            if value is not None:
-                text += str(value)
-        return max(1, len(text) // 4)
-
-    def _token_sum(self, messages: list[dict[str, Any]]) -> int:
-        return sum(self._estimate_message_tokens(message) for message in messages)
+    def _tool_tokens(self, tools: list[dict[str, Any]] | None) -> int:
+        if not tools:
+            return 0
+        empty = [{"role": "user", "content": ""}]
+        return max(0, self._token_sum(empty, tools) - self._token_sum(empty))
 
     def _message_groups(
         self,
@@ -604,182 +584,34 @@ class FusionCoordinator:
     def _drop_old_groups(
         self, messages: list[dict[str, Any]], max_input_tokens: int
     ) -> list[dict[str, Any]]:
+        """Drop the oldest groups first, preserving tool pairing and live prompts.
+
+        The latest group is always kept (even over budget) so the newest
+        review/follow-up contract reaches the provider; its oversized tool
+        bodies are pruned instead.
+        """
         if not messages:
             return messages
-        estimates = [self._estimate_message_tokens(message) for message in messages]
         trimmed = [messages[0]]
-        budget = max_input_tokens - estimates[0]
-        tail: list[dict[str, Any]] = []
-        for group in reversed(self._message_groups(messages[1:])):
-            group_tokens = sum(self._estimate_message_tokens(item) for item in group)
-            if group_tokens > budget:
-                break
-            tail.extend(reversed(group))
-            budget -= group_tokens
-        trimmed.extend(reversed(tail))
-        return trimmed
-
-    def _flatten_groups(self, groups: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
-        flattened: list[dict[str, Any]] = []
-        for group in groups:
-            flattened.extend(group)
-        return flattened
-
-    def _compact_replay(
-        self,
-        slot: str,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None,
-        max_input_tokens: int,
-    ) -> list[dict[str, Any]] | None:
-        """Summarize the middle of history on the same slot, replaying the prefix.
-
-        The summarizer request is system + history + a trailing instruction so
-        the provider cache stays warm up to that instruction. Stored history
-        keeps the original system message and a verbatim tail.
-        """
-        if len(messages) < 3:
-            return None
-        system = messages[0]
+        budget = max_input_tokens - self._token_sum(trimmed)
         groups = self._message_groups(messages[1:])
-        if len(groups) < 2:
-            return None
-        instruction = {"role": "user", "content": COMPACTION_INSTRUCTION}
-        system_tokens = self._estimate_message_tokens(system)
-        instruction_tokens = self._estimate_message_tokens(instruction)
-        min_middle_tokens = self._token_sum(groups[0])
-        max_tail = min(
-            max_input_tokens - system_tokens - instruction_tokens - min_middle_tokens,
-            max_input_tokens - system_tokens - 64,
-        )
-        if max_tail <= 0:
-            return None
-        body_tokens = sum(self._token_sum(group) for group in groups)
-        tail_target = max(1, min(int(body_tokens * COMPACTION_RETAIN_RATIO), max_tail))
-        tail_groups: list[list[dict[str, Any]]] = []
-        tail_tokens = 0
-        while len(groups) > 1:
-            group = groups[-1]
+        kept: list[list[dict[str, Any]]] = []
+        for group in reversed(groups):
             group_tokens = self._token_sum(group)
-            if tail_groups and tail_tokens + group_tokens > tail_target:
+            if group_tokens > budget:
+                if not kept:
+                    # Never drop the live contract: prune its tool bodies first.
+                    kept = [
+                        self._prune_tool_messages(
+                            group, max_chars=2048, head_chars=1024, tail_chars=256
+                        )
+                    ]
                 break
-            if not tail_groups and group_tokens > tail_target:
-                return None
-            groups.pop()
-            tail_groups.insert(0, group)
-            tail_tokens += group_tokens
-            if tail_tokens >= tail_target:
-                break
-        if not groups or not tail_groups:
-            return None
-
-        def replay(middle: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
-            return [
-                system,
-                *self._flatten_groups(middle),
-                *self._flatten_groups(tail_groups),
-                instruction,
-            ]
-
-        while groups and self._token_sum(replay(groups)) > max_input_tokens:
-            groups.pop(0)
-        if not groups:
-            return None
-
-        run = getattr(serve_config._history_context, "active_run", None)
-        previous_choice = getattr(run, "active_tool_choice", None) if run is not None else None
-        if run is not None:
-            run.active_tool_choice = "none"
-        try:
-            data = providers._provider_response(
-                slot,
-                replay(groups),
-                min(COMPACTION_MAX_OUTPUT_TOKENS, self._output_tokens_for(slot)),
-                0.7,
-                tools,
-            )
-        except (RuntimeError, TypeError, KeyError, IndexError):
-            return None
-        finally:
-            if run is not None:
-                run.active_tool_choice = previous_choice
-
-        message = (data.get("choices") or [{}])[0].get("message") or {}
-        if message.get("tool_calls"):
-            return None
-        text = str(message.get("content") or "").strip()
-        if not text:
-            return None
-        summary = text
-        match = re.search(
-            r"<compacted-summary>\s*([\s\S]*?)\s*</compacted-summary>", text, re.IGNORECASE
-        )
-        if match:
-            summary = match.group(1).strip() or text
-        return [
-            system,
-            {
-                "role": "user",
-                "content": f"<compacted-summary>\n{summary}\n</compacted-summary>",
-            },
-            *self._flatten_groups(tail_groups),
-        ]
-
-    def _compact_summary(
-        self,
-        slot: str,
-        messages: list[dict[str, Any]],
-        max_input_tokens: int,
-    ) -> list[dict[str, Any]] | None:
-        """Summarize the entire role context and replace it with system + summary.
-
-        Matches the reference `SessionStore.compact`: the model sees the full
-        context plus a compaction instruction and returns a brief that becomes a
-        single user message after the original system preamble.
-        """
-        if not messages:
-            return None
-        system = messages[0]
-        instruction = {"role": "user", "content": COMPACTION_INSTRUCTION}
-        replay = [system, *messages[1:], instruction]
-        if self._token_sum(replay) > max_input_tokens:
-            return None
-        run = getattr(serve_config._history_context, "active_run", None)
-        previous_choice = getattr(run, "active_tool_choice", None) if run is not None else None
-        if run is not None:
-            run.active_tool_choice = "none"
-        try:
-            data = providers._provider_response(
-                slot,
-                replay,
-                min(COMPACTION_MAX_OUTPUT_TOKENS, self._output_tokens_for(slot)),
-                0.7,
-                None,
-            )
-        except (RuntimeError, TypeError, KeyError, IndexError):
-            return None
-        finally:
-            if run is not None:
-                run.active_tool_choice = previous_choice
-        message = (data.get("choices") or [{}])[0].get("message") or {}
-        if message.get("tool_calls"):
-            return None
-        text = str(message.get("content") or "").strip()
-        if not text:
-            return None
-        summary = text
-        match = re.search(
-            r"<compacted-summary>\s*([\s\S]*?)\s*</compacted-summary>", text, re.IGNORECASE
-        )
-        if match:
-            summary = match.group(1).strip() or text
-        return [
-            system,
-            {
-                "role": "user",
-                "content": f"<compacted-summary>\n{summary}\n</compacted-summary>",
-            },
-        ]
+            kept.insert(0, group)
+            budget -= group_tokens
+        for group in kept:
+            trimmed.extend(group)
+        return trimmed
 
     def _fit_messages(
         self,
@@ -788,31 +620,15 @@ class FusionCoordinator:
         tools: list[dict[str, Any]] | None,
         max_input_tokens: int,
     ) -> list[dict[str, Any]]:
+        """Fit history for one provider call without losing the live contract.
+
+        Tool-pairing is preserved and the newest review/follow-up
+        prompt always survives fitting so the live contract reaches the model.
+        """
         pruned = self._prune_for_budget(messages, max_input_tokens)
-        token_sum = self._token_sum(pruned)
-
-        # Primary trigger: message-count limit, matching the reference behavior.
-        if len(messages) > self.context_message_limit:
-            if self.compaction_mode == "summary":
-                compacted = self._compact_summary(slot, messages, max_input_tokens)
-                if compacted is not None:
-                    serve_config._history_context.fusion_compacted = True
-                    return compacted
-                # Fall back to replay/drop if the summarizer could not run.
-            compacted = self._compact_replay(slot, pruned, tools, max_input_tokens)
-            if compacted is not None and self._token_sum(compacted) <= max_input_tokens:
-                serve_config._history_context.fusion_compacted = True
-                return compacted
-            return self._drop_old_groups(compacted or pruned, max_input_tokens)
-
-        # Secondary trigger: token budget exceeded (safety net).
-        if token_sum <= max_input_tokens:
+        if self._token_sum(pruned, tools) <= max_input_tokens:
             return pruned
-        compacted = self._compact_replay(slot, pruned, tools, max_input_tokens)
-        if compacted is not None and self._token_sum(compacted) <= max_input_tokens:
-            serve_config._history_context.fusion_compacted = True
-            return compacted
-        return self._drop_old_groups(compacted or pruned, max_input_tokens)
+        return self._drop_old_groups(pruned, max_input_tokens - self._tool_tokens(tools))
 
     def _trim_messages(
         self,
@@ -850,6 +666,11 @@ class FusionCoordinator:
         input_budget = max(0, self.context_window - output_tokens)
         serve_config._history_context.fusion_compacted = False
         fitted = self._fit_messages(slot, messages, tools, input_budget)
+        if fitted is not messages and self._token_sum(fitted) < self._token_sum(messages):
+            # Persist the fitted history so trimming is not recomputed (and tool
+            # bodies are not re-sent in full) on every later provider call.
+            messages[:] = fitted
+            serve_config._history_context.fusion_compacted = True
         run = getattr(serve_config._history_context, "active_run", None)
         budget = getattr(run, "budget", None)
         timeout_s = budget.remaining_timeout_s() if budget is not None else None
@@ -1001,15 +822,15 @@ class ExecutionLane:
         slot = self._select_slot()
         tools = self._tools_for_lane()
         message, usage = self.coordinator._call_worker(slot, self.messages, tools)
-        if (
-            self.profile.model is None
-            and getattr(serve_config._history_context, "fusion_compacted", False)
+        if self.profile.model is None and getattr(
+            serve_config._history_context, "fusion_compacted", False
         ):
             self.run._reroute_after_compaction(self.role, slot)
         if self.run.budget is not None:
             self.run.budget.consume_tokens(usage)
             self.run.budget.consume_turn()
-        self.run.add_usage(usage, model=slot)
+        if getattr(serve_config._history_context, "active_run", None) is not self.run:
+            self.run.add_usage(usage, model=slot)
         self.run.record_activity(
             "execution_lane_turn",
             lane=self.lane_id,
@@ -1549,9 +1370,13 @@ class FusionRun(NativeRun):
         return tools
 
     def _can_execute_server_side(self, calls: list[dict[str, Any]]) -> bool:
-        return bool(calls) and self.tool_options.server_execution and all(
-            str((call.get("function") or {}).get("name", "")) in tool_exec.SERVER_TOOL_NAMES
-            for call in calls
+        return (
+            bool(calls)
+            and self.tool_options.server_execution
+            and all(
+                str((call.get("function") or {}).get("name", "")) in tool_exec.SERVER_TOOL_NAMES
+                for call in calls
+            )
         )
 
     def _server_tool_results(self, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1620,7 +1445,15 @@ class FusionRun(NativeRun):
         lines: list[str] = []
         total_calls = 0
         error_count = 0
-        for msg in self.sidekick_messages:
+        latest_user = max(
+            (
+                index
+                for index, msg in enumerate(self.sidekick_messages)
+                if msg.get("role") == "user"
+            ),
+            default=-1,
+        )
+        for msg in self.sidekick_messages[latest_user + 1 :]:
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
                 for call in msg["tool_calls"]:
                     total_calls += 1
@@ -1639,6 +1472,31 @@ class FusionRun(NativeRun):
             return "None (sidekick used no tools)"
         summary_header = f"Total tool invocations: {total_calls} (Errors: {error_count})\n"
         return summary_header + "\n".join(lines)
+
+    def _queue_review_prompt(self, review_prompt: str) -> None:
+        """Queue a fresh review request as the live transcript tail.
+
+        A previous review turn is only cleared when nothing but its own
+        assistant/tool transcript follows it. Resumed runs append client turns
+        and new plans after the old review; those are live context and must
+        never be discarded.
+        """
+        previous_index = next(
+            (
+                index
+                for index in range(len(self.main_messages) - 1, -1, -1)
+                if self.main_messages[index].get("role") == "user"
+                and REVIEW_PROMPT in str(self.main_messages[index].get("content", ""))
+            ),
+            None,
+        )
+        if previous_index is not None:
+            suffix = self.main_messages[previous_index + 1 :]
+            if not any(msg.get("role") == "user" for msg in suffix):
+                # Stale suffix is only the old review transcript (e.g. its
+                # FOLLOW_UP response); drop it so the new prompt is the tail.
+                del self.main_messages[previous_index:]
+        self.main_messages.append({"role": "user", "content": review_prompt})
 
     def _advance_legacy(
         self,
@@ -1806,7 +1664,9 @@ class FusionRun(NativeRun):
 
                 # Queue the report for the single review state. Keeping the prompt in
                 # main_messages also lets a tool-assisted review resume without a
-                # separate first-review branch.
+                # separate first-review branch. Follow-up rounds replace the
+                # previous review prompt so cumulative tool history is not
+                # re-embedded into the main context on every round.
                 remaining = coordinator.max_follow_ups - self.follow_up_count
                 review_prompt = (
                     f"{REVIEW_PROMPT}"
@@ -1814,7 +1674,7 @@ class FusionRun(NativeRun):
                     f"Report:\n{sidekick_text}\n\n"
                     f"Follow-up budget remaining: {remaining} of {coordinator.max_follow_ups}."
                 )
-                self.main_messages.append({"role": "user", "content": review_prompt})
+                self._queue_review_prompt(review_prompt)
                 self.status = "main_review"
                 continue
             if self.status == "main_review":
@@ -1900,9 +1760,7 @@ class FusionRun(NativeRun):
             # Also allow main-lane tool results if main is reviewing with tools.
             if self.active_role == "main" and self.pending_tool_calls:
                 main_results = (
-                    by_lane.get("main", [])
-                    + by_lane.get("main_exec", [])
-                    + by_lane.get("", [])
+                    by_lane.get("main", []) + by_lane.get("main_exec", []) + by_lane.get("", [])
                 )
                 validated = self._validate_tool_results(main_results)
                 self._append_tool_results(validated)
@@ -1972,8 +1830,8 @@ class FusionRun(NativeRun):
         # Server-executed tool rounds consume loop iterations, so the ceiling
         # must cover a lane's full tool budget, not just client round-trips.
         execution_lanes = (
-            ([self.main_lane] if self.main_lane is not None else []) + self.sidekick_lanes
-        )
+            [self.main_lane] if self.main_lane is not None else []
+        ) + self.sidekick_lanes
         step_ceiling = max_iterations * 4 + coordinator.sidekick_max_tool_rounds * max(
             1, len(execution_lanes)
         )

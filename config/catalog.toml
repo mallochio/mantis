@@ -116,7 +116,5 @@ fallback_on_escalate = true
 max_follow_ups = 2
 sidekick_max_tool_rounds = 16
 main_tools = "none"
-context_message_limit = 24
 context_token_limit = 262144
-compaction_mode = "summary"
 max_output_tokens = 4096

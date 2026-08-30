@@ -14,11 +14,12 @@ import api
 import fusion
 import providers
 import pytest
-import runs
 import serve_config
 import tool_exec
 import utils
 from fastapi.testclient import TestClient
+
+import runs
 
 
 class FakeWorker:
@@ -58,9 +59,7 @@ class FakeWorker:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         self.calls.append((slot, messages, tools))
         first_content = messages[0].get("content", "")
-        if first_content.startswith(
-            (fusion.MAIN_PREAMBLE, fusion.MAIN_EXEC_PREAMBLE)
-        ):
+        if first_content.startswith((fusion.MAIN_PREAMBLE, fusion.MAIN_EXEC_PREAMBLE)):
             return self._main_response(messages)
         return self._sidekick_response(messages, tools)
 
@@ -193,9 +192,7 @@ class SequenceWorker:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         self.calls.append((slot, messages, tools))
         first_content = messages[0].get("content", "")
-        if first_content.startswith(
-            (fusion.MAIN_PREAMBLE, fusion.MAIN_EXEC_PREAMBLE)
-        ):
+        if first_content.startswith((fusion.MAIN_PREAMBLE, fusion.MAIN_EXEC_PREAMBLE)):
             content, tool_calls, usage = self._next(self.main_outputs, self.main_idx)
             self.main_idx += 1
         else:
@@ -537,125 +534,129 @@ def test_fusion_repeat_tool_reminder_is_a_user_message():
     )
 
 
-def test_fusion_compaction_replays_same_slot_and_keeps_system(monkeypatch):
+def test_fusion_fitting_keeps_latest_prompt_and_prunes_old_history(monkeypatch):
+    """Over-budget history is dropped oldest-first; the latest prompt survives.
+
+    Model-driven full-history compaction was removed (it re-fired on every
+    call and swallowed the live review/follow-up contract), so fitting must be
+    purely local: prune tool bodies, then drop old groups newest-first.
+    """
     coordinator = fusion.FusionCoordinator()
-    monkeypatch.setattr(coordinator, "_output_tokens_for", lambda _slot: 256)
-    calls: list[dict[str, Any]] = []
-
-    def fake_provider(spec, messages, max_tokens, temperature, tools=None):
-        calls.append({"spec": spec, "messages": messages, "tools": tools})
-        last = messages[-1]["content"] if messages else ""
-        if last == fusion.COMPACTION_INSTRUCTION:
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "role": "assistant",
-                            "content": "<compacted-summary>inspected files</compacted-summary>",
-                        }
-                    }
-                ],
-                "usage": {},
-            }
-        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}], "usage": {}}
-
-    monkeypatch.setattr(providers, "_provider_response", fake_provider)
     pad = "x" * 320
     messages = [{"role": "system", "content": "system prompt"}]
     for index in range(6):
         messages.append({"role": "user", "content": f"{index}-{pad}"})
         messages.append({"role": "assistant", "content": f"a{index}-{pad}"})
     messages.append({"role": "user", "content": "latest"})
-    tools = [
-        {"type": "function", "function": {"name": "bash"}},
-        {"type": "function", "function": {"name": "read"}},
-    ]
-    fitted = coordinator._fit_messages("gpt-5_6-sol", messages, tools, 400)
+    fitted = coordinator._fit_messages("gpt-5_6-sol", messages, None, 400)
     assert fitted[0]["content"] == "system prompt"
-    assert fitted[1]["content"].startswith("<compacted-summary>")
-    assert "inspected files" in fitted[1]["content"]
     assert fitted[-1]["content"] == "latest"
-    assert calls
-    compact = calls[0]
-    assert compact["spec"] == "gpt-5_6-sol"
-    assert compact["tools"] == tools
-    assert compact["messages"][0]["content"] == "system prompt"
-    assert compact["messages"][-1]["content"] == fusion.COMPACTION_INSTRUCTION
+    assert len(fitted) < len(messages)
+    # Oldest groups go first: the oldest filler must be gone while newer
+    # history that still fits is retained.
+    assert all("0-" not in str(msg.get("content", "")) for msg in fitted[1:])
 
 
-def test_fusion_context_message_limit_triggers_summary_compaction(monkeypatch):
+def test_fusion_fitting_never_drops_only_latest_group(monkeypatch):
+    """Even a single oversized group is kept (pruned), never dropped."""
     coordinator = fusion.FusionCoordinator()
-    # Force the message-count path; token budget is generous so it is not the trigger.
-    coordinator.context_message_limit = 4
-    coordinator.compaction_mode = "summary"
-    monkeypatch.setattr(coordinator, "_output_tokens_for", lambda _slot: 256)
-    calls: list[dict[str, Any]] = []
-
-    def fake_provider(spec, messages, max_tokens, temperature, tools=None):
-        calls.append({"spec": spec, "messages": messages, "tools": tools})
-        last = messages[-1]["content"] if messages else ""
-        if last == fusion.COMPACTION_INSTRUCTION:
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "role": "assistant",
-                            "content": "<compacted-summary>inspected files</compacted-summary>",
-                        }
-                    }
-                ],
-                "usage": {},
-            }
-        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}], "usage": {}}
-
-    monkeypatch.setattr(providers, "_provider_response", fake_provider)
-    messages = [{"role": "system", "content": "system prompt"}]
-    messages.extend({"role": "user", "content": f"{index}"} for index in range(5))
-    fitted = coordinator._fit_messages("gpt-5_6-sol", messages, None, 100_000)
-    assert fitted[0]["content"] == "system prompt"
-    assert fitted[1]["content"].startswith("<compacted-summary>")
-    assert "inspected files" in fitted[1]["content"]
-    assert len(fitted) == 2
-    assert len(calls) == 1
-    compact = calls[0]
-    assert compact["tools"] is None
-
-
-def test_fusion_summary_compaction_replaces_context(monkeypatch):
-    coordinator = fusion.FusionCoordinator()
-    coordinator.context_message_limit = 4
-    coordinator.compaction_mode = "summary"
-    monkeypatch.setattr(coordinator, "_output_tokens_for", lambda _slot: 256)
-
-    def fake_provider(spec, messages, max_tokens, temperature, tools=None):
-        if messages and messages[-1]["content"] == fusion.COMPACTION_INSTRUCTION:
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "role": "assistant",
-                            "content": "<compacted-summary>summary text</compacted-summary>",
-                        }
-                    }
-                ],
-                "usage": {},
-            }
-        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}], "usage": {}}
-
-    monkeypatch.setattr(providers, "_provider_response", fake_provider)
     messages = [
         {"role": "system", "content": "system prompt"},
-        {"role": "user", "content": "a"},
-        {"role": "assistant", "content": "b"},
-        {"role": "user", "content": "c"},
-        {"role": "assistant", "content": "d"},
-        {"role": "user", "content": "e"},
+        {"role": "user", "content": "plan the work"},
     ]
-    fitted = coordinator._fit_messages("gpt-5_6-sol", messages, None, 100_000)
-    assert len(fitted) == 2
-    assert fitted[0]["role"] == "system"
-    assert fitted[1]["role"] == "user"
-    assert "summary text" in fitted[1]["content"]
+    fitted = coordinator._fit_messages("gpt-5_6-sol", messages, None, 1)
+    assert fitted[-1]["content"] == "plan the work"
+    assert fitted[0]["content"] == "system prompt"
+
+
+def test_fusion_token_sum_counts_replay_metadata():
+    coordinator = fusion.FusionCoordinator()
+    base = {
+        "role": "assistant",
+        "content": "ok",
+        "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+        ],
+    }
+    replay = {
+        **base,
+        "reasoning": "r" * 40_000,
+        "reasoning_details": [{"text": "d" * 40_000}],
+        "_anthropic_content": [{"type": "thinking", "thinking": "a" * 40_000}],
+    }
+    assert coordinator._token_sum([base]) < coordinator._token_sum([replay]) // 100
+
+
+def test_fusion_token_sum_counts_tool_schemas():
+    coordinator = fusion.FusionCoordinator()
+    messages = [{"role": "user", "content": "hello"}]
+    big_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": f"tool_{index}",
+                "description": "d" * 4000,
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        for index in range(10)
+    ]
+    without = coordinator._token_sum(messages)
+    with_tools = coordinator._token_sum(messages, big_tools)
+    assert with_tools > without * 5
+
+
+def test_fusion_fitting_counts_tool_schema_overhead(monkeypatch):
+    coordinator = fusion.FusionCoordinator()
+    big_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "tool",
+                "description": "d" * 200_000,
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    messages = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "go"},
+    ]
+    monkeypatch.setattr(coordinator, "_tool_tokens", lambda _tools: 50_000)
+    fitted = coordinator._fit_messages("gpt-5_6-sol", messages, big_tools, 10_000)
+    # Tool overhead consumes budget, but the live prompt is never dropped.
+    assert fitted[-1]["content"] == "go"
+
+
+def test_fusion_call_worker_persists_fitted_history(monkeypatch):
+    """Trimmed (pruned) history is written back so old tool bodies are not
+    re-sent on every later provider call."""
+    coordinator = fusion.FusionCoordinator()
+    coordinator.context_window = 5000
+    coordinator.max_output_tokens = 256
+    big = "x" * 30_000
+    messages = [{"role": "system", "content": "system prompt"}]
+    for index in range(6):
+        messages.append({"role": "user", "content": f"{index}-{big}"})
+        messages.append({"role": "assistant", "content": f"a{index}"})
+    messages.append({"role": "user", "content": "latest"})
+
+    sent_sizes: list[int] = []
+
+    def recording(spec, sent, max_tokens, temperature, tools=None, timeout_s=None):
+        sent_sizes.append(len(sent))
+        return {
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+    monkeypatch.setattr(providers, "_provider_response", recording)
+    coordinator._call_worker("gpt-5_6-sol", messages, None)
+    assert serve_config._history_context.fusion_compacted is True
+    assert len(messages) < 14  # stored history was persisted smaller
+    coordinator._call_worker("gpt-5_6-sol", messages, None)
+    assert len(sent_sizes) == 2
+    assert sent_sizes[1] == len(messages)
 
 
 def test_fusion_trimmer_keeps_tool_call_result_pairs():
@@ -2246,9 +2247,7 @@ def test_fusion_synthesis_receives_main_and_sidekick_reports(monkeypatch):
     assert len(worker.calls) == 4
     review_call = worker.calls[3]
     assert review_call[1][0].get("content", "").startswith(fusion.MAIN_PREAMBLE)
-    review_content = "\n".join(
-        str(msg.get("content", "")) for msg in review_call[1]
-    )
+    review_content = "\n".join(str(msg.get("content", "")) for msg in review_call[1])
     assert "Main result:" in review_content
     assert "sidekick result" in review_content
 
@@ -2320,6 +2319,263 @@ def test_fusion_filter_tools_generates_server_schemas_for_enabled():
     }
 
 
+def test_fusion_chat_streams_per_request_usage(client, fake_worker):
+    """Streaming usage chunks must also be per-request, not run-lifetime."""
+    request_messages = [{"role": "user", "content": "write a hello world script"}]
+    payload = {
+        "model": "mantis/fusion",
+        "messages": request_messages,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    response = client.post("/v1/chat/completions", headers=_headers(), json=payload)
+    assert response.status_code == 200
+    usage_chunks: list[dict[str, Any]] = []
+    completion_text = ""
+    for line in response.text.splitlines():
+        if not line.startswith("data: ") or line == "data: [DONE]":
+            continue
+        chunk = json.loads(line[len("data: ") :])
+        for choice in chunk.get("choices") or []:
+            completion_text += str((choice.get("delta") or {}).get("content") or "")
+        if chunk.get("usage"):
+            usage_chunks.append(chunk["usage"])
+    assert usage_chunks, response.text
+    expected = utils._request_usage(request_messages, completion_text)
+    assert usage_chunks[0]["prompt_tokens"] == expected["prompt_tokens"]
+    run = fusion.get_run(response.headers["X-Mantis-Run-Id"])
+    assert usage_chunks[0] != run.usage
+
+
+def test_fusion_chat_reports_per_request_usage(client, fake_worker):
+    """Public chat usage must be this request's context only.
+
+    Run-lifetime usage (every internal planner/sidekick/review call) would
+    make context-tracking clients compact after nearly every turn.
+    """
+    headers = _headers()
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "run a shell command",
+                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+            },
+        }
+    ]
+    body = {
+        "model": "mantis/fusion",
+        "messages": [{"role": "user", "content": "write a hello world script"}],
+        "tools": tools,
+    }
+    first = client.post("/v1/chat/completions", headers=headers, json=body)
+    assert first.status_code == 200
+    run_id = first.headers["X-Mantis-Run-Id"]
+    first_usage = first.json()["usage"]
+    run = fusion.get_run(run_id)
+    assert first_usage != run.usage
+
+    second_messages = [
+        {"role": "user", "content": "write a hello world script"},
+        {"role": "assistant", "content": "done"},
+        {"role": "user", "content": "now lint it"},
+    ]
+    second = client.post(
+        "/v1/chat/completions",
+        headers={**headers, "X-Mantis-Run-Id": run_id},
+        json={
+            **body,
+            "messages": second_messages,
+        },
+    )
+    assert second.status_code == 200
+    second_body = second.json()
+    second_usage = second_body["usage"]
+    response_message = second_body["choices"][0]["message"]
+    completion_text = str(response_message.get("content") or "")
+    completion_text += "".join(
+        f"{call['function'].get('name', '')}:{call['function'].get('arguments', '')}"
+        for call in response_message.get("tool_calls") or []
+    )
+    # Per-request estimate of this turn's messages, not the run accumulator.
+    assert second_usage == utils._request_usage(second_messages, completion_text)
+
+
+def test_fusion_queue_review_preserves_resumed_client_context():
+    """A completed run's old review must not swallow resumed client context."""
+    run = fusion.FusionRun("rev-resume", "goal")
+    run.main_messages = [
+        {"role": "system", "content": fusion.MAIN_PREAMBLE},
+        {"role": "user", "content": "original goal"},
+        {"role": "assistant", "content": "PLAN: old\nBRIEF: old"},
+        {"role": "user", "content": f"{fusion.REVIEW_PROMPT}first report"},
+        {"role": "assistant", "content": "ACCEPT"},
+        # Client resumed the completed run with a new request; planning ran.
+        {"role": "user", "content": "client's resumed request"},
+        {"role": "assistant", "content": "PLAN: new\nBRIEF: new"},
+    ]
+    snapshot = [dict(m) for m in run.main_messages]
+
+    run._queue_review_prompt(f"{fusion.REVIEW_PROMPT}second report")
+
+    # Nothing between the old review and the new prompt was dropped.
+    assert run.main_messages[:-1] == snapshot
+    assert run.main_messages[-1]["role"] == "user"
+    assert "second report" in run.main_messages[-1]["content"]
+    assert "client's resumed request" in str(
+        next(
+            m["content"]
+            for m in run.main_messages
+            if "client's resumed" in str(m.get("content", ""))
+        )
+    )
+
+
+def test_fusion_queue_review_clears_stale_suffix_intra_loop():
+    """Inside the loop the stale review suffix (its FOLLOW_UP reply) is cleared."""
+    run = fusion.FusionRun("rev-intra", "goal")
+    run.main_messages = [
+        {"role": "system", "content": fusion.MAIN_PREAMBLE},
+        {"role": "user", "content": "goal"},
+        {"role": "assistant", "content": "PLAN: p\nBRIEF: b"},
+        {"role": "user", "content": f"{fusion.REVIEW_PROMPT}first report"},
+        {"role": "assistant", "content": "FOLLOW_UP: add tests"},
+    ]
+
+    run._queue_review_prompt(f"{fusion.REVIEW_PROMPT}second report")
+
+    assert (
+        sum(1 for m in run.main_messages if fusion.REVIEW_PROMPT in str(m.get("content", ""))) == 1
+    )
+    assert run.main_messages[-1]["role"] == "user"
+    assert "second report" in run.main_messages[-1]["content"]
+    assert not any(
+        m.get("role") == "assistant" and "FOLLOW_UP" in str(m.get("content", ""))
+        for m in run.main_messages
+    )
+
+
+def test_fusion_sidekick_tool_history_reports_delta_after_follow_up():
+    run = fusion.FusionRun("delta-summary", "goal")
+    run.sidekick_messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "brief"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "bash", "arguments": "1"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "a", "content": "old result"},
+        {"role": "user", "content": "<fusion-follow-up>\nredo\n</fusion-follow-up>"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "b", "type": "function", "function": {"name": "bash", "arguments": "2"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "b", "content": "new result"},
+    ]
+    summary = run._summarize_sidekick_tool_history()
+    assert "old result" not in summary
+    assert "new result" in summary
+    assert "Tool call: bash(2)" in summary
+
+
+def test_fusion_follow_up_review_replaces_stale_review_turn():
+    """Round-2 reviews must end with the NEW prompt, not the old FOLLOW_UP reply."""
+    run = fusion.FusionRun("rev-dup", "write a project")
+    run.main_messages = [
+        {"role": "system", "content": fusion.MAIN_PREAMBLE},
+        {"role": "user", "content": "write a project"},
+        {"role": "assistant", "content": "PLAN: p\nBRIEF: b"},
+    ]
+
+    def queue_report(text: str, remaining: int, *, answered: bool) -> None:
+        review_prompt = (
+            f"{fusion.REVIEW_PROMPT}Tool Activity by Sidekick:\nNone\n\n"
+            f"Report:\n{text}\n\nFollow-up budget remaining: {remaining} of 2."
+        )
+        run._queue_review_prompt(review_prompt)
+        if answered:
+            run.main_messages.append({"role": "assistant", "content": f"FOLLOW_UP: {text}"})
+
+    # Round 1 review request + the assistant's FOLLOW_UP response.
+    queue_report("first report", 2, answered=True)
+    before = [dict(m) for m in run.main_messages]
+    assert (
+        sum(1 for m in run.main_messages if fusion.REVIEW_PROMPT in str(m.get("content", ""))) == 1
+    )
+
+    # Round 2: the stale review turn (prompt + FOLLOW_UP reply) is replaced
+    # wholesale; the new prompt must be the live tail.
+    queue_report("second report", 1, answered=False)
+
+    review_count = sum(
+        1 for m in run.main_messages if fusion.REVIEW_PROMPT in str(m.get("content", ""))
+    )
+    assert review_count == 1
+    assert run.main_messages[-1]["role"] == "user"
+    assert "second report" in run.main_messages[-1]["content"]
+    assert not any(
+        m.get("role") == "assistant" and "FOLLOW_UP" in str(m.get("content", ""))
+        for m in run.main_messages
+    )
+    # Planning history is preserved.
+    assert run.main_messages[:3] == before[:3]
+
+
+def test_fusion_structured_usage_single_counted(monkeypatch):
+    """Usage flows through the provider seam exactly once per lane call."""
+    from types import SimpleNamespace
+
+    resolved = SimpleNamespace(
+        adapter="opencode-go",
+        protocols=["chat_completions"],
+        model="deepseek-v4-flash",
+        slot="deepseek-v4-flash",
+        max_tokens=128000,
+        effort=None,
+        binding=None,
+        credential_env="TEST_KEY",
+        base_url="http://test",
+    )
+    monkeypatch.setattr(providers, "_resolve_model_spec", lambda spec, bindings=None: resolved)
+    monkeypatch.setattr(providers, "_litellm_kwargs", lambda *args, **kwargs: {"model": "openai/x"})
+    calls: list[dict[str, Any]] = []
+
+    def fake_completion(**kwargs):
+        calls.append(kwargs)
+        return {
+            "choices": [{"message": {"role": "assistant", "content": "done"}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+        }
+
+    monkeypatch.setattr(providers, "_litellm_completion", fake_completion)
+    monkeypatch.setattr(providers, "_response_to_dict", lambda response: response)
+    run = fusion.FusionRun("acct", "write a test")
+    run.structured = True
+    serve_config._history_context.active_run = run
+    try:
+        lane = fusion.ExecutionLane(
+            "acct-lane",
+            run,
+            fusion.FusionCoordinator(),
+            fusion.FusionSidekickAssignment(task="t"),
+            fusion.FusionWorkerProfile(name="default"),
+            role="sidekick",
+        )
+        lane.step()
+    finally:
+        serve_config._history_context.active_run = None
+    assert len(calls) == 1
+    assert run.usage["prompt_tokens"] == 100
+    assert run.usage["completion_tokens"] == 20
+
+
 def test_fusion_structured_lanes_step_in_parallel(monkeypatch):
     """Main and sidekick lanes must rendezvous; sequential stepping breaks the barrier."""
     plan_json = json.dumps(
@@ -2338,9 +2594,7 @@ def test_fusion_structured_lanes_step_in_parallel(monkeypatch):
         user_messages = [msg for msg in messages if msg.get("role") == "user"]
         is_main_exec = first.startswith(fusion.MAIN_PREAMBLE) and (
             user_messages
-            and str(user_messages[-1].get("content", "")).startswith(
-                fusion.MAIN_EXEC_PREAMBLE
-            )
+            and str(user_messages[-1].get("content", "")).startswith(fusion.MAIN_EXEC_PREAMBLE)
         )
         if is_main_exec:
             barrier.wait(timeout=5)
@@ -2443,9 +2697,7 @@ def _tool_call(call_id: str, name: str, arguments: dict[str, Any]) -> dict[str, 
 def test_tool_exec_file_and_shell_tools(tmp_path):
     workspace = tool_exec.workspace_for("t", root=tmp_path)
     assert (
-        tool_exec.execute(
-            "write_file", {"path": "a.py", "content": "print('hi')"}, workspace
-        )
+        tool_exec.execute("write_file", {"path": "a.py", "content": "print('hi')"}, workspace)
         == "ok"
     )
     assert tool_exec.execute("read_file", {"path": "a.py"}, workspace) == "print('hi')"
@@ -2453,9 +2705,7 @@ def test_tool_exec_file_and_shell_tools(tmp_path):
     assert "print" in tool_exec.execute("search_files", {"query": "print"}, workspace)
     assert "hello" in tool_exec.execute("bash", {"command": "echo hello"}, workspace)
     assert "2" in tool_exec.execute("run_code", {"code": "print(1 + 1)"}, workspace)
-    tool_exec.execute(
-        "edit_file", {"path": "a.py", "old_text": "hi", "new_text": "bye"}, workspace
-    )
+    tool_exec.execute("edit_file", {"path": "a.py", "old_text": "hi", "new_text": "bye"}, workspace)
     assert "bye" in tool_exec.execute("read_file", {"path": "a.py"}, workspace)
 
 
@@ -2499,11 +2749,7 @@ def test_fusion_server_side_execution_completes_without_client(monkeypatch, tmp_
         [
             (
                 "",
-                [
-                    _tool_call(
-                        "w1", "write_file", {"path": "script.py", "content": "print(40 + 2)"}
-                    )
-                ],
+                [_tool_call("w1", "write_file", {"path": "script.py", "content": "print(40 + 2)"})],
                 DEFAULT_USAGE,
             ),
             (
@@ -2625,29 +2871,8 @@ def test_fusion_run_records_compaction_reroute():
     ]
 
 
-def test_fit_messages_marks_successful_compaction(monkeypatch):
-    coordinator = fusion.FusionCoordinator()
-    messages = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "x" * 2000},
-    ]
-    compacted = [
-        {"role": "system", "content": "system"},
-        {"role": "user", "content": "summary"},
-    ]
-    monkeypatch.setattr(coordinator, "_compact_replay", lambda *_args: compacted)
-    serve_config._history_context.fusion_compacted = False
-
-    fitted = coordinator._fit_messages("slot", messages, None, 100)
-
-    assert fitted == compacted
-    assert serve_config._history_context.fusion_compacted is True
-
-
 def test_main_compaction_reroute_waits_for_plan_complexity():
-    config = fusion.FusionRoutingConfig(
-        main=["main-strong", "main-cheap"], sidekick="side"
-    )
+    config = fusion.FusionRoutingConfig(main=["main-strong", "main-cheap"], sidekick="side")
     run = fusion.FusionRun(
         "deferred-reroute",
         "goal",
