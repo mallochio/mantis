@@ -88,6 +88,47 @@ def _make_request(data: dict) -> object:
     return Request()
 
 
+def test_router_body_strips_endpoint_bound_reasoning_details():
+    body = base_proxy.router_body(
+        _make_request(
+            {
+                "model": "mantis/base",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "pong",
+                        "reasoning_details": [
+                            {"type": "reasoning.summary", "text": "portable"},
+                            {"type": "reasoning.encrypted", "data": "endpoint-bound"},
+                            {"type": "compaction.encrypted", "data": "endpoint-bound"},
+                        ],
+                    }
+                ],
+            }
+        )
+    )
+    assert body["messages"][0]["reasoning_details"] == [
+        {"type": "reasoning.summary", "text": "portable"}
+    ]
+
+
+def test_router_body_drops_all_endpoint_bound_reasoning_details():
+    body = base_proxy.router_body(
+        _make_request(
+            {
+                "model": "mantis/base",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "reasoning_details": [{"type": "reasoning.encrypted", "data": "secret"}],
+                    }
+                ],
+            }
+        )
+    )
+    assert "reasoning_details" not in body["messages"][0]
+
+
 def test_router_body_normalizes_reasoning_object():
     body = base_proxy.router_body(
         _make_request(

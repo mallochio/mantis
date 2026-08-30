@@ -249,6 +249,40 @@ def _coerce_max_completion_tokens(body: dict[str, Any]) -> dict[str, Any]:
     return body
 
 
+def _strip_endpoint_bound_reasoning(body: dict[str, Any]) -> dict[str, Any]:
+    """Drop encrypted reasoning that cannot cross Switchyard model targets.
+
+    OpenAI-compatible reasoning payloads may contain endpoint-bound encrypted
+    items. The stage router can switch between efficient and capable targets,
+    so replaying those items to a different target yields an upstream 404.
+    Plain reasoning summaries remain useful and portable.
+    """
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return body
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        details = message.get("reasoning_details")
+        if not isinstance(details, list):
+            continue
+        portable = [
+            detail
+            for detail in details
+            if not isinstance(detail, dict)
+            or not any(
+                marker in str(detail.get(key, "")).lower()
+                for key in ("type", "format")
+                for marker in ("encrypted", "compaction")
+            )
+        ]
+        if portable:
+            message["reasoning_details"] = portable
+        else:
+            message.pop("reasoning_details", None)
+    return body
+
+
 def _apply_base_cache_markers(body: dict[str, Any]) -> dict[str, Any]:
     """Add provider-native prompt-cache markers to the outgoing chat body.
 
@@ -271,6 +305,7 @@ def router_body(request: BaseChatRequest) -> dict[str, Any]:
     body = _normalize_reasoning(body)
     body = _coerce_base_reasoning(body)
     body = _coerce_max_completion_tokens(body)
+    body = _strip_endpoint_bound_reasoning(body)
     return _apply_base_cache_markers(body)
 
 
