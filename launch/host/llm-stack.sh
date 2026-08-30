@@ -28,10 +28,8 @@ if [ -f "$HOME/.zshrc" ]; then
   done < <(/bin/zsh -lc 'source "$HOME/.zshrc" >/dev/null && env')
 fi
 
-BIFROST_URL="http://127.0.0.1:8080/health"
 ROUTER_URL="http://127.0.0.1:5500/health"
 MANTIS_LOCAL_READY="http://127.0.0.1:8088/ready"
-BIFROST_PIDFILE="$HOME/.local/share/bifrost/server.pid"
 SWITCHYARD_PIDFILE="$HOME/.local/share/mantis/switchyard/server.pid"
 CATALOG="${AI_ROUTING_CONFIG:-$HOME/.config/ai-routing/catalog.toml}"
 
@@ -136,30 +134,21 @@ api_runtime_mode() {
 cmd_start() {
   acquire_lock
   configure_runtime_mode
-  printf '
-\033[1mStarting the local LLM stack (Bifrost -> Switchyard -> Mantis API)\033[0m
-'
+  printf '\n\033[1mStarting the local LLM stack (Switchyard -> Mantis API)\033[0m\n'
   [ -f "$CATALOG" ] || warn "catalog missing: $CATALOG (required by Switchyard and the API)"
-  if health_ok "$BIFROST_URL"; then
-    ok "bifrost already ready"
-  elif [ -n "$(pid_on_port 8080)" ] && wait_ready "existing bifrost" "$BIFROST_URL" 30; then
-    :
-  else
-    start_one "1/3" "bifrost" "$LIB_DIR/bifrost-local.sh" "$BIFROST_URL" 90 || return 1
-  fi
   if switchyard_ready; then
     ok "Switchyard already ready"
   elif [ -n "$(pid_on_port 5500)" ] && wait_ready "existing Switchyard" "$ROUTER_URL" 30; then
     :
   else
-    start_one "2/3" "Switchyard" "$LIB_DIR/switchyard-local.sh" "$ROUTER_URL" 60 || return 1
+    start_one "1/2" "Switchyard" "$LIB_DIR/switchyard-local.sh" "$ROUTER_URL" 60 || return 1
   fi
   local desired_mode="normal"
   [ "$EXPERIMENTAL_MODES" = 1 ] && desired_mode="experimental"
   if health_ok "$MANTIS_LOCAL_READY" && [ "$(api_runtime_mode)" = "$desired_mode" ]; then
     ok "Mantis API already ready in $desired_mode mode"
   else
-    start_one "3/3" "Mantis API" "$LIB_DIR/mantis-local.sh" "$MANTIS_LOCAL_READY" 180 || return 1
+    start_one "2/2" "Mantis API" "$LIB_DIR/mantis-local.sh" "$MANTIS_LOCAL_READY" 180 || return 1
   fi
   cmd_status
 }
@@ -168,16 +157,15 @@ cmd_restart() {
   acquire_lock
   configure_runtime_mode
   printf '\n\033[1mRestarting the whole local stack\033[0m\n'
-  start_one "1/3" "bifrost" "$LIB_DIR/bifrost-local.sh" "$BIFROST_URL" 90 || return 1
-  start_one "2/3" "Switchyard" "$LIB_DIR/switchyard-local.sh" "$ROUTER_URL" 60 || return 1
-  start_one "3/3" "Mantis API" "$LIB_DIR/mantis-local.sh" "$MANTIS_LOCAL_READY" 180 || return 1
+  start_one "1/2" "Switchyard" "$LIB_DIR/switchyard-local.sh" "$ROUTER_URL" 60 || return 1
+  start_one "2/2" "Mantis API" "$LIB_DIR/mantis-local.sh" "$MANTIS_LOCAL_READY" 180 || return 1
   cmd_status
 }
 
 cmd_stop() {
   acquire_lock
-  printf '\n\033[1mStopping local stack (Mantis API -> Switchyard -> Bifrost)\033[0m\n'
-  step "1/3 stopping Mantis API (:8088)"
+  printf '\n\033[1mStopping local stack (Mantis API -> Switchyard)\033[0m\n'
+  step "1/2 stopping Mantis API (:8088)"
   kill_all_listeners "$(port_from_url "$MANTIS_LOCAL_READY")"
   local mp="$HOME/.local/share/mantis/server.pid"
   if [ -f "$mp" ]; then
@@ -190,14 +178,10 @@ cmd_stop() {
     rm -f "$mp"
   fi
   ok "Mantis API stopped"
-  step "2/3 stopping Switchyard (:5500)"
+  step "2/2 stopping Switchyard (:5500)"
   kill_all_listeners "$(port_from_url "$ROUTER_URL")"
   rm -f "$SWITCHYARD_PIDFILE"
   ok "Switchyard stopped"
-  step "3/3 stopping bifrost (:8080)"
-  kill_all_listeners "$(port_from_url "$BIFROST_URL")"
-  rm -f "$BIFROST_PIDFILE"
-  ok "bifrost stopped"
 }
 
 print_model_config() {
@@ -246,11 +230,6 @@ PY
 cmd_status() {
   printf '\n\033[1mLLM Stack Status\033[0m\n'
   printf '  %-14s %-7s %-8s %s\n' SERVICE PORT PID STATE
-  if health_ok "$BIFROST_URL"; then
-    printf '  %-14s %-7s %-8s \033[1;32mup\033[0m\n' bifrost :8080 "$(pid_on_port 8080)"
-  else
-    printf '  %-14s %-7s %-8s \033[1;31mdown\033[0m\n' bifrost :8080 -
-  fi
   if switchyard_ready; then
     printf '  %-14s %-7s %-8s \033[1;32mup\033[0m\n' switchyard :5500 "$(pid_on_port 5500)"
   else

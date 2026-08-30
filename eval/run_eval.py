@@ -37,13 +37,19 @@ REPO = Path(__file__).resolve().parent.parent
 
 
 def load_catalog_models(path: Path) -> tuple[list[str], str]:
-    """Return Bifrost worker models and the Conductor planner from the catalog."""
+    """Return worker models and the Conductor planner from the catalog."""
     with path.open("rb") as handle:
         catalog = tomllib.load(handle)
     mantis = catalog["mantis"]
     workers = mantis["workers"]
     models = [workers[slot]["upstream_model"] for slot in mantis["slot_order"]]
-    return models, mantis["conductor_model"].removeprefix("bifrost/")
+    cm = mantis["conductor_model"]
+    # strip any provider prefix for backwards compat (bifrost/, openrouter/, etc.)
+    for prefix in ("bifrost/", "openrouter/", "opencode-go/"):
+        if cm.startswith(prefix):
+            cm = cm[len(prefix):]
+            break
+    return models, cm
 
 
 def load_worker_costs(path: Path) -> dict[str, float]:
@@ -62,7 +68,11 @@ def prepare_output(path: Path, *, append: bool) -> None:
 
 
 def _cost_key(model: str) -> str:
-    return model.removeprefix("bifrost/")
+    # strip any provider prefix (bifrost/, openrouter/, opencode-go/)
+    for prefix in ("bifrost/", "openrouter/", "opencode-go/"):
+        if model.startswith(prefix):
+            return model[len(prefix):]
+    return model
 
 
 def avg_pool_cost(costs: dict[str, float], models: list[str]) -> float:

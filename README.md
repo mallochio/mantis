@@ -1,9 +1,9 @@
 # Mantis
 
-Mantis is a local AI model orchestration and routing platform with an OpenAI-compatible API. The supported runtime is a three-process loopback stack:
+Mantis is a local AI model orchestration and routing platform with an OpenAI-compatible API. The supported runtime is a two-process loopback stack with LiteLLM in-process:
 
 ```text
-Bifrost :8080 → Switchyard :5500 → Mantis API :8088
+Switchyard :5500 → Mantis API :8088 → (LiteLLM SDK → providers)
 ```
 
 No service binds publicly by default. Provider credentials remain on this machine.
@@ -12,7 +12,7 @@ No service binds publicly by default. Provider credentials remain on this machin
 
 | Model | Mode | Use |
 |---|---|---|
-| `mantis/base` | Direct | NVIDIA NeMo Switchyard stage-router picks an efficient or capable model through Bifrost. |
+| `mantis/base` | Direct | NVIDIA NeMo Switchyard stage-router picks an efficient or capable model (LiteLLM-routed). |
 | `mantis/trinity` | Trinity | Multi-agent coordination over Worker, Thinker, and Verifier roles. |
 | `mantis/ultra` | Ultra | Conductor plans and executes a bounded workflow DAG over the worker pool. |
 | `mantis/fusion` | Fusion | Lead/sidekick orchestration with tool-use follow-ups and a review loop. Chat uses available mode (main may `ANSWER` without a sidekick); native `/v1/fusion/delegate` stays forced. Resume chat turns with `X-Mantis-Run-Id` or prior Fusion-encoded tool call ids. |
@@ -27,12 +27,11 @@ mantis/
 │   └── api/                    # Mantis API (:8088)
 ├── artifacts/                  # Trinity router vector/head
 ├── config/
-│   ├── catalog.toml            # Shared model/provider routing catalog
-│   ├── bifrost.template.json   # Canonical Bifrost providers, keys, and fallback rules
+│   ├── catalog.toml            # Shared model/provider routing catalog (single source of truth)
 │   └── worker-costs.json       # Evaluation price tables
 ├── launch/host/
-│   ├── llm-stack.sh            # Full local stack controller
-│   └── lib/                    # Bifrost, Switchyard, and API launchers
+│   ├── llm-stack.sh            # Full local stack controller (Switchyard + Mantis)
+│   └── lib/                    # Switchyard and API launchers
 ├── scripts/                    # Development, retraining and verification
 ├── eval/                       # Router evaluations and SWE-rebench harnesses
 └── tests/                      # Test suite
@@ -43,7 +42,6 @@ mantis/
 ### Requirements
 
 - macOS or Linux with `zsh`, `curl`, and `lsof`
-- Node/npm (`npx` launches `@maximhq/bifrost`)
 - Rust with Cargo, then `cargo install --locked switchyard-server`
 - [`uv`](https://docs.astral.sh/uv/)
 - Python 3.13
@@ -56,25 +54,20 @@ cd ~/Personal/other/mantis
 uv sync --locked --no-dev
 ```
 
-Create private runtime directories and seed Bifrost from the tracked, secret-free template:
+Create private runtime directories and wire the catalog:
 
 ```bash
-install -d -m 700 ~/.local/share/bifrost/logs ~/.local/share/mantis/switchyard ~/.local/share/llm-stack
-install -m 600 config/bifrost.template.json ~/.local/share/bifrost/config.json
+install -d -m 700 ~/.local/share/mantis/switchyard ~/.local/share/llm-stack
 ln -sfn "$PWD/config/catalog.toml" ~/.config/ai-routing/catalog.toml
 ```
 
-The Bifrost template references environment variables; never place secret values in the tracked JSON. At minimum configure:
+At minimum configure:
 
 ```text
 MANTIS_API_KEY
-BIFROST_API_KEY                 # must start with sk-bf-
-BIFROST_ENCRYPTION_KEY
-BIFROST_ADMIN_USERNAME
-BIFROST_ADMIN_PASSWORD
 ```
 
-Provider routes additionally require the matching Azure, AWS/Bedrock, Vertex ADC, OpenRouter, or OpenCode credentials. For Vertex, export `GOOGLE_APPLICATION_CREDENTIALS`, `VERTEXAI_PROJECT`, and `VERTEXAI_LOCATION`.
+Provider routes additionally require the matching OpenRouter (`OPENROUTER_API_KEY`), OpenCode (`OPENCODE_API_KEY`), or optionally Azure, AWS/Bedrock, Vertex ADC for direct provider mixing. `config/catalog.toml` is the single control file. For Vertex, export `GOOGLE_APPLICATION_CREDENTIALS`, `VERTEXAI_PROJECT`, and `VERTEXAI_LOCATION`.
 
 ## Start and stop
 
@@ -101,7 +94,7 @@ Control the stack:
 ~/Startup/llm-stack.sh stop
 ```
 
-A bare StartupFolder invocation defaults to `start` in normal mode. The controller starts Bifrost, Switchyard, and the API in dependency order and checks readiness. Trinity's Qwen coordinator remains lazy and is not loaded unless an experimental Trinity request is made; Ultra/Conductor also starts work only on an experimental request. Runtime state/logs live under `~/.local/share/bifrost` and `~/.local/share/mantis`.
+A bare StartupFolder invocation defaults to `start` in normal mode. The controller starts Switchyard and the API in dependency order and checks readiness. Trinity's Qwen coordinator remains lazy and is not loaded unless an experimental Trinity request is made; Ultra/Conductor also starts work only on an experimental request. Runtime state/logs live under `~/.local/share/mantis`.
 
 You can also run only the Mantis API in the foreground for development:
 
@@ -109,7 +102,7 @@ You can also run only the Mantis API in the foreground for development:
 ./scripts/run_mantis_native.sh
 ```
 
-That command expects Bifrost and Switchyard to be available separately.
+That command expects Switchyard to be available separately (Mantis now calls providers via LiteLLM in-process).
 
 ## Call Mantis
 

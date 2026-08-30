@@ -1,37 +1,36 @@
 version = 1
 
-[providers.bifrost]
-adapter = "openai-compatible"
-base_url = "http://127.0.0.1:8080/v1"
-credential_env = "BIFROST_API_KEY"
-developer_role = "system"
+[providers.openrouter]
+adapter = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+credential_env = "OPENROUTER_API_KEY"
 protocols = ["chat_completions", "responses"]
 
-[providers.bifrost-anthropic]
-adapter = "anthropic"
-base_url = "http://127.0.0.1:8080/anthropic"
-credential_env = "BIFROST_API_KEY"
-protocols = ["anthropic_messages"]
+[providers.opencode-go]
+adapter = "opencode-go"
+base_url = "https://opencode.ai/zen/go/v1"
+credential_env = "OPENCODE_API_KEY"
+protocols = ["chat_completions"]
 
 [base]
-# Switchyard stage-router for mantis/base. Swap these models or their
-# providers without changing application code; launch regenerates routes.toml.
-revision = "switchyard-2026-08-26-grok-kimi"
+# Switchyard stage-router for mantis/base — now direct, no Bifrost hop.
+# Swap efficient/capable models or their providers here; launch regenerates routes.toml.
+revision = "direct-2026-08-30-litellm"
 picker = "efficient_first"
 confidence_threshold = 0.5
 recent_turn_window = 3
 
 [base.targets.efficient]
-provider = "bifrost"
+provider = "opencode-go"
 reasoning_effort = "max"
-max_tokens = 128000
-upstream_model = "gpt-5.6-luna"
+max_tokens = 384000
+upstream_model = "deepseek-v4-flash"
 
 [base.targets.capable]
-provider = "bifrost"
+provider = "openrouter"
 reasoning_effort = "high"
 max_tokens = 128000
-upstream_model = "gpt-5.6-sol"
+upstream_model = "openai/gpt-5.6-sol"
 
 [mantis]
 slot_order = [
@@ -44,12 +43,12 @@ slot_order = [
     "gemini-3_1-pro-preview",
 ]
 conductor = "gpt-5_6-luna"
-conductor_model = "bifrost/gpt-5.6-luna"
+conductor_model = "openrouter/openai/gpt-5.6-luna"
 trained_slot_contract = "52eac89b5e96f1bf64b2bd83af4d8fbc649ddaaf162f4cabf9504aa93b6ae4cf"
 
 [mantis.workers.gemini-3_6-flash]
-provider = "bifrost"
-# gemini-3.7-flash (models.dev google-vertex): max output 65536
+provider = "openrouter"
+# gemini-3.7-flash via openrouter
 max_tokens = 65536
 upstream_model = "google/gemini-3.7-flash"
 model_identity = "gemini-3.6-flash"
@@ -57,52 +56,52 @@ reasoning_effort = "high"
 protocols = ["chat_completions"]
 
 [mantis.workers.gpt-5_6-luna]
-provider = "bifrost"
-# gpt-5.6-luna (models.dev azure/openai): max output 128000
+provider = "openrouter"
+# gpt-5.6-luna via openrouter
 max_tokens = 128000
-upstream_model = "gpt-5.6-luna"
+upstream_model = "openai/gpt-5.6-luna"
 model_identity = "gpt-5.6-luna"
 reasoning_effort = "xhigh"
 protocols = ["chat_completions"]
 
 [mantis.workers.gpt-5_6-sol]
-provider = "bifrost"
-# gpt-5.6-sol (models.dev azure/openai): max output 128000
+provider = "openrouter"
+# gpt-5.6-sol via openrouter
 max_tokens = 128000
-upstream_model = "gpt-5.6-sol"
+upstream_model = "openai/gpt-5.6-sol"
 model_identity = "gpt-5.6-sol"
 reasoning_effort = "medium"
 protocols = ["chat_completions"]
 
 [mantis.workers.deepseek-v4-flash]
-provider = "bifrost"
-# deepseek-v4-flash (models.dev opencode/deepseek): max output 384000
+provider = "opencode-go"
+# deepseek-v4-flash via opencode subscription
 max_tokens = 384000
 upstream_model = "deepseek-v4-flash"
 model_identity = "deepseek-v4-flash"
 protocols = ["chat_completions"]
 
 [mantis.workers.claude-opus-5]
-provider = "bifrost-anthropic"
-# claude-opus-5 (models.dev bedrock/anthropic): max output 128000
+provider = "openrouter"
+# claude-opus-5 via openrouter (previously bedrock anthropic)
 max_tokens = 128000
-upstream_model = "bedrock/anthropic/claude-opus-5"
+upstream_model = "anthropic/claude-opus-5"
 model_identity = "claude-opus-5"
 reasoning_effort = "medium"
-protocols = ["anthropic_messages"]
+protocols = ["chat_completions"]
 
 [mantis.workers.claude-sonnet-5]
-provider = "bifrost-anthropic"
-# claude-sonnet-5 (models.dev bedrock/anthropic): max output 128000
+provider = "openrouter"
+# claude-sonnet-5 via openrouter
 max_tokens = 128000
-upstream_model = "bedrock/anthropic/claude-sonnet-5"
+upstream_model = "anthropic/claude-sonnet-5"
 model_identity = "claude-sonnet-5"
 reasoning_effort = "medium"
-protocols = ["anthropic_messages"]
+protocols = ["chat_completions"]
 
 [mantis.workers.gemini-3_1-pro-preview]
-provider = "bifrost"
-# gemini-3.1-pro-preview (models.dev google-vertex): max output 65536
+provider = "openrouter"
+# gemini-3.1-pro-preview via openrouter
 max_tokens = 65536
 upstream_model = "google/gemini-3.1-pro-preview"
 model_identity = "gemini-3.1-pro-preview"
@@ -110,8 +109,9 @@ reasoning_effort = "high"
 protocols = ["chat_completions"]
 
 [fusion]
+# demo mix: main via openrouter, sidekick pools opencode-go then openrouter
 main = "gpt-5_6-sol"
-sidekick = ["gpt-5_6-luna", "gpt-5_6-sol"]
+sidekick = ["deepseek-v4-flash", "gpt-5_6-luna"]
 fallback_on_escalate = true
 max_follow_ups = 2
 sidekick_max_tool_rounds = 16
