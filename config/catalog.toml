@@ -120,18 +120,11 @@ protocols = ["chat_completions"]
 # slot, so escalation always promotes and never degrades capability. See
 # FusionRouter.select / .strongest in apps/api/fusion_router.py.
 #
-# Main runs on every plan, escalation, review, and follow-up, so it dominates run
-# cost. gpt-5.6-sol has the highest output price in eval/model_prices.json
-# ($30/M, above claude-opus-5 at $25/M), so paying it up front on every run is
-# poor value. claude-sonnet-5 is ~2.9x cheaper per task (config/worker-costs.json)
-# and handles the main lane's text-only plan/review contract; sol stays one
-# escalation away, so the quality ceiling is unchanged.
-#
 # Pool members may differ in context size. Each worker declares its own
 # context_window and FusionCoordinator._context_window_for clamps the transcript
 # to the selected slot, so promoting into a smaller-window model no longer
 # overruns it mid-run.
-main = ["claude-sonnet-5", "gpt-5_6-sol"]
+main = "gpt-5_6-sol"
 sidekick = ["deepseek-v4-flash", "gpt-5_6-luna"]
 fallback_on_escalate = true
 max_follow_ups = 2
