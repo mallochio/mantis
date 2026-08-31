@@ -56,18 +56,33 @@ def _write(tmp_path: Path, content: str) -> Path:
 
 
 def test_shipped_catalog_renders_stage_router():
-    route = load_switchyard_route(Path("config/catalog.toml"))
+    catalog_path = Path("config/catalog.toml")
+    route = load_switchyard_route(catalog_path)
     text = render_switchyard_toml(route)
     parsed = tomllib.loads(text)
+
+    with catalog_path.open("rb") as handle:
+        catalog = tomllib.load(handle)
+    base = catalog["base"]
+    providers = catalog["providers"]
+
     assert parsed["schema_version"] == 1
     assert parsed["routes"]["mantis_base"]["type"] == "stage_router"
     assert parsed["routes"]["mantis_base"]["id"] == SWITCHYARD_ROUTE_ID
-    assert parsed["routes"]["mantis_base"]["picker"] == "efficient_first"
-    # catalog.toml is the single source of truth — pin to its current values
-    assert parsed["targets"]["efficient"]["id"] == "openai/gpt-5.6-luna"
-    assert parsed["targets"]["capable"]["id"] == "openai/gpt-5.6-sol"
-    assert parsed["llm_clients"]["openrouter"]["api_key_env"] == "OPENROUTER_API_KEY"
-    assert parsed["llm_clients"]["openrouter"]["base_url"] == "https://openrouter.ai/api/v1"
+    assert parsed["routes"]["mantis_base"]["picker"] == base["picker"]
+    assert parsed["routes"]["mantis_base"]["confidence_threshold"] == base["confidence_threshold"]
+    assert parsed["routes"]["mantis_base"]["recent_turn_window"] == base["recent_turn_window"]
+
+    # catalog.toml is the single source of truth — derive expected values from it
+    for role in ("efficient", "capable"):
+        target = base["targets"][role]
+        provider = providers[target["provider"]]
+        rendered_target = parsed["targets"][role]
+        rendered_client = parsed["llm_clients"][rendered_target["llm_client"]]
+
+        assert rendered_target["id"] == target["upstream_model"]
+        assert rendered_client["api_key_env"] == provider["credential_env"]
+        assert rendered_client["base_url"] == provider["base_url"]
 
 
 def test_openrouter_free_smoke_catalog_renders_distinct_targets():
