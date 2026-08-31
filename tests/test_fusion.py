@@ -2909,6 +2909,40 @@ def test_record_selected_slot_tracks_promotions():
     assert run.slot_models.count("main-strong") == 1
 
 
+def test_base_route_lead_resolves_to_capable_target_with_full_budget():
+    """The lead runs through [base] so it can use an effort the ABI slot pins.
+
+    [mantis.workers.gpt-5_6-sol] is ABI-bound to "medium", so routing the lead
+    via base.targets.capable is what lets it run at a different effort. The
+    resolved spec is a provider/model passthrough, which carries no
+    context_window and must therefore get the full endpoint budget.
+    """
+    config = fusion.FusionRoutingConfig(main="mantis/base", sidekick="gpt-5_6-luna")
+    router = fusion.FusionRouter.from_config(config, "main")
+    spec = router.select(escalation_count=0)
+    assert spec.startswith("openrouter/")
+    assert "gpt-5.6-sol" in spec
+    # strongest() must agree with select() for a single-slot pool.
+    assert router.strongest() == spec
+
+    coordinator = fusion.FusionCoordinator()
+    assert coordinator._context_window_for(spec) == coordinator.context_window
+    # base:capable is the explicit spelling of the same target.
+    explicit = fusion.FusionRouter.from_config(
+        fusion.FusionRoutingConfig(main="base:capable", sidekick="gpt-5_6-luna"), "main"
+    )
+    assert explicit.select(escalation_count=0) == spec
+
+
+def test_base_route_lead_and_sidekick_have_distinct_provenance():
+    """Reasoning must not cross between the lead and sidekick models."""
+    coordinator = fusion.FusionCoordinator()
+    run = fusion.FusionRun("provenance", "goal")
+    main = coordinator._upstream_model_for(run.main_router.select())
+    side = coordinator._upstream_model_for(run.sidekick_router.select())
+    assert main != side
+
+
 def test_shipped_slots_get_the_full_endpoint_budget():
     """The harness owns compaction, so Fusion must not trim early.
 
