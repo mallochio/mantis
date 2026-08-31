@@ -173,6 +173,7 @@ def render_mantis_environment(catalog: MantisCatalog) -> dict[str, str]:
             "model_identity": binding.model_identity,
             **({"reasoning_effort": binding.reasoning_effort} if binding.reasoning_effort else {}),
             **({"max_tokens": binding.max_tokens} if binding.max_tokens else {}),
+            **({"context_window": binding.context_window} if binding.context_window else {}),
             "protocols": list(binding.protocols),
         }
         for name, binding in sorted(catalog.bindings.workers.items())

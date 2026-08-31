@@ -2647,7 +2647,7 @@ def test_fusion_structured_preamble_delegates_and_legacy_unchanged():
     assert legacy_run.main_messages[0]["content"] == fusion.MAIN_PREAMBLE
 
 
-def test_fusion_frontier_profile_uses_main_slot(monkeypatch):
+def test_fusion_frontier_profile_uses_strongest_slot(monkeypatch):
     plan_json = json.dumps(
         {
             "complexity": 0.9,
@@ -2681,8 +2681,14 @@ def test_fusion_frontier_profile_uses_main_slot(monkeypatch):
         for call in worker.calls
         if call[1][0].get("content", "").startswith(fusion.SIDEKICK_PREAMBLE)
     ]
-    assert run.main_slot in lane_slots
+    # "frontier" means the strongest slot, which under cheapest-first pools is
+    # the last pool entry -- not main_slot, which is the cheapest on turn zero.
+    assert run.main_router is not None
+    strongest = run.main_router.strongest()
+    assert strongest in lane_slots
     assert len(lane_slots) == 2
+    if strongest != run.main_slot:
+        assert run.main_slot not in lane_slots
 
 
 def _tool_call(call_id: str, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -2829,9 +2835,197 @@ def test_fusion_budget_remaining_timeout():
         guard.remaining_timeout_s()
 
 
+def test_fusion_router_pools_are_cheapest_first_for_every_role():
+    """A higher pool index must always be the stronger, costlier slot."""
+    config = fusion.FusionRoutingConfig(
+        main=["main-cheap", "main-strong"],
+        sidekick=["side-cheap", "side-strong"],
+    )
+    main = fusion.FusionRouter(config, "main")
+    sidekick = fusion.FusionRouter(config, "sidekick")
+    # Escalation promotes, never degrades, in both lanes.
+    assert main.select(escalation_count=0) == "main-cheap"
+    assert main.select(escalation_count=1) == "main-strong"
+    assert sidekick.select(escalation_count=0) == "side-cheap"
+    assert sidekick.select(escalation_count=1) == "side-strong"
+
+
+def test_server_execution_does_not_hijack_a_client_declared_tool():
+    """A harness tool named `bash` must run in the harness, not the sandbox."""
+    run = fusion.FusionRun(
+        "shadow",
+        "goal",
+        tools=[{"type": "function", "function": {"name": "bash"}}],
+        tool_options=fusion.FusionToolOptions(enabled=["shell"], server_execution=True),
+    )
+    run.tools = run._filter_tools()
+    # The client declared `bash`, so Fusion must not claim it.
+    assert "bash" not in run.server_tool_names
+    assert not run._can_execute_server_side([_tool_call("c1", "bash", {"command": "ls"})])
+    # And the tool list still offers it exactly once.
+    assert [t["function"]["name"] for t in run.tools].count("bash") == 1
+
+
+def test_server_execution_still_runs_tools_fusion_injected():
+    run = fusion.FusionRun(
+        "injected",
+        "goal",
+        tool_options=fusion.FusionToolOptions(enabled=["shell"], server_execution=True),
+    )
+    run.tools = run._filter_tools()
+    assert "bash" in run.server_tool_names
+    assert run._can_execute_server_side([_tool_call("c1", "bash", {"command": "ls"})])
+
+
+def test_server_execution_off_claims_nothing():
+    run = fusion.FusionRun(
+        "no-server",
+        "goal",
+        tools=[{"type": "function", "function": {"name": "bash"}}],
+    )
+    run.tools = run._filter_tools()
+    assert run.server_tool_names == set()
+    assert not run._can_execute_server_side([_tool_call("c1", "bash", {"command": "ls"})])
+
+
+def test_record_selected_slot_tracks_promotions():
+    """Trace and learning records must name the model that actually ran."""
+    run = fusion.FusionRun("promote", "goal")
+    run.main_slot = "main-cheap"
+    run.sidekick_slot = "side-cheap"
+    run.slot_models = ["main-cheap", "side-cheap"]
+
+    run._record_selected_slot("main", "main-strong")
+    assert run.main_slot == "main-strong"
+    assert "main-strong" in run.slot_models
+
+    # Concurrent sidekick lanes only contribute pool membership.
+    run._record_selected_slot("sidekick", "lane-model", primary=False)
+    assert run.sidekick_slot == "side-cheap"
+    assert "lane-model" in run.slot_models
+
+    # No duplicates.
+    run._record_selected_slot("main", "main-strong")
+    assert run.slot_models.count("main-strong") == 1
+
+
+def test_context_window_clamps_to_the_selected_slot(monkeypatch):
+    """A pool may mix window sizes; each turn is sized for the slot it uses."""
+    from types import SimpleNamespace
+
+    coordinator = fusion.FusionCoordinator()
+    coordinator.context_window = 262144
+    windows = {"big": 500000, "mid": 128000, "small": 65536, "undeclared": None}
+
+    def fake_resolve(spec, bindings=None):
+        if spec not in windows:
+            raise ValueError(f"unknown spec {spec}")
+        return SimpleNamespace(max_tokens=4096, context_window=windows[spec])
+
+    monkeypatch.setattr(fusion.providers, "_resolve_model_spec", fake_resolve)
+
+    # A window larger than the endpoint budget cannot raise it.
+    assert coordinator._context_window_for("big") == 262144
+    # Smaller windows clamp down, which is the whole point.
+    assert coordinator._context_window_for("mid") == 128000
+    assert coordinator._context_window_for("small") == 65536
+    # No declared window keeps today's behaviour.
+    assert coordinator._context_window_for("undeclared") == 262144
+    # An unresolvable spec must not break the run.
+    assert coordinator._context_window_for("passthrough/model") == 262144
+
+
+def test_call_worker_sizes_input_budget_for_the_promoted_slot(monkeypatch):
+    """Promoting into a smaller-window model must shrink the transcript."""
+    from types import SimpleNamespace
+
+    coordinator = fusion.FusionCoordinator()
+    coordinator.context_window = 262144
+    coordinator.max_output_tokens = 4096
+    seen: list[int] = []
+
+    def fake_resolve(spec, bindings=None):
+        return SimpleNamespace(max_tokens=4096, context_window=65536 if spec == "small" else 128000)
+
+    def fake_fit(slot, messages, tools, input_budget):
+        seen.append(input_budget)
+        return messages
+
+    monkeypatch.setattr(fusion.providers, "_resolve_model_spec", fake_resolve)
+    monkeypatch.setattr(coordinator, "_fit_messages", fake_fit)
+    monkeypatch.setattr(
+        fusion.providers,
+        "_provider_response",
+        lambda *a, **k: {"choices": [{"message": {"content": "ok"}}], "usage": {}},
+    )
+
+    coordinator._call_worker("mid", [{"role": "user", "content": "hi"}], None)
+    coordinator._call_worker("small", [{"role": "user", "content": "hi"}], None)
+    assert seen == [128000 - 4096, 65536 - 4096]
+
+
+def test_fusion_router_strongest_is_last_pool_entry():
+    config = fusion.FusionRoutingConfig(
+        main=["main-cheap", "main-strong"],
+        sidekick="side-only",
+    )
+    main = fusion.FusionRouter(config, "main")
+    sidekick = fusion.FusionRouter(config, "sidekick")
+    # main_slot equivalent (turn zero) is the cheapest; strongest() is not.
+    assert main.select(escalation_count=0) == "main-cheap"
+    assert main.strongest() == "main-strong"
+    # A bare string pool is its own strongest slot.
+    assert sidekick.strongest() == "side-only"
+
+
+def test_refresh_fusion_run_tools_replaces_stale_harness_schemas():
+    """A harness that compacts or loads a skill resumes with a new tool set."""
+    run = fusion.FusionRun(
+        "refresh",
+        "goal",
+        tools=[{"type": "function", "function": {"name": "old_tool"}}],
+    )
+    assert [t["function"]["name"] for t in run.tools] == ["old_tool"]
+
+    fusion.refresh_fusion_run_tools(
+        run,
+        [
+            {"type": "function", "function": {"name": "zebra"}},
+            {"type": "function", "function": {"name": "alpha"}},
+        ],
+    )
+    # Replaced, not merged, and re-sorted so a reshuffle cannot bust the
+    # provider prompt-cache prefix.
+    assert [t["function"]["name"] for t in run.tools] == ["alpha", "zebra"]
+
+    # An empty list is a real instruction: the client now offers no tools.
+    fusion.refresh_fusion_run_tools(run, [])
+    assert run.tools == []
+
+
+def test_refresh_fusion_run_tools_reapplies_lane_authority():
+    """After planning, refreshed schemas stay subject to tool_options."""
+    run = fusion.FusionRun(
+        "refresh-filtered",
+        "goal",
+        tools=[{"type": "function", "function": {"name": "read_file"}}],
+        tool_options=fusion.FusionToolOptions(enabled=["files"]),
+    )
+    run.structured_plan = fusion.FusionPlan(complexity=0.5, main_task="verify")
+
+    fusion.refresh_fusion_run_tools(
+        run,
+        [
+            {"type": "function", "function": {"name": "read_file"}},
+            {"type": "function", "function": {"name": "not_in_bundle"}},
+        ],
+    )
+    assert [t["function"]["name"] for t in run.tools] == ["read_file"]
+
+
 def test_fusion_router_reroutes_only_at_compaction():
     config = fusion.FusionRoutingConfig(
-        main=["main-strong", "main-cheap"],
+        main=["main-cheap", "main-strong"],
         sidekick=["side-cheap", "side-strong"],
     )
     main = fusion.FusionRouter(config, "main")
@@ -2844,7 +3038,7 @@ def test_fusion_router_reroutes_only_at_compaction():
 
 def test_fusion_run_records_compaction_reroute():
     config = fusion.FusionRoutingConfig(
-        main=["main-strong", "main-cheap"],
+        main=["main-cheap", "main-strong"],
         sidekick=["side-cheap", "side-strong"],
     )
     run = fusion.FusionRun(
@@ -2871,7 +3065,7 @@ def test_fusion_run_records_compaction_reroute():
 
 
 def test_main_compaction_reroute_waits_for_plan_complexity():
-    config = fusion.FusionRoutingConfig(main=["main-strong", "main-cheap"], sidekick="side")
+    config = fusion.FusionRoutingConfig(main=["main-cheap", "main-strong"], sidekick="side")
     run = fusion.FusionRun(
         "deferred-reroute",
         "goal",

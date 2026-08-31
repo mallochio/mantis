@@ -70,6 +70,7 @@ class ResolvedModelSpec:
     protocols: tuple[str, ...] | None
     slot: str | None
     max_tokens: int | None = None
+    context_window: int | None = None
 
 
 def _resolve_model_spec(spec: str, bindings: RuntimeBindings | None = None) -> ResolvedModelSpec:
@@ -91,6 +92,7 @@ def _resolve_model_spec(spec: str, bindings: RuntimeBindings | None = None) -> R
             worker.protocols,
             spec,
             worker.max_tokens,
+            worker.context_window,
         )
     provider_name, separator, remainder = spec.partition("/")
     provider = bindings.providers.get(provider_name) if separator and bindings is not None else None
@@ -316,6 +318,39 @@ _REASONING_FIELDS = frozenset(
 )
 
 
+_ENDPOINT_BOUND_MARKERS = ("encrypted", "compaction")
+
+# Internal bookkeeping that must never reach a provider.
+_INTERNAL_FIELDS = ("_anthropic_content", "_anthropic_tool_ids", "_mantis_model")
+
+
+def _portable_reasoning_details(msg: dict[str, Any]) -> None:
+    """Drop reasoning items that are bound to the endpoint that produced them.
+
+    Mirrors ``base_proxy._strip_endpoint_bound_reasoning``. Encrypted and
+    compaction items are only valid at their originating endpoint, so replaying
+    them after a model switch yields an upstream 404. Plain summaries are
+    portable and stay.
+    """
+    details = msg.get("reasoning_details")
+    if not isinstance(details, list):
+        return
+    portable = [
+        detail
+        for detail in details
+        if not isinstance(detail, dict)
+        or not any(
+            marker in str(detail.get(key, "")).lower()
+            for key in ("type", "format")
+            for marker in _ENDPOINT_BOUND_MARKERS
+        )
+    ]
+    if portable:
+        msg["reasoning_details"] = portable
+    else:
+        msg.pop("reasoning_details", None)
+
+
 def _sanitize_messages(
     messages: list[dict[str, Any]],
     model: str,
@@ -329,7 +364,12 @@ def _sanitize_messages(
         role = msg.get("role")
         if role == "assistant":
             has_tool_calls = bool(msg.get("tool_calls"))
-            keep_reasoning = is_responses or (is_deepseek and has_tool_calls)
+            # Reasoning is model-bound. A Fusion pool can promote mid-run, so
+            # replaying the previous model's reasoning is wasted at best and an
+            # upstream rejection at worst. Only the producer may see it again.
+            produced_by = msg.get("_mantis_model")
+            same_model = produced_by is None or str(produced_by) == model
+            keep_reasoning = (is_responses or (is_deepseek and has_tool_calls)) and same_model
             content = msg.get("content")
             if isinstance(content, list):
                 if is_anthropic:
@@ -342,7 +382,10 @@ def _sanitize_messages(
                         and p.get("type")
                         not in ("thinking", "reasoning", "reasoning_content")
                     ]
-            if not keep_reasoning:
+            if keep_reasoning:
+                # Even for the producing model, endpoint-bound items are unsafe.
+                _portable_reasoning_details(msg)
+            else:
                 for k in _REASONING_FIELDS:
                     msg.pop(k, None)
             if not is_anthropic:
@@ -353,19 +396,28 @@ def _sanitize_messages(
                 msg.pop(k, None)
             for k in ("_anthropic_content", "_anthropic_tool_ids"):
                 msg.pop(k, None)
+        msg.pop("_mantis_model", None)
         sanitized.append(msg)
     return sanitized
 
 
 def _prompt_cache_namespace(
-    messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None
+    messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None, model: str = ""
 ) -> str:
+    """Fingerprint the cacheable prompt prefix for one model.
+
+    ``model`` is part of the namespace because provider prompt caches are
+    per-model: a Fusion pool that promotes mid-run must not be handed a
+    namespace it shares with the slot it was promoted from.
+    """
     root: list[dict[str, Any]] = []
     for m in messages:
         root.append(m)
         if m.get("role") == "user":
             break
-    payload = json.dumps({"messages": root, "tools": tools or []}, sort_keys=True, default=str)
+    payload = json.dumps(
+        {"model": model, "messages": root, "tools": tools or []}, sort_keys=True, default=str
+    )
     return hashlib.sha256(payload.encode()).hexdigest()[:32]
 
 

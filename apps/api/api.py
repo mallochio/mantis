@@ -934,6 +934,14 @@ def _run_fusion_chat(
         )
         resumed = fusion.try_get_fusion_run(resume_id) if resume_id else None
         if resumed is not None and resumed.status != "awaiting_tools":
+            # A harness that compacted its context, loaded a skill, or entered a
+            # subagent resumes with a different tool set than the one the run was
+            # created with. Refresh the schemas so later lanes are not offered
+            # tools the client can no longer execute.
+            if request.tools is not None:
+                fusion.refresh_fusion_run_tools(
+                    resumed, [tool.model_dump() for tool in request.tools]
+                )
             event = fusion.advance_fusion_run(resumed.run_id, message=brief)
         else:
             tools = [tool.model_dump() for tool in (request.tools or [])]

@@ -54,6 +54,10 @@ class FusionRouter:
         times the sidekick escalated or failed. When ``fallback_on_escalate``
         is set and a pool is configured, each escalation promotes to the next
         slot in the pool.
+
+        Pool ordering is cheapest-first for every role, so a higher index is
+        always a stronger, costlier slot. Escalation therefore always promotes
+        and never degrades capability.
         """
         pool: str | list[str] = self.config.main if self.role == "main" else self.config.sidekick
         if isinstance(pool, str):
@@ -66,6 +70,21 @@ class FusionRouter:
         if self.config.fallback_on_escalate:
             index = min(escalation_count, len(pool) - 1)
         return self._resolve(pool[index], turn_index + escalation_count)
+
+    def strongest(self) -> str:
+        """Return the strongest, costliest slot in this role's pool.
+
+        Pools are cheapest-first, so the strongest slot is the last entry.
+        Callers that need capability rather than economy (for example the
+        built-in ``frontier`` worker profile) must use this instead of the
+        currently selected slot, which is the cheapest entry on turn zero.
+        """
+        pool: str | list[str] = self.config.main if self.role == "main" else self.config.sidekick
+        if isinstance(pool, str):
+            return self._resolve(pool, 0)
+        if not pool:
+            raise ValueError(f"fusion {self.role} pool is empty")
+        return self._resolve(pool[-1], 0)
 
     def select_at_compaction(
         self,
@@ -81,10 +100,12 @@ class FusionRouter:
             raise ValueError(f"fusion {self.role} pool is empty")
         if self.role == "main":
             if complexity < 0.85 and len(pool) > 1:
-                index = 1
+                # Easy task, and compaction already forced a cache miss: settle
+                # on the cheapest slot instead of re-paying for the strong one.
+                index = 0
             else:
                 resolved = [self._resolve(candidate, 0) for candidate in pool]
-                index = resolved.index(previous) if previous in resolved else 0
+                index = resolved.index(previous) if previous in resolved else len(pool) - 1
         else:
             index = min(1 if failure_count > 0 else 0, len(pool) - 1)
         return self._resolve(pool[index], failure_count)

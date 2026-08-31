@@ -1042,6 +1042,72 @@ def test_sanitize_messages_keeps_reasoning_for_responses():
     assert out[0]["reasoning_details"][0]["type"] == "reasoning"
 
 
+def test_sanitize_messages_drops_encrypted_reasoning_even_for_the_producer():
+    """Endpoint-bound items are unsafe to replay even to the same model."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning": "long chain",
+            "reasoning_details": [
+                {"type": "reasoning.encrypted", "data": "opaque"},
+                {"format": "openai-compaction", "data": "opaque"},
+                {"type": "reasoning", "text": "portable summary"},
+            ],
+        }
+    ]
+    out = providers._sanitize_messages(messages, "openai/gpt-5.6-sol", is_responses=True)
+    kept = out[0]["reasoning_details"]
+    assert [d.get("type") or d.get("format") for d in kept] == ["reasoning"]
+
+
+def test_sanitize_messages_drops_reasoning_produced_by_another_model():
+    """A Fusion pool can promote mid-run; reasoning must not cross models."""
+    same = {
+        "role": "assistant",
+        "content": "a",
+        "tool_calls": [{"id": "1"}],
+        "reasoning": "mine",
+        "reasoning_details": [{"type": "reasoning", "text": "mine"}],
+        "_mantis_model": "deepseek-v4-flash",
+    }
+    other = {
+        "role": "assistant",
+        "content": "b",
+        "tool_calls": [{"id": "2"}],
+        "reasoning": "theirs",
+        "reasoning_details": [{"type": "reasoning", "text": "theirs"}],
+        "_mantis_model": "openai/gpt-5.6-sol",
+    }
+    out = providers._sanitize_messages([same, other], "deepseek-v4-flash")
+    assert out[0]["reasoning"] == "mine"
+    assert "reasoning" not in out[1]
+    assert "reasoning_details" not in out[1]
+    # The provenance marker itself must never reach a provider.
+    assert all("_mantis_model" not in m for m in out)
+
+
+def test_sanitize_messages_untagged_reasoning_keeps_legacy_behaviour():
+    """Runs created before provenance tagging must not regress."""
+    msg = {
+        "role": "assistant",
+        "content": "a",
+        "tool_calls": [{"id": "1"}],
+        "reasoning": "legacy",
+    }
+    out = providers._sanitize_messages([msg], "deepseek-v4-flash")
+    assert out[0]["reasoning"] == "legacy"
+
+
+def test_prompt_cache_namespace_is_model_scoped():
+    """Two pool members must not share one prompt-cache namespace."""
+    messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    a = providers._prompt_cache_namespace(messages, None, "claude-sonnet-5")
+    b = providers._prompt_cache_namespace(messages, None, "gpt-5_6-sol")
+    assert a != b
+    assert a == providers._prompt_cache_namespace(messages, None, "claude-sonnet-5")
+
+
 def test_openai_cache_breakpoints_mark_system_and_penultimate():
     messages = [
         {"role": "system", "content": "instructions"},

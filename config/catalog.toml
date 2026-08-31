@@ -50,6 +50,7 @@ trained_slot_contract = "52eac89b5e96f1bf64b2bd83af4d8fbc649ddaaf162f4cabf9504aa
 provider = "openrouter"
 # gemini-3.7-flash via openrouter
 max_tokens = 65536
+context_window = 65536
 upstream_model = "google/gemini-3.7-flash"
 model_identity = "gemini-3.6-flash"
 reasoning_effort = "high"
@@ -59,6 +60,7 @@ protocols = ["chat_completions"]
 provider = "openrouter"
 # gpt-5.6-luna via openrouter
 max_tokens = 128000
+context_window = 128000
 upstream_model = "openai/gpt-5.6-luna"
 model_identity = "gpt-5.6-luna"
 reasoning_effort = "xhigh"
@@ -68,6 +70,7 @@ protocols = ["chat_completions"]
 provider = "openrouter"
 # gpt-5.6-sol via openrouter
 max_tokens = 128000
+context_window = 128000
 upstream_model = "openai/gpt-5.6-sol"
 model_identity = "gpt-5.6-sol"
 reasoning_effort = "medium"
@@ -77,6 +80,7 @@ protocols = ["chat_completions"]
 provider = "opencode-go"
 # deepseek-v4-flash via opencode subscription
 max_tokens = 384000
+context_window = 384000
 upstream_model = "deepseek-v4-flash"
 model_identity = "deepseek-v4-flash"
 protocols = ["chat_completions"]
@@ -85,6 +89,7 @@ protocols = ["chat_completions"]
 provider = "openrouter"
 # claude-opus-5 via openrouter (previously bedrock anthropic)
 max_tokens = 128000
+context_window = 128000
 upstream_model = "anthropic/claude-opus-5"
 model_identity = "claude-opus-5"
 reasoning_effort = "medium"
@@ -94,6 +99,7 @@ protocols = ["chat_completions"]
 provider = "openrouter"
 # claude-sonnet-5 via openrouter
 max_tokens = 128000
+context_window = 128000
 upstream_model = "anthropic/claude-sonnet-5"
 model_identity = "claude-sonnet-5"
 reasoning_effort = "medium"
@@ -103,18 +109,33 @@ protocols = ["chat_completions"]
 provider = "openrouter"
 # gemini-3.1-pro-preview via openrouter
 max_tokens = 65536
+context_window = 65536
 upstream_model = "google/gemini-3.1-pro-preview"
 model_identity = "gemini-3.1-pro-preview"
 reasoning_effort = "high"
 protocols = ["chat_completions"]
 
 [fusion]
-# demo mix: main via openrouter, sidekick pools opencode-go then openrouter
+# Pools are CHEAPEST-FIRST for every role: a higher index is a stronger, costlier
+# slot, so escalation always promotes and never degrades capability. See
+# FusionRouter.select / .strongest in apps/api/fusion_router.py.
+#
+# Pool members may differ in context size. Each worker declares its own
+# context_window and FusionCoordinator._context_window_for clamps the transcript
+# to the selected slot, so promoting into a smaller-window model no longer
+# overruns it mid-run.
 main = "gpt-5_6-sol"
 sidekick = ["deepseek-v4-flash", "gpt-5_6-luna"]
 fallback_on_escalate = true
 max_follow_ups = 2
 sidekick_max_tool_rounds = 16
+# Cost gate, not a capability gap. The main slot costs ~70x the sidekick per
+# task (gpt-5.6-sol vs deepseek-v4-flash in config/worker-costs.json), and main
+# already receives the sidekick's tool history and verification-command results
+# for free in the review prompt. Paying main-slot tokens to re-verify that
+# summary is poor value. Raise to "review" only when review accuracy is
+# measurably limited by missing evidence; "plan+review" is rarely worth it,
+# since a plan is written before any work exists to inspect.
 main_tools = "none"
 context_token_limit = 262144
 max_output_tokens = 4096

@@ -627,6 +627,66 @@ def test_rendered_worker_bindings_include_max_tokens():
     assert "max_tokens" not in workers[other]
 
 
+def test_worker_max_tokens_may_not_exceed_context_window():
+    """max_tokens is the output cap; a value above the window signals a mix-up."""
+    workers = _full_workers()
+    workers[DEEPSEEK]["context_window"] = 65536
+    workers[DEEPSEEK]["max_tokens"] = 128000
+    with pytest.raises(model_catalog.CatalogError, match="output cap"):
+        model_catalog._runtime_bindings(_edge_provider(), workers)
+    # Equal is fine, and so is a smaller cap.
+    for cap in (65536, 4096):
+        workers[DEEPSEEK]["max_tokens"] = cap
+        bindings = model_catalog._runtime_bindings(_edge_provider(), workers)
+        assert bindings.workers[DEEPSEEK].max_tokens == cap
+
+
+def test_worker_context_window_must_be_positive():
+    for bad in (0, -1, "65536", 1.5, True):
+        workers = _full_workers()
+        workers[DEEPSEEK]["context_window"] = bad
+        with pytest.raises(model_catalog.CatalogError, match="context_window"):
+            model_catalog._runtime_bindings(_edge_provider(), workers)
+
+
+def test_rendered_worker_bindings_include_context_window():
+    """context_window must survive catalog -> rendered env -> runtime bindings."""
+    catalog = _unchecked_catalog(
+        _catalog().replace(
+            f'upstream_model = "vendor/{DEEPSEEK}"',
+            f'context_window = 384000\nupstream_model = "vendor/{DEEPSEEK}"',
+            1,
+        )
+    )
+    rendered = model_catalog.render_mantis_environment(catalog)
+    workers = json.loads(rendered["MANTIS_WORKER_BINDINGS"])
+    assert workers[DEEPSEEK]["context_window"] == 384000
+    # Workers without a declared window stay absent so fingerprints don't drift.
+    other = next(slot for slot in SLOTS if slot != DEEPSEEK)
+    assert "context_window" not in workers[other]
+    # And it round-trips back into a WorkerBinding.
+    bindings = model_catalog._runtime_bindings(
+        json.loads(rendered["MANTIS_PROVIDER_BINDINGS"]), workers
+    )
+    assert bindings.workers[DEEPSEEK].context_window == 384000
+    assert bindings.workers[other].context_window is None
+
+
+def test_context_window_does_not_change_identity_contract():
+    """Declaring a window must not force an ABI retrain."""
+    plain = _unchecked_catalog(_catalog())
+    with_window = _unchecked_catalog(
+        _catalog().replace(
+            f'upstream_model = "vendor/{DEEPSEEK}"',
+            f'context_window = 384000\nupstream_model = "vendor/{DEEPSEEK}"',
+            1,
+        )
+    )
+    assert model_catalog.identity_fingerprint(plain) == model_catalog.identity_fingerprint(
+        with_window
+    )
+
+
 def test_runtime_worker_max_tokens_clamps_upstream_request(monkeypatch):
     providers = _edge_provider()
     workers = _full_workers()

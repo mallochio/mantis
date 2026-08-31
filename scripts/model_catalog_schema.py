@@ -78,6 +78,10 @@ class WorkerBinding:
     reasoning_effort: str | None
     protocols: tuple[str, ...]
     max_tokens: int | None = None
+    # Total input+output tokens the upstream model accepts. ``max_tokens`` is
+    # only the *output* clamp (see providers._litellm_kwargs), so a consumer
+    # that needs to size a transcript must use this instead.
+    context_window: int | None = None
 
 
 @dataclass(frozen=True)
@@ -207,19 +211,40 @@ def _max_tokens(value: Any, label: str) -> int | None:
     return value
 
 
+def _validate_token_limits(
+    max_tokens: int | None, context_window: int | None, label: str
+) -> None:
+    """Reject an output cap larger than the model's own context window.
+
+    ``max_tokens`` is the *output* clamp sent upstream (see
+    ``providers._litellm_kwargs``); ``context_window`` is the total the model
+    accepts. An output cap above the window can never be honoured and signals a
+    field mix-up.
+    """
+    if max_tokens is not None and context_window is not None and max_tokens > context_window:
+        raise CatalogError(
+            f"{label}.max_tokens ({max_tokens}) exceeds {label}.context_window "
+            f"({context_window}); max_tokens is the output cap, not the context window"
+        )
+
+
 def _worker(value: Any, label: str) -> WorkerBinding:
     table = _mapping(value, label)
     upstream_model = _model_name(table.get("upstream_model"), f"{label}.upstream_model")
     model_identity = _model_name(
         table.get("model_identity", upstream_model), f"{label}.model_identity"
     )
+    max_tokens = _max_tokens(table.get("max_tokens"), f"{label}.max_tokens")
+    context_window = _max_tokens(table.get("context_window"), f"{label}.context_window")
+    _validate_token_limits(max_tokens, context_window, label)
     return WorkerBinding(
         _identifier(table.get("provider"), f"{label}.provider"),
         upstream_model,
         model_identity,
         _reasoning_effort(table.get("reasoning_effort"), f"{label}.reasoning_effort"),
         _protocols(table.get("protocols"), f"{label}.protocols", required=True),
-        _max_tokens(table.get("max_tokens"), f"{label}.max_tokens"),
+        max_tokens,
+        context_window,
     )
 
 
