@@ -327,3 +327,49 @@ def test_quotes_non_identifier_client_keys(tmp_path):
     parsed = tomllib.loads(text)
     assert parsed["targets"]["efficient"]["llm_client"] == "edge-fast"
     assert parsed["routes"]["mantis_base"]["id"] == SWITCHYARD_ROUTE_ID
+
+
+def test_efficient_target_may_not_reason_harder_than_capable():
+    """Guard the tier inversion that shipped once.
+
+    Reasoning tokens bill as output tokens, so an efficient target with a higher
+    effort than capable makes the tier chosen for simple turns the most
+    expensive per turn. Fail the catalog load instead of relying on review.
+    """
+    text = _catalog().replace(
+        '[base.targets.efficient]\n'
+        'provider = "bifrost"\n'
+        'upstream_model = "google/gemini-3.7-flash"\n'
+        'reasoning_effort = "medium"',
+        '[base.targets.efficient]\n'
+        'provider = "bifrost"\n'
+        'upstream_model = "google/gemini-3.7-flash"\n'
+        'reasoning_effort = "max"',
+    )
+    root = tomllib.loads(text)
+    assert root["base"]["targets"]["efficient"]["reasoning_effort"] == "max"
+    with pytest.raises(CatalogError, match="must not exceed"):
+        load_base_route(root)
+
+
+def test_equal_efforts_across_tiers_are_allowed():
+    """The common case: both tiers at the same effort is not an inversion."""
+    root = tomllib.loads(_catalog())
+    route = load_base_route(root)
+    assert route.efficient.reasoning_effort == route.capable.reasoning_effort
+
+
+def test_shipped_base_route_is_capable_first_with_ordered_efforts():
+    """The measured baseline resolved 0/4 under efficient_first.
+
+    128 routing decisions all went to the efficient tier with no escalation, so
+    the shipped picker must start on the tier that can finish the task, and the
+    efficient tier must not reason harder than the capable one.
+    """
+    route = load_switchyard_route(Path("config/catalog.toml"))
+    assert route.picker == "capable_first"
+    ranks = ("none", "low", "medium", "high", "xhigh", "max")
+    assert ranks.index(route.efficient.reasoning_effort) <= ranks.index(
+        route.capable.reasoning_effort
+    )
+    assert 'picker = "capable_first"' in render_switchyard_toml(route)
