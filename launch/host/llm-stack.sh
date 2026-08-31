@@ -210,18 +210,34 @@ eff_tokens = eff.get("max_tokens") or "default"
 cap_tokens = cap.get("max_tokens") or "default"
 picker = base.get("picker") or "efficient_first"
 
+def _slot_str(slot):
+    return ", ".join(slot) if isinstance(slot, list) else str(slot)
+
+
+def _slot_effort(slot):
+    if isinstance(slot, list):
+        slot = slot[0] if slot else None
+    return (workers.get(slot) or {}).get("reasoning_effort") or "none" if slot else "none"
+
+
 main_slot = fusion.get("main", "?")
 side_slot = fusion.get("sidekick", "?")
-main_eff = (workers.get(main_slot) or {}).get("reasoning_effort") or "none"
-side_eff = (workers.get(side_slot) or {}).get("reasoning_effort") or "none"
+main_eff = _slot_effort(main_slot)
+side_eff = _slot_effort(side_slot)
 
 print(f"  Base:          {picker}")
 print(f"    efficient:   {eff_model} (reasoning={eff_effort}, max_tokens={eff_tokens})")
 print(f"    capable:     {cap_model} (reasoning={cap_effort}, max_tokens={cap_tokens})")
-print(f"  Fusion:        main={main_slot} (reasoning={main_eff}), sidekick={side_slot} (reasoning={side_eff})")
+print(
+    f"  Fusion:        main={_slot_str(main_slot)} (reasoning={main_eff}), "
+    f"sidekick={_slot_str(side_slot)} (reasoning={side_eff})"
+)
 PY
   )" || output=""
-  [ -n "$output" ] && printf '\n\033[1mMantis routing models\033[0m\n%s\n' "$output"
+  if [ -n "$output" ]; then
+    printf '\n\033[1mMantis routing models\033[0m\n%s\n' "$output"
+  fi
+  return 0
 }
 
 cmd_status() {
@@ -242,6 +258,7 @@ cmd_status() {
   printf '\n  Active Environment MANTIS_URL: %s\n' "$active_url"
   printf '  Routing target: \033[1;33mLocal Loopback\033[0m\n'
   print_model_config
+  return 0
 }
 
 command="${1:-start}"

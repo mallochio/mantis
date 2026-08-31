@@ -828,6 +828,44 @@ def test_basic_model_relays_router_stream(client, monkeypatch):
     assert api._capacity._value == initial_value
 
 
+def test_basic_model_router_stream_survives_upstream_disconnect(client, monkeypatch):
+    import httpx
+
+    def handler(_request):
+        response = httpx.Response(
+            200,
+            headers={
+                "content-type": "text/event-stream",
+                "x-model-router-selected-model": "google/gemini-3.7-flash",
+            },
+        )
+
+        def bad_iter_bytes(*_args, **_kwargs):
+            yield b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+            raise httpx.RemoteProtocolError("peer closed connection mid-stream")
+
+        response.iter_bytes = bad_iter_bytes
+        return response
+
+    monkeypatch.setenv("MANTIS_ROUTER_KEY", "router-key")
+    monkeypatch.setattr(api, "_router_client", lambda: _router_client(handler))
+    initial_value = api._capacity._value
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "mantis/base",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.content.endswith(b"data: [DONE]\n\n")
+    # Concurrency capacity must still be released after an upstream disconnect.
+    assert api._capacity._value == initial_value
+
+
 def test_basic_model_reports_router_connection_failure(client, monkeypatch):
     import httpx
 

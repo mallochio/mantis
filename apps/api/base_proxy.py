@@ -330,7 +330,18 @@ def router_error(upstream: httpx.Response) -> JSONResponse:
     try:
         body = upstream.json()
         if isinstance(body, dict) and "error" in body:
-            return JSONResponse(body, status_code=upstream.status_code)
+            error = body["error"]
+            status = upstream.status_code
+            if isinstance(error, dict):
+                # Switchyard and some providers embed the HTTP code in the
+                # payload while returning a 200. Trust the embedded code so the
+                # response is treated as an error by OpenAI clients.
+                if "type" not in error:
+                    error["type"] = "upstream_error"
+                if "status_code" not in error:
+                    error["status_code"] = error.get("code", status)
+                status = error.get("code") or status
+            return JSONResponse(body, status_code=status)
         # Router returned JSON but not an error object; wrap it.
         return JSONResponse(
             {"error": {"message": json.dumps(body), "type": "upstream_error"}},
@@ -389,13 +400,15 @@ def _router_stream(
         # Upstream hung up mid-stream; stop the response cleanly instead of
         # letting the transport error crash the whole ASGI server.
         logger.warning("upstream stream closed early: %s", exc)
+        # Emit a terminating SSE frame so clients see a clean end.
+        yield b"data: [DONE]\n\n"
     finally:
-        try:
+        with contextlib.suppress(Exception):
             stream.__exit__(None, None, None)
-        finally:
+        with contextlib.suppress(Exception):
             client.close()
-            if on_close is not None:
-                on_close()
+        if on_close is not None:
+            on_close()
 
 
 def forward(
@@ -433,11 +446,15 @@ def forward(
         )
     with client:
         upstream = client.post(url, headers=outbound_headers, json=outbound_body)
-    if upstream.is_error:
+    try:
+        body = upstream.json()
+    except ValueError:
+        body = None
+    if upstream.is_error or (isinstance(body, dict) and body.get("error")):
         return router_error(upstream), False
     return (
         JSONResponse(
-            upstream.json(),
+            body,
             headers={"X-Request-Id": request_id, **router_response_headers(upstream)},
         ),
         False,
