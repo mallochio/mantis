@@ -2909,6 +2909,44 @@ def test_record_selected_slot_tracks_promotions():
     assert run.slot_models.count("main-strong") == 1
 
 
+def test_shipped_slots_get_the_full_endpoint_budget():
+    """The harness owns compaction, so Fusion must not trim early.
+
+    Every slot either Fusion lane can select must be sized against
+    context_token_limit. A slot that silently gets a smaller budget would make
+    Fusion drop turns the harness still believes are in context.
+    """
+    coordinator = fusion.FusionCoordinator()
+    for slot in (coordinator.main_slot, coordinator.sidekick_slot):
+        assert coordinator._context_window_for(slot) == coordinator.context_window
+
+
+def test_context_trim_emits_an_observable_event(monkeypatch):
+    """Fusion-side trimming is a safety net and must never be silent."""
+    coordinator = fusion.FusionCoordinator()
+    coordinator.context_window = 4000
+    coordinator.max_output_tokens = 500
+    monkeypatch.setattr(
+        fusion.providers,
+        "_provider_response",
+        lambda *a, **k: {"choices": [{"message": {"content": "ok"}}], "usage": {}},
+    )
+    events: list[dict[str, Any]] = []
+    messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "g"}]
+    for i in range(400):
+        messages.append({"role": "assistant", "content": f"turn {i} " + "x" * 400})
+        messages.append({"role": "user", "content": f"next {i}"})
+
+    with fusion.providers.progress_events(events.append):
+        coordinator._call_worker("gpt-5_6-sol", messages, None)
+
+    trimmed = [e for e in events if e.get("type") == "fusion_context_trimmed"]
+    assert trimmed, "trimming must emit fusion_context_trimmed"
+    assert trimmed[0]["tokens_dropped"] > 0
+    assert trimmed[0]["tokens_after"] <= trimmed[0]["input_budget"]
+    assert trimmed[0]["model"] == "gpt-5_6-sol"
+
+
 def test_context_window_clamps_to_the_selected_slot(monkeypatch):
     """A pool may mix window sizes; each turn is sized for the slot it uses."""
     from types import SimpleNamespace

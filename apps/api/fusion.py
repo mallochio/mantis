@@ -698,12 +698,27 @@ class FusionCoordinator:
         output_tokens = min(self.max_output_tokens, model_cap)
         input_budget = max(0, self._context_window_for(slot) - output_tokens)
         serve_config._history_context.fusion_compacted = False
+        before_tokens = self._token_sum(messages)
         fitted = self._fit_messages(slot, messages, tools, input_budget)
-        if fitted is not messages and self._token_sum(fitted) < self._token_sum(messages):
+        if fitted is not messages and self._token_sum(fitted) < before_tokens:
             # Persist the fitted history so trimming is not recomputed (and tool
             # bodies are not re-sent in full) on every later provider call.
+            after_tokens = self._token_sum(fitted)
             messages[:] = fitted
             serve_config._history_context.fusion_compacted = True
+            # The harness owns compaction. Reaching this branch means Fusion had
+            # to drop turns the harness still believed were in context, so make
+            # it observable instead of silent.
+            providers._emit_progress(
+                {
+                    "type": "fusion_context_trimmed",
+                    "model": slot,
+                    "input_budget": input_budget,
+                    "tokens_before": before_tokens,
+                    "tokens_after": after_tokens,
+                    "tokens_dropped": before_tokens - after_tokens,
+                }
+            )
         run = getattr(serve_config._history_context, "active_run", None)
         budget = getattr(run, "budget", None)
         timeout_s = budget.remaining_timeout_s() if budget is not None else None

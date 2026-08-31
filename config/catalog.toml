@@ -50,7 +50,6 @@ trained_slot_contract = "52eac89b5e96f1bf64b2bd83af4d8fbc649ddaaf162f4cabf9504aa
 provider = "openrouter"
 # gemini-3.7-flash via openrouter
 max_tokens = 65536
-context_window = 65536
 upstream_model = "google/gemini-3.7-flash"
 model_identity = "gemini-3.6-flash"
 reasoning_effort = "high"
@@ -60,7 +59,6 @@ protocols = ["chat_completions"]
 provider = "openrouter"
 # gpt-5.6-luna via openrouter
 max_tokens = 128000
-context_window = 128000
 upstream_model = "openai/gpt-5.6-luna"
 model_identity = "gpt-5.6-luna"
 reasoning_effort = "xhigh"
@@ -70,7 +68,6 @@ protocols = ["chat_completions"]
 provider = "openrouter"
 # gpt-5.6-sol via openrouter
 max_tokens = 128000
-context_window = 128000
 upstream_model = "openai/gpt-5.6-sol"
 model_identity = "gpt-5.6-sol"
 reasoning_effort = "medium"
@@ -80,7 +77,6 @@ protocols = ["chat_completions"]
 provider = "opencode-go"
 # deepseek-v4-flash via opencode subscription
 max_tokens = 384000
-context_window = 384000
 upstream_model = "deepseek-v4-flash"
 model_identity = "deepseek-v4-flash"
 protocols = ["chat_completions"]
@@ -89,7 +85,6 @@ protocols = ["chat_completions"]
 provider = "openrouter"
 # claude-opus-5 via openrouter (previously bedrock anthropic)
 max_tokens = 128000
-context_window = 128000
 upstream_model = "anthropic/claude-opus-5"
 model_identity = "claude-opus-5"
 reasoning_effort = "medium"
@@ -99,7 +94,6 @@ protocols = ["chat_completions"]
 provider = "openrouter"
 # claude-sonnet-5 via openrouter
 max_tokens = 128000
-context_window = 128000
 upstream_model = "anthropic/claude-sonnet-5"
 model_identity = "claude-sonnet-5"
 reasoning_effort = "medium"
@@ -109,7 +103,6 @@ protocols = ["chat_completions"]
 provider = "openrouter"
 # gemini-3.1-pro-preview via openrouter
 max_tokens = 65536
-context_window = 65536
 upstream_model = "google/gemini-3.1-pro-preview"
 model_identity = "gemini-3.1-pro-preview"
 reasoning_effort = "high"
@@ -120,10 +113,20 @@ protocols = ["chat_completions"]
 # slot, so escalation always promotes and never degrades capability. See
 # FusionRouter.select / .strongest in apps/api/fusion_router.py.
 #
-# Pool members may differ in context size. Each worker declares its own
-# context_window and FusionCoordinator._context_window_for clamps the transcript
-# to the selected slot, so promoting into a smaller-window model no longer
-# overruns it mid-run.
+# CONTEXT OWNERSHIP: the calling harness owns compaction. Mantis advertises
+# context_token_limit to clients (api.py context_length), so prime-agent or any
+# other harness compacts when it reaches that number. Fusion's own trimming in
+# _fit_messages is a last-resort safety net against an upstream 400, not a
+# compaction strategy -- it drops the oldest turns without summarizing, so if it
+# fires the harness has already lost context it believed it had. It emits a
+# fusion_context_trimmed event when that happens.
+#
+# Therefore keep context_token_limit <= the real context length of every slot
+# either lane can select. Only set [mantis.workers.*].context_window when a
+# model genuinely has a SMALLER window than context_token_limit; leaving it
+# unset means "same as context_token_limit". Do not copy it from max_tokens:
+# max_tokens is the output cap sent upstream (providers._litellm_kwargs) and
+# says nothing about context length.
 # Both lanes are pinned to explicit single slots, matching the Kylejeong2/fusion
 # reference (lead gpt-5.6-sol, persistent sidekick gpt-5.6-luna). Effort comes
 # from the worker binding: sol is "medium", luna is "xhigh". Those live in
