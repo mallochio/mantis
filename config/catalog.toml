@@ -124,13 +124,22 @@ protocols = ["chat_completions"]
 # context_window and FusionCoordinator._context_window_for clamps the transcript
 # to the selected slot, so promoting into a smaller-window model no longer
 # overruns it mid-run.
+# Both lanes are pinned to explicit single slots, matching the Kylejeong2/fusion
+# reference (lead gpt-5.6-sol, persistent sidekick gpt-5.6-luna). Effort comes
+# from the worker binding: sol is "medium", luna is "xhigh". Those live in
+# [mantis.workers.*] because the trained ABI contract covers model_identity and
+# reasoning_effort, so changing them there requires a retrain.
+#
+# Single slots mean fallback_on_escalate has nothing to promote to. It is left
+# enabled so that appending a slot to either list is all that is needed to turn
+# the ladder back on.
 main = "gpt-5_6-sol"
-sidekick = ["deepseek-v4-flash", "gpt-5_6-luna"]
+sidekick = "gpt-5_6-luna"
 fallback_on_escalate = true
 max_follow_ups = 2
 sidekick_max_tool_rounds = 16
-# Cost gate, not a capability gap. The main slot costs ~70x the sidekick per
-# task (gpt-5.6-sol vs deepseek-v4-flash in config/worker-costs.json), and main
+# Cost gate, not a capability gap. The main slot costs ~50x the sidekick per
+# task (gpt-5.6-sol vs gpt-5.6-luna in config/worker-costs.json), and main
 # already receives the sidekick's tool history and verification-command results
 # for free in the review prompt. Paying main-slot tokens to re-verify that
 # summary is poor value. Raise to "review" only when review accuracy is
