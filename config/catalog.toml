@@ -28,7 +28,7 @@ upstream_model = "openai/gpt-5.6-luna"
 
 [base.targets.capable]
 provider = "openrouter"
-reasoning_effort = "high"
+reasoning_effort = "medium"
 max_tokens = 128000
 upstream_model = "openai/gpt-5.6-sol"
 
@@ -127,29 +127,22 @@ protocols = ["chat_completions"]
 # unset means "same as context_token_limit". Do not copy it from max_tokens:
 # max_tokens is the output cap sent upstream (providers._litellm_kwargs) and
 # says nothing about context length.
-# Lead follows the [base] stage router's capable target; sidekick is the
-# gpt-5.6-luna worker slot. This matches the Kylejeong2/fusion reference pairing
-# (lead gpt-5.6-sol, persistent sidekick gpt-5.6-luna).
+# Both lanes are catalog worker slots, matching the Kylejeong2/fusion reference
+# pairing (lead gpt-5.6-sol, persistent sidekick gpt-5.6-luna). Effort comes from
+# the worker binding: sol is "medium", luna is "xhigh".
 #
-# Why "mantis/base" rather than the gpt-5_6-sol slot: reasoning effort for a
-# worker slot is covered by the trained ABI contract, so [mantis.workers.
-# gpt-5_6-sol] cannot leave "medium" without a retrain. [base.targets.*] is not
-# ABI-bound, so routing the lead through it is how the lead runs sol at "high".
-# Change the lead model or its effort in [base.targets.capable].
-#
-# Two consequences worth knowing:
-#  - For the main role this resolves statically to base.targets.capable. It does
-#    NOT give the lead the base router's adaptive efficient/capable selection;
-#    Fusion resolves one concrete model per turn.
-#  - It resolves to a provider/model spec, not a catalog slot, so it carries no
-#    context_window and always gets the full context_token_limit budget. That is
-#    correct while context_token_limit <= the target's real window, but it means
-#    the per-slot clamp cannot protect this lane.
+# Use the slot names, not "mantis/base". Routing a lane through [base] is only
+# worth it to escape the trained ABI contract, which covers a worker slot's
+# reasoning_effort -- that is the one way to run sol at an effort other than
+# "medium" without a retrain. Since "medium" is the intended effort, the slot is
+# the better spelling: it keeps the slot name in traces and learning records, and
+# it stays eligible for the per-slot context clamp that a provider/model
+# passthrough spec cannot use.
 #
 # Single slots mean fallback_on_escalate has nothing to promote to. It is left
 # enabled so that appending a slot to either list is all that is needed to turn
 # the ladder back on.
-main = "mantis/base"
+main = "gpt-5_6-sol"
 sidekick = "gpt-5_6-luna"
 fallback_on_escalate = true
 max_follow_ups = 2
