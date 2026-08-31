@@ -64,10 +64,10 @@ def test_shipped_catalog_renders_stage_router():
     assert parsed["routes"]["mantis_base"]["id"] == SWITCHYARD_ROUTE_ID
     assert parsed["routes"]["mantis_base"]["picker"] == "efficient_first"
     # catalog.toml is the single source of truth — pin to its current values
-    assert parsed["targets"]["efficient"]["id"] == "deepseek-v4-flash"
+    assert parsed["targets"]["efficient"]["id"] == "openai/gpt-5.6-luna"
     assert parsed["targets"]["capable"]["id"] == "openai/gpt-5.6-sol"
-    assert parsed["llm_clients"]["opencode-go"]["api_key_env"] == "OPENCODE_API_KEY"
-    assert parsed["llm_clients"]["opencode-go"]["base_url"] == "https://opencode.ai/zen/go/v1"
+    assert parsed["llm_clients"]["openrouter"]["api_key_env"] == "OPENROUTER_API_KEY"
+    assert parsed["llm_clients"]["openrouter"]["base_url"] == "https://openrouter.ai/api/v1"
 
 
 def test_openrouter_free_smoke_catalog_renders_distinct_targets():
