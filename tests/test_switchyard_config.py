@@ -329,7 +329,7 @@ def test_quotes_non_identifier_client_keys(tmp_path):
     assert parsed["routes"]["mantis_base"]["id"] == SWITCHYARD_ROUTE_ID
 
 
-def test_shipped_base_route_is_capable_first():
+def test_shipped_base_route_is_efficient_first():
     route = load_switchyard_route(Path("config/catalog.toml"))
-    assert route.picker == "capable_first"
-    assert 'picker = "capable_first"' in render_switchyard_toml(route)
+    assert route.picker == "efficient_first"
+    assert 'picker = "efficient_first"' in render_switchyard_toml(route)

@@ -229,6 +229,19 @@ def escalation_suffix(body: BaseChatRequest) -> str:
     return f"#esc{signals}" if signals else ""
 
 
+def _capable_provider_info() -> tuple[str, str, str] | None:
+    """Return (base_url, credential_env, upstream_model) for the capable tier."""
+    route = _load_base_route()
+    if route is None:
+        return None
+    try:
+        capable = route.capable
+        provider = route.providers[capable.provider]
+        return provider.base_url, provider.credential_env, capable.upstream_model
+    except (AttributeError, KeyError, TypeError):
+        return None
+
+
 def router_headers(headers: dict[str, str], body: BaseChatRequest) -> dict[str, str]:
     out: dict[str, str] = {}
     key = os.environ.get("MANTIS_ROUTER_KEY")
@@ -236,7 +249,11 @@ def router_headers(headers: dict[str, str], body: BaseChatRequest) -> dict[str, 
         out["Authorization"] = f"Bearer {key}"
     session = session_id(headers, body)
     if session:
-        out[SWITCHYARD_SESSION_HEADER] = session + escalation_suffix(body)
+        suffix = escalation_suffix(body)
+        out[SWITCHYARD_SESSION_HEADER] = session + suffix
+        if suffix:
+            out["x-switchyard-force-tier"] = "capable"
+            out["x-switchyard-escalated"] = "1"
         # xAI Grok routes prompt-cache state by conversation; pinning the same
         # conversation to the same server makes cache hits reliable. Other
         # providers ignore the custom header, so it is safe to forward whenever
@@ -469,6 +486,26 @@ def _router_stream(
             on_close()
 
 
+def _direct_capable_headers_and_body(
+    headers: dict[str, str], body: dict[str, Any]
+) -> tuple[dict[str, str], dict[str, Any]] | None:
+    """Build headers/body for a direct capable-tier call, or None if unavailable."""
+    info = _capable_provider_info()
+    if info is None:
+        return None
+    base_url, credential_env, upstream_model = info
+    api_key = os.environ.get(credential_env)
+    if not api_key:
+        return None
+    direct_headers: dict[str, str] = {"Authorization": f"Bearer {api_key}"}
+    # Preserve escalated routing signal for observability; providers ignore it.
+    direct_headers["x-switchyard-force-tier"] = "capable"
+    direct_headers["x-switchyard-escalated"] = "1"
+    direct_body = dict(body)
+    direct_body["model"] = upstream_model
+    return direct_headers, direct_body
+
+
 def forward(
     request: BaseChatRequest,
     headers: dict[str, str],
@@ -478,14 +515,68 @@ def forward(
 ) -> tuple[JSONResponse | StreamingResponse, bool]:
     """Proxy a Base chat request to Switchyard.
 
-    Returns ``(response, handed_off)``. ``handed_off`` is True when a streaming
-    response now owns the HTTP client; the caller should not release capacity
-    until that stream ends.
+    When failure repetition is detected the request is sent directly to the
+    capable tier so promotion does not depend on the Switchyard picker.
+    Otherwise the request goes through Switchyard with its normal picker
+    (now ``efficient_first``). Returns ``(response, handed_off)``.
     """
-    client = client_factory()
-    url = os.environ.get("MANTIS_ROUTER_URL", DEFAULT_ROUTER_URL) + "/chat/completions"
     outbound_headers = router_headers(headers, request)
     outbound_body = router_body(request)
+    suffix = escalation_suffix(request)
+
+    # Picker-independent promotion: if looping is detected, bypass Switchyard
+    # and hit the capable provider directly. This makes efficient_first safe.
+    if suffix:
+        direct = _direct_capable_headers_and_body(outbound_headers, outbound_body)
+        if direct is not None:
+            direct_headers, direct_body = direct
+            info = _capable_provider_info()
+            assert info is not None
+            base_url = info[0]
+            url = base_url.rstrip("/") + "/chat/completions"
+            client = client_factory()
+            if request.stream:
+                stream = client.stream("POST", url, headers=direct_headers, json=direct_body)
+                upstream = stream.__enter__()
+                if upstream.is_error:
+                    # Capable direct failed — fall through to Switchyard.
+                    try:
+                        stream.__exit__(None, None, None)
+                    except Exception:
+                        pass
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                else:
+                    return (
+                        StreamingResponse(
+                            _router_stream(client, stream, upstream, on_close=on_close),
+                            media_type="text/event-stream",
+                            headers={"X-Request-Id": request_id, **router_response_headers(upstream)},
+                        ),
+                        True,
+                    )
+            else:
+                with client:
+                    upstream = client.post(url, headers=direct_headers, json=direct_body)
+                try:
+                    body = upstream.json()
+                except ValueError:
+                    body = None
+                if not upstream.is_error and not (isinstance(body, dict) and body.get("error")):
+                    return (
+                        JSONResponse(
+                            body,
+                            headers={"X-Request-Id": request_id, **router_response_headers(upstream)},
+                        ),
+                        False,
+                    )
+                # Direct capable errored — fall through to Switchyard below.
+            # If we reach here direct path did not return, so continue to Switchyard.
+
+    client = client_factory()
+    url = os.environ.get("MANTIS_ROUTER_URL", DEFAULT_ROUTER_URL) + "/chat/completions"
     if request.stream:
         stream = client.stream("POST", url, headers=outbound_headers, json=outbound_body)
         upstream = stream.__enter__()
