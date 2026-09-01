@@ -237,9 +237,10 @@ def _capable_provider_info() -> tuple[str, str, str] | None:
     try:
         capable = route.capable
         provider = route.providers[capable.provider]
-        return provider.base_url, provider.credential_env, capable.upstream_model
     except (AttributeError, KeyError, TypeError):
         return None
+    else:
+        return provider.base_url, provider.credential_env, capable.upstream_model
 
 
 def router_headers(headers: dict[str, str], body: BaseChatRequest) -> dict[str, str]:
@@ -540,20 +541,19 @@ def forward(
                 upstream = stream.__enter__()
                 if upstream.is_error:
                     # Capable direct failed — fall through to Switchyard.
-                    try:
+                    with contextlib.suppress(Exception):
                         stream.__exit__(None, None, None)
-                    except Exception:
-                        pass
-                    try:
+                    with contextlib.suppress(Exception):
                         client.close()
-                    except Exception:
-                        pass
                 else:
                     return (
                         StreamingResponse(
                             _router_stream(client, stream, upstream, on_close=on_close),
                             media_type="text/event-stream",
-                            headers={"X-Request-Id": request_id, **router_response_headers(upstream)},
+                            headers={
+                                "X-Request-Id": request_id,
+                                **router_response_headers(upstream),
+                            },
                         ),
                         True,
                     )
@@ -568,7 +568,10 @@ def forward(
                     return (
                         JSONResponse(
                             body,
-                            headers={"X-Request-Id": request_id, **router_response_headers(upstream)},
+                            headers={
+                                "X-Request-Id": request_id,
+                                **router_response_headers(upstream),
+                            },
                         ),
                         False,
                     )
