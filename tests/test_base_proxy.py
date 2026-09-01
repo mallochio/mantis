@@ -207,3 +207,92 @@ def test_router_body_renames_max_completion_tokens():
     )
     assert body.get("max_tokens") == 32000
     assert "max_completion_tokens" not in body
+
+class _SessionRequest:
+    """Minimal BaseChatRequest stand-in that exposes the attributes read here."""
+
+    def __init__(self, messages=None, metadata=None, user=None):
+        self.messages = messages
+        self.metadata = metadata
+        self.user = user
+        self.stream = False
+
+    def model_dump(self, *, exclude_none, exclude):
+        return {"messages": self.messages}
+
+
+def _looping_messages(*, repeats: int, tool: str = "bash") -> list[dict]:
+    """A history where the same tool call and the same error repeat."""
+    messages: list[dict] = [{"role": "user", "content": "fix the failing test"}]
+    for _ in range(repeats):
+        messages.append(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"function": {"name": tool, "arguments": '{"cmd": "pytest -q"}'}}
+                ],
+            }
+        )
+        messages.append({"role": "tool", "content": "Traceback: AssertionError in test_x"})
+    return messages
+
+
+def test_no_escalation_on_a_healthy_session():
+    """Distinct calls and one-off errors are normal work, not looping."""
+    messages = [
+        {"role": "user", "content": "add a flag"},
+        {"role": "assistant", "tool_calls": [{"function": {"name": "read", "arguments": "a"}}]},
+        {"role": "tool", "content": "file contents"},
+        {"role": "assistant", "tool_calls": [{"function": {"name": "edit", "arguments": "b"}}]},
+        {"role": "tool", "content": "error: patch did not apply"},
+    ]
+    assert base_proxy.failure_signals(messages) == 0
+    assert base_proxy.escalation_suffix(_SessionRequest(messages=messages)) == ""
+
+
+def test_repeated_identical_tool_call_is_a_failure_signal():
+    """Three identical calls plus three identical errors are two signals."""
+    assert base_proxy.failure_signals(_looping_messages(repeats=2)) == 0
+    assert base_proxy.failure_signals(_looping_messages(repeats=3)) == 2
+
+
+def test_escalation_salts_the_stickiness_key_only():
+    """The salt must move the Switchyard session and leave cache affinity alone."""
+    request = _SessionRequest(
+        messages=_looping_messages(repeats=3), metadata={"session_id": "s-1"}
+    )
+    out = base_proxy.router_headers({}, request)
+    assert out[base_proxy.SWITCHYARD_SESSION_HEADER] == "s-1#esc2"
+    assert out[base_proxy.GROK_CONV_HEADER] == "s-1"
+
+
+def test_escalation_is_deterministic_and_idempotent():
+    """Same history -> same salt, so a tier cannot oscillate within a turn."""
+    messages = _looping_messages(repeats=4)
+    first = base_proxy.router_headers({}, _SessionRequest(messages=messages, user="u"))
+    second = base_proxy.router_headers({}, _SessionRequest(messages=messages, user="u"))
+    assert first[base_proxy.SWITCHYARD_SESSION_HEADER] == second[
+        base_proxy.SWITCHYARD_SESSION_HEADER
+    ]
+
+
+def test_escalation_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("MANTIS_BASE_ESCALATE_ON_FAILURE", "0")
+    request = _SessionRequest(
+        messages=_looping_messages(repeats=5), metadata={"session_id": "s-2"}
+    )
+    assert base_proxy.router_headers({}, request)[base_proxy.SWITCHYARD_SESSION_HEADER] == "s-2"
+
+
+def test_escalation_threshold_is_configurable(monkeypatch):
+    monkeypatch.setenv("MANTIS_BASE_ESCALATE_REPEATS", "5")
+    assert base_proxy.failure_signals(_looping_messages(repeats=3)) == 0
+    assert base_proxy.failure_signals(_looping_messages(repeats=5)) == 2
+
+
+def test_failure_signals_tolerates_malformed_history():
+    """The proxy must never 500 on a shape it did not expect."""
+    assert base_proxy.failure_signals(None) == 0
+    assert base_proxy.failure_signals("not a list") == 0
+    assert base_proxy.failure_signals([None, 7, {"role": "assistant"}]) == 0
+    assert base_proxy.failure_signals([{"role": "tool", "content": {"blocks": []}}]) == 0

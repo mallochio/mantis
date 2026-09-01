@@ -72,13 +72,7 @@ class FusionRouter:
         return self._resolve(pool[index], turn_index + escalation_count)
 
     def strongest(self) -> str:
-        """Return the strongest, costliest slot in this role's pool.
-
-        Pools are cheapest-first, so the strongest slot is the last entry.
-        Callers that need capability rather than economy (for example the
-        built-in ``frontier`` worker profile) must use this instead of the
-        currently selected slot, which is the cheapest entry on turn zero.
-        """
+        """Return the strongest, costliest slot in this role's pool."""
         pool: str | list[str] = self.config.main if self.role == "main" else self.config.sidekick
         if isinstance(pool, str):
             return self._resolve(pool, 0)
@@ -100,8 +94,6 @@ class FusionRouter:
             raise ValueError(f"fusion {self.role} pool is empty")
         if self.role == "main":
             if complexity < 0.85 and len(pool) > 1:
-                # Easy task, and compaction already forced a cache miss: settle
-                # on the cheapest slot instead of re-paying for the strong one.
                 index = 0
             else:
                 resolved = [self._resolve(candidate, 0) for candidate in pool]

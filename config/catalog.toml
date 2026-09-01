@@ -15,28 +15,6 @@ protocols = ["chat_completions"]
 [base]
 # Switchyard stage-router for mantis/base
 # Swap efficient/capable models or their providers here; launch regenerates routes.toml.
-#
-# picker = "capable_first" is deliberate, and it is a reversal. The only measured
-# baseline in this repo (eval/runs/results-quality-cost-baseline.jsonl) ran
-# "efficient_first" and recorded a cheap-tier trap: 128 routing decisions across
-# 4 SWE-bench instances, 100% served by the efficient tier, 0 escalations, and
-# 0/4 resolved for $2.85. Two instances died on "budget ceiling reached" and two
-# on a 600s timeout after looping 27-34 turns.
-#
-# That is a quality/cost ratio of zero, not a cheap one: spend with no successes
-# has no ratio to improve. Escalation is keyed on the model's own confidence, so
-# a cheap model that loops confidently never triggers it, and hitting the budget
-# ceiling aborts the run instead of promoting it. Both of those live in
-# Switchyard, not here -- this repo only renders routes.toml -- so "capable_first"
-# is the fix that is available from config: start on the tier that can finish the
-# task and let the router demote simple turns, rather than starting on the tier
-# that demonstrably cannot and never leaving it.
-#
-# Multi-turn coding is the workload this is tuned for. With prefix caching and a
-# sticky tier most input is a cache read, so a ~30-turn session is dominated by
-# output tokens rather than by re-reading history; paying more per turn on a tier
-# that converges beats paying less per turn forever. Revisit if a measured run
-# shows the efficient tier resolving real tasks.
 revision = "direct-2026-08-30-litellm"
 picker = "capable_first"
 confidence_threshold = 0.5
@@ -44,18 +22,13 @@ recent_turn_window = 3
 
 [base.targets.efficient]
 provider = "openrouter"
-# Effort must stay at or below the capable target's. Reasoning tokens bill as
-# output, so "max" here (coerced to "xhigh" upstream for gpt-5.6-*) made the tier
-# chosen for SIMPLE turns burn the most reasoning of anything in this catalog --
-# and efficient_first sent ~97% of traffic to it. load_base_route now rejects an
-# efficient target that reasons harder than capable.
-reasoning_effort = "low"
+reasoning_effort = "xhigh"
 max_tokens = 128000
 upstream_model = "openai/gpt-5.6-luna"
 
 [base.targets.capable]
 provider = "openrouter"
-reasoning_effort = "medium"
+reasoning_effort = "low"
 max_tokens = 128000
 upstream_model = "openai/gpt-5.6-sol"
 
@@ -136,51 +109,11 @@ reasoning_effort = "high"
 protocols = ["chat_completions"]
 
 [fusion]
-# Pools are CHEAPEST-FIRST for every role: a higher index is a stronger, costlier
-# slot, so escalation always promotes and never degrades capability. See
-# FusionRouter.select / .strongest in apps/api/fusion_router.py.
-#
-# CONTEXT OWNERSHIP: the calling harness owns compaction. Mantis advertises
-# context_token_limit to clients (api.py context_length), so prime-agent or any
-# other harness compacts when it reaches that number. Fusion's own trimming in
-# _fit_messages is a last-resort safety net against an upstream 400, not a
-# compaction strategy -- it drops the oldest turns without summarizing, so if it
-# fires the harness has already lost context it believed it had. It emits a
-# fusion_context_trimmed event when that happens.
-#
-# Therefore keep context_token_limit <= the real context length of every slot
-# either lane can select. Only set [mantis.workers.*].context_window when a
-# model genuinely has a SMALLER window than context_token_limit; leaving it
-# unset means "same as context_token_limit". Do not copy it from max_tokens:
-# max_tokens is the output cap sent upstream (providers._litellm_kwargs) and
-# says nothing about context length.
-# Both lanes are catalog worker slots, matching the Kylejeong2/fusion reference
-# pairing (lead gpt-5.6-sol, persistent sidekick gpt-5.6-luna). Effort comes from
-# the worker binding: sol is "medium", luna is "xhigh".
-#
-# Use the slot names, not "mantis/base". Routing a lane through [base] is only
-# worth it to escape the trained ABI contract, which covers a worker slot's
-# reasoning_effort -- that is the one way to run sol at an effort other than
-# "medium" without a retrain. Since "medium" is the intended effort, the slot is
-# the better spelling: it keeps the slot name in traces and learning records, and
-# it stays eligible for the per-slot context clamp that a provider/model
-# passthrough spec cannot use.
-#
-# Single slots mean fallback_on_escalate has nothing to promote to. It is left
-# enabled so that appending a slot to either list is all that is needed to turn
-# the ladder back on.
 main = "gpt-5_6-sol"
 sidekick = "gpt-5_6-luna"
 fallback_on_escalate = true
 max_follow_ups = 2
 sidekick_max_tool_rounds = 16
-# Cost gate, not a capability gap. The main slot costs ~50x the sidekick per
-# task (gpt-5.6-sol vs gpt-5.6-luna in config/worker-costs.json), and main
-# already receives the sidekick's tool history and verification-command results
-# for free in the review prompt. Paying main-slot tokens to re-verify that
-# summary is poor value. Raise to "review" only when review accuracy is
-# measurably limited by missing evidence; "plan+review" is rarely worth it,
-# since a plan is written before any work exists to inspect.
 main_tools = "none"
 context_token_limit = 262144
 max_output_tokens = 4096

@@ -2681,8 +2681,6 @@ def test_fusion_frontier_profile_uses_strongest_slot(monkeypatch):
         for call in worker.calls
         if call[1][0].get("content", "").startswith(fusion.SIDEKICK_PREAMBLE)
     ]
-    # "frontier" means the strongest slot, which under cheapest-first pools is
-    # the last pool entry -- not main_slot, which is the cheapest on turn zero.
     assert run.main_router is not None
     strongest = run.main_router.strongest()
     assert strongest in lane_slots
@@ -2843,7 +2841,6 @@ def test_fusion_router_pools_are_cheapest_first_for_every_role():
     )
     main = fusion.FusionRouter(config, "main")
     sidekick = fusion.FusionRouter(config, "sidekick")
-    # Escalation promotes, never degrades, in both lanes.
     assert main.select(escalation_count=0) == "main-cheap"
     assert main.select(escalation_count=1) == "main-strong"
     assert sidekick.select(escalation_count=0) == "side-cheap"
@@ -2859,10 +2856,8 @@ def test_server_execution_does_not_hijack_a_client_declared_tool():
         tool_options=fusion.FusionToolOptions(enabled=["shell"], server_execution=True),
     )
     run.tools = run._filter_tools()
-    # The client declared `bash`, so Fusion must not claim it.
     assert "bash" not in run.server_tool_names
     assert not run._can_execute_server_side([_tool_call("c1", "bash", {"command": "ls"})])
-    # And the tool list still offers it exactly once.
     assert [t["function"]["name"] for t in run.tools].count("bash") == 1
 
 
@@ -2899,35 +2894,25 @@ def test_record_selected_slot_tracks_promotions():
     assert run.main_slot == "main-strong"
     assert "main-strong" in run.slot_models
 
-    # Concurrent sidekick lanes only contribute pool membership.
     run._record_selected_slot("sidekick", "lane-model", primary=False)
     assert run.sidekick_slot == "side-cheap"
     assert "lane-model" in run.slot_models
 
-    # No duplicates.
     run._record_selected_slot("main", "main-strong")
     assert run.slot_models.count("main-strong") == 1
 
 
 def test_base_route_lead_resolves_to_capable_target_with_full_budget():
-    """The lead runs through [base] so it can use an effort the ABI slot pins.
-
-    [mantis.workers.gpt-5_6-sol] is ABI-bound to "medium", so routing the lead
-    via base.targets.capable is what lets it run at a different effort. The
-    resolved spec is a provider/model passthrough, which carries no
-    context_window and must therefore get the full endpoint budget.
-    """
+    """The lead runs through [base] so it can use an effort the ABI slot pins."""
     config = fusion.FusionRoutingConfig(main="mantis/base", sidekick="gpt-5_6-luna")
     router = fusion.FusionRouter.from_config(config, "main")
     spec = router.select(escalation_count=0)
     assert spec.startswith("openrouter/")
     assert "gpt-5.6-sol" in spec
-    # strongest() must agree with select() for a single-slot pool.
     assert router.strongest() == spec
 
     coordinator = fusion.FusionCoordinator()
     assert coordinator._context_window_for(spec) == coordinator.context_window
-    # base:capable is the explicit spelling of the same target.
     explicit = fusion.FusionRouter.from_config(
         fusion.FusionRoutingConfig(main="base:capable", sidekick="gpt-5_6-luna"), "main"
     )
@@ -2944,12 +2929,7 @@ def test_base_route_lead_and_sidekick_have_distinct_provenance():
 
 
 def test_shipped_slots_get_the_full_endpoint_budget():
-    """The harness owns compaction, so Fusion must not trim early.
-
-    Every slot either Fusion lane can select must be sized against
-    context_token_limit. A slot that silently gets a smaller budget would make
-    Fusion drop turns the harness still believes are in context.
-    """
+    """The harness owns compaction, so Fusion must not trim early."""
     coordinator = fusion.FusionCoordinator()
     for slot in (coordinator.main_slot, coordinator.sidekick_slot):
         assert coordinator._context_window_for(slot) == coordinator.context_window
@@ -2996,14 +2976,10 @@ def test_context_window_clamps_to_the_selected_slot(monkeypatch):
 
     monkeypatch.setattr(fusion.providers, "_resolve_model_spec", fake_resolve)
 
-    # A window larger than the endpoint budget cannot raise it.
     assert coordinator._context_window_for("big") == 262144
-    # Smaller windows clamp down, which is the whole point.
     assert coordinator._context_window_for("mid") == 128000
     assert coordinator._context_window_for("small") == 65536
-    # No declared window keeps today's behaviour.
     assert coordinator._context_window_for("undeclared") == 262144
-    # An unresolvable spec must not break the run.
     assert coordinator._context_window_for("passthrough/model") == 262144
 
 
@@ -3043,10 +3019,8 @@ def test_fusion_router_strongest_is_last_pool_entry():
     )
     main = fusion.FusionRouter(config, "main")
     sidekick = fusion.FusionRouter(config, "sidekick")
-    # main_slot equivalent (turn zero) is the cheapest; strongest() is not.
     assert main.select(escalation_count=0) == "main-cheap"
     assert main.strongest() == "main-strong"
-    # A bare string pool is its own strongest slot.
     assert sidekick.strongest() == "side-only"
 
 
@@ -3066,11 +3040,8 @@ def test_refresh_fusion_run_tools_replaces_stale_harness_schemas():
             {"type": "function", "function": {"name": "alpha"}},
         ],
     )
-    # Replaced, not merged, and re-sorted so a reshuffle cannot bust the
-    # provider prompt-cache prefix.
     assert [t["function"]["name"] for t in run.tools] == ["alpha", "zebra"]
 
-    # An empty list is a real instruction: the client now offers no tools.
     fusion.refresh_fusion_run_tools(run, [])
     assert run.tools == []
 

@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import tomllib
+from collections import Counter
 from collections.abc import Callable, Iterator
 from functools import lru_cache
 from pathlib import Path
@@ -171,6 +172,63 @@ def session_id(headers: dict[str, str], body: BaseChatRequest) -> str | None:
     return None
 
 
+_ESCALATE_ENV = "MANTIS_BASE_ESCALATE_ON_FAILURE"
+_REPEAT_THRESHOLD_ENV = "MANTIS_BASE_ESCALATE_REPEATS"
+_ERROR_MARKERS = (
+    "error",
+    "traceback",
+    "exception",
+    "command failed",
+    "no such file",
+    "is not defined",
+)
+
+
+def _escalation_enabled() -> bool:
+    return os.environ.get(_ESCALATE_ENV, "1").lower() not in {"0", "false", "no", "off"}
+
+
+def _repeat_threshold() -> int:
+    try:
+        return max(2, int(os.environ.get(_REPEAT_THRESHOLD_ENV, "3")))
+    except ValueError:
+        return 3
+
+
+def failure_signals(messages: Any) -> int:
+    """Count identical tool calls or identical errors repeated past the threshold."""
+    if not isinstance(messages, list):
+        return 0
+    counts: Counter[tuple[str, str, str]] = Counter()
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role == "assistant":
+            for call in message.get("tool_calls") or []:
+                function = (call or {}).get("function") or {}
+                name = str(function.get("name") or "")
+                arguments = str(function.get("arguments") or "")
+                counts[("call", name, arguments)] += 1
+        elif role == "tool":
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            lowered = content.strip().lower()
+            if any(marker in lowered for marker in _ERROR_MARKERS):
+                counts[("error", "", lowered[:200])] += 1
+    threshold = _repeat_threshold()
+    return sum(1 for occurrences in counts.values() if occurrences >= threshold)
+
+
+def escalation_suffix(body: BaseChatRequest) -> str:
+    """Return the session-id suffix that forces a fresh tier decision."""
+    if not _escalation_enabled():
+        return ""
+    signals = failure_signals(getattr(body, "messages", None))
+    return f"#esc{signals}" if signals else ""
+
+
 def router_headers(headers: dict[str, str], body: BaseChatRequest) -> dict[str, str]:
     out: dict[str, str] = {}
     key = os.environ.get("MANTIS_ROUTER_KEY")
@@ -178,7 +236,7 @@ def router_headers(headers: dict[str, str], body: BaseChatRequest) -> dict[str, 
         out["Authorization"] = f"Bearer {key}"
     session = session_id(headers, body)
     if session:
-        out[SWITCHYARD_SESSION_HEADER] = session
+        out[SWITCHYARD_SESSION_HEADER] = session + escalation_suffix(body)
         # xAI Grok routes prompt-cache state by conversation; pinning the same
         # conversation to the same server makes cache hits reliable. Other
         # providers ignore the custom header, so it is safe to forward whenever

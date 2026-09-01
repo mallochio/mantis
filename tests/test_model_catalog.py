@@ -634,7 +634,6 @@ def test_worker_max_tokens_may_not_exceed_context_window():
     workers[DEEPSEEK]["max_tokens"] = 128000
     with pytest.raises(model_catalog.CatalogError, match="output cap"):
         model_catalog._runtime_bindings(_edge_provider(), workers)
-    # Equal is fine, and so is a smaller cap.
     for cap in (65536, 4096):
         workers[DEEPSEEK]["max_tokens"] = cap
         bindings = model_catalog._runtime_bindings(_edge_provider(), workers)
@@ -661,10 +660,8 @@ def test_rendered_worker_bindings_include_context_window():
     rendered = model_catalog.render_mantis_environment(catalog)
     workers = json.loads(rendered["MANTIS_WORKER_BINDINGS"])
     assert workers[DEEPSEEK]["context_window"] == 384000
-    # Workers without a declared window stay absent so fingerprints don't drift.
     other = next(slot for slot in SLOTS if slot != DEEPSEEK)
     assert "context_window" not in workers[other]
-    # And it round-trips back into a WorkerBinding.
     bindings = model_catalog._runtime_bindings(
         json.loads(rendered["MANTIS_PROVIDER_BINDINGS"]), workers
     )

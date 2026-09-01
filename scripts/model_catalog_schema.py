@@ -78,9 +78,6 @@ class WorkerBinding:
     reasoning_effort: str | None
     protocols: tuple[str, ...]
     max_tokens: int | None = None
-    # Total input+output tokens the upstream model accepts. ``max_tokens`` is
-    # only the *output* clamp (see providers._litellm_kwargs), so a consumer
-    # that needs to size a transcript must use this instead.
     context_window: int | None = None
 
 
@@ -214,13 +211,7 @@ def _max_tokens(value: Any, label: str) -> int | None:
 def _validate_token_limits(
     max_tokens: int | None, context_window: int | None, label: str
 ) -> None:
-    """Reject an output cap larger than the model's own context window.
-
-    ``max_tokens`` is the *output* clamp sent upstream (see
-    ``providers._litellm_kwargs``); ``context_window`` is the total the model
-    accepts. An output cap above the window can never be honoured and signals a
-    field mix-up.
-    """
+    """Reject an output cap larger than the model's own context window."""
     if max_tokens is not None and context_window is not None and max_tokens > context_window:
         raise CatalogError(
             f"{label}.max_tokens ({max_tokens}) exceeds {label}.context_window "
@@ -344,37 +335,6 @@ def _load_named_providers(providers_raw: Any, names: set[str]) -> dict[str, Prov
     return providers
 
 
-# Ordered weakest to strongest. Reasoning tokens bill as output tokens, so this
-# is a cost ordering as much as a capability one.
-_EFFORT_RANK = ("none", "low", "medium", "high", "xhigh", "max")
-
-
-def _validate_effort_ordering(efficient: BaseTarget, capable: BaseTarget) -> None:
-    """Reject an efficient target that reasons harder than the capable one.
-
-    The efficient tier exists to serve simple turns cheaply. Because reasoning
-    tokens are billed as output tokens, giving it a higher effort than capable
-    inverts the tiers: the tier picked for easy work becomes the most expensive
-    per turn. That shipped once (efficient "max" against capable "medium") while
-    the picker sent nearly all traffic to efficient, so it is worth failing the
-    catalog load rather than leaving it to review.
-    """
-    if efficient.reasoning_effort is None or capable.reasoning_effort is None:
-        return
-    try:
-        low = _EFFORT_RANK.index(efficient.reasoning_effort)
-        high = _EFFORT_RANK.index(capable.reasoning_effort)
-    except ValueError:  # pragma: no cover - EFFORTS already validated upstream
-        return
-    if low > high:
-        raise CatalogError(
-            "base.targets.efficient.reasoning_effort "
-            f"({efficient.reasoning_effort}) must not exceed "
-            f"base.targets.capable.reasoning_effort ({capable.reasoning_effort}); "
-            "reasoning tokens bill as output, so this inverts the cost tiers"
-        )
-
-
 def load_base_route(root: Mapping[str, Any]) -> BaseRoute:
     """Parse the catalog [base] stage-router used to generate Switchyard config."""
     if root.get("version") != 1:
@@ -408,7 +368,6 @@ def load_base_route(root: Mapping[str, Any]) -> BaseRoute:
         and efficient.provider == capable.provider
     ):
         raise CatalogError("base.targets.efficient and capable must be distinct models")
-    _validate_effort_ordering(efficient, capable)
     typed_picker: Literal["efficient_first", "capable_first"]
     match picker:
         case "efficient_first":

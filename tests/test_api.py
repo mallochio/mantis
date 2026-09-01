@@ -1083,7 +1083,6 @@ def test_sanitize_messages_drops_reasoning_produced_by_another_model():
     assert out[0]["reasoning"] == "mine"
     assert "reasoning" not in out[1]
     assert "reasoning_details" not in out[1]
-    # The provenance marker itself must never reach a provider.
     assert all("_mantis_model" not in m for m in out)
 
 

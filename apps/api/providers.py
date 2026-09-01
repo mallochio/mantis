@@ -320,18 +320,11 @@ _REASONING_FIELDS = frozenset(
 
 _ENDPOINT_BOUND_MARKERS = ("encrypted", "compaction")
 
-# Internal bookkeeping that must never reach a provider.
 _INTERNAL_FIELDS = ("_anthropic_content", "_anthropic_tool_ids", "_mantis_model")
 
 
 def _portable_reasoning_details(msg: dict[str, Any]) -> None:
-    """Drop reasoning items that are bound to the endpoint that produced them.
-
-    Mirrors ``base_proxy._strip_endpoint_bound_reasoning``. Encrypted and
-    compaction items are only valid at their originating endpoint, so replaying
-    them after a model switch yields an upstream 404. Plain summaries are
-    portable and stay.
-    """
+    """Drop reasoning items that are bound to the endpoint that produced them."""
     details = msg.get("reasoning_details")
     if not isinstance(details, list):
         return
@@ -364,9 +357,6 @@ def _sanitize_messages(
         role = msg.get("role")
         if role == "assistant":
             has_tool_calls = bool(msg.get("tool_calls"))
-            # Reasoning is model-bound. A Fusion pool can promote mid-run, so
-            # replaying the previous model's reasoning is wasted at best and an
-            # upstream rejection at worst. Only the producer may see it again.
             produced_by = msg.get("_mantis_model")
             same_model = produced_by is None or str(produced_by) == model
             keep_reasoning = (is_responses or (is_deepseek and has_tool_calls)) and same_model
@@ -383,7 +373,6 @@ def _sanitize_messages(
                         not in ("thinking", "reasoning", "reasoning_content")
                     ]
             if keep_reasoning:
-                # Even for the producing model, endpoint-bound items are unsafe.
                 _portable_reasoning_details(msg)
             else:
                 for k in _REASONING_FIELDS:

@@ -663,22 +663,13 @@ class FusionCoordinator:
             return slot
 
     def _context_window_for(self, slot: str) -> int:
-        """Return the smaller of the Fusion context budget and the slot's window.
-
-        ``self.context_window`` is one number for the whole endpoint, but a pool
-        promotes between models with different windows. Sizing every transcript
-        against the endpoint number overruns the smaller model and the provider
-        rejects the request mid-run, after tool results are already paid for.
-        Clamping here keeps a heterogeneous pool safe; slots that declare no
-        ``context_window`` keep the endpoint budget unchanged.
-        """
+        """Return the smaller of the Fusion context budget and the slot's window."""
         try:
             resolved = providers._resolve_model_spec(slot)
         except (RuntimeError, ValueError):
             return self.context_window
-        # Partial/stubbed specs are common in tests and passthrough paths.
         window = getattr(resolved, "context_window", None)
-        if not window or window <= 0:
+        if not isinstance(window, int) or window <= 0:
             return self.context_window
         return min(self.context_window, window)
 
@@ -706,9 +697,6 @@ class FusionCoordinator:
             after_tokens = self._token_sum(fitted)
             messages[:] = fitted
             serve_config._history_context.fusion_compacted = True
-            # The harness owns compaction. Reaching this branch means Fusion had
-            # to drop turns the harness still believed were in context, so make
-            # it observable instead of silent.
             providers._emit_progress(
                 {
                     "type": "fusion_context_trimmed",
@@ -731,9 +719,6 @@ class FusionCoordinator:
         msg = dict(data["choices"][0]["message"])
         msg.setdefault("role", "assistant")
         msg["content"] = str(msg.get("content") or "")
-        # Record which upstream model produced this turn so a later call to a
-        # different pool member does not replay its model-bound reasoning.
-        # providers._sanitize_messages strips this before the request goes out.
         msg["_mantis_model"] = self._upstream_model_for(slot)
         tcs = msg.get("tool_calls") or []
         calls: list[dict[str, Any]] = []
@@ -1051,10 +1036,6 @@ class FusionRun(NativeRun):
         self._resume_allows_answer = False
         self.turns: list[dict[str, Any]] = []
         self.structured_plan: FusionPlan | None = None
-        # Names of server tools Fusion itself injected. Only these may be
-        # executed server-side; a same-named client tool must stay with the
-        # client, or its work silently lands in the run sandbox instead of the
-        # harness workspace.
         self.server_tool_names: set[str] = set()
         self.main_lane: ExecutionLane | None = None
         self.sidekick_lanes: list[ExecutionLane] = []
@@ -1349,14 +1330,7 @@ class FusionRun(NativeRun):
         *,
         response_format: dict[str, Any] | None = None,
     ) -> str:
-        """Pair stray main tool calls, then re-ask the main lane once with no tools.
-
-        The main lane is the expensive slot, so a stray tool call must not
-        discard a run that has already paid for planning and sidekick work.
-        Every call is paired with an error result before retrying because
-        strict providers reject a transcript that leaves an assistant
-        ``tool_calls`` message unanswered.
-        """
+        """Pair stray main tool calls, then re-ask the main lane once with no tools."""
         names = ", ".join(
             sorted({str((call.get("function") or {}).get("name", "")) for call in calls})
         )
@@ -1369,8 +1343,6 @@ class FusionRun(NativeRun):
                     "is_error": True,
                 }
             )
-        # providers.py reads this the same way; ``follow_imports = "skip"`` hides
-        # the NativeRun declaration from mypy, so read it defensively.
         previous_format: dict[str, Any] | None = getattr(self, "active_response_format", None)
         self.active_response_format = response_format
         try:
@@ -1390,17 +1362,7 @@ class FusionRun(NativeRun):
         return text
 
     def _record_selected_slot(self, role: str, slot: str, *, primary: bool = True) -> None:
-        """Keep the reported slot in step with the slot that actually ran.
-
-        A pool promotes on escalation, so ``main_slot``/``sidekick_slot`` would
-        otherwise keep naming the turn-zero model in status and trace output,
-        and ``slot_models`` (the learning record's ``pool``) would omit every
-        promoted model.
-
-        ``primary=False`` records pool membership only. Sidekick lanes run
-        concurrently and may carry per-profile model overrides, so a scalar
-        field cannot represent them.
-        """
+        """Keep the reported slot in step with the slot that actually ran."""
         if primary:
             if role == "main":
                 self.main_slot = slot
@@ -1480,8 +1442,6 @@ class FusionRun(NativeRun):
             return coordinator.worker_profiles[name]
         if name == "frontier":
             # Built-in main-lane equivalent: the strongest slot as a lane.
-            # Pools are cheapest-first, so main_slot is the *cheapest* entry on
-            # turn zero and must not be used here.
             model = self.main_slot
             if self.main_router is not None:
                 try:
@@ -1505,9 +1465,6 @@ class FusionRun(NativeRun):
                 for schema in tool_exec.server_tool_schemas(self.tool_options.enabled)
                 if schema["function"]["name"] not in present
             ]
-            # A client tool that shares a server tool name keeps client
-            # execution: it was declared by the harness and runs in the
-            # harness workspace, not the run sandbox.
             self.server_tool_names = {str(schema["function"]["name"]) for schema in injected}
             tools.extend(injected)
         return tools
@@ -2220,20 +2177,9 @@ def create_fusion_run(
 
 
 def refresh_fusion_run_tools(run: FusionRun, tools: list[dict[str, Any]]) -> None:
-    """Replace a live run's tool schemas with the ones the client just sent.
-
-    Coding harnesses change their tool set between turns: a compaction can drop
-    schemas, a skill can add them, and a subagent turn can present a different
-    set entirely. Lanes read ``run.tools`` on every step, so refreshing here is
-    enough to reach both the main and sidekick lanes.
-
-    ``_convert_tools`` re-sorts by name, which keeps the provider prompt-cache
-    prefix stable when a client merely reshuffles an unchanged tool set.
-    """
+    """Replace a live run's tool schemas with the ones the client just sent."""
     converted = utils._convert_tools(tools)
     if run.structured and run.structured_plan is not None:
-        # Planning already ran, so ``self.tools`` is the filtered lane set.
-        # Re-apply the same authority rules to the new schemas.
         run.tools = converted
         run.tools = run._filter_tools()
     else:
