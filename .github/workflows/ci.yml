@@ -1,6 +1,7 @@
 name: CI
 
-# Deliberately main-only; stacked PRs may have no checks until the base lands.
+# Ruff + mypy + pytest run on main pushes and all PRs targeting main so
+# failures are caught before merge, never discovered on main after landing.
 on:
   push:
     branches: [main]

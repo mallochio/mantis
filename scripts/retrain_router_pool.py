@@ -71,7 +71,6 @@ import numpy as np
 import requests
 import torch
 import torch.nn.functional as F
-from datasets import load_dataset
 from huggingface_hub import snapshot_download
 from torch import nn
 from tqdm.auto import tqdm
@@ -431,6 +430,10 @@ def load_terminalbench_tasks(
 
 
 def load_toolscale_tasks(limit: int, seed: int = 42, val_frac: float = 0.1):
+    # Imported lazily so API-only installs (without the `train` extra) can
+    # still import this module for pool parsing and unit tests.
+    from datasets import load_dataset
+
     ds = load_dataset("nvidia/ToolScale", split="train")
     ds = ds.shuffle(seed=seed)
 

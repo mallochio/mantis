@@ -16,9 +16,15 @@ Individual tests that explicitly monkeypatch ``serve._provider_client`` or
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import httpx
 import pytest
+
+# Hermetic catalog default: tests must not depend on ~/.config/ai-routing
+# state. Point MANTIS_CATALOG_PATH at the repo catalog unless a test
+# overrides it explicitly with monkeypatch.
+_REPO_CATALOG = Path(__file__).resolve().parent.parent / "config" / "catalog.toml"
 
 # Interactive shells export endpoint/catalog overrides (~/.zshrc sets
 # OPENROUTER_BASE_URL/OPENCODE_GO_ENDPOINT_URL to provider URLs, exports
@@ -60,9 +66,10 @@ def _block_external_provider_calls(monkeypatch: pytest.MonkeyPatch):
     # provider URLs, AI_ROUTING_CONFIG, rendered catalog bindings, ...).
     # Serve code reads os.environ directly, so tests must not inherit
     # the host environment; tests that need these set them via monkeypatch.
+    # MANTIS_CATALOG_PATH is the exception: it defaults to the repo catalog
+    # so no test depends on ~/.config/ai-routing state.
     for name in (
         "AI_ROUTING_CONFIG",
-        "MANTIS_CATALOG_PATH",
         "MANTIS_ENDPOINT_PROFILE",
         "MANTIS_PROVIDER_BINDINGS",
         "MANTIS_WORKER_BINDINGS",
@@ -78,6 +85,17 @@ def _block_external_provider_calls(monkeypatch: pytest.MonkeyPatch):
         "AI_GATEWAY_API_KEY",
     ):
         monkeypatch.delenv(name, raising=False)
+    if _REPO_CATALOG.is_file():
+        monkeypatch.setenv("MANTIS_CATALOG_PATH", str(_REPO_CATALOG))
+    else:  # pragma: no cover - repo checkout always ships config/catalog.toml
+        monkeypatch.delenv("MANTIS_CATALOG_PATH", raising=False)
+
+    # base_proxy caches the parsed [base] route per process; drop it so one
+    # test's catalog override cannot leak into the next.
+    import base_proxy
+
+    base_proxy._load_base_route.cache_clear()
+    base_proxy._base_route_family.cache_clear()
 
     def blocked_post(*_args, **_kwargs):
         raise httpx.NetworkError(

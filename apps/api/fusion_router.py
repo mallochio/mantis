@@ -8,6 +8,7 @@ sidekick escalates or fails.
 from __future__ import annotations
 
 import tomllib
+from pathlib import Path
 from typing import Any
 
 from fusion_types import FusionRoutingConfig
@@ -29,9 +30,18 @@ class FusionRouter:
         self.base_route = base_route
 
     @staticmethod
-    def _load_base_route() -> BaseRoute | None:
-        """Read the active catalog's [base] stage router, if present."""
-        path, _ = catalog_path()
+    def _load_base_route(catalog: str | Path | None = None) -> BaseRoute | None:
+        """Read the [base] stage router from an explicit catalog if given.
+
+        Defaults to the active catalog resolved from ``AI_ROUTING_CONFIG`` /
+        ``MANTIS_CATALOG_PATH`` so production callers keep working without
+        changes, while tests can inject a hermetic catalog path instead of
+        depending on ``~/`` state.
+        """
+        if catalog is not None:
+            path = Path(catalog).expanduser()
+        else:
+            path, _ = catalog_path()
         if not path.is_file():
             return None
         try:
@@ -44,8 +54,13 @@ class FusionRouter:
             return None
 
     @classmethod
-    def from_config(cls, config: FusionRoutingConfig, role: str) -> FusionRouter:
-        return cls(config, role, cls._load_base_route())
+    def from_config(
+        cls,
+        config: FusionRoutingConfig,
+        role: str,
+        catalog: str | Path | None = None,
+    ) -> FusionRouter:
+        return cls(config, role, cls._load_base_route(catalog))
 
     def select(self, turn_index: int = 0, escalation_count: int = 0) -> str:
         """Return a provider-executable spec for this turn.

@@ -243,6 +243,9 @@ def test_load_terminalbench_s3(monkeypatch, tmp_path):
 
 
 def test_load_toolscale_tasks(monkeypatch):
+    pytest.importorskip("datasets")
+    import datasets
+
     class _FakeDS:
         def __init__(self, rows):
             self._rows = rows
@@ -259,7 +262,7 @@ def test_load_toolscale_tasks(monkeypatch):
             "evaluation_criteria": {"actions": [{"name": "tool", "arguments": {}}]},
         }
     ]
-    monkeypatch.setattr(rp, "load_dataset", lambda *args, **kwargs: _FakeDS(rows))
+    monkeypatch.setattr(datasets, "load_dataset", lambda *args, **kwargs: _FakeDS(rows))
     train, val = rp.load_toolscale_tasks(limit=1)
     assert len(train) == 1
     assert train[0]["task"] == "do X"
@@ -441,6 +444,9 @@ def test_load_terminalbench_with_limit(tmp_path):
 
 
 def test_load_toolscale_with_limit(monkeypatch):
+    pytest.importorskip("datasets")
+    import datasets
+
     class _FakeDS:
         def __init__(self, rows):
             self._rows = rows
@@ -458,7 +464,7 @@ def test_load_toolscale_with_limit(monkeypatch):
         }
         for i in range(3)
     ]
-    monkeypatch.setattr(rp, "load_dataset", lambda *a, **kw: _FakeDS(rows))
+    monkeypatch.setattr(datasets, "load_dataset", lambda *a, **kw: _FakeDS(rows))
     train, val = rp.load_toolscale_tasks(limit=2)
     assert len(train) == 2
 

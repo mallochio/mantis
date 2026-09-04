@@ -19,7 +19,6 @@ Design (honest scope):
 from __future__ import annotations
 import json, re
 from typing import List
-from datasets import load_dataset
 
 SYSTEM = (
     "You are a tool-use planner. Given a user request and the list of available "
@@ -49,6 +48,10 @@ def make_datasets(data_limit=4000, seed=42, tokenizer=None,
                   dataset_id_or_path="nvidia/ToolScale", **kwargs):
     # base.yaml injects dataset_id_or_path / dataset_local_directory /
     # model_name_or_path / name — absorbed via kwargs; we honor the id.
+    # Imported lazily so API-only installs (without the `train` extra) can
+    # import this module for planning/scoring helpers and unit tests.
+    from datasets import load_dataset
+
     ds = load_dataset(dataset_id_or_path, split="train")
     ds = ds.shuffle(seed=seed)
     if data_limit and data_limit < len(ds):

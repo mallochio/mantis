@@ -2904,8 +2904,9 @@ def test_record_selected_slot_tracks_promotions():
 
 def test_base_route_lead_resolves_to_capable_target_with_full_budget():
     """The lead runs through [base] so it can use an effort the ABI slot pins."""
+    catalog = Path(__file__).resolve().parent.parent / "config" / "catalog.toml"
     config = fusion.FusionRoutingConfig(main="mantis/base", sidekick="gpt-5_6-luna")
-    router = fusion.FusionRouter.from_config(config, "main")
+    router = fusion.FusionRouter.from_config(config, "main", catalog=catalog)
     spec = router.select(escalation_count=0)
     assert spec.startswith("openrouter/")
     assert "gpt-5.6-sol" in spec
@@ -2914,7 +2915,9 @@ def test_base_route_lead_resolves_to_capable_target_with_full_budget():
     coordinator = fusion.FusionCoordinator()
     assert coordinator._context_window_for(spec) == coordinator.context_window
     explicit = fusion.FusionRouter.from_config(
-        fusion.FusionRoutingConfig(main="base:capable", sidekick="gpt-5_6-luna"), "main"
+        fusion.FusionRoutingConfig(main="base:capable", sidekick="gpt-5_6-luna"),
+        "main",
+        catalog=catalog,
     )
     assert explicit.select(escalation_count=0) == spec
 

@@ -71,6 +71,7 @@ def test_build_prompt_contains_conductor_lists():
 
 
 def test_build_dataset_carries_expected_column():
+    pytest.importorskip("datasets")
     tok = _mock_tokenizer()
     records = [
         {"task": "a", "expected": "solve_a.sh"},
