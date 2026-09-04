@@ -938,9 +938,16 @@ def test_only_public_mantis_model_ids_are_accepted(client):
         assert response.status_code == 400
 
 
-def test_short_model_aliases_are_accepted(client):
-    # Short aliases route to the same modes. Base reaches Switchyard; that
-    # hop is 200 when a local server is up and 502/401 when it is not.
+def test_short_model_aliases_are_accepted(client, monkeypatch):
+    # The base hop is Switchyard-backed; mock the transport so the test does
+    # not depend on a live local stack (or leak billed upstream calls).
+    def base_handler(_request):
+        return __import__("httpx").Response(
+            200,
+            json={"id": "chatcmpl-router", "choices": [{"message": {"content": "ok"}}]},
+        )
+
+    monkeypatch.setattr(api, "_router_client", lambda: _router_client(base_handler))
     for model in ("base", "trinity", "ultra"):
         response = client.post(
             "/v1/chat/completions",
