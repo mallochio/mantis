@@ -296,3 +296,355 @@ def test_failure_signals_tolerates_malformed_history():
     assert base_proxy.failure_signals("not a list") == 0
     assert base_proxy.failure_signals([None, 7, {"role": "assistant"}]) == 0
     assert base_proxy.failure_signals([{"role": "tool", "content": {"blocks": []}}]) == 0
+
+
+# -- Improvement 4: Complexity classifier ----------------------------------
+
+
+def test_classify_complexity_simple():
+    messages = [{"role": "user", "content": "What time is it?"}]
+    assert base_proxy._classify_complexity(messages) == "simple"
+
+
+def test_classify_complexity_empty():
+    assert base_proxy._classify_complexity([]) == "simple"
+    assert base_proxy._classify_complexity([{"role": "system", "content": "sys"}]) == "simple"
+
+
+def test_classify_complexity_reasoning():
+    messages = [
+        {
+            "role": "user",
+            "content": "Please think through this step by step and reason about the tradeoffs.",
+        }
+    ]
+    assert base_proxy._classify_complexity(messages) == "reasoning"
+
+
+def test_classify_complexity_complex():
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "Write a distributed algorithm for consensus. "
+                "The system must handle concurrency correctly."
+            ),
+        }
+    ]
+    tier = base_proxy._classify_complexity(messages)
+    assert tier in ("complex", "reasoning")
+
+
+def test_classify_complexity_medium():
+    messages = [
+        {
+            "role": "user",
+            "content": "Can you analyze this code?\n```python\ndef foo(): pass\n```",
+        }
+    ]
+    tier = base_proxy._classify_complexity(messages)
+    assert tier in ("medium", "complex")
+
+
+def test_classify_complexity_uses_last_user_message():
+    messages = [
+        {"role": "user", "content": "Please derive the proof step by step and reason carefully."},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "Thanks!"},
+    ]
+    # "Thanks!" is simple despite the first message being complex
+    assert base_proxy._classify_complexity(messages) == "simple"
+
+
+def test_classify_complexity_content_list():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Prove that the algorithm terminates."},
+            ],
+        }
+    ]
+    tier = base_proxy._classify_complexity(messages)
+    assert tier in ("medium", "complex", "reasoning")
+
+
+def test_router_headers_include_complexity():
+    body = type("R", (), {"metadata": {"session_id": "s"}, "user": None})
+    headers = base_proxy.router_headers({}, body, complexity="reasoning")
+    assert headers[base_proxy.SWITCHYARD_COMPLEXITY_HEADER] == "reasoning"
+    assert headers["x-switchyard-force-tier"] == "capable"
+
+
+def test_router_headers_complexity_simple_no_force_tier():
+    body = type("R", (), {"metadata": {"session_id": "s"}, "user": None})
+    headers = base_proxy.router_headers({}, body, complexity="simple")
+    assert headers[base_proxy.SWITCHYARD_COMPLEXITY_HEADER] == "simple"
+    assert "x-switchyard-force-tier" not in headers
+
+
+def test_router_headers_no_complexity():
+    body = type("R", (), {"metadata": {"session_id": "s"}, "user": None})
+    headers = base_proxy.router_headers({}, body)
+    assert base_proxy.SWITCHYARD_COMPLEXITY_HEADER not in headers
+
+
+# -- Direct LiteLLM leg for non-Switchyard adapters ------------------------
+
+
+def _write_catalog(
+    tmp_path, efficient_provider, efficient_model, capable_model="openai/gpt-5.6-sol"
+):
+    adapter = "bedrock" if efficient_provider == "bedrock" else "openrouter"
+    base_url = (
+        "https://bedrock-runtime.eu-central-1.amazonaws.com"
+        if adapter == "bedrock"
+        else "https://openrouter.ai/api/v1"
+    )
+    credential_env = "AWS_ACCESS_KEY_ID" if adapter == "bedrock" else "OPENROUTER_API_KEY"
+    path = tmp_path / "catalog.toml"
+    path.write_text(
+        "version = 1\n"
+        f'[providers.{efficient_provider}]\n'
+        f'adapter = "{adapter}"\n'
+        f'base_url = "{base_url}"\n'
+        f'credential_env = "{credential_env}"\n'
+        'protocols = ["chat_completions"]\n'
+        '[providers.openrouter]\n'
+        'adapter = "openrouter"\n'
+        'base_url = "https://openrouter.ai/api/v1"\n'
+        'credential_env = "OPENROUTER_API_KEY"\n'
+        'protocols = ["chat_completions"]\n'
+        "[base]\n"
+        'revision = "test-direct-leg"\n'
+        'picker = "efficient_first"\n'
+        "confidence_threshold = 0.5\n"
+        "recent_turn_window = 3\n"
+        "[base.targets.efficient]\n"
+        f'provider = "{efficient_provider}"\n'
+        'reasoning_effort = "high"\n'
+        "max_tokens = 64000\n"
+        f'upstream_model = "{efficient_model}"\n'
+        "[base.targets.capable]\n"
+        'provider = "openrouter"\n'
+        'reasoning_effort = "medium"\n'
+        "max_tokens = 128000\n"
+        f'upstream_model = "{capable_model}"\n'
+    )
+    return path
+
+
+def _use_catalog(monkeypatch, path):
+    monkeypatch.setenv("MANTIS_CATALOG_PATH", str(path))
+    monkeypatch.delenv("AI_ROUTING_CONFIG", raising=False)
+    base_proxy._load_base_route.cache_clear()
+    base_proxy._base_route_family.cache_clear()
+
+
+def _litellm_ok_response(content="hi"):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message={"role": "assistant", "content": content},
+                finish_reason="stop",
+            )
+        ],
+        usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    )
+
+
+def test_direct_litellm_spec_selects_bedrock_efficient(tmp_path, monkeypatch):
+    _use_catalog(
+        monkeypatch, _write_catalog(tmp_path, "bedrock", "global.xai.grok-4.6")
+    )
+    spec = base_proxy._direct_litellm_spec()
+    assert spec is not None
+    assert spec.adapter == "bedrock"
+    assert spec.model == "global.xai.grok-4.6"
+    assert spec.credential_env == "AWS_ACCESS_KEY_ID"
+
+
+def test_direct_litellm_spec_skips_switchyard_servable_adapters(tmp_path, monkeypatch):
+    _use_catalog(monkeypatch, _write_catalog(tmp_path, "openrouter", "openai/gpt-4o"))
+    assert base_proxy._direct_litellm_spec() is None
+
+
+def test_forward_uses_direct_litellm_for_bedrock_efficient(tmp_path, monkeypatch):
+    _use_catalog(
+        monkeypatch, _write_catalog(tmp_path, "bedrock", "global.xai.grok-4.6")
+    )
+    monkeypatch.setattr(
+        providers, "_litellm_completion", lambda **kwargs: _litellm_ok_response("grok-hi")
+    )
+
+    def client_factory():
+        raise AssertionError("Switchyard must not be called for bedrock efficient")
+
+    request = _SessionRequest(messages=[{"role": "user", "content": "hi"}])
+    response, handed_off = base_proxy.forward(request, {}, "req-1", client_factory)
+    assert handed_off is False
+    assert response.status_code == 200
+    import json
+
+    body = json.loads(response.body.decode())
+    assert body["model"] == "mantis/base"
+    assert body["choices"][0]["message"]["content"] == "grok-hi"
+    assert response.headers["x-route-model"] == "global.xai.grok-4.6"
+
+
+def test_direct_litellm_prefers_target_budget_over_small_client_value(
+    tmp_path, monkeypatch
+):
+    _use_catalog(
+        monkeypatch, _write_catalog(tmp_path, "bedrock", "global.xai.grok-4.6")
+    )
+    seen = {}
+    orig_kwargs = base_proxy._direct_litellm_kwargs
+
+    def spy(body, resolved):
+        kwargs = orig_kwargs(body, resolved)
+        seen.update(kwargs)
+        return kwargs
+
+    monkeypatch.setattr(base_proxy, "_direct_litellm_kwargs", spy)
+    monkeypatch.setattr(
+        providers, "_litellm_completion", lambda **kwargs: _litellm_ok_response("ok")
+    )
+
+    def client_factory():
+        raise AssertionError("Switchyard must not be called for bedrock efficient")
+
+    request = _SessionRequest(messages=[{"role": "user", "content": "hi"}])
+    base_proxy.forward(request, {}, "req-budget", client_factory)
+    # The catalog target budget (64000) wins so reasoning models keep room
+    # for thinking instead of returning empty content on small client budgets.
+    assert seen["max_tokens"] == 64000
+
+
+def test_forward_streams_direct_litellm_for_bedrock_efficient(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    _use_catalog(
+        monkeypatch, _write_catalog(tmp_path, "bedrock", "global.xai.grok-4.6")
+    )
+
+    def fake_completion(**kwargs):
+        assert kwargs.get("stream") is True
+        yield SimpleNamespace(
+            id="c1",
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content="hel", reasoning_content=None),
+                    finish_reason=None,
+                )
+            ],
+        )
+        yield SimpleNamespace(
+            id="c1",
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content=None,
+                        reasoning_content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                id="call-1",
+                                type="function",
+                                index=0,
+                                function=SimpleNamespace(
+                                    name="ipython", arguments='{"code": "1+1"}'
+                                ),
+                            )
+                        ],
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(providers, "_litellm_completion", fake_completion)
+
+    def client_factory():
+        raise AssertionError("Switchyard must not be called for bedrock efficient")
+
+    request = _SessionRequest(messages=[{"role": "user", "content": "hi"}])
+    request.stream = True
+    closed = []
+    response, handed_off = base_proxy.forward(
+        request, {}, "req-2", client_factory, on_close=lambda: closed.append(True)
+    )
+    assert handed_off is True
+    import asyncio
+    import json
+
+    async def _collect():
+        return b"".join([chunk async for chunk in response.body_iterator])
+
+    payload = asyncio.run(_collect()).decode()
+    assert 'data: [DONE]' in payload
+    assert '"content": "hel"' in payload
+    assert json.loads(payload.splitlines()[0].removeprefix("data: "))["model"] == "mantis/base"
+    # Tool-call deltas must survive translation or the harness loop stalls.
+    tool_frames = [
+        json.loads(line.removeprefix("data: "))
+        for line in payload.splitlines()
+        if line.startswith("data:") and "tool_calls" in line
+    ]
+    assert tool_frames, payload
+    call = tool_frames[0]["choices"][0]["delta"]["tool_calls"][0]
+    assert call["id"] == "call-1"
+    assert call["function"]["name"] == "ipython"
+    assert json.loads(call["function"]["arguments"]) == {"code": "1+1"}
+    assert closed == [True]
+
+
+def test_forward_falls_back_to_switchyard_when_direct_fails(tmp_path, monkeypatch):
+    _use_catalog(
+        monkeypatch, _write_catalog(tmp_path, "bedrock", "global.xai.grok-4.6")
+    )
+
+    def boom(**kwargs):
+        raise RuntimeError("bedrock down")
+
+    monkeypatch.setattr(providers, "_litellm_completion", boom)
+
+    def handler(_request):
+        return httpx.Response(
+            200,
+            json={"id": "c", "choices": [{"message": {"content": "via-switchyard"}}]},
+        )
+
+    request = _SessionRequest(messages=[{"role": "user", "content": "hi"}])
+    response, handed_off = base_proxy.forward(
+        request, {}, "req-3", lambda: httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    assert handed_off is False
+    assert response.status_code == 200
+    import json
+
+    assert json.loads(response.body.decode())["choices"][0]["message"]["content"] == (
+        "via-switchyard"
+    )
+
+
+def test_forward_rejects_non_chat_200_payload(tmp_path, monkeypatch):
+    _use_catalog(monkeypatch, _write_catalog(tmp_path, "openrouter", "openai/gpt-4o"))
+
+    def handler(_request):
+        # Raw provider error passed through with 200: no "error" key, no choices.
+        return httpx.Response(
+            200,
+            json={
+                "Output": {"__type": "com.amazon.coral.service#UnknownOperationException"},
+                "Version": "1.0",
+            },
+        )
+
+    request = _SessionRequest(messages=[{"role": "user", "content": "hi"}])
+    response, handed_off = base_proxy.forward(
+        request, {}, "req-4", lambda: httpx.Client(transport=httpx.MockTransport(handler))
+    )
+    assert handed_off is False
+    assert response.status_code == 502

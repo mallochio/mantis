@@ -19,6 +19,9 @@ _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _CONTRACT = re.compile(r"[0-9a-f]{64}\Z")
 PROTOCOLS = frozenset({"chat_completions", "responses", "anthropic_messages"})
 EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
+# Ordered weakest to strongest. Reasoning tokens bill as output tokens, so this
+# is a cost ordering when the upstream model is the same for both targets.
+_EFFORT_RANK = ("none", "low", "medium", "high", "xhigh", "max")
 # Adapter -> supported wire protocols. The Anthropic adapter retains signed
 # thinking blocks across tool continuations for Claude on Bedrock.
 ADAPTER_PROTOCOLS = {
@@ -27,6 +30,9 @@ ADAPTER_PROTOCOLS = {
     "modal": frozenset({"chat_completions"}),
     "openai-compatible": frozenset({"chat_completions", "responses"}),
     "anthropic": frozenset({"anthropic_messages"}),
+    "bedrock": frozenset({"chat_completions", "responses", "anthropic_messages"}),
+    "vertex": frozenset({"chat_completions", "responses"}),
+    "azure_ai": frozenset({"responses"}),
 }
 ADAPTERS = frozenset(ADAPTER_PROTOCOLS)
 SWITCHYARD_FORMATS = frozenset({"openai_chat", "openai_responses", "anthropic_messages"})
@@ -36,6 +42,9 @@ ADAPTER_SWITCHYARD_FORMAT = {
     "modal": "openai_chat",
     "openai-compatible": "openai_chat",
     "anthropic": "anthropic_messages",
+    "bedrock": "openai_chat",
+    "vertex": "openai_chat",
+    "azure_ai": "openai_responses",
 }
 BASE_TARGET_ROLES = ("efficient", "capable")
 BASE_SECTION_KEYS = frozenset(
@@ -208,6 +217,35 @@ def _max_tokens(value: Any, label: str) -> int | None:
     return value
 
 
+def _validate_effort_ordering(efficient: BaseTarget, capable: BaseTarget) -> None:
+    """Reject an efficient target that reasons harder than the capable one.
+
+    Only applies when both targets route to the same upstream model. Across
+    different models, effort is not a reliable cost signal (a cheap model at
+    high effort can cost less per turn than a strong model at medium), so the
+    guard is skipped there.
+    """
+    if (
+        efficient.upstream_model != capable.upstream_model
+        or efficient.provider != capable.provider
+    ):
+        return
+    if efficient.reasoning_effort is None or capable.reasoning_effort is None:
+        return
+    try:
+        low = _EFFORT_RANK.index(efficient.reasoning_effort)
+        high = _EFFORT_RANK.index(capable.reasoning_effort)
+    except ValueError:  # pragma: no cover - EFFORTS already validated upstream
+        return
+    if low > high:
+        raise CatalogError(
+            "base.targets.efficient.reasoning_effort "
+            f"({efficient.reasoning_effort}) must not exceed "
+            f"base.targets.capable.reasoning_effort ({capable.reasoning_effort}); "
+            "reasoning tokens bill as output, so this inverts the cost tiers"
+        )
+
+
 def _validate_token_limits(
     max_tokens: int | None, context_window: int | None, label: str
 ) -> None:
@@ -239,7 +277,11 @@ def _worker(value: Any, label: str) -> WorkerBinding:
     )
 
 
-def _runtime_bindings(providers_raw: Any, workers_raw: Any) -> RuntimeBindings:
+def _runtime_bindings(
+    providers_raw: Any,
+    workers_raw: Any,
+    extra_provider_names: set[str] | None = None,
+) -> RuntimeBindings:
     provider_table = _mapping(providers_raw, "providers")
     worker_table = _mapping(workers_raw, "mantis.workers")
     workers = {
@@ -247,6 +289,8 @@ def _runtime_bindings(providers_raw: Any, workers_raw: Any) -> RuntimeBindings:
         for name, value in worker_table.items()
     }
     provider_names = {worker.provider for worker in workers.values()}
+    provider_names |= extra_provider_names or set()
+    provider_names |= set(provider_table)
     providers: dict[str, ProviderBinding] = {}
     for name in provider_names:
         if name not in provider_table:
@@ -364,10 +408,14 @@ def load_base_route(root: Mapping[str, Any]) -> BaseRoute:
     efficient = _base_target(targets["efficient"], "efficient", providers)
     capable = _base_target(targets["capable"], "capable", providers)
     if (
-        efficient.upstream_model == capable.upstream_model
-        and efficient.provider == capable.provider
+        efficient.provider == capable.provider
+        and efficient.upstream_model == capable.upstream_model
+        and efficient.reasoning_effort == capable.reasoning_effort
+        and efficient.max_tokens == capable.max_tokens
+        and efficient.wire_format == capable.wire_format
     ):
-        raise CatalogError("base.targets.efficient and capable must be distinct models")
+        raise CatalogError("base.targets.efficient and capable must be distinct targets")
+    _validate_effort_ordering(efficient, capable)
     typed_picker: Literal["efficient_first", "capable_first"]
     match picker:
         case "efficient_first":

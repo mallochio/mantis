@@ -1,0 +1,218 @@
+[
+  {
+    "path": "apps/api/api.py",
+    "file_name": "api.py",
+    "functions": [
+      {
+        "name": "ready",
+        "complexity": 21
+      },
+      {
+        "name": "_sse",
+        "complexity": 24
+      },
+      {
+        "name": "_fusion_run_id_from_messages",
+        "complexity": 35
+      },
+      {
+        "name": "_run_fusion_chat",
+        "complexity": 42
+      },
+      {
+        "name": "_stream",
+        "complexity": 57
+      }
+    ]
+  },
+  {
+    "path": "apps/api/base_proxy.py",
+    "file_name": "base_proxy.py",
+    "functions": [
+      {
+        "name": "failure_signals",
+        "complexity": 25
+      },
+      {
+        "name": "_delta_to_dict",
+        "complexity": 27
+      },
+      {
+        "name": "_classify_complexity",
+        "complexity": 30
+      },
+      {
+        "name": "router_error",
+        "complexity": 40
+      },
+      {
+        "name": "forward",
+        "complexity": 47
+      }
+    ]
+  },
+  {
+    "path": "apps/api/fusion.py",
+    "file_name": "fusion.py",
+    "functions": [
+      {
+        "name": "_extract_reasoning_trace",
+        "complexity": 56
+      },
+      {
+        "name": "FusionRun::_advance_legacy",
+        "complexity": 110
+      },
+      {
+        "name": "FusionRun::_advance_structured",
+        "complexity": 126
+      }
+    ]
+  },
+  {
+    "path": "apps/api/mini.py",
+    "file_name": "mini.py",
+    "functions": [
+      {
+        "name": "Coordinator::run",
+        "complexity": 25
+      }
+    ]
+  },
+  {
+    "path": "apps/api/providers.py",
+    "file_name": "providers.py",
+    "functions": [
+      {
+        "name": "_normalize_upstream_tool_ids",
+        "complexity": 21
+      },
+      {
+        "name": "_run_mantis_details",
+        "complexity": 22
+      },
+      {
+        "name": "_build_request",
+        "complexity": 23
+      },
+      {
+        "name": "_clear_thinking",
+        "complexity": 23
+      },
+      {
+        "name": "_cost_breakdown",
+        "complexity": 26
+      },
+      {
+        "name": "_litellm_kwargs",
+        "complexity": 34
+      },
+      {
+        "name": "_coerce_reasoning_effort",
+        "complexity": 39
+      },
+      {
+        "name": "_extract_portable_reasoning_text",
+        "complexity": 50
+      },
+      {
+        "name": "_provider_response",
+        "complexity": 67
+      },
+      {
+        "name": "_sanitize_messages",
+        "complexity": 75
+      },
+      {
+        "name": "_response_to_dict",
+        "complexity": 79
+      }
+    ]
+  },
+  {
+    "path": "apps/api/runs.py",
+    "file_name": "runs.py",
+    "functions": [
+      {
+        "name": "NativeRun::_add_usage",
+        "complexity": 29
+      },
+      {
+        "name": "_sweep_runs",
+        "complexity": 29
+      }
+    ]
+  },
+  {
+    "path": "apps/api/tool_exec.py",
+    "file_name": "tool_exec.py",
+    "functions": [
+      {
+        "name": "execute",
+        "complexity": 37
+      }
+    ]
+  },
+  {
+    "path": "apps/api/trinity.py",
+    "file_name": "trinity.py",
+    "functions": [
+      {
+        "name": "HistoryWorker::__call__",
+        "complexity": 60
+      }
+    ]
+  },
+  {
+    "path": "apps/api/ultra.py",
+    "file_name": "ultra.py",
+    "functions": [
+      {
+        "name": "_balanced_list",
+        "complexity": 22
+      }
+    ]
+  },
+  {
+    "path": "scripts/fx_gateway_proxy.py",
+    "file_name": "fx_gateway_proxy.py",
+    "functions": [
+      {
+        "name": "GatewayHandler::do_POST",
+        "complexity": 21
+      },
+      {
+        "name": "_looks_like_failed_command",
+        "complexity": 27
+      },
+      {
+        "name": "sse_events_from_chat",
+        "complexity": 34
+      },
+      {
+        "name": "openai_messages",
+        "complexity": 87
+      }
+    ]
+  },
+  {
+    "path": "scripts/retrain_conductor.py",
+    "file_name": "retrain_conductor.py",
+    "functions": [
+      {
+        "name": "main",
+        "complexity": 37
+      }
+    ]
+  },
+  {
+    "path": "scripts/toolscale_data.py",
+    "file_name": "toolscale_data.py",
+    "functions": [
+      {
+        "name": "_score",
+        "complexity": 24
+      }
+    ]
+  }
+]

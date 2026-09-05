@@ -24,6 +24,24 @@ base_url = "https://interhuman-ai--ep-qwen3-8-2-4t-a95b-server.us-west.modal.dir
 credential_env = "MODAL_PROXY_TOKEN"
 protocols = ["chat_completions"]
 
+[providers.bedrock]
+adapter = "bedrock"
+base_url = "https://bedrock-runtime.eu-central-1.amazonaws.com"
+credential_env = "AWS_ACCESS_KEY_ID"
+protocols = ["chat_completions"]
+
+[providers.azure-foundry-router]
+adapter = "azure_ai"
+base_url = "https://ih-foundry-resource.services.ai.azure.com/api/projects/ih-foundry/openai/v1"
+credential_env = "AZURE_API_KEY"
+protocols = ["responses"]
+
+[providers."vertex"]
+adapter = "vertex"
+base_url = "https://aiplatform.googleapis.com/v1"
+credential_env = "GOOGLE_APPLICATION_CREDENTIALS"
+protocols = ["chat_completions"]
+
 [base]
 # Switchyard stage-router for mantis/base
 # Swap efficient/capable models or their providers here; launch regenerates routes.toml.
@@ -40,7 +58,7 @@ upstream_model = "kimi-k3"
 
 [base.targets.capable]
 provider = "openrouter"
-reasoning_effort = "medium"
+reasoning_effort = "high"
 max_tokens = 128000
 upstream_model = "openai/gpt-5.6-sol"
 

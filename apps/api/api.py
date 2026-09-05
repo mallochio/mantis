@@ -19,6 +19,8 @@ import base_proxy
 import fusion
 import httpx
 import model_catalog
+import openai
+import providers
 import serve
 import utils
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
@@ -144,6 +146,7 @@ class ChatRequest(BaseModel):
     response_format: JsonSchemaFormat | JsonObjectFormat | None = None
     max_tokens: int | None = Field(default=None, ge=1)
     max_completion_tokens: int | None = Field(default=None, ge=1)
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     reasoning: ReasoningOptions | None = None
     reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] | None = None
     web_search_options: dict[str, Any] | None = None
@@ -309,6 +312,260 @@ def _mantis_headers(mantis: dict[str, Any], body: dict[str, Any]) -> dict[str, s
     if isinstance(cost, (int, float)):
         headers["X-Mantis-Cost-Usd"] = f"{cost:.6f}"
     return headers
+
+
+_AZURE_ROUTER_MODEL = "mantis/azure-router"
+_AZURE_ROUTER_ALIAS = "azure-router"
+_AZURE_ROUTER_PROVIDER = "azure-foundry-router"
+_AZURE_ROUTER_DEPLOYMENT = "model-router"
+_AZURE_SESSION_LIMIT = 1024
+_azure_sessions: dict[str, tuple[str, list[dict[str, Any]]]] = {}
+
+
+def _azure_router_spec(request: ChatRequest) -> str:
+    effort = _azure_router_effort(request)
+    if effort:
+        return f"{_AZURE_ROUTER_PROVIDER}/{_AZURE_ROUTER_DEPLOYMENT}|{effort}"
+    return f"{_AZURE_ROUTER_PROVIDER}/{_AZURE_ROUTER_DEPLOYMENT}"
+
+
+def _azure_router_effort(request: ChatRequest) -> str:
+    effort = request.reasoning_effort
+    if effort is None and request.reasoning is not None:
+        effort = request.reasoning.effort
+    return effort or "medium"
+
+
+def _azure_router_max_tokens(request: ChatRequest) -> int:
+    cap = 128000
+    value = request.max_completion_tokens or request.max_tokens
+    if value is not None:
+        return min(value, cap)
+    return cap
+
+
+def _azure_session_key(request: ChatRequest, headers: dict[str, str] | None) -> str | None:
+    """Resolve a stable conversation key for Azure prompt-cache reuse."""
+    if headers:
+        explicit = headers.get("x-mantis-session-id") or headers.get("x-mantis-session")
+        if explicit:
+            return f"explicit:{explicit.strip()}"
+    if request.user:
+        return f"user:{request.user.strip()}"
+    metadata = request.metadata or {}
+    if isinstance(metadata, dict) and metadata.get("session_id"):
+        return f"metadata:{metadata['session_id']}"
+    return None
+
+
+def _azure_content_item(role: str, part: TextPart | ImagePart) -> dict[str, Any]:
+    """Convert a Mantis message part into an Azure Responses input content item."""
+    if isinstance(part, TextPart):
+        text_type = "output_text" if role == "assistant" else "input_text"
+        return {"type": text_type, "text": part.text}
+    if part.type == "image_url":
+        return {
+            "type": "input_image",
+            "image_url": {
+                "url": part.image_url.url,
+                "detail": part.image_url.detail or "auto",
+            },
+        }
+    return {"type": "input_text", "text": str(part)}
+
+
+def _azure_canonical_content(role: str, content: str | list[TextPart | ImagePart] | None) -> str | list[dict[str, Any]] | None:
+    """Return Azure Responses-compatible content for a message role.
+
+    System and developer messages are sent as a single text string.
+    User and assistant messages are sent as content-part lists with the
+    correct part types (``input_text`` / ``output_text`` / ``input_image``).
+    """
+    if content is None:
+        return None
+    if isinstance(content, str):
+        if role in ("system", "developer"):
+            return content
+        part_type = "output_text" if role == "assistant" else "input_text"
+        return [{"type": part_type, "text": content}]
+    parts = [_azure_content_item(role, p) for p in content]
+    if role in ("system", "developer"):
+        return "\n".join(p["text"] for p in parts if p.get("type") in ("input_text", "output_text"))
+    return parts
+
+
+def _azure_canonical_message(message: Message) -> dict[str, Any] | None:
+    """Return an Azure Responses-compatible input item for a Mantis message."""
+    content = _azure_canonical_content(message.role, message.content)
+    if not content:
+        return None
+    return {"type": "message", "role": message.role, "content": content}
+
+
+def _azure_input_for_request(
+    request: ChatRequest,
+    headers: dict[str, str] | None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Return the input list and previous_response_id for an Azure request.
+
+    When the new messages extend the stored conversation, only the new tail is
+    sent with ``previous_response_id`` so the prior prompt prefix is cached.
+    When the conversation is reset, shortened, or has no session key, the full
+    message list is sent without a previous response id.
+    """
+    input_messages = [m for m in (_azure_canonical_message(msg) for msg in request.messages) if m]
+    key = _azure_session_key(request, headers)
+    if not key:
+        return input_messages, None
+    previous = _azure_sessions.get(key)
+    if not previous:
+        return input_messages, None
+    previous_id, previous_messages = previous
+    previous_len = len(previous_messages)
+    if previous_len and previous_len < len(input_messages) and input_messages[:previous_len] == previous_messages:
+        return input_messages[previous_len:], previous_id
+    return input_messages, None
+
+
+def _azure_output_text(item: openai.types.responses.ResponseOutputMessage) -> str:
+    return "\n".join(
+        part.text for part in item.content if part.type == "output_text" and hasattr(part, "text")
+    )
+
+
+def _azure_output_reasoning(item: openai.types.responses.ResponseOutputMessage) -> str:
+    parts: list[str] = []
+    for part in item.content:
+        if part.type != "reasoning" or not hasattr(part, "summary"):
+            continue
+        summaries = getattr(part, "summary", []) or []
+        parts.extend(
+            s.text
+            for s in summaries
+            if s.type == "summary_text" and hasattr(s, "text")
+        )
+    return "\n".join(parts)
+
+
+def _azure_response_to_chat_completion(model: str, resp: openai.types.responses.Response) -> dict[str, Any]:
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    for item in resp.output:
+        if item.type != "message":
+            continue
+        text_parts.append(_azure_output_text(item))
+        reasoning_parts.append(_azure_output_reasoning(item))
+    message: dict[str, Any] = {"role": "assistant", "content": "\n".join(text_parts)}
+    if reasoning := "\n".join(reasoning_parts):
+        message["reasoning"] = reasoning
+    usage = resp.usage
+    return {
+        "id": resp.id,
+        "object": "chat.completion",
+        "created": int(resp.created_at or 0),
+        "model": model,
+        "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": usage.input_tokens if usage else 0,
+            "completion_tokens": usage.output_tokens if usage else 0,
+            "total_tokens": usage.total_tokens if usage else 0,
+        },
+    }
+
+
+def _azure_store_session(
+    request: ChatRequest,
+    headers: dict[str, str] | None,
+    input_messages: list[dict[str, Any]],
+    response_id: str,
+) -> None:
+    """Store the latest Azure response id for a session, pruning on overflow."""
+    key = _azure_session_key(request, headers)
+    if not key:
+        return
+    while len(_azure_sessions) >= _AZURE_SESSION_LIMIT:
+        _azure_sessions.pop(next(iter(_azure_sessions)))
+    _azure_sessions[key] = (response_id, input_messages)
+
+
+def _complete_direct(request: ChatRequest, headers: dict[str, str] | None = None) -> dict[str, Any]:
+    resolved = providers._resolve_model_spec(_azure_router_spec(request))
+    key = providers._provider_keys().get(_AZURE_ROUTER_PROVIDER) or os.environ.get(resolved.credential_env)
+    client = openai.OpenAI(
+        base_url=resolved.base_url,
+        api_key=key or "",
+        default_headers={"api-key": key or ""},
+    )
+    input_messages, previous_id = _azure_input_for_request(request, headers)
+    create_kwargs: dict[str, Any] = {
+        "model": resolved.model,
+        "input": input_messages,
+        "max_output_tokens": _azure_router_max_tokens(request),
+        "reasoning": {"effort": _azure_router_effort(request)},
+    }
+    if previous_id:
+        create_kwargs["previous_response_id"] = previous_id
+    resp = client.responses.create(**create_kwargs, stream=False)
+    body = _azure_response_to_chat_completion(request.model, resp)
+    full_messages: list[dict[str, Any]] = [m for m in (_azure_canonical_message(msg) for msg in request.messages) if m]
+    assistant = body["choices"][0]["message"]
+    assistant_content = _azure_canonical_content(assistant["role"], assistant["content"])
+    if assistant_content:
+        full_messages.append({"type": "message", "role": assistant["role"], "content": assistant_content})
+    _azure_store_session(request, headers, full_messages, resp.id)
+    return body
+
+
+def _stream_direct(
+    request: ChatRequest,
+    headers: dict[str, str] | None,
+    completion_id: str | None,
+) -> Iterator[bytes]:
+    results: queue.Queue[tuple[str, Any]] = queue.Queue()
+    cancelled = threading.Event()
+    stream_id = completion_id or "chatcmpl-" + uuid.uuid4().hex[:24]
+    base = {
+        "id": stream_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": request.model,
+    }
+
+    def complete() -> None:
+        try:
+            result = _complete_direct(request, headers)
+            result["id"] = stream_id
+            result["model"] = request.model
+            results.put(("result", result))
+        except HTTPException as error:
+            results.put(("error", error))
+        except Exception as error:  # noqa: BLE001 - never leave the stream hanging
+            results.put(("error", HTTPException(502, f"direct provider failed: {error}")))
+        finally:
+            _capacity.release()
+
+    threading.Thread(target=complete, daemon=True).start()
+    include_usage = bool(request.stream_options and request.stream_options.include_usage)
+    try:
+        while True:
+            try:
+                kind, value = results.get(timeout=_KEEPALIVE_SECONDS)
+            except queue.Empty:
+                yield b": keep-alive\n\n"
+                continue
+            if kind == "error":
+                payload = {
+                    **base,
+                    "error": {"message": str(value.detail), "type": "upstream_error"},
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+                }
+                yield f"data: {json.dumps(payload)}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+                return
+            yield from _sse(value, include_usage)
+            return
+    finally:
+        cancelled.set()
 
 
 def _complete(request: ChatRequest, headers: dict[str, str] | None = None) -> dict[str, Any]:
@@ -657,6 +914,8 @@ _MODEL_ALIASES = {
     "ultra": "mantis/ultra",
     "mantis-fusion": "mantis/fusion",
     "fusion": "mantis/fusion",
+    "mantis-azure-router": _AZURE_ROUTER_MODEL,
+    "azure-router": _AZURE_ROUTER_MODEL,
 }
 _SUPPORTED_PARAMETERS = [
     "tools",
@@ -666,6 +925,7 @@ _SUPPORTED_PARAMETERS = [
     "reasoning_effort",
     "max_tokens",
     "max_completion_tokens",
+    "temperature",
     "stream",
     "stream_options",
     "web_search_options",
@@ -1004,10 +1264,11 @@ def models() -> dict[str, Any]:
     }
     data = [
         {"id": _BASIC_MODEL, "status": "stable", **basic},
+        {"id": _AZURE_ROUTER_MODEL, "status": "stable", **basic},
         {"id": "mantis/fusion", "status": "stable", **descriptor},
     ]
     if _experimental_modes_enabled():
-        data[1:1] = [
+        data[2:2] = [
             {"id": "mantis/trinity", "status": "experimental", **descriptor},
             {"id": "mantis/ultra", "status": "experimental", **descriptor},
         ]
@@ -1043,6 +1304,21 @@ def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Respons
             )
         try:
             return _build_fusion_chat_response(request_id, "mantis/fusion", event, request)
+        finally:
+            _capacity.release()
+    if request.model == _AZURE_ROUTER_MODEL:
+        if request.stream:
+            return StreamingResponse(
+                _stream_direct(request, headers, "chatcmpl-" + request_id[:24]),
+                media_type="text/event-stream",
+                headers={
+                    "X-Request-Id": request_id,
+                    "X-Mantis-Streaming": "live-status,verified-buffered-content",
+                },
+            )
+        try:
+            body = _complete_direct(request, headers)
+            return JSONResponse(body, headers={"X-Request-Id": request_id})
         finally:
             _capacity.release()
     if request.model == _BASIC_MODEL:

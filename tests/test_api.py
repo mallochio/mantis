@@ -4,13 +4,27 @@ import json
 import threading
 import time
 from types import SimpleNamespace
+from typing import Any
 
 import api
+import base_proxy
 import providers
 import pytest
 import serve
 from fastapi.testclient import TestClient
 from openai import OpenAI
+
+
+@pytest.fixture(autouse=True)
+def _switchyard_relay_only(monkeypatch):
+    """Pin the Switchyard relay for contract tests.
+
+    These tests mock the Switchyard hop; the direct LiteLLM efficient leg
+    (Bedrock/Vertex targets) must not intercept them or they would make real
+    upstream calls. That leg has its own hermetic tests in
+    test_base_proxy.py.
+    """
+    monkeypatch.setattr(base_proxy, "_direct_litellm_spec", lambda: None)
 
 
 @pytest.fixture
@@ -997,10 +1011,15 @@ def test_sanitize_messages_strips_cross_model_reasoning():
         {"role": "tool", "tool_call_id": "1", "content": "ok", "reasoning": "..."},
     ]
     out = providers._sanitize_messages(messages, "openai/gpt-4o")
-    assert out[0]["content"] == "answer"
+    # Reasoning fields are stripped from the message dict.
     assert "reasoning" not in out[0]
     assert "reasoning_details" not in out[0]
     assert "_anthropic_content" not in out[0]
+    # Portable reasoning text is downgraded into the content as a
+    # <prior_reasoning> block so the next model gets useful context.
+    assert "answer" in out[0]["content"]
+    assert "<prior_reasoning>" in out[0]["content"]
+    assert "long chain" in out[0]["content"]
     assert "reasoning" not in out[1]
 
 
@@ -1219,6 +1238,7 @@ def test_experimental_modes_are_hidden_and_rejected_by_default(client, monkeypat
     models = client.get("/v1/models", headers=_headers()).json()["data"]
     assert [(item["id"], item["status"]) for item in models] == [
         ("mantis/base", "stable"),
+        ("mantis/azure-router", "stable"),
         ("mantis/fusion", "stable"),
     ]
 
@@ -1259,6 +1279,7 @@ def test_experimental_startup_exposes_and_allows_trinity_and_ultra(client, monke
     models = client.get("/v1/models", headers=_headers()).json()["data"]
     assert [(item["id"], item["status"]) for item in models] == [
         ("mantis/base", "stable"),
+        ("mantis/azure-router", "stable"),
         ("mantis/trinity", "experimental"),
         ("mantis/ultra", "experimental"),
         ("mantis/fusion", "stable"),
@@ -1276,3 +1297,311 @@ def test_base_and_fusion_are_never_experimental(monkeypatch):
     for model in ("mantis/base", "mantis/fusion"):
         request = api.ChatRequest(model=model, messages=[api.Message(role="user", content="hi")])
         assert api._experimental_gate(request) is None
+
+
+# -- Improvement 1: Reasoning downgrade to inline text ---------------------
+
+
+def test_sanitize_messages_downgrades_reasoning_to_inline_text():
+    """Cross-model reasoning should be inlined as <prior_reasoning>, not dropped."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning": "I thought about X and concluded Y.",
+            "_mantis_model": "openai/gpt-5.6-sol",
+        }
+    ]
+    out = providers._sanitize_messages(messages, "anthropic/claude-opus-5")
+    assert "reasoning" not in out[0]
+    assert "<prior_reasoning>" in out[0]["content"]
+    assert "I thought about X and concluded Y." in out[0]["content"]
+    assert "answer" in out[0]["content"]
+
+
+def test_sanitize_messages_downgrade_excludes_encrypted_details():
+    """Encrypted reasoning details must not leak into the downgraded text."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning": "safe text",
+            "reasoning_details": [
+                {"type": "reasoning.encrypted", "data": "opaque-cipher"},
+                {"type": "reasoning", "text": "portable summary"},
+            ],
+            "_mantis_model": "openai/gpt-5.6-sol",
+        }
+    ]
+    out = providers._sanitize_messages(messages, "deepseek-v4-flash")
+    content = out[0]["content"]
+    assert "safe text" in content
+    assert "portable summary" in content
+    assert "opaque-cipher" not in content
+    assert "reasoning" not in out[0] or out[0].get("reasoning") is None
+
+
+def test_sanitize_messages_downgrade_respects_char_limit():
+    """Downgraded reasoning text should be bounded."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning": "x" * 5000,
+            "_mantis_model": "openai/gpt-5.6-sol",
+        }
+    ]
+    out = providers._sanitize_messages(messages, "deepseek-v4-flash")
+    content = out[0]["content"]
+    assert len(content) < 5000
+    assert "..." in content
+
+
+def test_sanitize_messages_downgrade_preserves_list_content():
+    """When content is a list, the downgrade should still work."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "original answer"}],
+            "reasoning": "thought process",
+            "_mantis_model": "openai/gpt-5.6-sol",
+        }
+    ]
+    out = providers._sanitize_messages(messages, "deepseek-v4-flash")
+    content = out[0]["content"]
+    assert isinstance(content, str)
+    assert "thought process" in content
+    assert "original answer" in content
+
+
+def test_sanitize_messages_no_downgrade_when_no_reasoning():
+    """Messages without reasoning should pass through unchanged."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "plain answer",
+            "_mantis_model": "openai/gpt-5.6-sol",
+        }
+    ]
+    out = providers._sanitize_messages(messages, "deepseek-v4-flash")
+    assert out[0]["content"] == "plain answer"
+    assert "<prior_reasoning>" not in out[0]["content"]
+
+
+def test_extract_portable_reasoning_text_skips_encrypted():
+    """The portable text extractor should skip endpoint-bound items."""
+    msg = {
+        "role": "assistant",
+        "reasoning": "plain reasoning",
+        "reasoning_details": [
+            {"type": "reasoning.encrypted", "data": "cipher"},
+            {"format": "openai-compaction", "data": "compact"},
+            {"type": "reasoning", "text": "safe detail"},
+        ],
+    }
+    text = providers._extract_portable_reasoning_text(msg)
+    assert "plain reasoning" in text
+    assert "safe detail" in text
+    assert "cipher" not in text
+    assert "compact" not in text
+
+
+# -- Improvement 3: clear_thinking compaction policy -----------------------
+
+
+def test_clear_thinking_keeps_last_n():
+    """Only the last N assistant messages should keep reasoning."""
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1", "reasoning": "r1"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "a2", "reasoning": "r2"},
+        {"role": "user", "content": "q3"},
+        {"role": "assistant", "content": "a3", "reasoning": "r3"},
+    ]
+    out = providers._clear_thinking(messages, keep=2)
+    assert "reasoning" not in out[2]  # a1: stripped
+    assert out[4].get("reasoning") == "r2"  # a2: kept
+    assert out[6].get("reasoning") == "r3"  # a3: kept
+
+
+def test_clear_thinking_strips_content_list_thinking_blocks():
+    """Thinking blocks in content lists should be removed from older turns."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "text": "old thought"},
+                {"type": "text", "text": "answer"},
+            ],
+            "reasoning": "old",
+        },
+        {"role": "user", "content": "next"},
+        {"role": "assistant", "content": "latest", "reasoning": "new"},
+    ]
+    out = providers._clear_thinking(messages, keep=1)
+    assert "reasoning" not in out[0]
+    content_types = [p.get("type") for p in out[0]["content"]]
+    assert "thinking" not in content_types
+    assert out[2].get("reasoning") == "new"
+
+
+def test_clear_thinking_noop_when_few_messages():
+    """When there are fewer assistant messages than keep, return unchanged."""
+    messages = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "a", "reasoning": "r"},
+    ]
+    out = providers._clear_thinking(messages, keep=2)
+    assert out[1].get("reasoning") == "r"
+
+
+def test_clear_thinking_does_not_mutate_originals():
+    """The function should not modify the original messages."""
+    original = {"role": "assistant", "content": "a", "reasoning": "r"}
+    messages = [original, {"role": "user", "content": "q"}, {"role": "assistant", "content": "b"}]
+    providers._clear_thinking(messages, keep=1)
+    assert original.get("reasoning") == "r"
+
+
+# -- Improvement 5: Reasoning drop telemetry -------------------------------
+
+
+def test_sanitize_messages_emits_reasoning_dropped_telemetry():
+    """Dropping reasoning from a tagged message should emit a progress event."""
+    events: list[dict] = []
+    import serve_config
+    serve_config._history_context.event_sink = events.append
+    try:
+        messages = [
+            {
+                "role": "assistant",
+                "content": "answer",
+                "reasoning": "chain",
+                "_mantis_model": "openai/gpt-5.6-sol",
+            }
+        ]
+        providers._sanitize_messages(messages, "deepseek-v4-flash")
+        dropped = [e for e in events if e.get("type") == "reasoning_dropped"]
+        assert len(dropped) == 1
+        assert dropped[0]["source_model"] == "openai/gpt-5.6-sol"
+        assert dropped[0]["target_model"] == "deepseek-v4-flash"
+        assert "reasoning" in dropped[0]["fields"]
+    finally:
+        serve_config._history_context.event_sink = None
+
+
+def test_sanitize_messages_no_telemetry_for_untagged():
+    """Untagged legacy messages should not emit telemetry."""
+    events: list[dict] = []
+    import serve_config
+    serve_config._history_context.event_sink = events.append
+    try:
+        messages = [{"role": "assistant", "content": "a", "reasoning": "r"}]
+        providers._sanitize_messages(messages, "openai/gpt-4o")
+        dropped = [e for e in events if e.get("type") == "reasoning_dropped"]
+        assert len(dropped) == 0
+    finally:
+        serve_config._history_context.event_sink = None
+
+
+def test_azure_router_complete_direct_uses_previous_response_id(monkeypatch):
+    """The direct Azure call sends previous_response_id when a session exists."""
+    from types import SimpleNamespace
+    calls: list[dict[str, Any]] = []
+
+    def fake_create(**kwargs: Any) -> SimpleNamespace:
+        calls.append(kwargs)
+        return SimpleNamespace(
+            id="resp-2",
+            output=[
+                SimpleNamespace(
+                    type="message",
+                    content=[SimpleNamespace(type="output_text", text=" Falcon.")],
+                )
+            ],
+            usage=SimpleNamespace(input_tokens=5, output_tokens=2, total_tokens=7),
+            created_at=1234567890,
+        )
+
+    fake_client = SimpleNamespace(responses=SimpleNamespace(create=fake_create))
+    monkeypatch.setattr(api.openai, "OpenAI", lambda **_: fake_client)
+    resolved = SimpleNamespace(
+        base_url="https://example.openai.azure.com",
+        credential_env="AZURE_API_KEY",
+        model="model-router",
+    )
+    monkeypatch.setattr(api.providers, "_resolve_model_spec", lambda _: resolved)
+    monkeypatch.setattr(api.providers, "_provider_keys", lambda: {})
+    monkeypatch.setenv("AZURE_API_KEY", "test-key")
+
+    first = api.ChatRequest(
+        model="mantis/azure-router",
+        messages=[api.Message(role="user", content="remember falcon")],
+        user="u2",
+    )
+    body1 = api._complete_direct(first, None)
+    assert body1["choices"][0]["message"]["content"] == " Falcon."
+    assert "previous_response_id" not in calls[-1]
+
+    second = api.ChatRequest(
+        model="mantis/azure-router",
+        messages=[
+            api.Message(role="user", content="remember falcon"),
+            api.Message(role="assistant", content=" Falcon."),
+            api.Message(role="user", content="which word?"),
+        ],
+        user="u2",
+    )
+    body2 = api._complete_direct(second, None)
+    assert body2["choices"][0]["message"]["content"] == " Falcon."
+    assert calls[-1]["previous_response_id"] == "resp-2"
+    api._azure_sessions.clear()
+
+
+def test_azure_router_session_reuses_previous_response_id():
+    """Extending an Azure session sends only new input with previous_response_id."""
+    api._azure_sessions.clear()
+    req1 = api.ChatRequest(
+        model="mantis/azure-router",
+        messages=[api.Message(role="user", content="first")],
+        user="u1",
+    )
+    input1, prev1 = api._azure_input_for_request(req1, None)
+    first_text = [{"type": "input_text", "text": "first"}]
+    expected_user = {"type": "message", "role": "user", "content": first_text}
+    assert input1 == [expected_user]
+    assert prev1 is None
+    full1 = [m for m in (api._azure_canonical_message(m) for m in req1.messages) if m]
+    assistant_response = [{"type": "output_text", "text": "ok"}]
+    full1.append({"type": "message", "role": "assistant", "content": assistant_response})
+    api._azure_store_session(req1, None, full1, "resp-1")
+
+    req2 = api.ChatRequest(
+        model="mantis/azure-router",
+        messages=[
+            api.Message(role="user", content="first"),
+            api.Message(role="assistant", content="ok"),
+            api.Message(role="user", content="second"),
+        ],
+        user="u1",
+    )
+    input2, prev2 = api._azure_input_for_request(req2, None)
+    second_text = [{"type": "input_text", "text": "second"}]
+    expected_second = {"type": "message", "role": "user", "content": second_text}
+    assert input2 == [expected_second]
+    assert prev2 == "resp-1"
+
+    # Shortening the conversation resets the cached prefix.
+    req3 = api.ChatRequest(
+        model="mantis/azure-router",
+        messages=[api.Message(role="user", content="first")],
+        user="u1",
+    )
+    input3, prev3 = api._azure_input_for_request(req3, None)
+    assert input3 == [
+        expected_user,
+    ]
+    assert prev3 is None
+    api._azure_sessions.clear()

@@ -100,13 +100,25 @@ class FusionRouter:
         complexity: float,
         previous: str,
         failure_count: int = 0,
+        cache_warm: bool = False,
     ) -> str:
-        """Reroute only where compaction already forces a cache miss."""
+        """Reroute only where compaction already forces a cache miss.
+
+        When ``cache_warm`` is True the previous model still has a warm
+        provider prompt cache. Switching models would bust the cache for no
+        quality gain, so we prefer staying on the current model unless the
+        task is stuck (``failure_count > 0``) or the complexity clearly
+        demands a stronger model.
+        """
         pool: str | list[str] = self.config.main if self.role == "main" else self.config.sidekick
         if isinstance(pool, str):
             return self._resolve(pool, failure_count)
         if not pool:
             raise ValueError(f"fusion {self.role} pool is empty")
+        # Cache-aware heuristic: if the cache is warm and the task is not
+        # stuck, stay on the current model to avoid a costly cache miss.
+        if cache_warm and failure_count == 0:
+            return previous
         if self.role == "main":
             if complexity < 0.85 and len(pool) > 1:
                 index = 0

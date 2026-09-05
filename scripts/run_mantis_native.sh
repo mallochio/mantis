@@ -4,6 +4,16 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVE_DIR="$REPO_ROOT/apps/api"
+
+# Mantis Bedrock: use static IAM keys (sid-bedrock) in eu-central-1, not SSO (expired)
+unset AWS_PROFILE AWS_SESSION_TOKEN 2>/dev/null || true
+export AWS_REGION="eu-central-1"
+if [[ -z "${AWS_ACCESS_KEY_ID:-}" ]]; then
+  export AWS_ACCESS_KEY_ID="$(security find-generic-password -a "$USER" -s "shell-env/AWS_ACCESS_KEY_ID" -w 2>/dev/null || true)"
+fi
+if [[ -z "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
+  export AWS_SECRET_ACCESS_KEY="$(security find-generic-password -a "$USER" -s "shell-env/AWS_SECRET_ACCESS_KEY" -w 2>/dev/null || true)"
+fi
 cd "$REPO_ROOT"
 
 [[ -f "$SERVE_DIR/api.py" ]] || { echo "missing $SERVE_DIR/api.py" >&2; exit 1; }

@@ -26,6 +26,7 @@ dependencies = [
     "pytest-cov>=7.1.0",
     "openai>=2.53.0",
     "litellm>=1.65,<2",
+    "google-cloud-aiplatform>=1.38",
 ]
 
 [project.optional-dependencies]
@@ -94,6 +95,7 @@ select = [
     "S",   # bandit (security)
     "TRY", # try/except style
     "PERF",# performance
+    "C901",# mccabe complexity
 ]
 ignore = [
     "S101",  # assert in tests
@@ -103,24 +105,40 @@ ignore = [
     "TRY003",# long messages outside exception class
     "EM101", # raw string in exception
     "EM102", # f-string in exception
+    "UP038", # isinstance tuple check
 ]
 
 [tool.ruff.lint.per-file-ignores]
 "apps/api/serve.py" = ["E402", "F403"]
 "apps/api/conductor.py" = ["E402"]
-"apps/api/providers.py" = ["E402", "E501", "B009", "BLE001", "TRY301"]
-"apps/api/runs.py" = ["E402"]
+"apps/api/providers.py" = ["E402", "E501", "B009", "BLE001", "TRY301", "C901"]
+"apps/api/runs.py" = ["E402", "C901"]
 "apps/api/serve_config.py" = ["E402"]
-"apps/api/trinity.py" = ["E402"]
+"apps/api/trinity.py" = ["E402", "C901"]
 "apps/api/utils.py" = ["E402"]
+"apps/api/base_proxy.py" = ["C901"]
+"apps/api/fusion.py" = ["C901"]
+"apps/api/tool_exec.py" = ["C901"]
 "scripts/retrain_router_pool.py" = ["E402"]
 "scripts/learn_router.py" = ["E402"]
-"scripts/retrain_conductor.py" = ["E402", "I001"]
+"scripts/retrain_conductor.py" = ["E402", "I001", "C901"]
+"scripts/fx_gateway_proxy.py" = ["C901"]
+"scripts/model_catalog_abi.py" = ["C901"]
 "scripts/toolscale_data.py" = ["ALL"]
 "tests/test_serve.py" = ["E501", "S310"]
-"apps/api/api.py" = ["E501"]
+"apps/api/api.py" = ["E501", "C901"]
 "tests/test_retrain_router_pool.py" = ["E501"]
 "tests/test_retrain_conductor.py" = ["I001", "S105"]
+"eval/*" = ["C901"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 12
+
+[tool.complexipy]
+paths = ["apps/api", "scripts"]
+max-complexity-allowed = 20
+sort = "desc"
+exclude = ["tests/**"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
