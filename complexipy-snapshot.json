@@ -105,7 +105,7 @@
       },
       {
         "name": "_litellm_kwargs",
-        "complexity": 36
+        "complexity": 34
       },
       {
         "name": "_coerce_reasoning_effort",

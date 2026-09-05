@@ -96,6 +96,7 @@ def _block_external_provider_calls(monkeypatch: pytest.MonkeyPatch):
 
     base_proxy._load_base_route.cache_clear()
     base_proxy._base_route_family.cache_clear()
+    base_proxy._session_tier_ranks.clear()
 
     def blocked_post(*_args, **_kwargs):
         raise httpx.NetworkError(

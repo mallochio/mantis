@@ -187,6 +187,19 @@ def _model_cache_family(model: str) -> str | None:
     return None
 
 
+def _apply_litellm_cache_markers(
+    messages: list[dict[str, Any]], resolved: ResolvedModelSpec, is_anthropic: bool
+) -> list[dict[str, Any]]:
+    """Add explicit markers for the resolved model family when enabled."""
+    if not _cache_breakpoints_enabled():
+        return messages
+    if is_anthropic:
+        return _with_cache_breakpoints(messages)
+    if _model_cache_family(resolved.model) == "openai":
+        return _with_openai_cache_breakpoints(messages)
+    return messages
+
+
 def _coerce_reasoning_effort(model: str, effort: str | None) -> str | None:
     name = model.rsplit("/", 1)[-1].lower()
     if name.startswith("glm-"):
@@ -249,9 +262,9 @@ def _with_openai_cache_breakpoints(messages: list[dict[str, Any]]) -> list[dict[
             last_system_index = i
     for i, message in enumerate(messages):
         msg = dict(message)
-        if i == last_system_index:
+        if i == last_system_index and "prompt_cache_breakpoint" not in msg:
             msg["prompt_cache_breakpoint"] = {"mode": "explicit"}
-        if i == len(messages) - 2 and len(messages) >= 2:
+        if i == len(messages) - 2 and len(messages) >= 2 and "prompt_cache_breakpoint" not in msg:
             msg["prompt_cache_breakpoint"] = {"mode": "explicit"}
         out.append(msg)
     return out
@@ -645,9 +658,8 @@ def _litellm_kwargs(
     # sanitize + cache
     is_anthropic = _is_anthropic_spec(resolved)
     sanitized = _sanitize_messages(_normalize_upstream_tool_ids(messages), resolved.model, is_anthropic, False)
-    # LiteLLM translates cache_control; keep mantis policy for anthropic family
-    if is_anthropic and _cache_breakpoints_enabled():
-        sanitized = _with_cache_breakpoints(sanitized)
+    # LiteLLM translates cache_control; keep mantis policy for explicit dialects.
+    sanitized = _apply_litellm_cache_markers(sanitized, resolved, is_anthropic)
 
     kwargs: dict[str, Any] = {
         "model": model,

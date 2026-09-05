@@ -909,7 +909,9 @@ class TrinityRun(NativeRun):
                 fn = call_info["function"]
                 reminder = self.repeat_guard.observe(fn.get("name", ""), fn.get("arguments", "{}"))
                 if reminder:
-                    pending["messages"].append({"role": "system", "content": reminder})
+                    pending["messages"].append(
+                        {"role": "user", "content": utils.system_reminder(reminder)}
+                    )
         self._expected_ids = set()
         self._pending = pending
 
@@ -1295,7 +1297,9 @@ class ConductorRun(NativeRun):
                 fn = call_info["function"]
                 reminder = self.repeat_guard.observe(fn.get("name", ""), fn.get("arguments", "{}"))
                 if reminder:
-                    pending["messages"].append({"role": "system", "content": reminder})
+                    pending["messages"].append(
+                        {"role": "user", "content": utils.system_reminder(reminder)}
+                    )
         self._expected_ids = set()
         self._pending = pending
 

@@ -7,9 +7,11 @@ this module forwards the chat body without rewriting ``model``.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
+import threading
 import tomllib
 from collections import Counter
 from collections.abc import Callable, Iterator
@@ -78,12 +80,43 @@ def _with_openai_cache_breakpoints(messages: list[dict[str, Any]]) -> list[dict[
             last_system_index = i
     for i, message in enumerate(messages):
         msg = dict(message)
-        if i == last_system_index:
+        if i == last_system_index and "prompt_cache_breakpoint" not in msg:
             msg["prompt_cache_breakpoint"] = {"mode": "explicit"}
-        if i == len(messages) - 2 and len(messages) >= 2:
+        if i == len(messages) - 2 and len(messages) >= 2 and "prompt_cache_breakpoint" not in msg:
             msg["prompt_cache_breakpoint"] = {"mode": "explicit"}
         out.append(msg)
     return out
+
+
+def _cache_breakpoints_enabled() -> bool:
+    return os.environ.get("MANTIS_CACHE_BREAKPOINTS", "1").lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _base_route_families() -> frozenset[str]:
+    """Return the set of explicit cache dialects used by the [base] route.
+
+    Only ``anthropic`` and ``openai`` need explicit markers. Models with
+    automatic prefix caching (kimi, deepseek, gemini, ...) contribute
+    nothing. A mixed ``kimi + gpt`` route therefore yields ``{"openai"}``
+    so the GPT leg still gets breakpoints instead of disabling all markers.
+    """
+    route = _load_base_route()
+    if route is None:
+        return frozenset()
+    try:
+        families = {_model_cache_family(m) for m in (
+            route.efficient.upstream_model,
+            route.capable.upstream_model,
+        )}
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        logger.debug("base route cache family not loaded: %s", error)
+        return frozenset()
+    return frozenset(f for f in families if f in {"anthropic", "openai"})
 
 
 def _catalog_path() -> Path:
@@ -111,22 +144,13 @@ def _load_base_route() -> Any | None:
 def _base_route_family() -> str | None:
     """Determine the prompt-cache family for the current [base] route.
 
-    Returns ``anthropic`` or ``openai`` when both base targets are the same
-    family, or ``None`` when the catalog cannot be read or the targets are
-    mixed/unknown (e.g., Grok and Claude in the same route).  In the mixed
-    case we avoid cache markers rather than risk sending Anthropic blocks to
-    xAI or dropping cache controls on a Claude call.
+    Kept for compatibility. Returns a family only when both targets share
+    one explicit dialect. Prefer ``_base_route_families`` which keeps the
+    usable dialect in mixed routes (e.g. ``kimi + gpt`` still caches GPT).
     """
-    route = _load_base_route()
-    if route is None:
-        return None
-    try:
-        models = (route.efficient.upstream_model, route.capable.upstream_model)
-        families = {_model_cache_family(m) for m in models}
-        if len(families) == 1 and None not in families:
-            return families.pop()
-    except (AttributeError, KeyError, TypeError, ValueError) as error:
-        logger.debug("base route cache family not loaded: %s", error)
+    families = _base_route_families()
+    if len(families) == 1:
+        return next(iter(families))
     return None
 
 
@@ -157,10 +181,18 @@ def session_id(headers: dict[str, str], body: BaseChatRequest) -> str | None:
     """Session identity for Switchyard stage-router stickiness.
 
     Accepts the Switchyard header, the legacy ``X-Route-Session`` client
-    header, or ``metadata.session_id`` / ``user`` in the body. Only
-    ``x-switchyard-session-id`` is sent upstream.
+    header, or ``metadata.session_id`` / ``user`` in the body. When the
+    harness sends none of these (common for opencode / prime-agent
+    defaults), fall back to a stable hash of the first user turn so
+    consecutive tool rounds still stick to one tier and reuse prefix cache.
+    Only ``x-switchyard-session-id`` is sent upstream.
     """
-    session = headers.get(SWITCHYARD_SESSION_HEADER) or headers.get("x-route-session")
+    session = (
+        headers.get(SWITCHYARD_SESSION_HEADER)
+        or headers.get("x-route-session")
+        or headers.get("x-mantis-session-id")
+        or headers.get("x-mantis-session")
+    )
     if session:
         return session
     if isinstance(body.metadata, dict):
@@ -170,7 +202,9 @@ def session_id(headers: dict[str, str], body: BaseChatRequest) -> str | None:
                 return value
     if isinstance(body.user, str) and body.user:
         return body.user
-    return None
+    messages = getattr(body, "messages", None)
+    tools = getattr(body, "tools", None)
+    return _synthetic_session_id(messages, tools)
 
 
 _ESCALATE_ENV = "MANTIS_BASE_ESCALATE_ON_FAILURE"
@@ -222,9 +256,18 @@ def failure_signals(messages: Any) -> int:
     return sum(1 for occurrences in counts.values() if occurrences >= threshold)
 
 
+def _salt_session_enabled() -> bool:
+    return os.environ.get("MANTIS_BASE_SALT_SESSION", "1").lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
 def escalation_suffix(body: BaseChatRequest) -> str:
     """Return the session-id suffix that forces a fresh tier decision."""
-    if not _escalation_enabled():
+    if not _escalation_enabled() or not _salt_session_enabled():
         return ""
     signals = failure_signals(getattr(body, "messages", None))
     return f"#esc{signals}" if signals else ""
@@ -259,6 +302,11 @@ def router_headers(
         suffix = escalation_suffix(body)
         out[SWITCHYARD_SESSION_HEADER] = session + suffix
         if suffix:
+            out["x-switchyard-force-tier"] = "capable"
+            out["x-switchyard-escalated"] = "1"
+        elif _escalation_enabled() and failure_signals(getattr(body, "messages", None)):
+            # Salt disabled: keep the session for prefix-cache reuse but still
+            # promote to capable so a looping task does not stay on efficient.
             out["x-switchyard-force-tier"] = "capable"
             out["x-switchyard-escalated"] = "1"
         # xAI Grok routes prompt-cache state by conversation; pinning the same
@@ -375,17 +423,22 @@ def _strip_endpoint_bound_reasoning(body: dict[str, Any]) -> dict[str, Any]:
 def _apply_base_cache_markers(body: dict[str, Any]) -> dict[str, Any]:
     """Add provider-native prompt-cache markers to the outgoing chat body.
 
-    The markers are chosen from the catalog [base] route so switching
-    ``catalog.toml`` between Grok and Anthropic does not require code changes.
+    Markers are the union of explicit dialects in the [base] route. A mixed
+    ``kimi + gpt`` route still marks the GPT leg; a ``claude + gpt`` route
+    marks both (Anthropic uses content blocks, OpenAI uses a message key,
+    so they do not conflict). Models with automatic caching need nothing.
     """
-    family = _base_route_family()
+    families = _base_route_families()
     messages = body.get("messages")
-    if not family or not isinstance(messages, list) or len(messages) < 2:
+    if not families or not isinstance(messages, list) or len(messages) < 2:
         return body
-    if family == "anthropic":
-        body["messages"] = _with_cache_breakpoints(messages)
-    elif family == "openai":
-        body["messages"] = _with_openai_cache_breakpoints(messages)
+    if not _cache_breakpoints_enabled():
+        return body
+    if "anthropic" in families:
+        messages = _with_cache_breakpoints(messages)
+    if "openai" in families:
+        messages = _with_openai_cache_breakpoints(messages)
+    body["messages"] = messages
     return body
 
 
@@ -532,6 +585,106 @@ def _classify_complexity(messages: list[dict[str, Any]]) -> str:
     if score >= 1.0:
         return "medium"
     return "simple"
+
+
+_TIER_RANK = {"simple": 0, "medium": 1, "complex": 2, "reasoning": 3}
+_RANK_TIER = ("simple", "medium", "complex", "reasoning")
+_SESSION_TIER_LIMIT = 1024
+_session_tier_ranks: dict[str, int] = {}
+_session_tier_lock = threading.Lock()
+
+
+def _tier_rank(tier: str | None) -> int:
+    return _TIER_RANK.get(tier or "", 0)
+
+
+def _recent_turn_window() -> int:
+    route = _load_base_route()
+    try:
+        window = int(getattr(route, "recent_turn_window", 3))
+    except (AttributeError, TypeError, ValueError):
+        return 3
+    return max(1, window)
+
+
+def _content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [_part_text(part) for part in content]
+        return " ".join(p for p in parts if p).strip()
+    if content is None:
+        return ""
+    return str(content).strip()
+
+
+def _part_text(part: Any) -> str:
+    text = part.get("text", "") if isinstance(part, dict) else getattr(part, "text", "")
+    return text if isinstance(text, str) else ""
+
+
+def _message_role_content(msg: Any) -> tuple[Any, Any]:
+    if isinstance(msg, dict):
+        return msg.get("role"), msg.get("content")
+    return getattr(msg, "role", None), getattr(msg, "content", None)
+
+
+def _user_texts(messages: Any) -> list[str]:
+    texts: list[str] = []
+    if not isinstance(messages, list):
+        return texts
+    for msg in messages:
+        role, content = _message_role_content(msg)
+        if role != "user":
+            continue
+        text = _content_text(content)
+        if text:
+            texts.append(text)
+    return texts
+
+
+def _classify_window(messages: Any, window: int) -> str:
+    texts = _user_texts(messages)[-max(1, window):]
+    if not texts:
+        return "simple"
+    best = 0
+    for text in texts:
+        rank = _tier_rank(_classify_complexity([{"role": "user", "content": text}]))
+        best = max(best, rank)
+    return _RANK_TIER[best]
+
+
+def _sticky_complexity(session: str | None, complexity: str) -> str:
+    """Keep the max tier per session so a warm capable prefix is not dropped."""
+    if not session:
+        return complexity
+    rank = _tier_rank(complexity)
+    with _session_tier_lock:
+        stored = _session_tier_ranks.get(session)
+        if stored is None or rank > stored:
+            while len(_session_tier_ranks) >= _SESSION_TIER_LIMIT:
+                _session_tier_ranks.pop(next(iter(_session_tier_ranks)))
+            _session_tier_ranks[session] = rank
+            return complexity
+        return _RANK_TIER[stored]
+
+
+def _synthetic_session_id(messages: Any, tools: Any = None) -> str | None:
+    """Hash the stable conversation prefix when the harness sends no session."""
+    texts = _user_texts(messages)
+    if not texts:
+        return None
+    names: list[str] = []
+    if isinstance(tools, list):
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            fn = tool.get("function")
+            name = fn.get("name") if isinstance(fn, dict) else tool.get("name")
+            if isinstance(name, str) and name:
+                names.append(name)
+    payload = "\n".join([texts[0], *sorted(set(names))])
+    return "auto-" + hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 def router_body(request: BaseChatRequest) -> dict[str, Any]:
@@ -852,13 +1005,16 @@ def forward(
     (now ``efficient_first``). Returns ``(response, handed_off)``.
     """
     outbound_body = router_body(request)
-    # Run the complexity classifier on the outbound body (after normalization)
-    # so the tier reflects the actual messages that will reach Switchyard.
-    complexity = _classify_complexity(outbound_body.get("messages", []))
+    # Classify over the recent window and keep the max tier per session so a
+    # reasoning turn warms capable once instead of flapping each turn.
+    complexity = _classify_window(
+        outbound_body.get("messages", []), _recent_turn_window()
+    )
     # An explicit reasoning_effort already implies the client knows the task
     # needs reasoning; boost to "reasoning" tier so Switchyard skips efficient.
     if outbound_body.get("reasoning_effort") and complexity != "reasoning":
         complexity = "reasoning"
+    complexity = _sticky_complexity(session_id(headers, request), complexity)
     outbound_headers = router_headers(headers, request, complexity=complexity)
     suffix = escalation_suffix(request)
 
