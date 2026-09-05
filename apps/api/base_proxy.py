@@ -718,7 +718,7 @@ def _direct_litellm_kwargs(body: dict[str, Any], resolved: Any) -> dict[str, Any
         for key in ("web_search_options", "reasoning", "reasoning_effort")
         if body.get(key) is not None
     }
-    kwargs = providers._litellm_kwargs(
+    kwargs: dict[str, Any] = providers._litellm_kwargs(
         resolved,
         body.get("messages", []),
         max_tokens,
@@ -943,8 +943,8 @@ def forward(
                         True,
                     )
                 envelope = _direct_litellm_chat(outbound_body, litellm_spec)
-            except Exception as error:  # noqa: BLE001 - fall through to Switchyard
-                logger.warning("direct efficient leg failed, using Switchyard: %s", error)
+            except Exception as exc:  # noqa: BLE001 - fall through to Switchyard
+                logger.warning("direct efficient leg failed, using Switchyard: %s", exc)
             else:
                 return (
                     JSONResponse(
