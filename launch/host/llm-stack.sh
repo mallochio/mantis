@@ -224,6 +224,9 @@ main_slot = fusion.get("main", "?")
 side_slot = fusion.get("sidekick", "?")
 main_eff = _slot_effort(main_slot)
 side_eff = _slot_effort(side_slot)
+providers = data.get("providers") or {}
+az = providers.get("azure-foundry-router") or {}
+az_url = az.get("base_url", "?")
 
 print(f"  Base:          {picker}")
 print(f"    efficient:   {eff_model} (reasoning={eff_effort}, max_tokens={eff_tokens})")
@@ -232,6 +235,8 @@ print(
     f"  Fusion:        main={_slot_str(main_slot)} (reasoning={main_eff}), "
     f"sidekick={_slot_str(side_slot)} (reasoning={side_eff})"
 )
+print(f"  Azure-router:  mantis/azure-router -> model-router (reasoning=medium, context=256000)")
+print(f"    endpoint:    {az_url}")
 PY
   )" || output=""
   if [ -n "$output" ]; then
