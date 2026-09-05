@@ -256,14 +256,25 @@ def test_repeated_identical_tool_call_is_a_failure_signal():
     assert base_proxy.failure_signals(_looping_messages(repeats=3)) == 2
 
 
-def test_escalation_salts_the_stickiness_key_only():
+def test_escalation_salts_the_stickiness_key_only(monkeypatch):
     """The salt must move the Switchyard session and leave cache affinity alone."""
+    monkeypatch.setenv("MANTIS_BASE_SALT_SESSION", "1")
     request = _SessionRequest(
         messages=_looping_messages(repeats=3), metadata={"session_id": "s-1"}
     )
     out = base_proxy.router_headers({}, request)
     assert out[base_proxy.SWITCHYARD_SESSION_HEADER] == "s-1#esc2"
     assert out[base_proxy.GROK_CONV_HEADER] == "s-1"
+
+
+def test_escalation_preserves_session_by_default():
+    """Default keeps prefix cache and still promotes via force-tier header."""
+    request = _SessionRequest(
+        messages=_looping_messages(repeats=3), metadata={"session_id": "s-1"}
+    )
+    out = base_proxy.router_headers({}, request)
+    assert out[base_proxy.SWITCHYARD_SESSION_HEADER] == "s-1"
+    assert out["x-switchyard-force-tier"] == "capable"
 
 
 def test_escalation_is_deterministic_and_idempotent():

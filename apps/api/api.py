@@ -337,19 +337,82 @@ def _azure_router_effort(request: ChatRequest) -> str:
 
 
 def _azure_router_max_tokens(request: ChatRequest) -> int:
-    cap = 128000
+    cap = 131072
     value = request.max_completion_tokens or request.max_tokens
     if value is not None:
         return min(value, cap)
     return cap
 
 
+def _azure_part_text(part: Any) -> str | None:
+    """Return stripped text from one content part, or None."""
+    text = getattr(part, "text", None)
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    if isinstance(part, dict) and isinstance(part.get("text"), str):
+        stripped = part["text"].strip()
+        if stripped:
+            return stripped
+    return None
+
+
+def _azure_list_text(content: list) -> str:
+    """Join text parts from a list content payload."""
+    parts = [text for part in content if (text := _azure_part_text(part))]
+    return " ".join(parts)
+
+
+def _azure_first_user_text(request: ChatRequest) -> str:
+    """Return the first user turn text for conversation fingerprinting."""
+    for msg in request.messages:
+        if msg.role != "user":
+            continue
+        content = msg.content
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        if isinstance(content, list):
+            joined = _azure_list_text(content)
+            if joined:
+                return joined
+    return ""
+
+
+def _azure_conversation_fingerprint(request: ChatRequest) -> str | None:
+    """Hash the stable conversation prefix for per-conversation isolation.
+
+    Uses only the first user turn plus sorted tool names so the key stays
+    stable across turns but differs across conversations sharing one harness
+    header such as ``opencode`` or ``prime-agent``.
+    """
+    first = _azure_first_user_text(request)
+    if not first:
+        return None
+    names: list[str] = []
+    for tool in request.tools or []:
+        name = getattr(getattr(tool, "function", None), "name", None)
+        if isinstance(name, str) and name:
+            names.append(name)
+    payload = first + "\n" + ",".join(sorted(set(names)))
+    import hashlib
+
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
 def _azure_session_key(request: ChatRequest, headers: dict[str, str] | None) -> str | None:
-    """Resolve a stable conversation key for Azure prompt-cache reuse."""
+    """Resolve a stable conversation key for Azure prompt-cache reuse.
+
+    Combines the harness namespace with a conversation fingerprint so two
+    different tasks sharing ``x-mantis-session-id: opencode`` do not evict
+    each other. Falls back to the bare header when no fingerprint exists.
+    """
     if headers:
         explicit = headers.get("x-mantis-session-id") or headers.get("x-mantis-session")
         if explicit:
-            return f"explicit:{explicit.strip()}"
+            cleaned = explicit.strip()
+            fingerprint = _azure_conversation_fingerprint(request)
+            if fingerprint:
+                return f"explicit:{cleaned}:{fingerprint}"
+            return f"explicit:{cleaned}"
     if request.user:
         return f"user:{request.user.strip()}"
     metadata = request.metadata or {}

@@ -747,7 +747,7 @@ def test_basic_model_relays_router_response_and_session(client, monkeypatch):
     assert response.headers["x-route-model"] == "anthropic/claude-opus-5"
     assert seen["body"]["model"] == "mantis/base"
     assert seen["headers"]["authorization"] == "Bearer router-key"
-    assert seen["headers"]["x-switchyard-session-id"] == "pi-session"
+    assert seen["headers"]["x-switchyard-session-id"].startswith("pi-session")
     assert "x-route-session" not in seen["headers"]
 
 

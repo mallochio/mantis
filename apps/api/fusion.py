@@ -1150,9 +1150,11 @@ class FusionRun(NativeRun):
         self._record_selected_slot(role, slot)
         messages = self.main_messages if role == "main" else self.sidekick_messages
         if role == "main" and messages and messages[0].get("role") == "system":
-            messages[0]["content"] = _main_preamble(
+            preamble = _main_preamble(
                 self.structured, self.worker_profiles, coordinator.worker_profiles
             )
+            if messages[0].get("content") != preamble:
+                messages[0]["content"] = preamble
         if prompt is not None:
             messages.append({"role": "user", "content": prompt})
         self.cache_namespace = providers._prompt_cache_namespace(

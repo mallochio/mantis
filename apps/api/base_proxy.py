@@ -182,9 +182,9 @@ def session_id(headers: dict[str, str], body: BaseChatRequest) -> str | None:
 
     Accepts the Switchyard header, the legacy ``X-Route-Session`` client
     header, or ``metadata.session_id`` / ``user`` in the body. When the
-    harness sends none of these (common for opencode / prime-agent
-    defaults), fall back to a stable hash of the first user turn so
-    consecutive tool rounds still stick to one tier and reuse prefix cache.
+    harness sends a shared header such as ``opencode``, combine it with a
+    synthetic hash of the first user turn so different conversations do not
+    share one Switchyard session and evict each other's prefix cache.
     Only ``x-switchyard-session-id`` is sent upstream.
     """
     session = (
@@ -194,6 +194,11 @@ def session_id(headers: dict[str, str], body: BaseChatRequest) -> str | None:
         or headers.get("x-mantis-session")
     )
     if session:
+        messages = getattr(body, "messages", None)
+        tools = getattr(body, "tools", None)
+        synthetic = _synthetic_session_id(messages, tools)
+        if synthetic and synthetic != session:
+            return f"{session}:{synthetic}"
         return session
     if isinstance(body.metadata, dict):
         for key in ("session_id", "sessionId"):
@@ -257,7 +262,13 @@ def failure_signals(messages: Any) -> int:
 
 
 def _salt_session_enabled() -> bool:
-    return os.environ.get("MANTIS_BASE_SALT_SESSION", "1").lower() not in {
+    """Return True when escalation must force a fresh Switchyard session.
+
+    Defaults to disabled so looping tasks keep prefix-cache reuse and still
+    promote to capable via ``x-switchyard-force-tier``. Set
+    ``MANTIS_BASE_SALT_SESSION=1`` to restore the old salting behavior.
+    """
+    return os.environ.get("MANTIS_BASE_SALT_SESSION", "0").lower() not in {
         "0",
         "false",
         "no",
@@ -687,12 +698,32 @@ def _synthetic_session_id(messages: Any, tools: Any = None) -> str | None:
     return "auto-" + hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
+def _trim_old_reasoning(body: dict[str, Any]) -> dict[str, Any]:
+    """Drop reasoning from old assistant turns to protect prefix-cache hits.
+
+    Keeps the last two assistant messages intact. Older traces bloat the
+    prefix and break cache reuse across providers. Best-effort: returns the
+    body unchanged when trimming is unavailable.
+    """
+    messages = body.get("messages")
+    if not isinstance(messages, list) or len(messages) < 3:
+        return body
+    try:
+        from providers import _clear_thinking
+
+        body["messages"] = _clear_thinking(messages, keep=2)
+    except Exception:  # noqa: BLE001 - trimming is best-effort
+        return body
+    return body
+
+
 def router_body(request: BaseChatRequest) -> dict[str, Any]:
     body = request.model_dump(exclude_none=True, exclude={"user", "metadata"})
     body = _normalize_reasoning(body)
     body = _coerce_base_reasoning(body)
     body = _coerce_max_completion_tokens(body)
     body = _strip_endpoint_bound_reasoning(body)
+    body = _trim_old_reasoning(body)
     return _apply_base_cache_markers(body)
 
 
