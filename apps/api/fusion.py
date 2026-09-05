@@ -631,7 +631,10 @@ class FusionCoordinator:
         Tool-pairing is preserved and the newest review/follow-up
         prompt always survives fitting so the live contract reaches the model.
         """
-        pruned = self._prune_for_budget(messages, max_input_tokens)
+        # Clear older reasoning traces before budget fitting so that stale
+        # thinking blocks do not consume context or break prompt-cache hits.
+        cleared = providers._clear_thinking(messages, keep=2)
+        pruned = self._prune_for_budget(cleared, max_input_tokens)
         if self._token_sum(pruned, tools) <= max_input_tokens:
             return pruned
         return self._drop_old_groups(pruned, max_input_tokens - self._tool_tokens(tools))
@@ -863,7 +866,9 @@ class ExecutionLane:
         if self.profile.model is None and getattr(
             serve_config._history_context, "fusion_compacted", False
         ):
-            self.run._reroute_after_compaction(self.role, slot)
+            self.run._reroute_after_compaction(
+                self.role, slot, cache_warm=self.run._has_cache_hits(usage),
+            )
         if self.run.budget is not None:
             self.run.budget.consume_tokens(usage)
             self.run.budget.consume_turn()
@@ -1157,7 +1162,9 @@ class FusionRun(NativeRun):
             self.budget.check_timeout()
         message, usage = coordinator._call_worker(slot, messages, tools)
         if getattr(serve_config._history_context, "fusion_compacted", False):
-            self._reroute_after_compaction(role, slot)
+            self._reroute_after_compaction(
+                role, slot, cache_warm=self._has_cache_hits(usage),
+            )
         messages.append(message)
         if self.budget is not None:
             self.budget.consume_tokens(usage)
@@ -1185,7 +1192,18 @@ class FusionRun(NativeRun):
         )
         return text, calls, usage
 
-    def _reroute_after_compaction(self, role: str, previous: str) -> None:
+    @staticmethod
+    def _has_cache_hits(usage: dict[str, Any]) -> bool:
+        """Return True when the usage dict reports prompt-cache hits."""
+        details = usage.get("prompt_tokens_details")
+        if isinstance(details, dict):
+            cached = details.get("cached_tokens", 0)
+            return isinstance(cached, int) and cached > 0
+        return False
+
+    def _reroute_after_compaction(
+        self, role: str, previous: str, cache_warm: bool = False
+    ) -> None:
         if role == "main" and self.structured and self.structured_plan is None:
             self.main_compaction_pending = previous
             return
@@ -1193,7 +1211,9 @@ class FusionRun(NativeRun):
         if router is None:
             return
         complexity = self.structured_plan.complexity if self.structured_plan else 1.0
-        selected = router.select_at_compaction(complexity, previous, self.follow_up_count)
+        selected = router.select_at_compaction(
+            complexity, previous, self.follow_up_count, cache_warm=cache_warm,
+        )
         if selected == previous:
             return
         if role == "main":

@@ -24,6 +24,18 @@ base_url = "https://interhuman-ai--ep-qwen3-8-2-4t-a95b-server.us-west.modal.dir
 credential_env = "MODAL_PROXY_TOKEN"
 protocols = ["chat_completions"]
 
+[providers.bedrock]
+adapter = "bedrock"
+base_url = "https://bedrock-runtime.eu-central-1.amazonaws.com"
+credential_env = "AWS_ACCESS_KEY_ID"
+protocols = ["chat_completions"]
+
+[providers."vertex"]
+adapter = "vertex"
+base_url = "https://aiplatform.googleapis.com/v1"
+credential_env = "GOOGLE_APPLICATION_CREDENTIALS"
+protocols = ["chat_completions"]
+
 [base]
 # Switchyard stage-router for mantis/base
 # Swap efficient/capable models or their providers here; launch regenerates routes.toml.

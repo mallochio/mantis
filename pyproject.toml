@@ -26,6 +26,7 @@ dependencies = [
     "pytest-cov>=7.1.0",
     "openai>=2.53.0",
     "litellm>=1.65,<2",
+    "google-cloud-aiplatform>=1.38",
 ]
 
 [project.optional-dependencies]

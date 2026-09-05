@@ -24,6 +24,7 @@ logger = logging.getLogger("mantis.base_proxy")
 
 SWITCHYARD_SESSION_HEADER = "x-switchyard-session-id"
 SWITCHYARD_SELECTED_MODEL_HEADER = "x-model-router-selected-model"
+SWITCHYARD_COMPLEXITY_HEADER = "x-switchyard-complexity"
 GROK_CONV_HEADER = "x-grok-conv-id"
 DEFAULT_ROUTER_URL = "http://127.0.0.1:5500/v1"
 
@@ -243,7 +244,12 @@ def _capable_provider_info() -> tuple[str, str, str] | None:
         return provider.base_url, provider.credential_env, capable.upstream_model
 
 
-def router_headers(headers: dict[str, str], body: BaseChatRequest) -> dict[str, str]:
+def router_headers(
+    headers: dict[str, str],
+    body: BaseChatRequest,
+    *,
+    complexity: str | None = None,
+) -> dict[str, str]:
     out: dict[str, str] = {}
     key = os.environ.get("MANTIS_ROUTER_KEY")
     if key:
@@ -260,6 +266,13 @@ def router_headers(headers: dict[str, str], body: BaseChatRequest) -> dict[str, 
         # providers ignore the custom header, so it is safe to forward whenever
         # we have a stable session identity.
         out[GROK_CONV_HEADER] = session
+    # Complexity classifier hint for Switchyard: lets the stage router send
+    # REASONING-tier requests directly to the capable target instead of
+    # trying efficient first and escalating.
+    if complexity and complexity in _COMPLEXITY_TIERS:
+        out[SWITCHYARD_COMPLEXITY_HEADER] = complexity
+        if complexity == "reasoning" and "x-switchyard-force-tier" not in out:
+            out["x-switchyard-force-tier"] = "capable"
     return out
 
 
@@ -374,6 +387,151 @@ def _apply_base_cache_markers(body: dict[str, Any]) -> dict[str, Any]:
     elif family == "openai":
         body["messages"] = _with_openai_cache_breakpoints(messages)
     return body
+
+
+# -- Complexity classifier --------------------------------------------------
+#
+# Lightweight prompt-based classifier inspired by LiteLLM's complexity_router.
+# Classifies the last user message into one of four tiers so Switchyard can
+# route REASONING-tier requests directly to the capable target.
+
+_COMPLEXITY_TIERS = ("simple", "medium", "complex", "reasoning")
+
+_REASONING_MARKERS = (
+    "step by step",
+    "think through",
+    "reason about",
+    "work through",
+    "chain of thought",
+    "let's think",
+    "explain your reasoning",
+    "show your work",
+    "prove that",
+    "derive",
+    "analyze",
+    "compare and contrast",
+    "evaluate the tradeoffs",
+    "what are the implications",
+)
+
+_TECHNICAL_MARKERS = (
+    "algorithm",
+    "complexity",
+    "optimization",
+    "architecture",
+    "distributed",
+    "concurrency",
+    "deadlock",
+    "race condition",
+    "memory leak",
+    "security vulnerability",
+    "cryptograph",
+    "differential equation",
+    "gradient",
+    "backpropag",
+    "eigenvalue",
+    "theorem",
+    "proof",
+    "formal verification",
+)
+
+_CODE_MARKERS = (
+    "```",
+    "def ",
+    "class ",
+    "function ",
+    "import ",
+    "SELECT ",
+    "CREATE TABLE",
+    "async ",
+    "await ",
+)
+
+_MULTISTEP_MARKERS = (
+    " then ",
+    " after that ",
+    " next ",
+    " finally ",
+    " first ",
+    " second ",
+    " third ",
+    "1.",
+    "2.",
+    "3.",
+)
+
+
+def _classify_complexity(messages: list[dict[str, Any]]) -> str:
+    """Return a complexity tier for the conversation's last user message.
+
+    Tiers: ``simple``, ``medium``, ``complex``, ``reasoning``.
+
+    The classifier uses cheap text heuristics (marker presence, token count,
+    question density) rather than an LLM call, so it adds negligible latency.
+    """
+    # Find the last user message content.
+    text = ""
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = " ".join(
+                p.get("text", "") for p in content if isinstance(p, dict)
+            )
+        break
+
+    if not text:
+        return "simple"
+
+    lowered = text.lower()
+    word_count = len(text.split())
+    score = 0.0
+
+    # Reasoning markers carry the strongest signal.
+    reasoning_hits = sum(1 for m in _REASONING_MARKERS if m in lowered)
+    if reasoning_hits >= 2:
+        return "reasoning"
+    score += reasoning_hits * 2.0
+
+    # Technical vocabulary.
+    tech_hits = sum(1 for m in _TECHNICAL_MARKERS if m in lowered)
+    score += tech_hits * 1.5
+
+    # Code presence.
+    code_hits = sum(1 for m in _CODE_MARKERS if m in text)
+    score += code_hits * 1.0
+
+    # Multi-step patterns.
+    step_hits = sum(1 for m in _MULTISTEP_MARKERS if m in text)
+    score += step_hits * 0.5
+
+    # Length contributes (longer prompts tend to be more complex).
+    if word_count > 500:
+        score += 2.0
+    elif word_count > 200:
+        score += 1.0
+    elif word_count > 50:
+        score += 0.5
+
+    # Question density.
+    question_count = text.count("?")
+    if question_count >= 3:
+        score += 1.5
+    elif question_count >= 1:
+        score += 0.5
+
+    if score >= 6.0:
+        return "reasoning"
+    if score >= 3.0:
+        return "complex"
+    if score >= 1.0:
+        return "medium"
+    return "simple"
 
 
 def router_body(request: BaseChatRequest) -> dict[str, Any]:
@@ -507,6 +665,178 @@ def _direct_capable_headers_and_body(
     return direct_headers, direct_body
 
 
+# Providers Switchyard 0.2.0 cannot serve: it only speaks OpenAI-chat,
+# OpenAI-responses, and Anthropic-messages wire formats with static bearer or
+# x-api-key auth. Bedrock needs SigV4-signed Converse calls and Vertex needs
+# OAuth, so the efficient leg for these adapters goes through LiteLLM
+# directly instead of the Switchyard hop. Anything else keeps using the
+# stage router (which also remains the escalation fallback below).
+_DIRECT_LITELLM_ADAPTERS = frozenset({"bedrock", "vertex", "vertex_ai"})
+
+
+def _direct_litellm_spec() -> Any | None:
+    """Build a provider spec for the efficient target, or None.
+
+    Returns None when there is no [base] route or when the efficient target
+    rides a Switchyard-servable adapter.
+    """
+    import providers
+
+    route = _load_base_route()
+    if route is None:
+        return None
+    try:
+        target = route.efficient
+        binding = route.providers[target.provider]
+    except (AttributeError, KeyError, TypeError):
+        return None
+    if binding.adapter not in _DIRECT_LITELLM_ADAPTERS:
+        return None
+    return providers.ResolvedModelSpec(
+        adapter=binding.adapter,
+        model=target.upstream_model,
+        effort=target.reasoning_effort,
+        base_url=binding.base_url,
+        credential_env=binding.credential_env,
+        binding=target.provider,
+        protocols=tuple(binding.protocols),
+        slot=None,
+        max_tokens=target.max_tokens,
+    )
+
+
+def _direct_litellm_kwargs(body: dict[str, Any], resolved: Any) -> dict[str, Any]:
+    """Render LiteLLM kwargs from an outbound chat body and resolved spec."""
+    import providers
+
+    # The catalog target budget wins over the client value (mirrors the
+    # Switchyard extra_body override): reasoning targets burn most of a small
+    # budget on thinking and would otherwise return empty content.
+    max_tokens = resolved.max_tokens or body.get("max_tokens") or 64000
+    controls = {
+        key: body[key]
+        for key in ("web_search_options", "reasoning", "reasoning_effort")
+        if body.get(key) is not None
+    }
+    kwargs = providers._litellm_kwargs(
+        resolved,
+        body.get("messages", []),
+        max_tokens,
+        body.get("temperature", 0.7),
+        body.get("tools"),
+        body.get("tool_choice"),
+        body.get("response_format"),
+        controls,
+    )
+    kwargs["timeout"] = float(os.environ.get("MANTIS_ROUTER_TIMEOUT_S", "300"))
+    return kwargs
+
+
+def _direct_litellm_chat(body: dict[str, Any], resolved: Any) -> dict[str, Any]:
+    """Run the efficient leg through LiteLLM; return an OpenAI chat envelope."""
+    import time
+
+    import providers
+
+    kwargs = _direct_litellm_kwargs(body, resolved)
+    data = providers._response_to_dict(providers._litellm_completion(**kwargs))
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise ValueError("efficient target returned no choices")
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    return {
+        "id": f"chatcmpl-direct-{int(time.time() * 1000):x}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": "mantis/base",
+        "choices": choices,
+        "usage": usage,
+    }
+
+
+def _delta_to_dict(delta: Any) -> dict[str, Any]:
+    """Convert a LiteLLM stream delta to a JSON-serializable OpenAI delta."""
+    event_delta: dict[str, Any] = {"role": "assistant"}
+    content = getattr(delta, "content", None)
+    if content is not None:
+        event_delta["content"] = content
+    reasoning = getattr(delta, "reasoning_content", None)
+    if reasoning is not None:
+        event_delta["reasoning_content"] = reasoning
+    raw_calls = getattr(delta, "tool_calls", None)
+    if raw_calls:
+        calls = []
+        for call in raw_calls:
+            if isinstance(call, dict):
+                calls.append(call)
+                continue
+            function = getattr(call, "function", None)
+            entry: dict[str, Any] = {}
+            if getattr(call, "id", None) is not None:
+                entry["id"] = call.id
+            if getattr(call, "type", None) is not None:
+                entry["type"] = call.type
+            if getattr(call, "index", None) is not None:
+                entry["index"] = call.index
+            if function is not None:
+                if isinstance(function, dict):
+                    entry["function"] = function
+                else:
+                    entry["function"] = {
+                        "name": getattr(function, "name", None),
+                        "arguments": getattr(function, "arguments", None),
+                    }
+            calls.append(entry)
+        if calls:
+            event_delta["tool_calls"] = calls
+    return event_delta
+
+
+def _direct_litellm_stream(body: dict[str, Any], resolved: Any) -> Iterator[bytes]:
+    """Yield OpenAI SSE frames for the efficient leg through LiteLLM."""
+    import time
+
+    import providers
+
+    kwargs = _direct_litellm_kwargs(body, resolved)
+    created = int(time.time())
+    try:
+        stream = providers._litellm_completion(stream=True, **kwargs)
+        for chunk in stream:
+            for choice in getattr(chunk, "choices", None) or []:
+                delta = getattr(choice, "delta", None)
+                finish = getattr(choice, "finish_reason", None)
+                if delta is None:
+                    if finish is None:
+                        continue
+                    event_delta = {"role": "assistant"}
+                else:
+                    event_delta = _delta_to_dict(delta)
+                    if (
+                        finish is None
+                        and "content" not in event_delta
+                        and "reasoning_content" not in event_delta
+                        and "tool_calls" not in event_delta
+                    ):
+                        continue
+                frame = {
+                    "id": getattr(chunk, "id", "chatcmpl-direct"),
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": "mantis/base",
+                    "choices": [
+                        {"index": 0, "delta": event_delta, "finish_reason": finish}
+                    ],
+                }
+                yield ("data: " + json.dumps(frame) + "\n\n").encode()
+    except Exception as exc:  # noqa: BLE001 - end the stream cleanly on failure
+        logger.warning("direct efficient stream failed: %s", exc)
+    finally:
+        yield b"data: [DONE]\n\n"
+
+
 def forward(
     request: BaseChatRequest,
     headers: dict[str, str],
@@ -521,8 +851,15 @@ def forward(
     Otherwise the request goes through Switchyard with its normal picker
     (now ``efficient_first``). Returns ``(response, handed_off)``.
     """
-    outbound_headers = router_headers(headers, request)
     outbound_body = router_body(request)
+    # Run the complexity classifier on the outbound body (after normalization)
+    # so the tier reflects the actual messages that will reach Switchyard.
+    complexity = _classify_complexity(outbound_body.get("messages", []))
+    # An explicit reasoning_effort already implies the client knows the task
+    # needs reasoning; boost to "reasoning" tier so Switchyard skips efficient.
+    if outbound_body.get("reasoning_effort") and complexity != "reasoning":
+        complexity = "reasoning"
+    outbound_headers = router_headers(headers, request, complexity=complexity)
     suffix = escalation_suffix(request)
 
     # Picker-independent promotion: if looping is detected, bypass Switchyard
@@ -578,6 +915,48 @@ def forward(
                 # Direct capable errored — fall through to Switchyard below.
             # If we reach here direct path did not return, so continue to Switchyard.
 
+    # Efficient targets on adapters Switchyard cannot serve (Bedrock SigV4,
+    # Vertex OAuth) run through LiteLLM directly. On failure we fall through
+    # to Switchyard so escalation to the capable tier still applies.
+    if not suffix:
+        litellm_spec = _direct_litellm_spec()
+        if litellm_spec is not None:
+            try:
+                if request.stream:
+
+                    def _closing_stream() -> Iterator[bytes]:
+                        try:
+                            yield from _direct_litellm_stream(outbound_body, litellm_spec)
+                        finally:
+                            if on_close is not None:
+                                on_close()
+
+                    return (
+                        StreamingResponse(
+                            _closing_stream(),
+                            media_type="text/event-stream",
+                            headers={
+                                "X-Request-Id": request_id,
+                                "x-route-model": litellm_spec.model,
+                            },
+                        ),
+                        True,
+                    )
+                envelope = _direct_litellm_chat(outbound_body, litellm_spec)
+            except Exception as error:  # noqa: BLE001 - fall through to Switchyard
+                logger.warning("direct efficient leg failed, using Switchyard: %s", error)
+            else:
+                return (
+                    JSONResponse(
+                        envelope,
+                        headers={
+                            "X-Request-Id": request_id,
+                            "x-route-model": litellm_spec.model,
+                        },
+                    ),
+                    False,
+                )
+
     client = client_factory()
     url = os.environ.get("MANTIS_ROUTER_URL", DEFAULT_ROUTER_URL) + "/chat/completions"
     if request.stream:
@@ -604,6 +983,28 @@ def forward(
         body = None
     if upstream.is_error or (isinstance(body, dict) and body.get("error")):
         return router_error(upstream), False
+    if not isinstance(body, dict) or "choices" not in body:
+        # Upstream returned 200 with a payload that is not an OpenAI chat
+        # completion (e.g. a raw provider error passed through). Surfacing it
+        # as success confuses clients and hides the outage; report 502.
+        logger.warning(
+            "router returned non-chat payload status=%s body=%r",
+            upstream.status_code,
+            str(body)[:500],
+        )
+        return (
+            JSONResponse(
+                {
+                    "error": {
+                        "message": "router returned a non-chat payload",
+                        "type": "upstream_error",
+                        "status_code": upstream.status_code,
+                    }
+                },
+                status_code=502,
+            ),
+            False,
+        )
     return (
         JSONResponse(
             body,

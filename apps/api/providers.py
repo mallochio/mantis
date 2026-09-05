@@ -322,6 +322,10 @@ _ENDPOINT_BOUND_MARKERS = ("encrypted", "compaction")
 
 _INTERNAL_FIELDS = ("_anthropic_content", "_anthropic_tool_ids", "_mantis_model")
 
+# Maximum characters of portable reasoning text to inline when downgrading
+# cross-model reasoning from structured fields to plain assistant content.
+_REASONING_DOWNGRADE_MAX_CHARS = 2048
+
 
 def _portable_reasoning_details(msg: dict[str, Any]) -> None:
     """Drop reasoning items that are bound to the endpoint that produced them."""
@@ -344,6 +348,74 @@ def _portable_reasoning_details(msg: dict[str, Any]) -> None:
         msg.pop("reasoning_details", None)
 
 
+def _extract_portable_reasoning_text(msg: dict[str, Any]) -> str:
+    """Collect plain-text reasoning from an assistant message for downgrade.
+
+    Returns safe, human-readable reasoning text. Encrypted blobs, signatures,
+    and provider-internal metadata are excluded. The result is bounded to
+    ``_REASONING_DOWNGRADE_MAX_CHARS``.
+    """
+    pieces: list[str] = []
+    limit = _REASONING_DOWNGRADE_MAX_CHARS
+    length = 0
+
+    def _add(text: str) -> bool:
+        nonlocal length
+        text = text.strip()
+        if not text:
+            return True
+        if length + len(text) > limit:
+            remaining = limit - length
+            if remaining > 0:
+                pieces.append(text[:remaining] + "...")
+            return False
+        pieces.append(text)
+        length += len(text)
+        return True
+
+    for key in ("reasoning", "reasoning_content", "thinking"):
+        value = msg.get(key)
+        if isinstance(value, str) and value.strip() and not _add(value):
+            break
+
+    details = msg.get("reasoning_details")
+    if isinstance(details, list):
+        for item in details:
+            if not isinstance(item, dict):
+                continue
+            # Skip encrypted / endpoint-bound items
+            if any(
+                marker in str(item.get(k, "")).lower()
+                for k in ("type", "format")
+                for marker in _ENDPOINT_BOUND_MARKERS
+            ):
+                continue
+            summary = item.get("summary")
+            if isinstance(summary, list):
+                for part in summary:
+                    if (
+                        isinstance(part, dict)
+                        and isinstance(part.get("text"), str)
+                        and not _add(part["text"])
+                    ):
+                        break
+            if isinstance(item.get("text"), str) and not _add(item["text"]):
+                break
+
+    anthropic_content = msg.get("_anthropic_content")
+    if isinstance(anthropic_content, list):
+        for block in anthropic_content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "thinking"
+                and isinstance(block.get("thinking"), str)
+                and not _add(block["thinking"])
+            ):
+                break
+
+    return "\n".join(pieces)
+
+
 def _sanitize_messages(
     messages: list[dict[str, Any]],
     model: str,
@@ -352,6 +424,7 @@ def _sanitize_messages(
 ) -> list[dict[str, Any]]:
     is_deepseek = "deepseek" in model.lower()
     sanitized: list[dict[str, Any]] = []
+    reasoning_dropped: list[dict[str, str]] = []
     for original in messages:
         msg = dict(original)
         role = msg.get("role")
@@ -375,8 +448,29 @@ def _sanitize_messages(
             if keep_reasoning:
                 _portable_reasoning_details(msg)
             else:
+                # Downgrade: extract portable text before stripping fields.
+                downgraded = _extract_portable_reasoning_text(msg)
+                dropped_fields = [k for k in _REASONING_FIELDS if k in msg]
                 for k in _REASONING_FIELDS:
                     msg.pop(k, None)
+                # Inline the portable text as a <prior_reasoning> block so
+                # the next model receives useful context without provider-
+                # specific artifacts.
+                if downgraded:
+                    existing = msg.get("content") or ""
+                    if isinstance(existing, list):
+                        existing = " ".join(
+                            p.get("text", "") for p in existing if isinstance(p, dict)
+                        ).strip()
+                    prefix = f"<prior_reasoning>\n{downgraded}\n</prior_reasoning>"
+                    msg["content"] = f"{prefix}\n{existing}" if existing else prefix
+                # Emit telemetry for each reasoning drop.
+                if dropped_fields and produced_by:
+                    reasoning_dropped.append({
+                        "source_model": str(produced_by),
+                        "target_model": model,
+                        "fields": ",".join(sorted(dropped_fields)),
+                    })
             if not is_anthropic:
                 for k in ("_anthropic_content", "_anthropic_tool_ids"):
                     msg.pop(k, None)
@@ -387,6 +481,14 @@ def _sanitize_messages(
                 msg.pop(k, None)
         msg.pop("_mantis_model", None)
         sanitized.append(msg)
+    # Telemetry: emit progress events for reasoning drops (Improvement 5).
+    for drop in reasoning_dropped:
+        _emit_progress({
+            "type": "reasoning_dropped",
+            "source_model": drop["source_model"],
+            "target_model": drop["target_model"],
+            "fields": drop["fields"],
+        })
     return sanitized
 
 
@@ -408,6 +510,48 @@ def _prompt_cache_namespace(
         {"model": model, "messages": root, "tools": tools or []}, sort_keys=True, default=str
     )
     return hashlib.sha256(payload.encode()).hexdigest()[:32]
+
+
+def _clear_thinking(
+    messages: list[dict[str, Any]],
+    keep: int = 2,
+) -> list[dict[str, Any]]:
+    """Drop reasoning fields from all but the last ``keep`` assistant messages.
+
+    Inspired by Helicone's ``clear_thinking`` primitive: long sessions
+    accumulate reasoning traces that bloat context and destroy prompt-cache
+    hits. This trims older reasoning while preserving recent continuity.
+
+    The function returns a shallow-copied list; messages that lose reasoning
+    are dict-copied so the caller's originals are not mutated.
+    """
+    if keep < 0:
+        return messages
+    assistant_indices = [
+        i for i, m in enumerate(messages)
+        if isinstance(m, dict) and m.get("role") == "assistant"
+    ]
+    if len(assistant_indices) <= keep:
+        return messages
+    # Indices of assistant messages to strip (all except the last ``keep``).
+    strip_set = set(assistant_indices[: len(assistant_indices) - keep])
+    out: list[dict[str, Any]] = []
+    for i, msg in enumerate(messages):
+        if i in strip_set:
+            msg = dict(msg)
+            for k in _REASONING_FIELDS:
+                msg.pop(k, None)
+            # Also trim thinking blocks from content lists.
+            content = msg.get("content")
+            if isinstance(content, list):
+                msg["content"] = [
+                    p for p in content
+                    if not (isinstance(p, dict) and p.get("type") in ("thinking", "reasoning", "reasoning_content"))
+                ]
+            for k in ("_anthropic_content",):
+                msg.pop(k, None)
+        out.append(msg)
+    return out
 
 
 @contextmanager
@@ -505,8 +649,11 @@ def _litellm_kwargs(
         if resolved.base_url and resolved.base_url != "http://127.0.0.1:8080/v1":
             kwargs["api_base"] = resolved.base_url
     else:
-        # bedrock / vertex read creds from env, still pass key if present
-        if key:
+        # bedrock / vertex read creds from env (SigV4 / ADC). Never forward an
+        # IAM access key or service-account path as `api_key`: LiteLLM treats
+        # any api_key as Bedrock API-key auth and rejects IAM keys with
+        # "Invalid API Key format". Only a real Bedrock API key passes through.
+        if key and (resolved.adapter != "bedrock" or key.startswith("bedrock-api-key")):
             kwargs["api_key"] = key
 
     # temperature: omit when reasoning is active
@@ -519,6 +666,21 @@ def _litellm_kwargs(
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": budgets.get(coerced, 8192)}
         elif coerced != "none":
             kwargs["reasoning_effort"] = coerced
+
+    # Proactively request reasoning summaries from OpenAI models so that
+    # cross-model handoffs have a portable text artifact even when the raw
+    # reasoning is encrypted/endpoint-bound.  Only set when the client has
+    # not already supplied a ``reasoning`` control with its own preferences.
+    if (
+        coerced is not None
+        and coerced != "none"
+        and not is_anthropic
+        and "reasoning" not in controls
+        and _model_cache_family(resolved.model) == "openai"
+    ):
+        kwargs.setdefault("reasoning", {})
+        if isinstance(kwargs["reasoning"], dict) and "summary" not in kwargs["reasoning"]:
+            kwargs["reasoning"]["summary"] = "auto"
 
     if tools:
         kwargs["tools"] = tools

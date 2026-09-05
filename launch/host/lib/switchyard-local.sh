@@ -16,13 +16,24 @@ LIB_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 REPO_ROOT="$(cd "$LIB_DIR/../../.." && pwd)"
 
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+export RUST_LOG="switchyard=debug,bedrock=debug"
 
 if [ -f "$HOME/.zshrc" ]; then
   while IFS='=' read -r name value; do
     [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && export "$name=$value"
   done < <(/bin/zsh -lc 'source "$HOME/.zshrc" >/dev/null && env')
 fi
+# Mantis Bedrock: use static IAM keys in eu-central-1, not SSO (expired)
+unset AWS_PROFILE AWS_SESSION_TOKEN 2>/dev/null || true
+export AWS_REGION="eu-central-1"
+if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+  export AWS_ACCESS_KEY_ID="$(security find-generic-password -a "$USER" -s "shell-env/AWS_ACCESS_KEY_ID" -w 2>/dev/null || true)"
+fi
+if [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+  export AWS_SECRET_ACCESS_KEY="$(security find-generic-password -a "$USER" -s "shell-env/AWS_SECRET_ACCESS_KEY" -w 2>/dev/null || true)"
+fi
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+export RUST_LOG="switchyard=debug,bedrock=debug"
 
 DATA_DIR="${MANTIS_DATA_DIR:-$HOME/.local/share/mantis}"
 LOG_DIR="$DATA_DIR/switchyard"
