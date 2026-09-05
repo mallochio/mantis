@@ -1,0 +1,54 @@
+# Pre-commit hooks configuration
+# See https://pre-commit.com for more information
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+        # complexipy rewrites its generated snapshot without a final newline.
+        exclude: ^complexipy-snapshot\.json$
+      - id: check-yaml
+      - id: check-added-large-files
+        args: ["--maxkb=1000"]
+      - id: check-merge-conflict
+      - id: debug-statements
+      - id: check-ast
+      - id: check-builtin-literals
+      - id: check-case-conflict
+      - id: check-json
+      - id: check-toml
+
+  # Ruff for fast linting and auto-fixes
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.6
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+
+  # Cognitive complexity complements Ruff's cyclomatic complexity check.
+  - repo: https://github.com/rohaquinlop/complexipy-pre-commit
+    rev: v7.0.1
+    hooks:
+      - id: complexipy
+        pass_filenames: false
+        always_run: true
+        types_or: [python]
+        args: ["--failed"]
+
+# Global configuration
+default_language_version:
+  python: python3
+
+exclude: |
+  (?x)^(
+    \.git/.*|
+    \.venv/.*|
+    __pycache__/.*|
+    .*\.egg-info/.*|
+    build/.*|
+    dist/.*|
+    \.tox/.*|
+    OpenFugu/.*
+  )$
