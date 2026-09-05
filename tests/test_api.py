@@ -1503,3 +1503,43 @@ def test_sanitize_messages_no_telemetry_for_untagged():
         assert len(dropped) == 0
     finally:
         serve_config._history_context.event_sink = None
+
+
+def test_azure_router_session_reuses_previous_response_id():
+    """Extending an Azure session sends only new input with previous_response_id."""
+    api._azure_sessions.clear()
+    req1 = api.ChatRequest(
+        model="mantis/azure-router",
+        messages=[api.Message(role="user", content="first")],
+        user="u1",
+    )
+    input1, prev1 = api._azure_input_for_request(req1, None)
+    assert input1 == [{"role": "user", "content": "first"}]
+    assert prev1 is None
+    full1 = [{"role": m.role, "content": m.content} for m in req1.messages]
+    full1.append({"role": "assistant", "content": "ok"})
+    api._azure_store_session(req1, None, full1, "resp-1")
+
+    req2 = api.ChatRequest(
+        model="mantis/azure-router",
+        messages=[
+            api.Message(role="user", content="first"),
+            api.Message(role="assistant", content="ok"),
+            api.Message(role="user", content="second"),
+        ],
+        user="u1",
+    )
+    input2, prev2 = api._azure_input_for_request(req2, None)
+    assert input2 == [{"role": "user", "content": "second"}]
+    assert prev2 == "resp-1"
+
+    # Shortening the conversation resets the cached prefix.
+    req3 = api.ChatRequest(
+        model="mantis/azure-router",
+        messages=[api.Message(role="user", content="first")],
+        user="u1",
+    )
+    input3, prev3 = api._azure_input_for_request(req3, None)
+    assert input3 == [{"role": "user", "content": "first"}]
+    assert prev3 is None
+    api._azure_sessions.clear()

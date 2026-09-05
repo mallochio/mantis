@@ -318,6 +318,8 @@ _AZURE_ROUTER_MODEL = "mantis/azure-router"
 _AZURE_ROUTER_ALIAS = "azure-router"
 _AZURE_ROUTER_PROVIDER = "azure-foundry-router"
 _AZURE_ROUTER_DEPLOYMENT = "model-router"
+_AZURE_SESSION_LIMIT = 1024
+_azure_sessions: dict[str, tuple[str, list[dict[str, Any]]]] = {}
 
 
 def _azure_router_spec(request: ChatRequest) -> str:
@@ -340,6 +342,45 @@ def _azure_router_max_tokens(request: ChatRequest) -> int:
     if value is not None:
         return min(value, cap)
     return cap
+
+
+def _azure_session_key(request: ChatRequest, headers: dict[str, str] | None) -> str | None:
+    """Resolve a stable conversation key for Azure prompt-cache reuse."""
+    if headers:
+        explicit = headers.get("x-mantis-session-id") or headers.get("x-mantis-session")
+        if explicit:
+            return f"explicit:{explicit.strip()}"
+    if request.user:
+        return f"user:{request.user.strip()}"
+    metadata = request.metadata or {}
+    if isinstance(metadata, dict) and metadata.get("session_id"):
+        return f"metadata:{metadata['session_id']}"
+    return None
+
+
+def _azure_input_for_request(
+    request: ChatRequest,
+    headers: dict[str, str] | None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Return the input list and previous_response_id for an Azure request.
+
+    When the new messages extend the stored conversation, only the new tail is
+    sent with ``previous_response_id`` so the prior prompt prefix is cached.
+    When the conversation is reset, shortened, or has no session key, the full
+    message list is sent without a previous response id.
+    """
+    input_messages = [{"role": m.role, "content": m.content} for m in request.messages]
+    key = _azure_session_key(request, headers)
+    if not key:
+        return input_messages, None
+    previous = _azure_sessions.get(key)
+    if not previous:
+        return input_messages, None
+    previous_id, previous_messages = previous
+    previous_len = len(previous_messages)
+    if previous_len and previous_len < len(input_messages) and input_messages[:previous_len] == previous_messages:
+        return input_messages[previous_len:], previous_id
+    return input_messages, None
 
 
 def _azure_output_text(item: openai.types.responses.ResponseOutputMessage) -> str:
@@ -388,6 +429,21 @@ def _azure_response_to_chat_completion(model: str, resp: openai.types.responses.
     }
 
 
+def _azure_store_session(
+    request: ChatRequest,
+    headers: dict[str, str] | None,
+    input_messages: list[dict[str, Any]],
+    response_id: str,
+) -> None:
+    """Store the latest Azure response id for a session, pruning on overflow."""
+    key = _azure_session_key(request, headers)
+    if not key:
+        return
+    while len(_azure_sessions) >= _AZURE_SESSION_LIMIT:
+        _azure_sessions.pop(next(iter(_azure_sessions)))
+    _azure_sessions[key] = (response_id, input_messages)
+
+
 def _complete_direct(request: ChatRequest, headers: dict[str, str] | None = None) -> dict[str, Any]:
     resolved = providers._resolve_model_spec(_azure_router_spec(request))
     key = providers._provider_keys().get(_AZURE_ROUTER_PROVIDER) or os.environ.get(resolved.credential_env)
@@ -396,15 +452,22 @@ def _complete_direct(request: ChatRequest, headers: dict[str, str] | None = None
         api_key=key or "",
         default_headers={"api-key": key or ""},
     )
-    input_messages = [{"role": m.role, "content": m.content} for m in request.messages]
-    resp = client.responses.create(
-        model=resolved.model,
-        input=input_messages,
-        max_output_tokens=_azure_router_max_tokens(request),
-        reasoning={"effort": _azure_router_effort(request)},
-        stream=False,
-    )
-    return _azure_response_to_chat_completion(request.model, resp)
+    input_messages, previous_id = _azure_input_for_request(request, headers)
+    create_kwargs: dict[str, Any] = {
+        "model": resolved.model,
+        "input": input_messages,
+        "max_output_tokens": _azure_router_max_tokens(request),
+        "reasoning": {"effort": _azure_router_effort(request)},
+    }
+    if previous_id:
+        create_kwargs["previous_response_id"] = previous_id
+    resp = client.responses.create(**create_kwargs, stream=False)
+    body = _azure_response_to_chat_completion(request.model, resp)
+    full_messages = [{"role": m.role, "content": m.content} for m in request.messages]
+    assistant = body["choices"][0]["message"]
+    full_messages.append({"role": assistant["role"], "content": assistant["content"]})
+    _azure_store_session(request, headers, full_messages, resp.id)
+    return body
 
 
 def _stream_direct(
