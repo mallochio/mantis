@@ -4,6 +4,7 @@ import json
 import threading
 import time
 from types import SimpleNamespace
+from typing import Any
 
 import api
 import base_proxy
@@ -1505,6 +1506,60 @@ def test_sanitize_messages_no_telemetry_for_untagged():
         serve_config._history_context.event_sink = None
 
 
+def test_azure_router_complete_direct_uses_previous_response_id(monkeypatch):
+    """The direct Azure call sends previous_response_id when a session exists."""
+    from types import SimpleNamespace
+    calls: list[dict[str, Any]] = []
+
+    def fake_create(**kwargs: Any) -> SimpleNamespace:
+        calls.append(kwargs)
+        return SimpleNamespace(
+            id="resp-2",
+            output=[
+                SimpleNamespace(
+                    type="message",
+                    content=[SimpleNamespace(type="output_text", text=" Falcon.")],
+                )
+            ],
+            usage=SimpleNamespace(input_tokens=5, output_tokens=2, total_tokens=7),
+            created_at=1234567890,
+        )
+
+    fake_client = SimpleNamespace(responses=SimpleNamespace(create=fake_create))
+    monkeypatch.setattr(api.openai, "OpenAI", lambda **_: fake_client)
+    resolved = SimpleNamespace(
+        base_url="https://example.openai.azure.com",
+        credential_env="AZURE_API_KEY",
+        model="model-router",
+    )
+    monkeypatch.setattr(api.providers, "_resolve_model_spec", lambda _: resolved)
+    monkeypatch.setattr(api.providers, "_provider_keys", lambda: {})
+    monkeypatch.setenv("AZURE_API_KEY", "test-key")
+
+    first = api.ChatRequest(
+        model="mantis/azure-router",
+        messages=[api.Message(role="user", content="remember falcon")],
+        user="u2",
+    )
+    body1 = api._complete_direct(first, None)
+    assert body1["choices"][0]["message"]["content"] == " Falcon."
+    assert "previous_response_id" not in calls[-1]
+
+    second = api.ChatRequest(
+        model="mantis/azure-router",
+        messages=[
+            api.Message(role="user", content="remember falcon"),
+            api.Message(role="assistant", content=" Falcon."),
+            api.Message(role="user", content="which word?"),
+        ],
+        user="u2",
+    )
+    body2 = api._complete_direct(second, None)
+    assert body2["choices"][0]["message"]["content"] == " Falcon."
+    assert calls[-1]["previous_response_id"] == "resp-2"
+    api._azure_sessions.clear()
+
+
 def test_azure_router_session_reuses_previous_response_id():
     """Extending an Azure session sends only new input with previous_response_id."""
     api._azure_sessions.clear()
@@ -1514,10 +1569,13 @@ def test_azure_router_session_reuses_previous_response_id():
         user="u1",
     )
     input1, prev1 = api._azure_input_for_request(req1, None)
-    assert input1 == [{"role": "user", "content": "first"}]
+    first_text = [{"type": "input_text", "text": "first"}]
+    expected_user = {"type": "message", "role": "user", "content": first_text}
+    assert input1 == [expected_user]
     assert prev1 is None
-    full1 = [{"role": m.role, "content": m.content} for m in req1.messages]
-    full1.append({"role": "assistant", "content": "ok"})
+    full1 = [m for m in (api._azure_canonical_message(m) for m in req1.messages) if m]
+    assistant_response = [{"type": "output_text", "text": "ok"}]
+    full1.append({"type": "message", "role": "assistant", "content": assistant_response})
     api._azure_store_session(req1, None, full1, "resp-1")
 
     req2 = api.ChatRequest(
@@ -1530,7 +1588,9 @@ def test_azure_router_session_reuses_previous_response_id():
         user="u1",
     )
     input2, prev2 = api._azure_input_for_request(req2, None)
-    assert input2 == [{"role": "user", "content": "second"}]
+    second_text = [{"type": "input_text", "text": "second"}]
+    expected_second = {"type": "message", "role": "user", "content": second_text}
+    assert input2 == [expected_second]
     assert prev2 == "resp-1"
 
     # Shortening the conversation resets the cached prefix.
@@ -1540,6 +1600,8 @@ def test_azure_router_session_reuses_previous_response_id():
         user="u1",
     )
     input3, prev3 = api._azure_input_for_request(req3, None)
-    assert input3 == [{"role": "user", "content": "first"}]
+    assert input3 == [
+        expected_user,
+    ]
     assert prev3 is None
     api._azure_sessions.clear()

@@ -358,6 +358,50 @@ def _azure_session_key(request: ChatRequest, headers: dict[str, str] | None) -> 
     return None
 
 
+def _azure_content_item(role: str, part: TextPart | ImagePart) -> dict[str, Any]:
+    """Convert a Mantis message part into an Azure Responses input content item."""
+    if isinstance(part, TextPart):
+        text_type = "output_text" if role == "assistant" else "input_text"
+        return {"type": text_type, "text": part.text}
+    if part.type == "image_url":
+        return {
+            "type": "input_image",
+            "image_url": {
+                "url": part.image_url.url,
+                "detail": part.image_url.detail or "auto",
+            },
+        }
+    return {"type": "input_text", "text": str(part)}
+
+
+def _azure_canonical_content(role: str, content: str | list[TextPart | ImagePart] | None) -> str | list[dict[str, Any]] | None:
+    """Return Azure Responses-compatible content for a message role.
+
+    System and developer messages are sent as a single text string.
+    User and assistant messages are sent as content-part lists with the
+    correct part types (``input_text`` / ``output_text`` / ``input_image``).
+    """
+    if content is None:
+        return None
+    if isinstance(content, str):
+        if role in ("system", "developer"):
+            return content
+        part_type = "output_text" if role == "assistant" else "input_text"
+        return [{"type": part_type, "text": content}]
+    parts = [_azure_content_item(role, p) for p in content]
+    if role in ("system", "developer"):
+        return "\n".join(p["text"] for p in parts if p.get("type") in ("input_text", "output_text"))
+    return parts
+
+
+def _azure_canonical_message(message: Message) -> dict[str, Any] | None:
+    """Return an Azure Responses-compatible input item for a Mantis message."""
+    content = _azure_canonical_content(message.role, message.content)
+    if not content:
+        return None
+    return {"type": "message", "role": message.role, "content": content}
+
+
 def _azure_input_for_request(
     request: ChatRequest,
     headers: dict[str, str] | None,
@@ -369,7 +413,7 @@ def _azure_input_for_request(
     When the conversation is reset, shortened, or has no session key, the full
     message list is sent without a previous response id.
     """
-    input_messages = [{"role": m.role, "content": m.content} for m in request.messages]
+    input_messages = [m for m in (_azure_canonical_message(msg) for msg in request.messages) if m]
     key = _azure_session_key(request, headers)
     if not key:
         return input_messages, None
@@ -463,9 +507,11 @@ def _complete_direct(request: ChatRequest, headers: dict[str, str] | None = None
         create_kwargs["previous_response_id"] = previous_id
     resp = client.responses.create(**create_kwargs, stream=False)
     body = _azure_response_to_chat_completion(request.model, resp)
-    full_messages = [{"role": m.role, "content": m.content} for m in request.messages]
+    full_messages: list[dict[str, Any]] = [m for m in (_azure_canonical_message(msg) for msg in request.messages) if m]
     assistant = body["choices"][0]["message"]
-    full_messages.append({"role": assistant["role"], "content": assistant["content"]})
+    assistant_content = _azure_canonical_content(assistant["role"], assistant["content"])
+    if assistant_content:
+        full_messages.append({"type": "message", "role": assistant["role"], "content": assistant_content})
     _azure_store_session(request, headers, full_messages, resp.id)
     return body
 
