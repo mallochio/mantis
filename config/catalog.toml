@@ -30,6 +30,12 @@ base_url = "https://bedrock-runtime.eu-central-1.amazonaws.com"
 credential_env = "AWS_ACCESS_KEY_ID"
 protocols = ["chat_completions"]
 
+[providers.azure-foundry-router]
+adapter = "azure_ai"
+base_url = "https://ih-foundry-resource.services.ai.azure.com/api/projects/ih-foundry/openai/v1"
+credential_env = "AZURE_API_KEY"
+protocols = ["responses"]
+
 [providers."vertex"]
 adapter = "vertex"
 base_url = "https://aiplatform.googleapis.com/v1"
@@ -52,7 +58,7 @@ upstream_model = "kimi-k3"
 
 [base.targets.capable]
 provider = "openrouter"
-reasoning_effort = "medium"
+reasoning_effort = "high"
 max_tokens = 128000
 upstream_model = "openai/gpt-5.6-sol"
 

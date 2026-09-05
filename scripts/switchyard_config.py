@@ -76,9 +76,15 @@ def _client_key(provider: str) -> str:
 def _target_extra_body(target: BaseTarget) -> str:
     lines: list[str] = []
     if target.max_tokens is not None:
-        lines.append(f"max_tokens = {target.max_tokens}")
+        token_key = (
+            "max_output_tokens" if target.wire_format == "openai_responses" else "max_tokens"
+        )
+        lines.append(f"{token_key} = {target.max_tokens}")
     if target.reasoning_effort is not None:
-        lines.append(f"reasoning_effort = {_toml_str(target.reasoning_effort)}")
+        if target.wire_format == "openai_responses":
+            lines.append(f"reasoning = {{effort = {_toml_str(target.reasoning_effort)}}}")
+        else:
+            lines.append(f"reasoning_effort = {_toml_str(target.reasoning_effort)}")
     if not lines:
         return ""
     body = "\n".join(f"  {line}" for line in lines)

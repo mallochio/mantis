@@ -32,6 +32,7 @@ ADAPTER_PROTOCOLS = {
     "anthropic": frozenset({"anthropic_messages"}),
     "bedrock": frozenset({"chat_completions", "responses", "anthropic_messages"}),
     "vertex": frozenset({"chat_completions", "responses"}),
+    "azure_ai": frozenset({"responses"}),
 }
 ADAPTERS = frozenset(ADAPTER_PROTOCOLS)
 SWITCHYARD_FORMATS = frozenset({"openai_chat", "openai_responses", "anthropic_messages"})
@@ -43,6 +44,7 @@ ADAPTER_SWITCHYARD_FORMAT = {
     "anthropic": "anthropic_messages",
     "bedrock": "openai_chat",
     "vertex": "openai_chat",
+    "azure_ai": "openai_responses",
 }
 BASE_TARGET_ROLES = ("efficient", "capable")
 BASE_SECTION_KEYS = frozenset(
@@ -275,7 +277,11 @@ def _worker(value: Any, label: str) -> WorkerBinding:
     )
 
 
-def _runtime_bindings(providers_raw: Any, workers_raw: Any) -> RuntimeBindings:
+def _runtime_bindings(
+    providers_raw: Any,
+    workers_raw: Any,
+    extra_provider_names: set[str] | None = None,
+) -> RuntimeBindings:
     provider_table = _mapping(providers_raw, "providers")
     worker_table = _mapping(workers_raw, "mantis.workers")
     workers = {
@@ -283,6 +289,8 @@ def _runtime_bindings(providers_raw: Any, workers_raw: Any) -> RuntimeBindings:
         for name, value in worker_table.items()
     }
     provider_names = {worker.provider for worker in workers.values()}
+    provider_names |= extra_provider_names or set()
+    provider_names |= set(provider_table)
     providers: dict[str, ProviderBinding] = {}
     for name in provider_names:
         if name not in provider_table:

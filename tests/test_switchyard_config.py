@@ -389,3 +389,34 @@ def test_shipped_base_route_is_efficient_first():
     route = load_switchyard_route(Path("config/catalog.toml"))
     assert route.picker == "efficient_first"
     assert 'picker = "efficient_first"' in render_switchyard_toml(route)
+
+
+def test_openai_responses_extra_body_uses_responses_params(tmp_path):
+    content = (
+        "version = 1\n\n"
+        '[providers.azure-foundry]\n'
+        'adapter = "azure_ai"\n'
+        'base_url = "https://example.services.ai.azure.com/api/projects/p/openai/v1"\n'
+        'credential_env = "AZURE_API_KEY"\n'
+        'protocols = ["responses"]\n\n'
+        "[base]\n"
+        'picker = "efficient_first"\n'
+        "confidence_threshold = 0.5\n\n"
+        "[base.targets.efficient]\n"
+        'provider = "azure-foundry"\n'
+        'upstream_model = "model-router"\n'
+        'reasoning_effort = "low"\n'
+        "max_tokens = 64000\n\n"
+        "[base.targets.capable]\n"
+        'provider = "azure-foundry"\n'
+        'upstream_model = "model-router"\n'
+        'reasoning_effort = "medium"\n'
+        "max_tokens = 128000\n"
+    )
+    text = render_switchyard_toml(load_switchyard_route(_write(tmp_path, content)))
+    parsed = tomllib.loads(text)
+    assert parsed["llm_clients"]["azure-foundry"]["format"] == "openai_responses"
+    assert parsed["targets"]["efficient"]["extra_body"]["max_output_tokens"] == 64000
+    assert parsed["targets"]["efficient"]["extra_body"]["reasoning"]["effort"] == "low"
+    assert parsed["targets"]["capable"]["extra_body"]["max_output_tokens"] == 128000
+    assert parsed["targets"]["capable"]["extra_body"]["reasoning"]["effort"] == "medium"

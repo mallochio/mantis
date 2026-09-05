@@ -582,7 +582,7 @@ def client_connection(is_connected: Any):
 
 # -- LiteLLM helpers -------------------------------------------------------
 
-_LITELLM_KNOWN = {"anthropic", "bedrock", "vertex_ai", "vertex", "azure", "openrouter"}
+_LITELLM_KNOWN = {"anthropic", "bedrock", "vertex_ai", "vertex", "azure", "azure_ai", "openrouter"}
 
 
 def _is_anthropic_spec(resolved: ResolvedModelSpec) -> bool:
@@ -591,10 +591,24 @@ def _is_anthropic_spec(resolved: ResolvedModelSpec) -> bool:
     )
 
 
+def _set_reasoning_kwarg(kwargs: dict[str, Any], resolved: ResolvedModelSpec, coerced: str) -> None:
+    if resolved.adapter == "azure_ai":
+        # Azure AI Foundry Responses API accepts reasoning as a nested object.
+        kwargs["reasoning"] = {"effort": coerced}
+    else:
+        kwargs["reasoning_effort"] = coerced
+
+
 def _litellm_model(resolved: ResolvedModelSpec) -> str:
     # ponytail: one branch for known litellm providers; everything else is
     # OpenAI-compatible with a custom base_url.
     if resolved.adapter in _LITELLM_KNOWN:
+        if resolved.adapter == "azure_ai":
+            # Azure AI Foundry model-router expects the model_router/<deployment>
+            # namespace. Preserve an already-qualified path; otherwise add it.
+            if resolved.model.startswith("model_router/"):
+                return f"azure_ai/{resolved.model}"
+            return f"azure_ai/model_router/{resolved.model}"
         prefix = "vertex_ai" if resolved.adapter == "vertex" else resolved.adapter
         # don’t double-prefix if upstream_model already provider-qualified
         if resolved.model.startswith(f"{prefix}/"):
@@ -644,7 +658,7 @@ def _litellm_kwargs(
     if resolved.adapter not in _LITELLM_KNOWN:
         kwargs["api_base"] = resolved.base_url
         kwargs["api_key"] = key
-    elif resolved.adapter in {"openrouter", "anthropic"}:
+    elif resolved.adapter in {"openrouter", "anthropic", "azure_ai"}:
         kwargs["api_key"] = key
         if resolved.base_url and resolved.base_url != "http://127.0.0.1:8080/v1":
             kwargs["api_base"] = resolved.base_url
@@ -665,7 +679,7 @@ def _litellm_kwargs(
             budgets = {"minimal": 1024, "low": 2048, "medium": 8192, "high": 16384, "xhigh": 16384}
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": budgets.get(coerced, 8192)}
         elif coerced != "none":
-            kwargs["reasoning_effort"] = coerced
+            _set_reasoning_kwarg(kwargs, resolved, coerced)
 
     # Proactively request reasoning summaries from OpenAI models so that
     # cross-model handoffs have a portable text artifact even when the raw

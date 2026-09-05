@@ -109,6 +109,23 @@ def catalog_path(env: Mapping[str, str] | None = None) -> tuple[Path, bool]:
     return root / DEFAULT_CATALOG_RELATIVE, False
 
 
+def _base_target_providers(base_section: Any) -> set[str]:
+    """Return provider names referenced by the [base] stage-router targets."""
+    names: set[str] = set()
+    if not isinstance(base_section, dict):
+        return names
+    targets = base_section.get("targets") or {}
+    if not isinstance(targets, dict):
+        return names
+    for role in ("efficient", "capable"):
+        target = targets.get(role)
+        if isinstance(target, dict):
+            provider = target.get("provider")
+            if isinstance(provider, str):
+                names.add(_identifier(provider, f"base.targets.{role}.provider"))
+    return names
+
+
 def load_mantis_catalog(
     path: str | Path | None = None,
     env: Mapping[str, str] | None = None,
@@ -136,7 +153,10 @@ def load_mantis_catalog(
     slots = _slot_order(section.get("slot_order"))
     conductor = _identifier(section.get("conductor"), "mantis.conductor")
     conductor_model = _string(section.get("conductor_model", conductor), "mantis.conductor_model")
-    bindings = _runtime_bindings(root.get("providers"), section.get("workers"))
+    extra_provider_names = _base_target_providers(root.get("base"))
+    bindings = _runtime_bindings(
+        root.get("providers"), section.get("workers"), extra_provider_names
+    )
     if set(bindings.workers) != set(slots):
         raise CatalogError("mantis.workers must contain exactly the slot_order IDs")
     if conductor not in bindings.workers:

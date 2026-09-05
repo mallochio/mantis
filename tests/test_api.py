@@ -1237,6 +1237,7 @@ def test_experimental_modes_are_hidden_and_rejected_by_default(client, monkeypat
     models = client.get("/v1/models", headers=_headers()).json()["data"]
     assert [(item["id"], item["status"]) for item in models] == [
         ("mantis/base", "stable"),
+        ("mantis/azure-router", "stable"),
         ("mantis/fusion", "stable"),
     ]
 
@@ -1277,6 +1278,7 @@ def test_experimental_startup_exposes_and_allows_trinity_and_ultra(client, monke
     models = client.get("/v1/models", headers=_headers()).json()["data"]
     assert [(item["id"], item["status"]) for item in models] == [
         ("mantis/base", "stable"),
+        ("mantis/azure-router", "stable"),
         ("mantis/trinity", "experimental"),
         ("mantis/ultra", "experimental"),
         ("mantis/fusion", "stable"),

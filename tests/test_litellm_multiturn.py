@@ -109,6 +109,30 @@ def test_multiturn_tool_loop_via_litellm(monkeypatch):
         serve_config._history_context.active_run = None
 
 
+def test_azure_foundry_router_litellm_kwargs(monkeypatch):
+    _setup_catalog(monkeypatch)
+    monkeypatch.setenv("AZURE_API_KEY", "test-key")
+    resolved = providers.ResolvedModelSpec(
+        adapter="azure_ai",
+        model="model-router",
+        effort="medium",
+        base_url="https://ih-foundry-resource.services.ai.azure.com/api/projects/ih-foundry/openai/v1",
+        credential_env="AZURE_API_KEY",
+        binding=None,
+        protocols=("responses",),
+        slot=None,
+        max_tokens=128000,
+    )
+    assert providers._litellm_model(resolved) == "azure_ai/model_router/model-router"
+    kwargs = providers._litellm_kwargs(
+        resolved, [{"role": "user", "content": "hi"}], 100, 0.7, None, None, None, {},
+    )
+    assert kwargs["model"] == "azure_ai/model_router/model-router"
+    assert kwargs["api_key"] == "test-key"
+    assert kwargs["api_base"] == resolved.base_url
+    assert kwargs["reasoning"] == {"effort": "medium"}
+
+
 def test_cache_and_cost_via_litellm(monkeypatch):
     _setup_catalog(monkeypatch)
     monkeypatch.setattr(

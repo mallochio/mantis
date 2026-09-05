@@ -695,3 +695,54 @@ def test_runtime_worker_max_tokens_clamps_upstream_request(monkeypatch):
     other = next(slot for slot in SLOTS if slot not in (DEEPSEEK, CONDUCTOR))
     _, _, body = serve._build_request(other, [], 384000, 0.7)
     assert body["max_tokens"] == 384000
+
+
+def test_base_target_providers_are_in_runtime_bindings(tmp_path):
+    abi = model_catalog.load_abi_manifest()
+    content = (
+        "version = 1\n\n"
+        "[providers.router]\n"
+        'adapter = "openrouter"\n'
+        'base_url = "https://router.example.test/v1"\n'
+        'credential_env = "ROUTER_KEY"\n'
+        'protocols = ["chat_completions", "responses"]\n\n'
+        "[providers.azure-foundry]\n"
+        'adapter = "azure_ai"\n'
+        'base_url = "https://example.services.ai.azure.com/api/projects/p/openai/v1"\n'
+        'credential_env = "AZURE_API_KEY"\n'
+        'protocols = ["responses"]\n\n'
+        "[base]\n"
+        'revision = "fixture"\n'
+        'picker = "efficient_first"\n'
+        "confidence_threshold = 0.5\n\n"
+        "[base.targets.efficient]\n"
+        'provider = "router"\n'
+        'upstream_model = "vendor/low"\n'
+        'reasoning_effort = "none"\n\n'
+        "[base.targets.capable]\n"
+        'provider = "azure-foundry"\n'
+        'upstream_model = "model-router"\n\n'
+        "[mantis]\n"
+        f"slot_order = {json.dumps(list(abi.slot_order))}\n"
+        f'conductor = "{abi.conductor}"\n'
+    )
+    workers = []
+    for slot in abi.slot_order:
+        identity, effort = abi.workers[slot]
+        protocols = '["responses"]' if slot == abi.conductor else '["chat_completions"]'
+        lines = [
+            f"[mantis.workers.{slot}]",
+            'provider = "router"',
+            f'upstream_model = "vendor/{slot}"',
+            f'model_identity = "{identity}"',
+            f"protocols = {protocols}",
+        ]
+        if effort:
+            lines.append(f'reasoning_effort = "{effort}"')
+        workers.append("\n".join(lines))
+    content += "\n".join(workers)
+    path = _write_catalog(tmp_path, content)
+    catalog = model_catalog.load_mantis_catalog(path, require_contract=False)
+    assert catalog is not None
+    assert "azure-foundry" in catalog.bindings.providers
+    assert catalog.bindings.providers["azure-foundry"].adapter == "azure_ai"

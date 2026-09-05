@@ -29,7 +29,7 @@ def test_descriptor_fields_and_defaults(client):
         assert isinstance(entry["id"], str)
         assert isinstance(entry["created"], int) and entry["created"] > 0
         assert entry["context_length"] == 262144
-        if entry["id"] == "mantis/base":
+        if entry["id"] in ("mantis/base", api._AZURE_ROUTER_MODEL):
             assert entry["max_completion_tokens"] == 131072
         else:
             assert entry["max_completion_tokens"] == 32768
@@ -42,7 +42,7 @@ def test_env_overrides(client, monkeypatch):
     monkeypatch.setenv("MANTIS_MAX_COMPLETION_TOKENS", "4096")
     for entry in _models(client):
         assert entry["context_length"] == 65536
-        if entry["id"] == "mantis/base":
+        if entry["id"] in ("mantis/base", api._AZURE_ROUTER_MODEL):
             assert entry["max_completion_tokens"] == 131072
         else:
             assert entry["max_completion_tokens"] == 4096
@@ -63,8 +63,17 @@ def test_supported_parameters_accepted_by_chat_request(client):
         "reasoning_effort",
         "max_tokens",
         "max_completion_tokens",
+        "temperature",
         "stream",
         "stream_options",
         "web_search_options",
     }
     assert set(_models(client)[0]["supported_parameters"]) == expected
+
+
+def test_azure_router_model_is_advertised(client):
+    ids = {entry["id"] for entry in _models(client)}
+    assert api._AZURE_ROUTER_MODEL in ids
+    azure_entry = next(entry for entry in _models(client) if entry["id"] == api._AZURE_ROUTER_MODEL)
+    assert azure_entry["status"] == "stable"
+    assert azure_entry["max_completion_tokens"] == 131072
