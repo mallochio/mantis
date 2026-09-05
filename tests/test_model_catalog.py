@@ -746,3 +746,43 @@ def test_base_target_providers_are_in_runtime_bindings(tmp_path):
     assert catalog is not None
     assert "azure-foundry" in catalog.bindings.providers
     assert catalog.bindings.providers["azure-foundry"].adapter == "azure_ai"
+
+
+def test_repo_catalog_has_no_real_azure_endpoint():
+    text = (REPO / "config" / "catalog.toml").read_text()
+    assert "services.ai.azure.com" not in text
+
+
+def _azure_bindings() -> model_catalog.RuntimeBindings:
+    from model_catalog_schema import ProviderBinding
+
+    return model_catalog.RuntimeBindings(
+        providers={
+            "azure-foundry-router": ProviderBinding(
+                adapter="azure_ai",
+                base_url="https://example.invalid/api/projects/example/openai/v1",
+                credential_env="AZURE_API_KEY",
+                protocols=("responses",),
+            )
+        },
+        workers={},
+    )
+
+
+def test_azure_router_base_url_keeps_placeholder_without_override():
+    bindings = model_catalog._apply_provider_url_overrides(_azure_bindings(), {})
+    assert (
+        bindings.providers["azure-foundry-router"].base_url
+        == "https://example.invalid/api/projects/example/openai/v1"
+    )
+
+
+def test_azure_router_base_url_override_from_env():
+    bindings = model_catalog._apply_provider_url_overrides(
+        _azure_bindings(),
+        {"MANTIS_AZURE_ROUTER_BASE_URL": "https://example.test/foundry/v1"},
+    )
+    assert (
+        bindings.providers["azure-foundry-router"].base_url
+        == "https://example.test/foundry/v1"
+    )

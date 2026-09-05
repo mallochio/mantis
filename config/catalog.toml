@@ -32,7 +32,10 @@ protocols = ["chat_completions"]
 
 [providers.azure-foundry-router]
 adapter = "azure_ai"
-base_url = "https://ih-foundry-resource.services.ai.azure.com/api/projects/ih-foundry/openai/v1"
+# Public placeholder. The real endpoint is local-only: set
+# MANTIS_AZURE_ROUTER_BASE_URL in the repo .env (gitignored) or shell.
+# Never commit the real URL; the repo stays public-safe.
+base_url = "https://example.invalid/api/projects/example/openai/v1"
 credential_env = "AZURE_API_KEY"
 protocols = ["responses"]
 

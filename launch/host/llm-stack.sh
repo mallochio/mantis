@@ -25,6 +25,14 @@ if [ -f "$HOME/.zshrc" ]; then
   done < <(/bin/zsh -lc 'source "$HOME/.zshrc" >/dev/null && env')
 fi
 
+if [ -f "$REPO_ROOT/.env" ]; then
+  set -a
+  # Repo .env holds local-only secrets (gitignored); sourced for status display.
+  # shellcheck disable=SC1091
+  source "$REPO_ROOT/.env"
+  set +a
+fi
+
 ROUTER_URL="http://127.0.0.1:5500/health"
 MANTIS_LOCAL_READY="http://127.0.0.1:8088/ready"
 SWITCHYARD_PIDFILE="$HOME/.local/share/mantis/switchyard/server.pid"
@@ -224,9 +232,7 @@ main_slot = fusion.get("main", "?")
 side_slot = fusion.get("sidekick", "?")
 main_eff = _slot_effort(main_slot)
 side_eff = _slot_effort(side_slot)
-providers = data.get("providers") or {}
-az = providers.get("azure-foundry-router") or {}
-az_url = az.get("base_url", "?")
+az_set = bool(os.environ.get("MANTIS_AZURE_ROUTER_BASE_URL"))
 
 print(f"  Base:          {picker}")
 print(f"    efficient:   {eff_model} (reasoning={eff_effort}, max_tokens={eff_tokens})")
@@ -236,7 +242,7 @@ print(
     f"sidekick={_slot_str(side_slot)} (reasoning={side_eff})"
 )
 print(f"  Azure-router:  mantis/azure-router -> model-router (reasoning=medium, context=256000)")
-print(f"    endpoint:    {az_url}")
+print("    endpoint:    local override set" if az_set else "    endpoint:    not set (export MANTIS_AZURE_ROUTER_BASE_URL)")
 PY
   )" || output=""
   if [ -n "$output" ]; then

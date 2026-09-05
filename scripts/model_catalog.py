@@ -9,7 +9,7 @@ import os
 import shlex
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +28,7 @@ from model_catalog_schema import (
     _runtime_bindings,
     _slot_order,
     _string,
+    _url,
     load_base_route,
 )
 
@@ -51,6 +52,30 @@ __all__ = [
 ]
 
 DEFAULT_CATALOG_RELATIVE = Path(".config/ai-routing/catalog.toml")
+
+_AZURE_ROUTER_PROVIDER = "azure-foundry-router"
+_AZURE_ROUTER_BASE_URL_ENV = "MANTIS_AZURE_ROUTER_BASE_URL"
+
+
+def _apply_provider_url_overrides(
+    bindings: RuntimeBindings, env: Mapping[str, str] | None = None
+) -> RuntimeBindings:
+    """Apply local-only endpoint overrides kept out of the public catalog.
+
+    The committed catalog carries a placeholder for the Azure Foundry router;
+    operators set ``MANTIS_AZURE_ROUTER_BASE_URL`` locally (repo ``.env`` or
+    shell) so the real endpoint never enters git.
+    """
+    source = os.environ if env is None else env
+    override = (source.get(_AZURE_ROUTER_BASE_URL_ENV) or "").strip()
+    if not override or _AZURE_ROUTER_PROVIDER not in bindings.providers:
+        return bindings
+    current = bindings.providers[_AZURE_ROUTER_PROVIDER]
+    providers = dict(bindings.providers)
+    providers[_AZURE_ROUTER_PROVIDER] = replace(
+        current, base_url=_url(override, _AZURE_ROUTER_BASE_URL_ENV)
+    )
+    return RuntimeBindings(providers=providers, workers=bindings.workers)
 
 
 @dataclass(frozen=True)
@@ -157,6 +182,7 @@ def load_mantis_catalog(
     bindings = _runtime_bindings(
         root.get("providers"), section.get("workers"), extra_provider_names
     )
+    bindings = _apply_provider_url_overrides(bindings, env)
     if set(bindings.workers) != set(slots):
         raise CatalogError("mantis.workers must contain exactly the slot_order IDs")
     if conductor not in bindings.workers:

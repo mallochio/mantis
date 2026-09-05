@@ -116,7 +116,7 @@ def test_azure_foundry_router_litellm_kwargs(monkeypatch):
         adapter="azure_ai",
         model="model-router",
         effort="medium",
-        base_url="https://ih-foundry-resource.services.ai.azure.com/api/projects/ih-foundry/openai/v1",
+        base_url="https://example.invalid/api/projects/example/openai/v1",
         credential_env="AZURE_API_KEY",
         binding=None,
         protocols=("responses",),
