@@ -1605,3 +1605,53 @@ def test_azure_router_session_reuses_previous_response_id():
     ]
     assert prev3 is None
     api._azure_sessions.clear()
+
+
+def test_azure_router_converts_tool_history_to_responses_items():
+    """Tool rounds map to function_call items; no `tool` message role is sent."""
+    api._azure_sessions.clear()
+    req = api.ChatRequest(
+        model="mantis/azure-router",
+        messages=[
+            api.Message(role="user", content="list files"),
+            api.Message(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": '{"cmd": "ls"}'},
+                    }
+                ],
+            ),
+            api.Message(role="tool", tool_call_id="call-1", content="a.txt"),
+            api.Message(role="user", content="done?"),
+        ],
+        user="u-tool",
+    )
+    input_items, prev = api._azure_input_for_request(req, None)
+    assert prev is None
+    user_first = {
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "list files"}],
+    }
+    call = {
+        "type": "function_call",
+        "call_id": "call-1",
+        "name": "bash",
+        "arguments": '{"cmd": "ls"}',
+    }
+    assert input_items == [
+        user_first,
+        call,
+        {"type": "function_call_output", "call_id": "call-1", "output": "a.txt"},
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "done?"}],
+        },
+    ]
+    assert all(item.get("role") != "tool" for item in input_items)
+    api._azure_sessions.clear()

@@ -447,11 +447,20 @@ def _azure_canonical_content(role: str, content: str | list[TextPart | ImagePart
     if content is None:
         return None
     if isinstance(content, str):
+        if not content:
+            return None
         if role in ("system", "developer"):
             return content
         part_type = "output_text" if role == "assistant" else "input_text"
         return [{"type": part_type, "text": content}]
     parts = [_azure_content_item(role, p) for p in content]
+    parts = [
+        p
+        for p in parts
+        if p.get("type") == "input_image" or str(p.get("text") or "")
+    ]
+    if not parts:
+        return None
     if role in ("system", "developer"):
         return "\n".join(p["text"] for p in parts if p.get("type") in ("input_text", "output_text"))
     return parts
@@ -465,6 +474,61 @@ def _azure_canonical_message(message: Message) -> dict[str, Any] | None:
     return {"type": "message", "role": message.role, "content": content}
 
 
+def _azure_tool_text(content: str | list[TextPart | ImagePart] | None) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    parts: list[str] = []
+    for part in content:
+        if isinstance(part, TextPart):
+            parts.append(part.text)
+        elif isinstance(part, ImagePart):
+            parts.append(part.image_url.url)
+        else:
+            parts.append(str(part))
+    return "\n".join(parts)
+
+
+def _azure_input_items(message: Message) -> list[dict[str, Any]]:
+    """Return Responses input items for a Mantis message.
+
+    Chat-style tool traffic maps to first-class items: assistant
+    ``tool_calls`` become ``function_call`` items and ``tool`` messages
+    become ``function_call_output`` items. The Responses API rejects the
+    ``tool`` message role, so passing it through caused 400
+    ValidationError on histories that already contain tool rounds
+    (e.g. switching to the router mid-conversation).
+    """
+    if message.role == "tool":
+        return [
+            {
+                "type": "function_call_output",
+                "call_id": message.tool_call_id or "",
+                "output": _azure_tool_text(message.content),
+            }
+        ]
+    items: list[dict[str, Any]] = []
+    canonical = _azure_canonical_message(message)
+    if canonical is not None:
+        items.append(canonical)
+    for call in message.tool_calls or []:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function")
+        function = function if isinstance(function, dict) else {}
+        arguments = function.get("arguments", "{}")
+        items.append(
+            {
+                "type": "function_call",
+                "call_id": str(call.get("id") or ""),
+                "name": str(function.get("name") or ""),
+                "arguments": arguments if isinstance(arguments, str) else json.dumps(arguments),
+            }
+        )
+    return items
+
+
 def _azure_input_for_request(
     request: ChatRequest,
     headers: dict[str, str] | None,
@@ -476,7 +540,7 @@ def _azure_input_for_request(
     When the conversation is reset, shortened, or has no session key, the full
     message list is sent without a previous response id.
     """
-    input_messages = [m for m in (_azure_canonical_message(msg) for msg in request.messages) if m]
+    input_messages = [item for msg in request.messages for item in _azure_input_items(msg)]
     key = _azure_session_key(request, headers)
     if not key:
         return input_messages, None
@@ -570,7 +634,9 @@ def _complete_direct(request: ChatRequest, headers: dict[str, str] | None = None
         create_kwargs["previous_response_id"] = previous_id
     resp = client.responses.create(**create_kwargs, stream=False)
     body = _azure_response_to_chat_completion(request.model, resp)
-    full_messages: list[dict[str, Any]] = [m for m in (_azure_canonical_message(msg) for msg in request.messages) if m]
+    full_messages: list[dict[str, Any]] = [
+        item for msg in request.messages for item in _azure_input_items(msg)
+    ]
     assistant = body["choices"][0]["message"]
     assistant_content = _azure_canonical_content(assistant["role"], assistant["content"])
     if assistant_content:
