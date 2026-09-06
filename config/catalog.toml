@@ -54,7 +54,7 @@ protocols = ["chat_completions"]
 [base]
 # Switchyard stage-router for mantis/base
 # Swap efficient/capable models or their providers here; launch regenerates routes.toml.
-revision = "responses-2026-09-06-grok-capable"
+revision = "kimi-k3-2026-09-06-modal-capable"
 picker = "efficient_first"
 confidence_threshold = 0.5
 recent_turn_window = 3
@@ -66,11 +66,10 @@ max_tokens = 128000
 upstream_model = "zai-org/GLM-5.3"
 
 [base.targets.capable]
-provider = "bedrock-openai"
-format = "openai_responses"
-reasoning_effort = "xhigh"
+provider = "modal.kimi-k3"
+reasoning_effort = "max"
 max_tokens = 128000
-upstream_model = "global.xai.grok-4.6"
+upstream_model = "moonshotai/Kimi-K3"
 
 [mantis]
 slot_order = [

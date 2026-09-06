@@ -402,10 +402,10 @@ def test_apply_base_cache_markers_leaves_grok_glm_messages_untouched(monkeypatch
     assert out["messages"] == body["messages"]
 
 
-def test_shipped_catalog_routes_glm_efficient_grok_responses_capable(monkeypatch):
+def test_shipped_catalog_routes_glm_efficient_kimi_chat_capable(monkeypatch):
     route = base_proxy._load_base_route()
     assert route is not None
     assert route.efficient.upstream_model == "zai-org/GLM-5.3"
-    assert route.capable.upstream_model == "global.xai.grok-4.6"
-    assert route.capable.provider == "bedrock-openai"
-    assert route.capable.wire_format == "openai_responses"
+    assert route.capable.upstream_model == "moonshotai/Kimi-K3"
+    assert route.capable.provider == "modal.kimi-k3"
+    assert route.capable.wire_format == "openai_chat"
