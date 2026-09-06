@@ -75,6 +75,12 @@ def test_session_id_synthesizes_stable_id_without_harness_session():
     assert first is not None and first == second
 
 
+def test_session_id_accepts_opencode_header():
+    messages = [{"role": "user", "content": "fix the bug"}]
+    session = base_proxy.session_id({"x-opencode-session": "opencode"}, _request(messages))
+    assert session is not None and session.startswith("opencode:")
+
+
 def test_shared_harness_session_is_scoped_per_conversation():
     messages = [{"role": "user", "content": "fix the bug"}]
     other = [{"role": "user", "content": "write docs"}]
@@ -250,6 +256,26 @@ def test_router_error_parses_sse_error_stream():
     )
     result = base_proxy.router_error(response)
     assert result.status_code == 500
+
+
+def test_router_error_coerces_string_code():
+    response = httpx.Response(
+        200,
+        json={"error": {"message": "upstream failed", "code": "503"}},
+        request=httpx.Request("POST", "http://example.com"),
+    )
+    result = base_proxy.router_error(response)
+    assert result.status_code == 503
+
+
+def test_router_error_ignores_non_http_code():
+    response = httpx.Response(
+        502,
+        json={"error": {"message": "upstream failed", "code": "overloaded"}},
+        request=httpx.Request("POST", "http://example.com"),
+    )
+    result = base_proxy.router_error(response)
+    assert result.status_code == 502
 
 
 # -- Forward: Switchyard is the only hop -----------------------------------------

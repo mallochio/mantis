@@ -94,7 +94,8 @@ def session_id(headers: dict[str, str], body: BaseChatRequest) -> str | None:
     """Session identity for Switchyard stage-router stickiness.
 
     Accepts the Switchyard header, the legacy ``X-Route-Session`` client
-    header, or ``metadata.session_id`` / ``user`` in the body. When the
+    header, the harness ``x-opencode-session`` / ``x-mantis-session-id``
+    headers, or ``metadata.session_id`` / ``user`` in the body. When the
     harness sends a shared header such as ``opencode``, combine it with a
     synthetic hash of the first user turn so different conversations do not
     share one Switchyard session and evict each other's prefix cache.
@@ -103,6 +104,7 @@ def session_id(headers: dict[str, str], body: BaseChatRequest) -> str | None:
     session = (
         headers.get(SWITCHYARD_SESSION_HEADER)
         or headers.get("x-route-session")
+        or headers.get("x-opencode-session")
         or headers.get("x-mantis-session-id")
         or headers.get("x-mantis-session")
     )
@@ -289,6 +291,15 @@ def router_response_headers(upstream: httpx.Response) -> dict[str, str]:
     return mapped
 
 
+def _coerce_status(raw: Any, fallback: int) -> int:
+    """Coerce an embedded error code to an int HTTP status."""
+    try:
+        status = int(raw)
+    except (TypeError, ValueError):
+        return fallback
+    return status if 100 <= status <= 599 else fallback
+
+
 def router_error(upstream: httpx.Response) -> JSONResponse:
     """Return an OpenAI-compatible error from a failed router response.
 
@@ -309,7 +320,7 @@ def router_error(upstream: httpx.Response) -> JSONResponse:
                     error["type"] = "upstream_error"
                 if "status_code" not in error:
                     error["status_code"] = error.get("code", status)
-                status = error.get("code") or status
+                status = _coerce_status(error.get("code"), status)
             return JSONResponse(body, status_code=status)
         # Router returned JSON but not an error object; wrap it.
         return JSONResponse(
