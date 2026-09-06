@@ -105,8 +105,12 @@ rm -f "$LOG_DIR/server.pid"
 
 # shellcheck source=detach.sh
 source "$LIB_DIR/detach.sh"
+# Per-request routing records (decision source, selected target, signals).
+# Post-hoc mining for threshold tuning; see scripts/summarize_routing_log.py.
+ROUTING_LOG="${SWITCHYARD_ROUTING_LOG:-$LOG_DIR/routing-log.jsonl}"
 detach_cmd "$LOG_DIR/server.pid" "$LOG_DIR/server.out" "$LOG_DIR/server.err" \
   "$SWITCHYARD_BIN" --config "$CONFIG_OUT" --host "$HOST" --port "$PORT" \
+  --routing-log-file "$ROUTING_LOG" \
   >/dev/null
 
 for _ in $(seq 1 150); do
