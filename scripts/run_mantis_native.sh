@@ -14,6 +14,12 @@ fi
 if [[ -z "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
   export AWS_SECRET_ACCESS_KEY="$(security find-generic-password -a "$USER" -s "shell-env/AWS_SECRET_ACCESS_KEY" -w 2>/dev/null || true)"
 fi
+# Bedrock OpenAI-compatible endpoint (Grok capable) needs a bearer API key.
+# Reuse the token minted by switchyard-local.sh when fresh; otherwise mint
+# one here so catalog validation (resolve_provider_keys) sees the key.
+# shellcheck source=../launch/host/lib/bedrock-key.sh
+source "$REPO_ROOT/launch/host/lib/bedrock-key.sh"
+ensure_bedrock_api_key
 cd "$REPO_ROOT"
 
 [[ -f "$SERVE_DIR/api.py" ]] || { echo "missing $SERVE_DIR/api.py" >&2; exit 1; }

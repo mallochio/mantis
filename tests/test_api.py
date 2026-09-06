@@ -7,7 +7,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import api
-import base_proxy
 import providers
 import pytest
 import serve
@@ -16,15 +15,12 @@ from openai import OpenAI
 
 
 @pytest.fixture(autouse=True)
-def _switchyard_relay_only(monkeypatch):
+def _switchyard_relay_only():
     """Pin the Switchyard relay for contract tests.
 
-    These tests mock the Switchyard hop; the direct LiteLLM efficient leg
-    (Bedrock/Vertex targets) must not intercept them or they would make real
-    upstream calls. That leg has its own hermetic tests in
-    test_base_proxy.py.
+    These tests mock the Switchyard hop. ``mantis/base`` always forwards
+    there now that both tiers are Switchyard-servable.
     """
-    monkeypatch.setattr(base_proxy, "_direct_litellm_spec", lambda: None)
 
 
 @pytest.fixture

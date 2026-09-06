@@ -177,6 +177,12 @@ def _is_reasoning_model(model: str) -> bool:
 
 
 def _model_cache_family(model: str) -> str | None:
+    """Return the explicit prompt-cache dialect for a model id.
+
+    Bedrock xAI grok (``global.xai.grok-*``) is intentionally absent: LiteLLM
+    reports ``supports_prompt_caching=False`` and AWS documents Converse
+    ``cachePoint`` only for Claude/Nova-class models, so no markers are sent.
+    """
     name = model.rsplit("/", 1)[-1].lower()
     if name.startswith("claude-"):
         return "anthropic"

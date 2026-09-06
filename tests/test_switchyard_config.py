@@ -116,6 +116,29 @@ def test_render_quotes_dotted_provider_names(tmp_path):
     assert parsed["targets"]["capable"]["llm_client"] == "bifrost"
 
 
+def test_responses_format_capable_renders_responses_client(tmp_path):
+    """A capable target on openai_responses renders its own client + body keys."""
+    content = _catalog()
+    content = content.replace(
+        '[base.targets.capable]\n'
+        'provider = "bifrost"\n'
+        'upstream_model = "anthropic/claude-opus-5"\n',
+        '[base.targets.capable]\n'
+        'provider = "bifrost"\n'
+        'format = "openai_responses"\n'
+        'upstream_model = "vendor/strong"\n',
+        1,
+    )
+    path = _write(tmp_path, content)
+    parsed = tomllib.loads(render_switchyard_toml(load_switchyard_route(path)))
+    capable_client = parsed["targets"]["capable"]["llm_client"]
+    assert capable_client == "bifrost__openai_responses"
+    assert parsed["llm_clients"][capable_client]["format"] == "openai_responses"
+    assert parsed["llm_clients"]["bifrost"]["format"] == "openai_chat"
+    assert parsed["targets"]["capable"]["extra_body"]["reasoning"] == {"effort": "medium"}
+    assert parsed["targets"]["capable"]["extra_body"]["max_output_tokens"] == 128000
+
+
 def test_rejects_identical_efficient_and_capable(tmp_path):
     content = (
         _catalog()

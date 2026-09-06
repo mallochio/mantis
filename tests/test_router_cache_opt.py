@@ -53,8 +53,6 @@ def _use_catalog(monkeypatch, catalog: Path) -> None:
     monkeypatch.setenv("MANTIS_CATALOG_PATH", str(catalog))
     monkeypatch.delenv("AI_ROUTING_CONFIG", raising=False)
     base_proxy._load_base_route.cache_clear()
-    base_proxy._base_route_family.cache_clear()
-    base_proxy._session_tier_ranks.clear()
 
 
 def _messages() -> list[dict]:
@@ -141,19 +139,26 @@ def test_litellm_preserves_client_openai_breakpoint(monkeypatch):
     assert kwargs["messages"][0].get("prompt_cache_breakpoint") == {"mode": "explicit"}
 
 
-def test_sticky_complexity_never_downgrades():
-    base_proxy._session_tier_ranks.clear()
-    assert base_proxy._sticky_complexity("s-1", "reasoning") == "reasoning"
-    assert base_proxy._sticky_complexity("s-1", "simple") == "reasoning"
-
-
-def test_window_classification_uses_max():
-    messages = [
-        {"role": "user", "content": "Please think through step by step and derive the proof."},
-        {"role": "assistant", "content": "ok"},
-        {"role": "user", "content": "Thanks!"},
-    ]
-    assert base_proxy._classify_window(messages, 3) == "reasoning"
+def test_shared_harness_header_scopes_sessions_per_conversation():
+    """One shared header must not merge two conversations into one session."""
+    key_a = base_proxy.session_id(
+        {"x-mantis-session-id": "opencode"},
+        type(
+            "R",
+            (),
+            {"messages": [{"role": "user", "content": "prove theorem"}], "tools": None},
+        ),
+    )
+    key_b = base_proxy.session_id(
+        {"x-mantis-session-id": "opencode"},
+        type(
+            "R",
+            (),
+            {"messages": [{"role": "user", "content": "what time is it"}], "tools": None},
+        ),
+    )
+    assert key_a is not None and key_b is not None
+    assert key_a != key_b
 
 
 def test_synthetic_session_is_stable():
@@ -170,17 +175,18 @@ def test_session_id_falls_back_to_synthetic():
         "metadata": None,
         "user": None,
         "messages": [{"role": "user", "content": "hello"}],
+        "tools": None,
     })()
     assert base_proxy.session_id({}, body).startswith("auto-")
 
 
 def test_session_id_accepts_mantis_header():
-    body = type("R", (), {"metadata": None, "user": None})()
+    body = type("R", (), {"metadata": None, "user": None, "messages": [], "tools": None})()
     assert base_proxy.session_id({"x-mantis-session-id": "opencode"}, body) == "opencode"
 
 
-def test_salt_disabled_preserves_session_but_promotes(monkeypatch):
-    monkeypatch.setenv("MANTIS_BASE_SALT_SESSION", "0")
+def test_router_headers_never_force_a_tier(monkeypatch):
+    """Tier decisions belong to Switchyard; the forwarder sends no directives."""
     body = type("R", (), {
         "metadata": {"session_id": "s-9"},
         "user": None,
@@ -200,10 +206,10 @@ def test_salt_disabled_preserves_session_but_promotes(monkeypatch):
             {"role": "tool", "content": "Traceback: AssertionError"},
         ],
     })()
-    assert base_proxy.escalation_suffix(body) == ""
     headers = base_proxy.router_headers({}, body)
     assert headers[base_proxy.SWITCHYARD_SESSION_HEADER] == "s-9"
-    assert headers["x-switchyard-force-tier"] == "capable"
+    assert "x-switchyard-force-tier" not in headers
+    assert "x-switchyard-escalated" not in headers
 
 
 def test_trinity_reminder_uses_user_role():

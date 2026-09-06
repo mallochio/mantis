@@ -2908,8 +2908,9 @@ def test_base_route_lead_resolves_to_capable_target_with_full_budget():
     config = fusion.FusionRoutingConfig(main="mantis/base", sidekick="gpt-5_6-luna")
     router = fusion.FusionRouter.from_config(config, "main", catalog=catalog)
     spec = router.select(escalation_count=0)
-    assert spec.startswith("openrouter/")
-    assert "gpt-5.6-sol" in spec
+    assert spec.startswith("bedrock-openai/")
+    assert "grok-4.6" in spec
+    assert spec.endswith("|xhigh")
     assert router.strongest() == spec
 
     coordinator = fusion.FusionCoordinator()

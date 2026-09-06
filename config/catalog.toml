@@ -24,10 +24,16 @@ base_url = "https://interhuman-ai--ep-qwen3-8-2-4t-a95b-server.us-west.modal.dir
 credential_env = "MODAL_PROXY_TOKEN"
 protocols = ["chat_completions"]
 
-[providers.bedrock]
-adapter = "bedrock"
-base_url = "https://bedrock-runtime.eu-central-1.amazonaws.com"
-credential_env = "AWS_ACCESS_KEY_ID"
+[providers."modal.glm-5-3"]
+adapter = "modal"
+base_url = "https://interhuman-ai--ep-glm-5-3-server.us-west.modal.direct/v1"
+credential_env = "MODAL_PROXY_TOKEN"
+protocols = ["chat_completions"]
+
+[providers.bedrock-openai]
+adapter = "openai-compatible"
+base_url = "https://bedrock-runtime.eu-central-1.amazonaws.com/openai/v1"
+credential_env = "BEDROCK_API_KEY"
 protocols = ["chat_completions"]
 
 [providers.azure-foundry-router]
@@ -48,22 +54,23 @@ protocols = ["chat_completions"]
 [base]
 # Switchyard stage-router for mantis/base
 # Swap efficient/capable models or their providers here; launch regenerates routes.toml.
-revision = "direct-2026-08-30-litellm"
+revision = "responses-2026-09-06-grok-capable"
 picker = "efficient_first"
 confidence_threshold = 0.5
 recent_turn_window = 3
 
 [base.targets.efficient]
-provider = "modal.kimi-k3"
+provider = "modal.glm-5-3"
 reasoning_effort = "high"
 max_tokens = 128000
-upstream_model = "kimi-k3"
+upstream_model = "zai-org/GLM-5.3"
 
 [base.targets.capable]
-provider = "openrouter"
-reasoning_effort = "high"
+provider = "bedrock-openai"
+format = "openai_responses"
+reasoning_effort = "xhigh"
 max_tokens = 128000
-upstream_model = "openai/gpt-5.6-sol"
+upstream_model = "global.xai.grok-4.6"
 
 [mantis]
 slot_order = [

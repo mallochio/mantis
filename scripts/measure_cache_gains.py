@@ -4,7 +4,7 @@ Simulates multi-turn coding sessions without network calls. Compares:
 
 - Azure-router input tokens sent with a shared static key (old) vs
   per-conversation isolated keys (new).
-- Base session-tier pollution when two conversations share one session.
+- Base session isolation when two conversations share one harness header.
 - Reasoning-trim savings from keeping only recent thinking blocks.
 
 Run: ``uv run python scripts/measure_cache_gains.py``
@@ -87,25 +87,25 @@ def simulate_azure_interleaved(turns: int = 8) -> dict[str, int]:
     return {"old_tokens_sent": old_sent, "new_tokens_sent": new_sent}
 
 
-def simulate_base_tier_pollution() -> dict[str, str]:
-    """Show sticky-tier pollution when sessions are shared vs isolated."""
-    base_proxy._session_tier_ranks.clear()
-    shared = "opencode"
-    base_proxy._sticky_complexity(shared, "reasoning")
-    polluted = base_proxy._sticky_complexity(shared, "simple")
-    base_proxy._session_tier_ranks.clear()
+def simulate_base_session_isolation() -> dict[str, str]:
+    """Show per-conversation session keys when the harness header is shared."""
     key_a = base_proxy.session_id(
         {"x-mantis-session-id": "opencode"},
-        type("R", (), {"messages": [{"role": "user", "content": "prove theorem"}]}),
+        type(
+            "R",
+            (),
+            {"messages": [{"role": "user", "content": "prove theorem"}], "tools": None},
+        ),
     )
     key_b = base_proxy.session_id(
         {"x-mantis-session-id": "opencode"},
-        type("R", (), {"messages": [{"role": "user", "content": "what time is it"}]}),
+        type(
+            "R",
+            (),
+            {"messages": [{"role": "user", "content": "what time is it"}], "tools": None},
+        ),
     )
-    if key_a is None or key_b is None:
-        return {"shared_simple_tier": polluted, "isolated": "error"}
-    isolated = base_proxy._sticky_complexity(key_b, "simple")
-    return {"shared_simple_tier": polluted, "isolated_simple_tier": isolated}
+    return {"conversation_a": str(key_a), "conversation_b": str(key_b)}
 
 
 def simulate_reasoning_trim(assistant_turns: int = 8) -> dict[str, int]:
@@ -126,7 +126,7 @@ def main() -> None:
     azure = simulate_azure_interleaved()
     azure_saved = azure["old_tokens_sent"] - azure["new_tokens_sent"]
     azure_pct = 100.0 * azure_saved / max(1, azure["old_tokens_sent"])
-    tier = simulate_base_tier_pollution()
+    sessions = simulate_base_session_isolation()
     trim = simulate_reasoning_trim()
     trim_saved = trim["before_tokens"] - trim["after_tokens"]
     trim_pct = 100.0 * trim_saved / max(1, trim["before_tokens"])
@@ -134,9 +134,9 @@ def main() -> None:
     print(f"  old shared key : {azure['old_tokens_sent']}")
     print(f"  new isolated   : {azure['new_tokens_sent']}")
     print(f"  saved          : {azure_saved} ({azure_pct:.1f}%)")
-    print("Base sticky-tier pollution")
-    print(f"  shared session simple -> {tier['shared_simple_tier']} (polluted)")
-    print(f"  isolated session simple -> {tier['isolated_simple_tier']}")
+    print("Base session isolation under one shared harness header")
+    print(f"  conversation A : {sessions['conversation_a']}")
+    print(f"  conversation B : {sessions['conversation_b']}")
     print("Reasoning trim keep-last-2 over 8 assistant turns")
     print(f"  before : {trim['before_tokens']}")
     print(f"  after  : {trim['after_tokens']}")

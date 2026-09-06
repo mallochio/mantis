@@ -32,6 +32,12 @@ fi
 if [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
   export AWS_SECRET_ACCESS_KEY="$(security find-generic-password -a "$USER" -s "shell-env/AWS_SECRET_ACCESS_KEY" -w 2>/dev/null || true)"
 fi
+# Bedrock OpenAI-compatible endpoint (Grok capable) needs a bearer API key,
+# not IAM keys. Shared helper mints a short-term token (12h) and persists it
+# so Switchyard and Mantis (separate envs) use the same key.
+# shellcheck source=bedrock-key.sh
+source "$LIB_DIR/bedrock-key.sh"
+ensure_bedrock_api_key
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 export RUST_LOG="switchyard=debug,bedrock=debug"
 

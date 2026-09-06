@@ -11,10 +11,9 @@ def test_azure_isolation_saves_tokens():
     assert result["old_tokens_sent"] - result["new_tokens_sent"] > 0
 
 
-def test_base_isolation_avoids_tier_pollution():
-    result = gains.simulate_base_tier_pollution()
-    assert result["shared_simple_tier"] == "reasoning"
-    assert result["isolated_simple_tier"] == "simple"
+def test_base_isolation_scopes_sessions_per_conversation():
+    result = gains.simulate_base_session_isolation()
+    assert result["conversation_a"] != result["conversation_b"]
 
 
 def test_reasoning_trim_saves_tokens():

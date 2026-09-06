@@ -18,6 +18,7 @@ from typing import Any, TextIO
 
 from model_catalog import catalog_path
 from model_catalog_schema import (
+    ADAPTER_SWITCHYARD_FORMAT,
     BaseRoute,
     BaseTarget,
     CatalogError,
@@ -69,19 +70,35 @@ def _toml_key(name: str) -> str:
     return _toml_str(name)
 
 
-def _client_key(provider: str) -> str:
-    return provider.replace(".", "_")
+def _client_key_for(provider_name: str, provider: ProviderBinding, wire_format: str) -> str:
+    """Client entry key for a target, format-suffixed when non-default.
+
+    One ``llm_clients`` entry carries one wire format. Two targets sharing a
+    provider with different formats (e.g. chat efficient + Responses capable)
+    need distinct entries; the default-format target keeps the bare provider
+    key so existing single-format routes render unchanged.
+    """
+    base = provider_name.replace(".", "_")
+    if wire_format == ADAPTER_SWITCHYARD_FORMAT[provider.adapter]:
+        return base
+    return f"{base}__{wire_format}"
+
+
+# Wire format -> (token budget key, reasoning rendered as object).
+_FORMAT_BODY = {
+    "openai_chat": ("max_tokens", False),
+    "openai_responses": ("max_output_tokens", True),
+    "anthropic_messages": ("max_tokens", False),
+}
 
 
 def _target_extra_body(target: BaseTarget) -> str:
+    token_key, reasoning_as_object = _FORMAT_BODY.get(target.wire_format, ("max_tokens", False))
     lines: list[str] = []
     if target.max_tokens is not None:
-        token_key = (
-            "max_output_tokens" if target.wire_format == "openai_responses" else "max_tokens"
-        )
         lines.append(f"{token_key} = {target.max_tokens}")
     if target.reasoning_effort is not None:
-        if target.wire_format == "openai_responses":
+        if reasoning_as_object:
             lines.append(f"reasoning = {{effort = {_toml_str(target.reasoning_effort)}}}")
         else:
             lines.append(f"reasoning_effort = {_toml_str(target.reasoning_effort)}")
@@ -91,15 +108,15 @@ def _target_extra_body(target: BaseTarget) -> str:
     return f"\n[targets.{target.role}.extra_body]\n{body}\n"
 
 
-def _render_clients(route: BaseRoute) -> str:
+def _render_clients(route: BaseRoute, keys: dict[str, str]) -> str:
     blocks: list[str] = []
     seen: set[str] = set()
     for target in (route.efficient, route.capable):
-        key = _client_key(target.provider)
+        provider = route.providers[target.provider]
+        key = keys[target.role]
         if key in seen:
             continue
         seen.add(key)
-        provider = route.providers[target.provider]
         blocks.append(_render_client(key, provider, target.wire_format))
     return "\n".join(blocks)
 
@@ -116,18 +133,21 @@ def _render_client(key: str, provider: ProviderBinding, wire_format: str) -> str
     )
 
 
-def _render_target(target: BaseTarget) -> str:
-    client = _client_key(target.provider)
+def _render_target(target: BaseTarget, client_key: str) -> str:
     return (
         f"[targets.{target.role}]\n"
         f"id = {_toml_str(target.upstream_model)}\n"
-        f"llm_client = {_toml_str(client)}\n"
+        f"llm_client = {_toml_str(client_key)}\n"
         f"{_target_extra_body(target)}"
     )
 
 
 def render_switchyard_toml(route: BaseRoute) -> str:
     """Render a Switchyard native TOML deployment from a parsed [base] route."""
+    keys = {
+        role: _client_key_for(target.provider, route.providers[target.provider], target.wire_format)
+        for role, target in (("efficient", route.efficient), ("capable", route.capable))
+    }
     route_block = "\n".join(
         [
             "[routes.mantis_base]",
@@ -145,9 +165,9 @@ def render_switchyard_toml(route: BaseRoute) -> str:
         "schema_version = 1\n"
         f"# generated from catalog [base] revision {route.revision}\n"
         "\n"
-        f"{_render_clients(route)}"
-        f"{_render_target(route.efficient)}"
-        f"{_render_target(route.capable)}"
+        f"{_render_clients(route, keys)}"
+        f"{_render_target(route.efficient, keys['efficient'])}"
+        f"{_render_target(route.capable, keys['capable'])}"
         f"{route_block}"
     )
 

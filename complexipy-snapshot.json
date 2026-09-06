@@ -30,24 +30,8 @@
     "file_name": "base_proxy.py",
     "functions": [
       {
-        "name": "failure_signals",
-        "complexity": 25
-      },
-      {
-        "name": "_delta_to_dict",
-        "complexity": 27
-      },
-      {
-        "name": "_classify_complexity",
-        "complexity": 30
-      },
-      {
         "name": "router_error",
         "complexity": 40
-      },
-      {
-        "name": "forward",
-        "complexity": 47
       }
     ]
   },
