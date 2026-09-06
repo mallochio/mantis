@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "apps" / "api"))
 
@@ -89,21 +91,21 @@ def simulate_azure_interleaved(turns: int = 8) -> dict[str, int]:
 
 def simulate_base_session_isolation() -> dict[str, str]:
     """Show per-conversation session keys when the harness header is shared."""
+
+    def _req(messages: list[dict]) -> Any:
+        return type(
+            "R",
+            (SimpleNamespace,),
+            {"messages": messages, "tools": None},
+        )()
+
     key_a = base_proxy.session_id(
         {"x-mantis-session-id": "opencode"},
-        type(
-            "R",
-            (),
-            {"messages": [{"role": "user", "content": "prove theorem"}], "tools": None},
-        ),
+        _req([{"role": "user", "content": "prove theorem"}]),
     )
     key_b = base_proxy.session_id(
         {"x-mantis-session-id": "opencode"},
-        type(
-            "R",
-            (),
-            {"messages": [{"role": "user", "content": "what time is it"}], "tools": None},
-        ),
+        _req([{"role": "user", "content": "what time is it"}]),
     )
     return {"conversation_a": str(key_a), "conversation_b": str(key_b)}
 

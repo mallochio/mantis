@@ -349,10 +349,10 @@ def _azure_part_text(part: Any) -> str | None:
     text = getattr(part, "text", None)
     if isinstance(text, str) and text.strip():
         return text.strip()
-    if isinstance(part, dict) and isinstance(part.get("text"), str):
-        stripped = part["text"].strip()
-        if stripped:
-            return stripped
+    if isinstance(part, dict):
+        value = part.get("text")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     return None
 
 
