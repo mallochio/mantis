@@ -31,7 +31,7 @@
     "functions": [
       {
         "name": "router_error",
-        "complexity": 40
+        "complexity": 39
       }
     ]
   },
@@ -195,6 +195,16 @@
     "functions": [
       {
         "name": "_score",
+        "complexity": 24
+      }
+    ]
+  },
+  {
+    "path": "scripts/calibrate_router.py",
+    "file_name": "calibrate_router.py",
+    "functions": [
+      {
+        "name": "sweep_thresholds",
         "complexity": 24
       }
     ]

@@ -37,6 +37,16 @@ repos:
         types_or: [python]
         args: ["--failed"]
 
+  # Type check with the same invocation as CI so local and CI agree.
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: uv run mypy apps/api scripts --exclude outputs
+        language: system
+        pass_filenames: false
+        always_run: true
+
 # Global configuration
 default_language_version:
   python: python3
