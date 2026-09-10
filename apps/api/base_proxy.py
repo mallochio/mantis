@@ -11,13 +11,15 @@ Body hygiene (catalog supremacy + prefix stability):
 * harness ``reasoning`` / ``reasoning_effort`` are dropped so the catalog
   tier governs effort via Switchyard per-target ``extra_body`` (Switchyard
   ``merge_extra_body`` uses ``or_insert``: request fields would win).
-* endpoint-bound encrypted reasoning is stripped; old thinking is trimmed.
+* endpoint-bound encrypted reasoning is stripped; message history is
+  otherwise forwarded verbatim so the reusable prefix stays identical
+  across turns and prompt-cache hits survive.
 * provider-native prompt-cache markers are applied for explicit dialects.
 
-Capable Grok rides the Bedrock OpenAI-compatible endpoint
-(``bedrock-runtime.../openai/v1``) with a bearer ``BEDROCK_API_KEY`` over the
-``openai_responses`` wire format, which is where Bedrock reports cache reads.
-Both tiers are Switchyard-servable, so there are no direct LiteLLM legs.
+The efficient tier rides the self-hosted Modal GLM-5.3-Flash endpoint at
+high reasoning effort and the capable tier rides Modal Kimi-K3 at max
+effort, both over the ``openai_chat`` wire format. Both tiers are
+Switchyard-servable, so there are no direct LiteLLM legs.
 """
 
 from __future__ import annotations
@@ -54,10 +56,13 @@ def _base_route_families() -> frozenset[str]:
     if route is None:
         return frozenset()
     try:
-        families = {providers._model_cache_family(m) for m in (
-            route.efficient.upstream_model,
-            route.capable.upstream_model,
-        )}
+        families = {
+            providers._model_cache_family(m)
+            for m in (
+                route.efficient.upstream_model,
+                route.capable.upstream_model,
+            )
+        }
     except (AttributeError, KeyError, TypeError, ValueError) as error:
         logger.debug("base route cache family not loaded: %s", error)
         return frozenset()
@@ -248,35 +253,20 @@ def _synthetic_session_id(messages: Any, tools: Any = None) -> str | None:
     return "auto-" + hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
-def _trim_old_reasoning(body: dict[str, Any]) -> dict[str, Any]:
-    """Drop reasoning from old assistant turns to protect prefix-cache hits.
-
-    Keeps the last two assistant messages intact. Older traces bloat the
-    prefix and break cache reuse across providers. Best-effort: returns the
-    body unchanged when trimming is unavailable.
-    """
-    messages = body.get("messages")
-    if not isinstance(messages, list) or len(messages) < 3:
-        return body
-    try:
-        body["messages"] = providers._clear_thinking(messages, keep=2)
-    except Exception:  # noqa: BLE001 - trimming is best-effort
-        return body
-    return body
-
-
 def router_body(request: BaseChatRequest) -> dict[str, Any]:
     """Build the outbound body with a stable, cache-friendly prefix.
 
     Harness reasoning controls are dropped so the catalog tier governs
-    effort; messages are trimmed of old reasoning and endpoint-bound items
-    so the reusable prefix stays identical across turns.
+    effort; endpoint-bound items are stripped while message history is
+    otherwise forwarded verbatim. Older reasoning is deliberately kept:
+    rewriting history every turn moves the prefix divergence point and
+    forces a full context prefill on Modal, which times out past ~60s on
+    long sessions and surfaces as a silently stopped conversation.
     """
     body = request.model_dump(exclude_none=True, exclude={"user", "metadata"})
     body = _drop_client_reasoning(body)
     body = _coerce_max_completion_tokens(body)
     body = _strip_endpoint_bound_reasoning(body)
-    body = _trim_old_reasoning(body)
     return _apply_base_cache_markers(body)
 
 
@@ -377,11 +367,12 @@ def _router_stream(
     try:
         yield from upstream.iter_bytes()
     except httpx.HTTPError as exc:
-        # Upstream hung up mid-stream; stop the response cleanly instead of
-        # letting the transport error crash the whole ASGI server.
+        # Upstream hung up mid-stream (e.g. Modal closing a long-prefill
+        # stream). End the stream truncated WITHOUT a [DONE] marker so the
+        # OpenAI client raises a connection error and retries instead of
+        # treating the partial turn as a clean stop with no tool calls.
         logger.warning("upstream stream closed early: %s", exc)
-        # Emit a terminating SSE frame so clients see a clean end.
-        yield b"data: [DONE]\n\n"
+        return
     finally:
         with contextlib.suppress(Exception):
             stream.__exit__(None, None, None)

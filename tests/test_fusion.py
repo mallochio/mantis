@@ -2902,7 +2902,7 @@ def test_record_selected_slot_tracks_promotions():
     assert run.slot_models.count("main-strong") == 1
 
 
-def test_base_route_lead_resolves_to_capable_target_with_full_budget():
+def test_base_route_lead_resolves_to_capable_target():
     """The lead runs through [base] so it can use an effort the ABI slot pins."""
     catalog = Path(__file__).resolve().parent.parent / "config" / "catalog.toml"
     config = fusion.FusionRoutingConfig(main="mantis/base", sidekick="gpt-5_6-luna")

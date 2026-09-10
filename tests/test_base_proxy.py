@@ -85,9 +85,7 @@ def test_shared_harness_session_is_scoped_per_conversation():
     messages = [{"role": "user", "content": "fix the bug"}]
     other = [{"role": "user", "content": "write docs"}]
     first = base_proxy.session_id({"x-mantis-session-id": "prime-agent"}, _request(messages))
-    second = base_proxy.session_id(
-        {"x-mantis-session-id": "prime-agent"}, _request(messages=other)
-    )
+    second = base_proxy.session_id({"x-mantis-session-id": "prime-agent"}, _request(messages=other))
     assert first != second
     assert first.startswith("prime-agent:")
 
@@ -300,9 +298,7 @@ def test_forward_serves_simple_turn_through_switchyard():
             },
         )
 
-    request = _request(
-        [{"role": "user", "content": "hi"}], metadata={"session_id": "sess-1"}
-    )
+    request = _request([{"role": "user", "content": "hi"}], metadata={"session_id": "sess-1"})
     response, handed_off = base_proxy.forward(
         request, {}, "req-1", lambda: _switchyard_client(handler)
     )
@@ -402,10 +398,58 @@ def test_apply_base_cache_markers_leaves_grok_glm_messages_untouched(monkeypatch
     assert out["messages"] == body["messages"]
 
 
-def test_shipped_catalog_routes_glm_efficient_kimi_chat_capable(monkeypatch):
+def test_shipped_catalog_routes_glm_efficient_kimi_capable(monkeypatch):
     route = base_proxy._load_base_route()
     assert route is not None
-    assert route.efficient.upstream_model == "zai-org/GLM-5.3"
-    assert route.capable.upstream_model == "moonshotai/Kimi-K3"
+    assert route.efficient.provider == "modal.glm-5-3-flash"
+    assert route.efficient.upstream_model == "zai-org/GLM-5.3-Flash"
+    assert route.efficient.reasoning_effort == "high"
     assert route.capable.provider == "modal.kimi-k3"
+    assert route.capable.upstream_model == "moonshotai/Kimi-K3"
+    assert route.capable.reasoning_effort == "max"
     assert route.capable.wire_format == "openai_chat"
+
+
+def test_router_body_preserves_old_reasoning_for_prefix_stability():
+    """History must round-trip verbatim so the prefix cache survives."""
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "one", "reasoning_content": "think-one"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "two", "reasoning_content": "think-two"},
+        {"role": "user", "content": "third"},
+        {"role": "assistant", "content": "three", "reasoning_content": "think-three"},
+        {"role": "user", "content": "fourth"},
+    ]
+    body = base_proxy.router_body(_request(messages=[dict(m) for m in messages]))
+    kept = [
+        m.get("reasoning_content")
+        for m in body["messages"]
+        if m.get("role") == "assistant"
+    ]
+    assert kept == ["think-one", "think-two", "think-three"]
+
+
+def test_router_stream_does_not_mask_midstream_failure():
+    """A truncated upstream stream must not end with a clean [DONE] marker."""
+
+    class _Upstream:
+        def iter_bytes(self):
+            yield b'data: {"choices": []}\n\n'
+            raise httpx.HTTPError("boom")
+
+    class _Stream:
+        def __exit__(self, *args):
+            return False
+
+    class _Client:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    client = _Client()
+    chunks = list(base_proxy._router_stream(client, _Stream(), _Upstream()))
+    assert b"".join(chunks) == b'data: {"choices": []}\n\n'
+    assert client.closed is True

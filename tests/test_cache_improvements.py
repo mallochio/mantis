@@ -112,16 +112,22 @@ def test_base_session_id_stable_across_tool_rounds():
     )
 
 
-def test_router_body_trims_old_reasoning():
+def test_router_body_preserves_old_reasoning():
+    """History round-trips verbatim so the Modal prefix cache survives.
+
+    Rewriting old assistant turns every request moves the divergence point
+    and forces a full context prefill, which times out past ~60s on long
+    sessions and surfaces as a silently stopped conversation.
+    """
     messages = [
         {"role": "user", "content": "start"},
-        {"role": "assistant", "content": "a", "reasoning": "old-one"},
+        {"role": "assistant", "content": "a", "reasoning_content": "old-one"},
         {"role": "user", "content": "next"},
-        {"role": "assistant", "content": "b", "reasoning": "old-two"},
+        {"role": "assistant", "content": "b", "reasoning_content": "old-two"},
         {"role": "user", "content": "more"},
-        {"role": "assistant", "content": "c", "reasoning": "keep-one"},
+        {"role": "assistant", "content": "c", "reasoning_content": "keep-one"},
         {"role": "user", "content": "again"},
-        {"role": "assistant", "content": "d", "reasoning": "keep-two"},
+        {"role": "assistant", "content": "d", "reasoning_content": "keep-two"},
         {"role": "user", "content": "final"},
     ]
 
@@ -131,7 +137,9 @@ def test_router_body_trims_old_reasoning():
 
     body = base_proxy.router_body(Request())
     kept = [m for m in body["messages"] if m.get("role") == "assistant"]
-    assert "reasoning" not in kept[0]
-    assert "reasoning" not in kept[1]
-    assert kept[2]["reasoning"] == "keep-one"
-    assert kept[3]["reasoning"] == "keep-two"
+    assert [m.get("reasoning_content") for m in kept] == [
+        "old-one",
+        "old-two",
+        "keep-one",
+        "keep-two",
+    ]

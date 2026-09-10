@@ -871,7 +871,11 @@ def test_basic_model_router_stream_survives_upstream_disconnect(client, monkeypa
     )
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
-    assert response.content.endswith(b"data: [DONE]\n\n")
+    # A truncated upstream stream must NOT end with a clean [DONE] marker:
+    # the client must see a truncated stream and retry instead of treating
+    # the partial turn as a finished stop with no tool calls.
+    assert b'"content":"ok"' in response.content
+    assert not response.content.endswith(b"data: [DONE]\n\n")
     # Concurrency capacity must still be released after an upstream disconnect.
     assert api._capacity._value == initial_value
 
