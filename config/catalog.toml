@@ -69,7 +69,7 @@ recent_turn_window = 3
 provider = "modal.glm-5-3-flash"
 reasoning_effort = "high"
 max_tokens = 128000
-upstream_model = "zai-org/GLM-5.3"
+upstream_model = "zai-org/GLM-5.3-Flash"
 
 [base.targets.capable]
 provider = "modal.kimi-k3"
