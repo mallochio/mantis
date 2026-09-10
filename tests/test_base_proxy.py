@@ -401,8 +401,8 @@ def test_apply_base_cache_markers_leaves_grok_glm_messages_untouched(monkeypatch
 def test_shipped_catalog_routes_glm_efficient_kimi_capable(monkeypatch):
     route = base_proxy._load_base_route()
     assert route is not None
-    assert route.efficient.provider == "modal.glm-5-3-flash"
-    assert route.efficient.upstream_model == "zai-org/GLM-5.3-Flash"
+    assert route.efficient.provider == "modal.glm-5-3"
+    assert route.efficient.upstream_model == "zai-org/GLM-5.3"
     assert route.efficient.reasoning_effort == "high"
     assert route.capable.provider == "modal.kimi-k3"
     assert route.capable.upstream_model == "moonshotai/Kimi-K3"
