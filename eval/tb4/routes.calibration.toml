@@ -1,0 +1,46 @@
+schema_version = 1
+# Calibration route for the PRODUCTION pair (modal-hosted GLM-5.3 / Kimi-K3).
+# Serve on a SECOND switchyard instance (port 5501) so the production
+# mantis/base route on :5500 is untouched:
+#
+#   switchyard-server --config eval/tb4/routes.calibration.toml \
+#     --host 127.0.0.1 --port 5501 \
+#     --routing-log-file ~/.local/share/mantis/switchyard/routing-log-cal.jsonl
+#
+# History: the cheap pair (opencode-go glm-5.3-flash / muse-spark-1.3-contributor)
+# was blocked twice — muse-spark 500s in this region, then the Go workspace
+# 5-hour usage cap. The modal endpoints are dedicated capacity with no such
+# window, and testing the real pair answers the actual question.
+
+[llm_clients.modal_glm]
+format = "openai_chat"
+base_url = "https://interhuman-ai--ep-glm-5-3-server.us-west.modal.direct/v1"
+api_key_env = "MODAL_PROXY_TOKEN"
+
+[llm_clients.modal_kimi]
+format = "openai_chat"
+base_url = "https://interhuman-ai--ep-kimi-k3-server.us-west.modal.direct/v1"
+api_key_env = "MODAL_PROXY_TOKEN"
+
+[targets.efficient]
+id = "zai-org/GLM-5.3"
+llm_client = "modal_glm"
+
+[targets.efficient.extra_body]
+reasoning_effort = "high"
+
+[targets.capable]
+id = "moonshotai/Kimi-K3"
+llm_client = "modal_kimi"
+
+[targets.capable.extra_body]
+reasoning_effort = "max"
+
+[routes.cal_base]
+id = "cal/base"
+type = "stage_router"
+capable_target = "capable"
+efficient_target = "efficient"
+picker = "efficient_first"
+confidence_threshold = 0.5
+recent_turn_window = 3
