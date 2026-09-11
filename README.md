@@ -80,7 +80,7 @@ ln -sfn "$PWD/launch/host/llm-stack.sh" ~/Startup/llm-stack.sh
 Control the stack:
 
 ```bash
-# Normal mode: Bifrost + Switchyard + Mantis API; exposes Base and Fusion only.
+# Normal mode: LiteLLM + Switchyard + Mantis API; exposes Base and Fusion only.
 ~/Startup/llm-stack.sh start
 
 # Experimental mode: additionally exposes Trinity and Ultra/Conductor.
@@ -130,7 +130,7 @@ curl -fsS http://127.0.0.1:8088/v1/models \
   -H "Authorization: Bearer $MANTIS_API_KEY"
 ```
 
-The private Bifrost dashboard is available only on this machine at `http://127.0.0.1:8080`; log in with `BIFROST_ADMIN_USERNAME` and `BIFROST_ADMIN_PASSWORD`.
+The private LiteLLM proxy UI is available only on this machine at `http://127.0.0.1:8080/ui`; log in with the `LITELLM_API_KEY` master key.
 
 ## Prime Agent
 

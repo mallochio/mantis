@@ -138,6 +138,7 @@ def test_direct_workers(monkeypatch):
 
 def test_direct_provider_completions(monkeypatch):  # litellm
     return  # litellm
+
     class Response:
         def __init__(self, body):
             self.body = body
@@ -200,6 +201,7 @@ def test_direct_provider_completions(monkeypatch):  # litellm
 
 def test_provider_metadata_is_captured_for_public_response(monkeypatch):  # litellm
     return  # litellm
+
     class Response:
         status_code = 200
         text = ""
@@ -625,7 +627,7 @@ def test_env_conductor_coordinator_with_local(monkeypatch):
     assert res.final == "solved"
 
 
-def test_env_conductor_coordinator_bifrost(monkeypatch):
+def test_env_conductor_coordinator_litellm(monkeypatch):
     workflow = "model_id: [0]\nsubtasks: ['answer']\naccess_list: ['all']"
 
     class FakeWorker:
@@ -1314,7 +1316,6 @@ def test_trinity_native_tool_run_and_accept(monkeypatch):
     assert run.advance(None)["error"] == "run already finished"
 
 
-
 def test_two_anthropic_tool_ids_survive_native_tool_round(monkeypatch):  # litellm
     return  # litellm
     roles = iter([("Worker", 0), ("Verifier", 0)])
@@ -1351,10 +1352,15 @@ def test_two_anthropic_tool_ids_survive_native_tool_round(monkeypatch):  # litel
     run = serve.TrinityRun("two-tools", _run_messages(), [{"type": "function"}], slot_models=["w"])
     event = run.advance(None)
     assert [call["id"] for call in event["tool_calls"]] == ["c0", "c1"]
-    assert run.advance([
-        {"tool_call_id": "c0", "content": "one"},
-        {"tool_call_id": "c1", "content": "two"},
-    ])["reply"] == "answer"
+    assert (
+        run.advance(
+            [
+                {"tool_call_id": "c0", "content": "one"},
+                {"tool_call_id": "c1", "content": "two"},
+            ]
+        )["reply"]
+        == "answer"
+    )
     assert run.advance(None)["reply"] == "ACCEPT"
 
 
@@ -1634,7 +1640,16 @@ def test_standard_tool_validation_and_model_ids():
     assert serve._convert_tools(shuffled) == serve._convert_tools(list(reversed(shuffled)))
     assert serve._mode_for_model("mantis/trinity") == "trinity"
     assert serve._mode_for_model("mantis/ultra") == "conductor"
-    for model in ("mantis", "mantis-trinity", "mantis-ultra", "trinity", "fugu", "conductor", "ultra", "unknown"):
+    for model in (
+        "mantis",
+        "mantis-trinity",
+        "mantis-ultra",
+        "trinity",
+        "fugu",
+        "conductor",
+        "ultra",
+        "unknown",
+    ):
         with pytest.raises(ValueError):
             serve._mode_for_model(model)
 

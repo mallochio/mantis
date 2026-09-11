@@ -329,7 +329,7 @@ def router_error(upstream: httpx.Response) -> JSONResponse:
         )
         message = text.strip() or f"router returned status {upstream.status_code}"
 
-        # Some providers (e.g. Bifrost) return an SSE error stream for a failed
+        # Some providers (e.g. LiteLLM) return an SSE error stream for a failed
         # chat request. Look for an ``error`` field in the first data line.
         if message.startswith("data:"):
             for line in message.splitlines():

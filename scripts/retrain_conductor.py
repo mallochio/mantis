@@ -2,7 +2,7 @@
 """Retrain the OpenFugu Conductor (Llama-3.2-3B GRPO) on a new worker pool.
 
 Usage (smoke test):
-  export BIFROST_API_KEY=...
+  export LITELLM_API_KEY=...
   export HF_TOKEN=hf-...
   python scripts/retrain_conductor.py \
     --pool "anthropic/claude-sonnet-5|medium,...,z-ai/glm-5.2|none" \
@@ -15,8 +15,8 @@ Real-3B one-step acceptance test:
     --real-checkpoint-smoke --base di-zhang-fdu/openfugu-conductor-3b
 
 The pool format is identical to scripts/retrain_router_pool.py. Worker calls during
-rollout DAG execution reuse retrain_router_pool.BifrostWorker, so Bifrost model
-IDs and BIFROST_API_KEY apply.
+rollout DAG execution reuse retrain_router_pool.LiteLLMWorker, so LiteLLM model
+IDs and LITELLM_API_KEY apply.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from typing import Any, cast
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 from retrain_router_pool import (  # noqa: E402
-    BifrostWorker,
+    LiteLLMWorker,
     load_terminalbench_tasks,
     load_toolscale_tasks,
     normalize_model_id,
@@ -577,7 +577,7 @@ def main() -> None:
     if args.mock_worker:
         worker: Any = MockWorker()
     else:
-        worker = BifrostWorker(
+        worker = LiteLLMWorker(
             models=pool_specs,
             timeout=args.worker_timeout,
             max_tokens=args.worker_max_tokens,

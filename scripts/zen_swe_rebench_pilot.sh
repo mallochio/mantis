@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Zen-only SWE-rebench Phase 1 pilot: 12 tasks x 7 fixed Zen arms = 84 rollouts.
 #
-# Starts a private Zen-only Bifrost on 127.0.0.1:8080 (same worker), then runs
+# Starts a private Zen-only LiteLLM proxy on 127.0.0.1:8080 (same worker), then runs
 # eval/router_eval.py in fixed-arm shadow-cost mode with resume. A heartbeat
 # loop uploads the incremental JSONL to gs://your-eval-storage-bucket/<JOB_ID>/ so a
 # spot preemption loses at most one heartbeat interval of work.
@@ -13,10 +13,10 @@ TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 EVAL_ROOT="/opt/mantis-eval"
 RESULT_DIR="/tmp/zen-pilot-results"
 LOG_DIR="${RESULT_DIR}/logs"
-BIFROST_DIR="${BIFROST_DIR:-$HOME/.bifrost-data}"
+LITELLM_DIR="${LITELLM_DIR:-$HOME/.litellm-data}"
 PILOT_OUT="${RESULT_DIR}/pilot.jsonl"
-mkdir -p "$LOG_DIR" "$BIFROST_DIR"
-chmod 700 "$BIFROST_DIR" "$RESULT_DIR"
+mkdir -p "$LOG_DIR" "$LITELLM_DIR"
+chmod 700 "$LITELLM_DIR" "$RESULT_DIR"
 
 export EVAL_PROXY_RETRIES="${EVAL_PROXY_RETRIES:-8}"
 export EVAL_PROXY_RETRY_BASE="${EVAL_PROXY_RETRY_BASE:-1.0}"
@@ -28,86 +28,67 @@ BUCKET_PREFIX="${GCS_EVAL_BUCKET:-gs://your-eval-storage-bucket}/${JOB_ID}"
 fail() { echo "PILOT_FAIL: $*" >&2; exit 1; }
 
 if [ -z "${OPENCODE_API_KEY:-}" ]; then fail "OPENCODE_API_KEY not set"; fi
-if [ -z "${BIFROST_API_KEY:-}" ]; then fail "BIFROST_API_KEY not set"; fi
-if [ -z "${BIFROST_ENCRYPTION_KEY:-}" ]; then fail "BIFROST_ENCRYPTION_KEY not set"; fi
+if [ -z "${LITELLM_API_KEY:-}" ]; then fail "LITELLM_API_KEY not set"; fi
 
-# --- Zen-only Bifrost config -------------------------------------------------------
-cat > "$BIFROST_DIR/config.json" <<'EOF'
-{
-  "encryption_key": "env.BIFROST_ENCRYPTION_KEY",
-  "client": {
-    "enforce_auth_on_inference": true,
-    "enable_logging": false,
-    "initial_pool_size": 50,
-    "allowed_origins": ["http://127.0.0.1:8080", "http://localhost:8080"],
-    "disable_content_logging": true
-  },
-  "governance": {
-    "virtual_keys": [
-      {
-        "id": "vk-zen-swe-rebench",
-        "name": "zen swe-rebench benchmark",
-        "value": "env.BIFROST_API_KEY",
-        "is_active": true,
-        "provider_configs": [
-          {
-            "provider": "opencode-zen",
-            "weight": 1.0,
-            "allowed_models": [
-              "deepseek-v4-flash-free",
-              "mimo-v2.5-free",
-              "hy3-free",
-              "ling-3.0-tiny-free",
-              "nemotron-3-ultra-free",
-              "nemotron-3.5-lightning-free",
-              "laguna-s-2.1-free"
-            ],
-            "key_ids": ["*"]
-          }
-        ]
-      }
-    ]
-  },
-  "providers": {
-    "opencode-zen": {
-      "keys": [
-        {
-          "name": "opencode-zen-free-benchmark",
-          "value": "env.OPENCODE_API_KEY",
-          "models": [
-            "deepseek-v4-flash-free",
-            "mimo-v2.5-free",
-            "hy3-free",
-            "ling-3.0-tiny-free",
-            "nemotron-3-ultra-free",
-            "nemotron-3.5-lightning-free",
-            "laguna-s-2.1-free"
-          ],
-          "weight": 1.0
-        }
-      ],
-      "store_raw_request_response": false
-    }
-  },
-  "source_of_truth": "config.json"
-}
+# --- Zen-only LiteLLM proxy config ---------------------------------------------------
+cat > "$LITELLM_DIR/config.yaml" <<'EOF'
+model_list:
+  - model_name: "opencode-zen/deepseek-v4-flash-free"
+    litellm_params:
+      model: "openai/deepseek-v4-flash-free"
+      api_base: "https://opencode.ai/zen/v1"
+      api_key: "os.environ/OPENCODE_API_KEY"
+  - model_name: "opencode-zen/mimo-v2.5-free"
+    litellm_params:
+      model: "openai/mimo-v2.5-free"
+      api_base: "https://opencode.ai/zen/v1"
+      api_key: "os.environ/OPENCODE_API_KEY"
+  - model_name: "opencode-zen/hy3-free"
+    litellm_params:
+      model: "openai/hy3-free"
+      api_base: "https://opencode.ai/zen/v1"
+      api_key: "os.environ/OPENCODE_API_KEY"
+  - model_name: "opencode-zen/ling-3.0-tiny-free"
+    litellm_params:
+      model: "openai/ling-3.0-tiny-free"
+      api_base: "https://opencode.ai/zen/v1"
+      api_key: "os.environ/OPENCODE_API_KEY"
+  - model_name: "opencode-zen/nemotron-3-ultra-free"
+    litellm_params:
+      model: "openai/nemotron-3-ultra-free"
+      api_base: "https://opencode.ai/zen/v1"
+      api_key: "os.environ/OPENCODE_API_KEY"
+  - model_name: "opencode-zen/nemotron-3.5-lightning-free"
+    litellm_params:
+      model: "openai/nemotron-3.5-lightning-free"
+      api_base: "https://opencode.ai/zen/v1"
+      api_key: "os.environ/OPENCODE_API_KEY"
+  - model_name: "opencode-zen/laguna-s-2.1-free"
+    litellm_params:
+      model: "openai/laguna-s-2.1-free"
+      api_base: "https://opencode.ai/zen/v1"
+      api_key: "os.environ/OPENCODE_API_KEY"
+general_settings:
+  master_key: "os.environ/LITELLM_API_KEY"
+litellm_settings:
+  drop_params: true
 EOF
-chmod 600 "$BIFROST_DIR/config.json"
+chmod 600 "$LITELLM_DIR/config.yaml"
 
-# --- Start Bifrost ------------------------------------------------------------------
-nohup npx -y @maximhq/bifrost -app-dir "$BIFROST_DIR" -host 127.0.0.1 -port 8080 -log-style pretty \
-  </dev/null >> "$LOG_DIR/bifrost.out" 2>> "$LOG_DIR/bifrost.err" &
-echo "$!" > "$BIFROST_DIR/bifrost.pid"
+# --- Start LiteLLM proxy -------------------------------------------------------------
+nohup litellm --config "$LITELLM_DIR/config.yaml" --host 127.0.0.1 --port 8080 \
+  </dev/null >> "$LOG_DIR/litellm.out" 2>> "$LOG_DIR/litellm.err" &
+echo "$!" > "$LITELLM_DIR/litellm.pid"
 
 ready=0
 for _ in $(seq 1 90); do
-  if curl -sf -m 3 "http://127.0.0.1:8080/v1/models" -H "x-bf-vk: ${BIFROST_API_KEY}" -o "$LOG_DIR/models.json" 2>/dev/null; then
+  if curl -sf -m 3 "http://127.0.0.1:8080/v1/models" -H "Authorization: Bearer ${LITELLM_API_KEY}" -o "$LOG_DIR/models.json" 2>/dev/null; then
     ready=1
     break
   fi
   sleep 2
 done
-[ "$ready" = "1" ] || fail "Bifrost did not become ready; see $LOG_DIR/bifrost.err"
+[ "$ready" = "1" ] || fail "LiteLLM did not become ready; see $LOG_DIR/litellm.err"
 
 python3 - "$LOG_DIR/models.json" <<'PY'
 import json, sys
@@ -145,8 +126,8 @@ fi
     if [ -f "$PILOT_OUT" ]; then
       gcloud storage cp "$PILOT_OUT" "${BUCKET_PREFIX}/pilot.jsonl" --quiet >/dev/null 2>&1 || true
     fi
-    if [ -f "$LOG_DIR/bifrost.err" ]; then
-      gcloud storage cp "$LOG_DIR/bifrost.err" "${BUCKET_PREFIX}/logs/bifrost.err" --quiet >/dev/null 2>&1 || true
+    if [ -f "$LOG_DIR/litellm.err" ]; then
+      gcloud storage cp "$LOG_DIR/litellm.err" "${BUCKET_PREFIX}/logs/litellm.err" --quiet >/dev/null 2>&1 || true
     fi
   done
 ) &
@@ -161,7 +142,7 @@ python3 eval/router_eval.py \
   --prices eval/model_prices.json \
   --shadow-prices eval/prices/zen-2026-08-13.json \
   --cost-mode shadow \
-  --bifrost-endpoint http://127.0.0.1:8080/v1/chat/completions \
+  --litellm-endpoint http://127.0.0.1:8080/v1/chat/completions \
   --fixed-model deepseek=opencode-zen/deepseek-v4-flash-free \
   --fixed-model mimo=opencode-zen/mimo-v2.5-free \
   --fixed-model hy3=opencode-zen/hy3-free \

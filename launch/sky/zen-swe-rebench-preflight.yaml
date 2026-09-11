@@ -39,12 +39,14 @@ setup: |
     curl -fsSL https://get.docker.com | sudo sh
     (sudo systemctl enable --now docker || (sudo nohup dockerd >/var/log/dockerd.log 2>&1 &)) || true
   fi
-  # Node 22 for the pi coding agent CLI and the Bifrost npx wrapper.
+  # Node 22 for the pi coding agent CLI.
   if ! command -v node >/dev/null 2>&1 || [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 22 ]; then
     curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
     sudo apt-get install -y nodejs
   fi
   sudo npm install -g @earendil-works/pi-coding-agent@0.84.1
+  # LiteLLM proxy serves the worker-local OpenAI-compatible gateway on :8080.
+  sudo python3 -m pip install --break-system-packages 'litellm[proxy]' || sudo python3 -m pip install 'litellm[proxy]'
   echo "node=$(node --version) pi=$(pi --version) docker=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo n/a)"
 
 run: |

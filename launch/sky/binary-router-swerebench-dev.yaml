@@ -22,6 +22,8 @@ setup: |
   if ! command -v docker >/dev/null 2>&1; then curl -fsSL https://get.docker.com | sudo sh; sudo systemctl enable --now docker || true; fi
   if ! command -v node >/dev/null 2>&1 || [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 22 ]; then curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -; sudo apt-get install -y nodejs; fi
   sudo npm install -g @earendil-works/pi-coding-agent@0.84.1
+  # LiteLLM proxy serves the worker-local OpenAI-compatible gateway on :8080.
+  sudo python3 -m pip install --break-system-packages 'litellm[proxy]' || sudo python3 -m pip install 'litellm[proxy]'
 run: |
   set -euo pipefail
   bash /opt/mantis-eval/scripts/binary_router_swerebench_arm.sh

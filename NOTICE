@@ -13,5 +13,5 @@ Third-party components used at runtime include (but are not limited to):
 - OpenFugu (https://github.com/trotsky1997/OpenFugu) — incorporated as a pinned
   git submodule.
 - Qwen3-0.6B and associated adapted router heads from Hugging Face.
-- Bifrost for external model routing.
+- LiteLLM for external model routing.
 - NVIDIA NeMo Switchyard for `mantis/base` model selection.

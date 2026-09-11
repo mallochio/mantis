@@ -2,12 +2,12 @@
 
 The agent driving each instance is `pi` in headless mode (`--mode json`,
 `-p`). pi is pointed at a local header-recording proxy that forwards chat
-completions to Bifrost / Switchyard; the proxy records `x-route-*`
+completions to LiteLLM / Switchyard; the proxy records `x-route-*`
 response headers, per-request usage, and enforces the arm/global budget
 ceiling by refusing to forward requests once a cap is reached.
 
-The model endpoints are OpenAI-compatible (Bifrost `:8080`, Mantis `:8088`),
-so no litellm or mini-swe-agent dependency is involved.
+The model endpoints are OpenAI-compatible (LiteLLM `:8080`, Mantis `:8088`),
+so no litellm SDK or mini-swe-agent dependency is involved.
 """
 
 from __future__ import annotations
@@ -37,25 +37,38 @@ DEFAULT_PRICES = REPO / "eval" / "model_prices.json"
 DEFAULT_WORKTREES = REPO / "eval" / "runs" / "worktrees"
 TIERS = ("cheap", "middle", "expensive")
 ARMS = (
-    "cheap-only", "middle-only", "expensive-only", "mantis-direct",
-    "heuristic", "random-matched", "trinity",
+    "cheap-only",
+    "middle-only",
+    "expensive-only",
+    "mantis-direct",
+    "heuristic",
+    "random-matched",
+    "trinity",
 )
 DEFAULT_CAPS = {
-    "cheap-only": 0.05, "middle-only": 0.25, "expensive-only": 0.85,
-    "mantis-direct": 0.80, "heuristic": 0.80, "random-matched": 0.80,
+    "cheap-only": 0.05,
+    "middle-only": 0.25,
+    "expensive-only": 0.85,
+    "mantis-direct": 0.80,
+    "heuristic": 0.80,
+    "random-matched": 0.80,
     "trinity": 1.50,
 }
 FIXED_ARM_DEFAULT_CAP = DEFAULT_CAPS["expensive-only"]
 DEFAULT_SHADOW_PRICES = REPO / "eval" / "prices" / "zen-2026-08-13.json"
-# Fixed arms must use explicit Bifrost provider-qualified IDs. Provider
+# Fixed arms must use explicit LiteLLM provider-qualified IDs. Provider
 # selection is controlled by each experiment's allowlist rather than a global
 # prefix ban: the Zen discovery study used opencode-zen/* only, while the
 # binary low/high study intentionally pairs Zen hy3 with subscription-backed
 # opencode-go/deepseek-v4-flash.
 FIXED_ARM_FORBIDDEN_PREFIXES: tuple[str, ...] = ()
 ROUTE_HEADER_KEYS = (
-    "x-route-decision", "x-route-reason", "x-route-model",
-    "x-route-sticky", "x-route-fallback", "x-model-router-selected-model",
+    "x-route-decision",
+    "x-route-reason",
+    "x-route-model",
+    "x-route-sticky",
+    "x-route-fallback",
+    "x-model-router-selected-model",
 )
 PI_TOOLS = "read,bash,edit,write"
 
@@ -137,8 +150,7 @@ def usage_cost(
     if price is None or prompt is None or completion is None:
         return None, "unknown"
     return (
-        float(prompt) * price["input_per_token"]
-        + float(completion) * price["output_per_token"],
+        float(prompt) * price["input_per_token"] + float(completion) * price["output_per_token"],
         "token_counts_x_price_table",
     )
 
@@ -205,9 +217,12 @@ def eval_costs(
     else:
         cost, method = actual, actual_method
     return {
-        "cost": cost, "cost_method": method,
-        "actual_cost_usd": actual, "actual_cost_method": actual_method,
-        "shadow_cost_usd": analytic, "shadow_cost_method": analytic_method,
+        "cost": cost,
+        "cost_method": method,
+        "actual_cost_usd": actual,
+        "actual_cost_method": actual_method,
+        "shadow_cost_usd": analytic,
+        "shadow_cost_method": analytic_method,
     }
 
 
@@ -237,9 +252,7 @@ def parse_fixed_models(specs: list[str]) -> dict[str, str]:
         if name in ARMS or name in fixed:
             raise ValueError(f"fixed arm name {name!r} collides with an existing arm")
         if "/" not in model:
-            raise ValueError(
-                f"fixed arm {name!r} model must be provider-qualified, got {model!r}"
-            )
+            raise ValueError(f"fixed arm {name!r} model must be provider-qualified, got {model!r}")
         if any(model.startswith(prefix + "/") for prefix in FIXED_ARM_FORBIDDEN_PREFIXES):
             raise ValueError(
                 f"fixed arm {name!r} targets forbidden provider {model.split('/')[0]!r}"
@@ -248,9 +261,7 @@ def parse_fixed_models(specs: list[str]) -> dict[str, str]:
     return fixed
 
 
-def _tier_for_arm(
-    arm: str, prompt: str, rng: random.Random, frequencies: dict[str, float]
-) -> str:
+def _tier_for_arm(arm: str, prompt: str, rng: random.Random, frequencies: dict[str, float]) -> str:
     if arm.endswith("-only"):
         return arm.removesuffix("-only")
     if arm == "heuristic":
@@ -277,9 +288,7 @@ def _model_for_arm(
     return ("mantis/trinity" if arm == "trinity" else "mantis/base"), None
 
 
-def routed_request_tiers(
-    row: dict[str, Any], tier_models: dict[str, str]
-) -> list[str]:
+def routed_request_tiers(row: dict[str, Any], tier_models: dict[str, str]) -> list[str]:
     model_to_tier = {model: tier for tier, model in tier_models.items()}
     tiers = []
     for event in row.get("route_trace", []):
@@ -318,9 +327,11 @@ def _run_test_command(
         setup = f"{install} && " if install else ""
         reset = ""
         if base_commit and reset_paths:
-            reset = f"git checkout {shlex.quote(base_commit)} -- " + " ".join(
-                shlex.quote(path) for path in reset_paths
-            ) + " && "
+            reset = (
+                f"git checkout {shlex.quote(base_commit)} -- "
+                + " ".join(shlex.quote(path) for path in reset_paths)
+                + " && "
+            )
         shell = (
             "source /root/.bashrc && conda activate testbed && "
             f"cd /testbed && git apply /tmp/model.patch && {reset}"
@@ -328,12 +339,22 @@ def _run_test_command(
         )
         result = subprocess.run(
             [
-                "docker", "run", "--rm",
-                "-v", f"{patch_path}:/tmp/model.patch:ro",
-                "-v", f"{test_path}:/tmp/test.patch:ro",
-                image, "bash", "-lc", shell,
+                "docker",
+                "run",
+                "--rm",
+                "-v",
+                f"{patch_path}:/tmp/model.patch:ro",
+                "-v",
+                f"{test_path}:/tmp/test.patch:ro",
+                image,
+                "bash",
+                "-lc",
+                shell,
             ],
-            capture_output=True, text=True, timeout=timeout, check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
         )
         return result.returncode == 0, result.stdout + result.stderr
     finally:
@@ -342,11 +363,13 @@ def _run_test_command(
 
 
 def _test_paths(test_patch: str) -> list[str]:
-    return sorted({
-        line[6:].split("\t", 1)[0]
-        for line in test_patch.splitlines()
-        if line.startswith("+++ b/")
-    })
+    return sorted(
+        {
+            line[6:].split("\t", 1)[0]
+            for line in test_patch.splitlines()
+            if line.startswith("+++ b/")
+        }
+    )
 
 
 def _test_command(instance: dict[str, Any], tests: list[str]) -> str:
@@ -369,12 +392,15 @@ def grade_patch(instance: dict[str, Any], patch: str) -> dict[str, Any]:
     f2p = list(instance.get("FAIL_TO_PASS", []))
     p2p = list(instance.get("PASS_TO_PASS", []))
     try:
-        commands = {"fail_to_pass": _test_command(instance, f2p),
-                    "pass_to_pass": _test_command(instance, p2p)}
+        commands = {
+            "fail_to_pass": _test_command(instance, f2p),
+            "pass_to_pass": _test_command(instance, p2p),
+        }
     except ValueError as exc:
         return {"resolved": False, "grader_output": str(exc), "grader_error": str(exc)}
     common = {
-        "image": instance["docker_image"], "patch": patch,
+        "image": instance["docker_image"],
+        "patch": patch,
         "test_patch": instance.get("test_patch", ""),
         "base_commit": instance.get("base_commit", ""),
         "reset_paths": _test_paths(instance.get("test_patch", "")),
@@ -387,16 +413,12 @@ def grade_patch(instance: dict[str, Any], patch: str) -> dict[str, Any]:
     return {
         "resolved": all(result["passed"] for result in results.values()),
         "test_results": results,
-        "grader_output": "\n".join(
-            cast(str, result["output"]) for result in results.values()
-        ),
+        "grader_output": "\n".join(cast(str, result["output"]) for result in results.values()),
     }
 
 
 def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True
-    )
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True)
 
 
 def _ensure_worktree(instance: dict[str, Any], root: Path) -> tuple[Path, Path | None, bool]:
@@ -418,9 +440,17 @@ def _ensure_worktree(instance: dict[str, Any], root: Path) -> tuple[Path, Path |
     if not (cache / ".git").is_dir():
         cache.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(
-            ["git", "clone", "--filter=blob:none", "--no-checkout",
-             f"https://github.com/{repo}.git", str(cache)],
-            capture_output=True, text=True, check=True,
+            [
+                "git",
+                "clone",
+                "--filter=blob:none",
+                "--no-checkout",
+                f"https://github.com/{repo}.git",
+                str(cache),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
         )
     else:
         _git("fetch", "origin", cwd=cache)
@@ -510,9 +540,8 @@ def _sleep_with_jitter(seconds: float) -> float:
 
 
 def _is_retryable_response(resp: requests.Response, statuses: frozenset[int]) -> bool:
-    """Treat Bifrost rate-limit envelopes as retryable even when the proxy
-    surfaces them as a 400 body (Bifrost returns FreeUsageLimitError with a
-    400 status rather than a 429)."""
+    """Treat proxy rate-limit envelopes as retryable even when surfaced as a
+    400 body rather than a 429."""
     if resp.status_code in statuses:
         return True
     if "json" not in (resp.headers.get("Content-Type") or ""):
@@ -523,8 +552,6 @@ def _is_retryable_response(resp: requests.Response, statuses: frozenset[int]) ->
         return False
     error = body.get("error") if isinstance(body, dict) else None
     if isinstance(error, dict):
-        if error.get("type") == "FreeUsageLimitError":
-            return True
         message = error.get("message")
         if isinstance(message, str) and "rate limit" in message.lower():
             return True
@@ -596,29 +623,27 @@ class _ProxyHandler(BaseHTTPRequestHandler):
                 continue
             break
         payload = resp.content
-        route = {
-            key: resp.headers[key]
-            for key in ROUTE_HEADER_KEYS
-            if resp.headers.get(key)
-        }
+        route = {key: resp.headers[key] for key in ROUTE_HEADER_KEYS if resp.headers.get(key)}
         usage = _usage_from_response(resp)
         billed_model = route.get("x-route-model") or (
             resp.json().get("model", proxy.model)
             if "json" in resp.headers.get("Content-Type", "")
             else proxy.model
         )
-        costs = eval_costs(
-            usage, billed_model, proxy.prices, proxy.shadow_prices, proxy.cost_mode
-        )
+        costs = eval_costs(usage, billed_model, proxy.prices, proxy.shadow_prices, proxy.cost_mode)
         with proxy.lock:
             proxy.records.append(
-                {"route_headers": route, "usage": usage, "served_model": billed_model,
-                 "status": resp.status_code, "retries": attempt, **costs}
+                {
+                    "route_headers": route,
+                    "usage": usage,
+                    "served_model": billed_model,
+                    "status": resp.status_code,
+                    "retries": attempt,
+                    **costs,
+                }
             )
             try:
-                proxy.ledger.record(
-                    proxy.instance_id, proxy.arm, costs["cost"], proxy.cap
-                )
+                proxy.ledger.record(proxy.instance_id, proxy.arm, costs["cost"], proxy.cap)
             except ArmBudgetExceeded:
                 proxy.exceeded = True
             except BudgetAbort:
@@ -700,8 +725,12 @@ class _RouteRecordingProxy:
 
 
 def _render_provider_extension(
-    models: list[str], base_url: str, api_key: str, session: str,
-    max_tokens: int, out_path: Path,
+    models: list[str],
+    base_url: str,
+    api_key: str,
+    session: str,
+    max_tokens: int,
+    out_path: Path,
 ) -> None:
     """Write a pi extension registering an `eval` provider pointed at the proxy."""
     lines = [
@@ -788,7 +817,7 @@ def run_pi_agent(
 ) -> dict[str, Any]:
     """Drive `pi` headless in a host worktree, then grade its patch.
 
-    pi is pointed at a local proxy that forwards to `endpoint` (Bifrost or the
+    pi is pointed at a local proxy that forwards to `endpoint` (LiteLLM or the
     Mantis API / Switchyard), records `x-route-*` headers and usage, and stops
     forwarding once the arm cap or global budget is reached.
     """
@@ -798,16 +827,24 @@ def run_pi_agent(
         arm, instance["problem_statement"], tier_models, rng, frequencies, fixed_models
     )
     session = f"router-eval-{secrets.token_hex(8)}"
-    # The Mantis API (8088) and Bifrost (8080) use different credentials.
+    # The Mantis API (8088) and LiteLLM (8080) use different credentials.
     # Select the right key based on which endpoint this arm targets.
     if "mantis" in endpoint or ":8088" in endpoint:
-        api_key = os.environ.get("MANTIS_API_KEY") or os.environ.get("BIFROST_API_KEY")
+        api_key = os.environ.get("MANTIS_API_KEY") or os.environ.get("LITELLM_API_KEY")
     else:
-        api_key = os.environ.get("BIFROST_API_KEY") or os.environ.get("MANTIS_API_KEY")
+        api_key = os.environ.get("LITELLM_API_KEY") or os.environ.get("MANTIS_API_KEY")
     proxy = _RouteRecordingProxy(
-        upstream=endpoint, api_key=api_key, ledger=ledger, instance_id=instance_id,
-        arm=arm, cap=arm_cap, prices=prices, shadow_prices=shadow_prices,
-        cost_mode=cost_mode, model=model_name, session=session,
+        upstream=endpoint,
+        api_key=api_key,
+        ledger=ledger,
+        instance_id=instance_id,
+        arm=arm,
+        cap=arm_cap,
+        prices=prices,
+        shadow_prices=shadow_prices,
+        cost_mode=cost_mode,
+        model=model_name,
+        session=session,
     )
     workdir: Path | None = None
     cache: Path | None = None
@@ -820,19 +857,28 @@ def run_pi_agent(
     try:
         workdir, cache, created = _ensure_worktree(instance, root)
         models = sorted(
-            set(tier_models.values()) | set(fixed_models.values())
+            set(tier_models.values())
+            | set(fixed_models.values())
             | {"mantis/base", "mantis/trinity"}
         )
         _render_provider_extension(
-            models, proxy.base_url(), api_key or "", session, output_token_limit,
+            models,
+            proxy.base_url(),
+            api_key or "",
+            session,
+            output_token_limit,
             ext_path,
         )
         cmd = [
             *pi_executable,
-            "-e", str(ext_path),
-            "--provider", "eval",
-            "--model", f"eval/{model_name}",
-            "--mode", "json",
+            "-e",
+            str(ext_path),
+            "--provider",
+            "eval",
+            "--model",
+            f"eval/{model_name}",
+            "--mode",
+            "json",
             "--no-session",
             "--no-extensions",
             "--no-skills",
@@ -841,11 +887,17 @@ def run_pi_agent(
             "--no-context-files",
             "--no-approve",
             "--offline",
-            "--tools", PI_TOOLS,
-            "-p", instance["problem_statement"],
+            "--tools",
+            PI_TOOLS,
+            "-p",
+            instance["problem_statement"],
         ]
         result = subprocess.run(
-            cmd, cwd=str(workdir), capture_output=True, text=True, timeout=timeout,
+            cmd,
+            cwd=str(workdir),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
             env={**os.environ, "EVAL_PROXY_BASE_URL": proxy.base_url()},
         )
         trajectory = _parse_pi_events(result.stdout)
@@ -857,14 +909,12 @@ def run_pi_agent(
             abort_scope = "global"
         if error is None and abort_scope is None:
             patch = _worktree_patch(workdir)
-        grade = (
-            grade_patch(instance, patch)
-            if error is None and abort_scope is None
-            else None
-        )
+        grade = grade_patch(instance, patch) if error is None and abort_scope is None else None
         row: dict[str, Any] = {
-            "instance_id": instance_id, "arm": arm,
-            "tier": selected_tier, "model": model_name,
+            "instance_id": instance_id,
+            "arm": arm,
+            "tier": selected_tier,
+            "model": model_name,
             "resolved": bool(grade and grade["resolved"]),
             "model_patch": patch,
             # Row-level cost is the selected evaluation cost; any unknown
@@ -875,11 +925,9 @@ def run_pi_agent(
             "cost_method": proxy.records[-1]["cost_method"] if proxy.records else None,
             "actual_cost_usd": _sum_cost(proxy.records, "actual_cost_usd"),
             "shadow_cost_usd": _sum_cost(proxy.records, "shadow_cost_usd"),
-            "served_models": sorted({
-                record["served_model"]
-                for record in proxy.records
-                if record.get("served_model")
-            }),
+            "served_models": sorted(
+                {record["served_model"] for record in proxy.records if record.get("served_model")}
+            ),
             "trajectory": trajectory,
             "route_trace": proxy.records,
         }
@@ -895,8 +943,12 @@ def run_pi_agent(
             row["error"] = error
     except subprocess.TimeoutExpired:
         return {
-            "instance_id": instance_id, "arm": arm, "tier": selected_tier,
-            "model": model_name, "resolved": False, "model_patch": "",
+            "instance_id": instance_id,
+            "arm": arm,
+            "tier": selected_tier,
+            "model": model_name,
+            "resolved": False,
+            "model_patch": "",
             "cost_usd": _sum_cost(proxy.records, "cost"),
             "cost_method": proxy.records[-1]["cost_method"] if proxy.records else None,
             "actual_cost_usd": _sum_cost(proxy.records, "actual_cost_usd"),
@@ -904,14 +956,20 @@ def run_pi_agent(
             "served_models": sorted(
                 {r["served_model"] for r in proxy.records if r.get("served_model")}
             ),
-            "trajectory": trajectory, "route_trace": proxy.records,
-            "error": f"pi timed out after {timeout}s", "aborted": True,
+            "trajectory": trajectory,
+            "route_trace": proxy.records,
+            "error": f"pi timed out after {timeout}s",
+            "aborted": True,
             "abort_scope": "timeout",
         }
     except Exception as exc:  # noqa: BLE001 - an eval run keeps going on failure
         return {
-            "instance_id": instance_id, "arm": arm, "tier": selected_tier,
-            "model": model_name, "resolved": False, "model_patch": "",
+            "instance_id": instance_id,
+            "arm": arm,
+            "tier": selected_tier,
+            "model": model_name,
+            "resolved": False,
+            "model_patch": "",
             "cost_usd": _sum_cost(proxy.records, "cost"),
             "cost_method": proxy.records[-1]["cost_method"] if proxy.records else None,
             "actual_cost_usd": _sum_cost(proxy.records, "actual_cost_usd"),
@@ -919,7 +977,8 @@ def run_pi_agent(
             "served_models": sorted(
                 {r["served_model"] for r in proxy.records if r.get("served_model")}
             ),
-            "trajectory": trajectory, "route_trace": proxy.records,
+            "trajectory": trajectory,
+            "route_trace": proxy.records,
             "error": f"{type(exc).__name__}: {exc}",
         }
     else:
@@ -947,10 +1006,7 @@ def dry_run(
             f"instances: {manifest['instance_count']}",
             f"price_table: {prices_path} (separate from caps)",
             "projected worst-case spend (caps only; no model calls):",
-            *[
-                f"  {arm}: ${caps[arm] * manifest['instance_count']:.2f}"
-                for arm in arms
-            ],
+            *[f"  {arm}: ${caps[arm] * manifest['instance_count']:.2f}" for arm in arms],
             f"projected total: ${total:.2f}",
             "model calls: 0 (dry-run)",
         ]
@@ -969,15 +1025,22 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--budget-usd", type=float, default=250.0)
     parser.add_argument(
-        "--per-instance-cost", type=float, default=None,
+        "--per-instance-cost",
+        type=float,
+        default=None,
         help="override every per-instance/arm cap (legacy alias)",
     )
     parser.add_argument(
-        "--arm-cap", action="append", default=[],
-        metavar="ARM=USD", help="override one arm's per-instance cap",
+        "--arm-cap",
+        action="append",
+        default=[],
+        metavar="ARM=USD",
+        help="override one arm's per-instance cap",
     )
     parser.add_argument(
-        "--timeout", type=int, default=600,
+        "--timeout",
+        type=int,
+        default=600,
         help="wall-clock seconds per (instance, arm) pi run",
     )
     parser.add_argument("--output-token-limit", type=int, default=4096)
@@ -986,7 +1049,7 @@ def main() -> None:
         "--output", type=Path, default=REPO / "eval" / "runs" / "router-results.jsonl"
     )
     parser.add_argument(
-        "--bifrost-endpoint",
+        "--litellm-endpoint",
         default="http://127.0.0.1:8080/v1/chat/completions",
     )
     parser.add_argument(
@@ -998,27 +1061,37 @@ def main() -> None:
         default="cheap=deepseek-v4-flash,middle=gpt-5.6-terra,expensive=gpt-5.6-sol",
     )
     parser.add_argument(
-        "--fixed-model", action="append", default=[], dest="fixed_models",
+        "--fixed-model",
+        action="append",
+        default=[],
+        dest="fixed_models",
         metavar="NAME=PROVIDER/MODEL",
-        help="declare a fixed arm pinned to one exact Bifrost provider/model ID; "
-             "repeatable. Fixed arms bypass tier selection entirely.",
+        help="declare a fixed arm pinned to one exact LiteLLM provider/model ID; "
+        "repeatable. Fixed arms bypass tier selection entirely.",
     )
     parser.add_argument(
-        "--cost-mode", choices=("actual", "shadow"), default="actual",
+        "--cost-mode",
+        choices=("actual", "shadow"),
+        default="actual",
         help="evaluation cost basis for caps, summaries, and metrics; "
-             "shadow ignores usage.cost and prices tokens from the frozen snapshot",
+        "shadow ignores usage.cost and prices tokens from the frozen snapshot",
     )
     parser.add_argument(
-        "--shadow-prices", type=Path, default=DEFAULT_SHADOW_PRICES,
+        "--shadow-prices",
+        type=Path,
+        default=DEFAULT_SHADOW_PRICES,
         help="frozen shadow price snapshot (created per experiment campaign)",
     )
     parser.add_argument(
-        "--resume", action="store_true",
+        "--resume",
+        action="store_true",
         help="skip (instance_id, arm) pairs already present in --output; "
-             "existing rows (including failed ones) are kept, never silently retried",
+        "existing rows (including failed ones) are kept, never silently retried",
     )
     parser.add_argument(
-        "--worktrees-root", type=Path, default=DEFAULT_WORKTREES,
+        "--worktrees-root",
+        type=Path,
+        default=DEFAULT_WORKTREES,
         help="host worktree root for per-instance checkouts (gitignored)",
     )
     parser.add_argument("--keep-worktrees", action="store_true")
@@ -1032,9 +1105,7 @@ def main() -> None:
         parser.error(str(exc))
     if args.cost_mode == "shadow" and not args.shadow_prices.exists():
         parser.error(f"--cost-mode shadow requires a snapshot: {args.shadow_prices}")
-    shadow_prices = (
-        load_shadow_prices(args.shadow_prices) if args.shadow_prices.exists() else {}
-    )
+    shadow_prices = load_shadow_prices(args.shadow_prices) if args.shadow_prices.exists() else {}
     arms = [arm.strip() for arm in args.arms.split(",") if arm.strip()]
     if args.include_trinity and "trinity" not in arms:
         arms.append("trinity")
@@ -1073,21 +1144,26 @@ def main() -> None:
     metadata = {
         "manifest": str(args.manifest),
         "manifest_sha256": hashlib.sha256(args.manifest.read_bytes()).hexdigest(),
-        "arms": arms, "caps": caps, "budget_usd": args.budget_usd,
+        "arms": arms,
+        "caps": caps,
+        "budget_usd": args.budget_usd,
         "per_arm_caps": caps,
         "timeout": args.timeout,
-        "output_token_limit": args.output_token_limit, "seed": args.seed,
+        "output_token_limit": args.output_token_limit,
+        "seed": args.seed,
         "pi_executable": args.pi_executable,
         "worktrees_root": str(args.worktrees_root),
         "cost_mode": args.cost_mode,
         "shadow_prices": str(args.shadow_prices),
         "shadow_prices_sha256": (
             hashlib.sha256(args.shadow_prices.read_bytes()).hexdigest()
-            if args.shadow_prices.exists() else None
+            if args.shadow_prices.exists()
+            else None
         ),
         "fixed_models": fixed_models,
         "tier_models": tier_models,
-        "aborted_on_budget": False, "excluded_instances": [],
+        "aborted_on_budget": False,
+        "excluded_instances": [],
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("a" if args.resume else "w") as output:
@@ -1102,13 +1178,22 @@ def main() -> None:
                 if (instance["instance_id"], "mantis-direct") in done_pairs:
                     continue
                 row = run_pi_agent(
-                    instance, arm="mantis-direct", endpoint=args.mantis_endpoint,
-                    tier_models=tier_models, prices=prices, shadow_prices=shadow_prices,
-                    cost_mode=args.cost_mode, fixed_models=fixed_models, ledger=ledger,
-                    arm_cap=caps["mantis-direct"], rng=rng,
-                    timeout=args.timeout, output_token_limit=args.output_token_limit,
+                    instance,
+                    arm="mantis-direct",
+                    endpoint=args.mantis_endpoint,
+                    tier_models=tier_models,
+                    prices=prices,
+                    shadow_prices=shadow_prices,
+                    cost_mode=args.cost_mode,
+                    fixed_models=fixed_models,
+                    ledger=ledger,
+                    arm_cap=caps["mantis-direct"],
+                    rng=rng,
+                    timeout=args.timeout,
+                    output_token_limit=args.output_token_limit,
                     frequencies={tier: 1 / len(TIERS) for tier in TIERS},
-                    worktrees_root=args.worktrees_root, pi_executable=pi_executable,
+                    worktrees_root=args.worktrees_root,
+                    pi_executable=pi_executable,
                     keep_worktrees=args.keep_worktrees,
                 )
                 output.write(json.dumps({"record_type": "result", **row}) + "\n")
@@ -1139,20 +1224,24 @@ def main() -> None:
                 for arm in remaining_arms:
                     if (instance_id, arm) in done_pairs:
                         continue
-                    endpoint = (
-                        args.mantis_endpoint if arm == "trinity"
-                        else args.bifrost_endpoint
-                    )
+                    endpoint = args.mantis_endpoint if arm == "trinity" else args.litellm_endpoint
                     row = run_pi_agent(
-                        instance, arm=arm, endpoint=endpoint,
-                        tier_models=tier_models, prices=prices,
-                        shadow_prices=shadow_prices, cost_mode=args.cost_mode,
-                        fixed_models=fixed_models, ledger=ledger,
+                        instance,
+                        arm=arm,
+                        endpoint=endpoint,
+                        tier_models=tier_models,
+                        prices=prices,
+                        shadow_prices=shadow_prices,
+                        cost_mode=args.cost_mode,
+                        fixed_models=fixed_models,
+                        ledger=ledger,
                         arm_cap=caps[arm],
-                        rng=rng, timeout=args.timeout,
+                        rng=rng,
+                        timeout=args.timeout,
                         output_token_limit=args.output_token_limit,
                         frequencies=frequencies,
-                        worktrees_root=args.worktrees_root, pi_executable=pi_executable,
+                        worktrees_root=args.worktrees_root,
+                        pi_executable=pi_executable,
                         keep_worktrees=args.keep_worktrees,
                     )
                     rows.append(row)

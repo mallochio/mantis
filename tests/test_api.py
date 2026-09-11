@@ -296,9 +296,11 @@ def test_stream_summary_suppresses_provider_noise_and_deduplicates(client, monke
 def test_stream_debug_retains_detailed_events(client, monkeypatch):
     run = serve.NativeRun("d" * 32)
     run.kind = "trinity"
+
     def advance(*_args):
         run.record_activity("provider", role="Worker", summary="Calling a model")
         return {"type": "final", "text": "answer"}
+
     monkeypatch.setattr(serve, "create_run", lambda *_a: run)
     monkeypatch.setattr(serve, "_advance_to_boundary", advance)
     monkeypatch.setattr(serve, "delete_run", lambda *_a, **_k: True)
@@ -1166,7 +1168,7 @@ def _chat_resolved(model: str) -> providers.ResolvedModelSpec:
         model=model,
         effort=None,
         base_url="http://127.0.0.1:8080/v1",
-        credential_env="BIFROST_API_KEY",
+        credential_env="LITELLM_API_KEY",
         binding=None,
         protocols=("chat_completions",),
         slot=None,
@@ -1181,7 +1183,7 @@ def _anthropic_resolved(
         model=model,
         effort="medium",
         base_url="http://127.0.0.1:8080/anthropic",
-        credential_env="BIFROST_API_KEY",
+        credential_env="LITELLM_API_KEY",
         binding=None,
         protocols=("anthropic_messages",),
         slot=None,
@@ -1201,7 +1203,7 @@ def test_openai_cache_override_can_disable_without_touching_anthropic(monkeypatc
 
 
 def test_master_cache_switch_disables_all_explicit_markup(monkeypatch):
-    monkeypatch.setenv("BIFROST_API_KEY", "k")
+    monkeypatch.setenv("LITELLM_API_KEY", "k")
     monkeypatch.setenv("MANTIS_CACHE_BREAKPOINTS", "0")
     messages = [
         {"role": "system", "content": "sys"},
@@ -1284,12 +1286,20 @@ def test_experimental_startup_exposes_and_allows_trinity_and_ultra(client, monke
         ("mantis/ultra", "experimental"),
         ("mantis/fusion", "stable"),
     ]
-    assert api._experimental_gate(
-        api.ChatRequest(model="mantis/trinity", messages=[api.Message(role="user", content="hi")])
-    ) is None
-    assert api._experimental_gate(
-        api.ChatRequest(model="mantis/ultra", messages=[api.Message(role="user", content="hi")])
-    ) is None
+    assert (
+        api._experimental_gate(
+            api.ChatRequest(
+                model="mantis/trinity", messages=[api.Message(role="user", content="hi")]
+            )
+        )
+        is None
+    )
+    assert (
+        api._experimental_gate(
+            api.ChatRequest(model="mantis/ultra", messages=[api.Message(role="user", content="hi")])
+        )
+        is None
+    )
 
 
 def test_base_and_fusion_are_never_experimental(monkeypatch):
@@ -1472,6 +1482,7 @@ def test_sanitize_messages_emits_reasoning_dropped_telemetry():
     """Dropping reasoning from a tagged message should emit a progress event."""
     events: list[dict] = []
     import serve_config
+
     serve_config._history_context.event_sink = events.append
     try:
         messages = [
@@ -1496,6 +1507,7 @@ def test_sanitize_messages_no_telemetry_for_untagged():
     """Untagged legacy messages should not emit telemetry."""
     events: list[dict] = []
     import serve_config
+
     serve_config._history_context.event_sink = events.append
     try:
         messages = [{"role": "assistant", "content": "a", "reasoning": "r"}]
@@ -1509,6 +1521,7 @@ def test_sanitize_messages_no_telemetry_for_untagged():
 def test_azure_router_complete_direct_uses_previous_response_id(monkeypatch):
     """The direct Azure call sends previous_response_id when a session exists."""
     from types import SimpleNamespace
+
     calls: list[dict[str, Any]] = []
 
     def fake_create(**kwargs: Any) -> SimpleNamespace:

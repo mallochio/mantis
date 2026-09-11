@@ -1,4 +1,5 @@
 """Unit tests for scripts/retrain_router_pool.py."""
+
 from __future__ import annotations
 
 import json
@@ -91,7 +92,9 @@ def test_split_model_spec_empty_effort():
 
 
 def test_normalize_full_openrouter_id():
-    assert rp.normalize_model_id("openrouter/anthropic/claude-sonnet-5") == "anthropic/claude-sonnet-5"
+    assert (
+        rp.normalize_model_id("openrouter/anthropic/claude-sonnet-5") == "anthropic/claude-sonnet-5"
+    )
 
 
 def test_normalize_known_alias():
@@ -139,12 +142,12 @@ def _make_fake_requests(captured: dict[str, Any] | None = None, side_effect=None
     return fake
 
 
-def test_bifrost_worker_reasoning(monkeypatch):
+def test_litellm_worker_reasoning(monkeypatch):
     captured: dict[str, Any] = {}
     monkeypatch.setattr(rp, "requests", _make_fake_requests(captured))
-    monkeypatch.setenv("BIFROST_API_KEY", "sk-test")
+    monkeypatch.setenv("LITELLM_API_KEY", "sk-test")
 
-    worker = rp.BifrostWorker(["claude-sonnet-5|medium"])
+    worker = rp.LiteLLMWorker(["claude-sonnet-5|medium"])
     result = worker("Worker", [{"role": "user", "content": "hi"}], 0)
 
     assert result == "ok"
@@ -153,12 +156,12 @@ def test_bifrost_worker_reasoning(monkeypatch):
     assert "temperature" not in captured
 
 
-def test_bifrost_worker_non_reasoning(monkeypatch):
+def test_litellm_worker_non_reasoning(monkeypatch):
     captured: dict[str, Any] = {}
     monkeypatch.setattr(rp, "requests", _make_fake_requests(captured))
-    monkeypatch.setenv("BIFROST_API_KEY", "sk-test")
+    monkeypatch.setenv("LITELLM_API_KEY", "sk-test")
 
-    worker = rp.BifrostWorker(["deepseek-v4-flash|none"])
+    worker = rp.LiteLLMWorker(["deepseek-v4-flash|none"])
     result = worker("Worker", [{"role": "user", "content": "hi"}], 0)
 
     assert result == "ok"
@@ -166,11 +169,11 @@ def test_bifrost_worker_non_reasoning(monkeypatch):
     assert "reasoning_effort" not in captured
 
 
-def test_bifrost_worker_failure(monkeypatch):
+def test_litellm_worker_failure(monkeypatch):
     monkeypatch.setattr(rp, "requests", _make_fake_requests(side_effect=RuntimeError("api down")))
-    monkeypatch.setenv("BIFROST_API_KEY", "sk-test")
+    monkeypatch.setenv("LITELLM_API_KEY", "sk-test")
 
-    worker = rp.BifrostWorker(["glm-5.2"])
+    worker = rp.LiteLLMWorker(["glm-5.2"])
     assert worker("Worker", [{"role": "user", "content": "hi"}], 0) == ""
 
 
@@ -329,9 +332,13 @@ def test_main_smoke(monkeypatch, tmp_path):
         def route(self, messages, sample=False):
             return {"agent_id": 0, "role_id": 1}
 
-    monkeypatch.setattr(rp, "BifrostWorker", FakeWorker)
+    monkeypatch.setattr(rp, "LiteLLMWorker", FakeWorker)
     monkeypatch.setattr(rp, "FuguRouter", FakeRouter)
-    monkeypatch.setattr(rp, "extract_hidden_states", lambda router, tasks, batch_size=8: torch.zeros(len(tasks), rp.HIDDEN))
+    monkeypatch.setattr(
+        rp,
+        "extract_hidden_states",
+        lambda router, tasks, batch_size=8: torch.zeros(len(tasks), rp.HIDDEN),
+    )
     monkeypatch.setattr(
         rp,
         "train_head",
@@ -378,7 +385,7 @@ def test_normalize_unsupported_alias():
         rp.normalize_model_id("not-a-real-model")
 
 
-def test_bifrost_worker_api_base(monkeypatch):
+def test_litellm_worker_api_base(monkeypatch):
     captured_url: list[str] = []
 
     def _post(url, **kwargs):
@@ -393,18 +400,18 @@ def test_bifrost_worker_api_base(monkeypatch):
     fake_requests = MagicMock()
     fake_requests.Session.return_value = session
     monkeypatch.setattr(rp, "requests", fake_requests)
-    monkeypatch.setenv("BIFROST_API_KEY", "sk-test")
+    monkeypatch.setenv("LITELLM_API_KEY", "sk-test")
 
-    worker = rp.BifrostWorker(["claude-sonnet-5|medium"], api_base="http://custom/")
+    worker = rp.LiteLLMWorker(["claude-sonnet-5|medium"], api_base="http://custom/")
     worker("Worker", [{"role": "user", "content": "hi"}], 0)
     assert captured_url == ["http://custom/chat/completions"]
 
 
-def test_bifrost_worker_missing_key(monkeypatch):
-    monkeypatch.delenv("BIFROST_API_KEY", raising=False)
+def test_litellm_worker_missing_key(monkeypatch):
+    monkeypatch.delenv("LITELLM_API_KEY", raising=False)
     monkeypatch.setattr(rp, "requests", MagicMock())
     with pytest.raises(ValueError):
-        rp.BifrostWorker(["claude-sonnet-5"])
+        rp.LiteLLMWorker(["claude-sonnet-5"])
 
 
 def test_sync_s3_to_local_invalid_uri(tmp_path):
@@ -510,14 +517,16 @@ def test_main_toolscale(monkeypatch, tmp_path):
         def route(self, messages, sample=False):
             return {"agent_id": 0, "role_id": 1}
 
-    monkeypatch.setattr(rp, "BifrostWorker", FakeWorker)
+    monkeypatch.setattr(rp, "LiteLLMWorker", FakeWorker)
     monkeypatch.setattr(rp, "FuguRouter", FakeRouter)
     monkeypatch.setattr(
-        rp, "extract_hidden_states",
+        rp,
+        "extract_hidden_states",
         lambda router, tasks, batch_size=8: torch.zeros(len(tasks), rp.HIDDEN),
     )
     monkeypatch.setattr(
-        rp, "train_head",
+        rp,
+        "train_head",
         lambda X, yw, yr, h0, **kwargs: (torch.zeros(rp.HEAD_ROWS, rp.HIDDEN), 0.5),
     )
     monkeypatch.setattr(rp, "tqdm", lambda x, **kw: x)
@@ -588,14 +597,16 @@ def test_main_uses_cache(monkeypatch, tmp_path):
         def route(self, messages, sample=False):
             return {"agent_id": 0, "role_id": 1}
 
-    monkeypatch.setattr(rp, "BifrostWorker", FakeWorker)
+    monkeypatch.setattr(rp, "LiteLLMWorker", FakeWorker)
     monkeypatch.setattr(rp, "FuguRouter", FakeRouter)
     monkeypatch.setattr(
-        rp, "extract_hidden_states",
+        rp,
+        "extract_hidden_states",
         lambda router, tasks, batch_size=8: torch.zeros(len(tasks), rp.HIDDEN),
     )
     monkeypatch.setattr(
-        rp, "train_head",
+        rp,
+        "train_head",
         lambda X, yw, yr, h0, **kwargs: (torch.zeros(rp.HEAD_ROWS, rp.HIDDEN), 0.5),
     )
     monkeypatch.setattr(rp, "tqdm", lambda x, **kw: x)
@@ -613,13 +624,20 @@ def test_main_uses_cache(monkeypatch, tmp_path):
 
     pool = "openai/m0,openai/m1,openai/m2,openai/m3,openai/m4,openai/m5,openai/m6"
     argv = [
-        "--pool", pool,
-        "--dataset", "terminal",
-        "--limit", "2",
-        "--epochs", "1",
-        "--fugu-vector", str(vec),
-        "--output-dir", str(out_dir),
-        "--val-frac", "0.0",
+        "--pool",
+        pool,
+        "--dataset",
+        "terminal",
+        "--limit",
+        "2",
+        "--epochs",
+        "1",
+        "--fugu-vector",
+        str(vec),
+        "--output-dir",
+        str(out_dir),
+        "--val-frac",
+        "0.0",
     ]
     rp.main(argv)
     report = json.loads((out_dir / "report.json").read_text())
@@ -667,14 +685,16 @@ def test_main_pad_pool(monkeypatch, tmp_path):
         def route(self, messages, sample=False):
             return {"agent_id": 0, "role_id": 1}
 
-    monkeypatch.setattr(rp, "BifrostWorker", FakeWorker)
+    monkeypatch.setattr(rp, "LiteLLMWorker", FakeWorker)
     monkeypatch.setattr(rp, "FuguRouter", FakeRouter)
     monkeypatch.setattr(
-        rp, "extract_hidden_states",
+        rp,
+        "extract_hidden_states",
         lambda router, tasks, batch_size=8: torch.zeros(len(tasks), rp.HIDDEN),
     )
     monkeypatch.setattr(
-        rp, "train_head",
+        rp,
+        "train_head",
         lambda X, yw, yr, h0, **kwargs: (torch.zeros(rp.HEAD_ROWS, rp.HIDDEN), 0.5),
     )
     monkeypatch.setattr(rp, "tqdm", lambda x, **kw: x)
@@ -686,13 +706,20 @@ def test_main_pad_pool(monkeypatch, tmp_path):
 
     out_dir = tmp_path / "out"
     argv = [
-        "--pool", "openai/m0,openai/m1",
-        "--dataset", str(dataset_dir),
-        "--limit", "1",
-        "--epochs", "1",
-        "--fugu-vector", str(vec),
-        "--output-dir", str(out_dir),
-        "--val-frac", "0.0",
+        "--pool",
+        "openai/m0,openai/m1",
+        "--dataset",
+        str(dataset_dir),
+        "--limit",
+        "1",
+        "--epochs",
+        "1",
+        "--fugu-vector",
+        str(vec),
+        "--output-dir",
+        str(out_dir),
+        "--val-frac",
+        "0.0",
     ]
     rp.main(argv)
     report = json.loads((out_dir / "report.json").read_text())
@@ -701,11 +728,15 @@ def test_main_pad_pool(monkeypatch, tmp_path):
 
 def test_load_cost_table_skips_comments(tmp_path):
     p = tmp_path / "costs.json"
-    p.write_text(json.dumps({
-        "_note": "comment",
-        "model/a": 0.01,
-        "model/b": 0.02,
-    }))
+    p.write_text(
+        json.dumps(
+            {
+                "_note": "comment",
+                "model/a": 0.01,
+                "model/b": 0.02,
+            }
+        )
+    )
     costs = rp._load_cost_table(p)
     assert costs == {"model/a": 0.01, "model/b": 0.02}
 
@@ -741,7 +772,7 @@ def test_pick_best_worker_quality_2x_score_wins_despite_price():
     assert rp._pick_best_worker(scores, pool, "quality", costs) == 1
 
 
-def test_model_cost_matches_bifrost_model_to_unique_shadow_price():
+def test_model_cost_matches_litellm_model_to_unique_shadow_price():
     assert rp._model_cost("gpt-5.6-luna", {"openai/gpt-5.6-luna": 0.0008}) == 0.0008
 
 
@@ -804,7 +835,7 @@ def test_pick_budgeted_worker_no_passing_binary():
     assert gold == -1
 
 
-def test_bifrost_worker_retry_success(monkeypatch):
+def test_litellm_worker_retry_success(monkeypatch):
     """Transient failure on first attempt should be retried and then succeed."""
     calls: list[int] = []
     resp = MagicMock()
@@ -825,9 +856,9 @@ def test_bifrost_worker_retry_success(monkeypatch):
     fake_requests = MagicMock()
     fake_requests.Session.return_value = session
     monkeypatch.setattr(rp, "requests", fake_requests)
-    monkeypatch.setenv("BIFROST_API_KEY", "sk-test")
+    monkeypatch.setenv("LITELLM_API_KEY", "sk-test")
 
-    worker = rp.BifrostWorker(["gpt-5.6-luna|max"], retry_backoff=0.0)
+    worker = rp.LiteLLMWorker(["gpt-5.6-luna|max"], retry_backoff=0.0)
     completion, event = worker.call_with_retry(
         "Worker", [{"role": "user", "content": "hi"}], 0, task_id=1
     )
@@ -837,7 +868,7 @@ def test_bifrost_worker_retry_success(monkeypatch):
     assert event["task_id"] == 1
 
 
-def test_bifrost_worker_non_transient_no_retry(monkeypatch):
+def test_litellm_worker_non_transient_no_retry(monkeypatch):
     def _post(*args, **kwargs):
         raise ValueError("bad request")
 
@@ -846,12 +877,10 @@ def test_bifrost_worker_non_transient_no_retry(monkeypatch):
     fake_requests = MagicMock()
     fake_requests.Session.return_value = session
     monkeypatch.setattr(rp, "requests", fake_requests)
-    monkeypatch.setenv("BIFROST_API_KEY", "sk-test")
+    monkeypatch.setenv("LITELLM_API_KEY", "sk-test")
 
-    worker = rp.BifrostWorker(["gpt-5.6-luna|max"], retry_backoff=0.0)
-    completion, event = worker.call_with_retry(
-        "Worker", [{"role": "user", "content": "hi"}], 0
-    )
+    worker = rp.LiteLLMWorker(["gpt-5.6-luna|max"], retry_backoff=0.0)
+    completion, event = worker.call_with_retry("Worker", [{"role": "user", "content": "hi"}], 0)
     assert completion == ""
     assert event["attempt"] == 1
     assert event["status"] == "error"
@@ -906,23 +935,29 @@ def test_main_cost_mode(monkeypatch, tmp_path):
         def route(self, messages, sample=False):
             return {"agent_id": 0, "role_id": 1}
 
-    monkeypatch.setattr(rp, "BifrostWorker", FakeWorker)
+    monkeypatch.setattr(rp, "LiteLLMWorker", FakeWorker)
     monkeypatch.setattr(rp, "FuguRouter", FakeRouter)
     monkeypatch.setattr(
-        rp, "extract_hidden_states",
+        rp,
+        "extract_hidden_states",
         lambda router, tasks, batch_size=8: torch.zeros(len(tasks), rp.HIDDEN),
     )
     monkeypatch.setattr(
-        rp, "train_head",
+        rp,
+        "train_head",
         lambda X, yw, yr, h0, **kwargs: (torch.zeros(rp.HEAD_ROWS, rp.HIDDEN), 0.5),
     )
     monkeypatch.setattr(rp, "tqdm", lambda x, **kw: x)
 
     cost_table = tmp_path / "costs.json"
-    cost_table.write_text(json.dumps({
-        "openai/m0": 1.0,
-        "openai/m1": 0.01,
-    }))
+    cost_table.write_text(
+        json.dumps(
+            {
+                "openai/m0": 1.0,
+                "openai/m1": 0.01,
+            }
+        )
+    )
 
     dataset_dir = tmp_path / "terminal"
     (dataset_dir / "task0" / "solution").mkdir(parents=True)
@@ -931,15 +966,24 @@ def test_main_cost_mode(monkeypatch, tmp_path):
 
     out_dir = tmp_path / "out"
     argv = [
-        "--pool", "openai/m0,openai/m1",
-        "--dataset", str(dataset_dir),
-        "--label-mode", "cost",
-        "--cost-table", str(cost_table),
-        "--limit", "1",
-        "--epochs", "1",
-        "--fugu-vector", str(vec),
-        "--output-dir", str(out_dir),
-        "--val-frac", "0.0",
+        "--pool",
+        "openai/m0,openai/m1",
+        "--dataset",
+        str(dataset_dir),
+        "--label-mode",
+        "cost",
+        "--cost-table",
+        str(cost_table),
+        "--limit",
+        "1",
+        "--epochs",
+        "1",
+        "--fugu-vector",
+        str(vec),
+        "--output-dir",
+        str(out_dir),
+        "--val-frac",
+        "0.0",
     ]
     rp.main(argv)
     report = json.loads((out_dir / "report.json").read_text())

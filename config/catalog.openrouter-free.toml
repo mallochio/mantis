@@ -2,7 +2,7 @@ version = 1
 
 # Live smoke catalog for fx multi-turn coding against mantis/base.
 # Cheap: OpenRouter's free-model router. Capable: stealth/ox-alpha (also free).
-# Production Base stays on config/catalog.toml (Flash / Opus via Bifrost).
+# Production Base stays on config/catalog.toml (Flash / Opus via LiteLLM).
 # Launch Switchyard with AI_ROUTING_CONFIG pointing here.
 
 [providers.openrouter]

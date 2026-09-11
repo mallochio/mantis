@@ -20,12 +20,12 @@ from switchyard_config import (
 def _catalog(*, extra: str = "") -> str:
     return (
         "version = 1\n\n"
-        "[providers.bifrost]\n"
+        "[providers.litellm]\n"
         'adapter = "openai-compatible"\n'
         'base_url = "http://127.0.0.1:8080/v1"\n'
-        'credential_env = "BIFROST_API_KEY"\n'
+        'credential_env = "LITELLM_API_KEY"\n'
         'protocols = ["chat_completions", "responses"]\n\n'
-        "[providers.\"modal.prod\"]\n"
+        '[providers."modal.prod"]\n'
         'adapter = "modal"\n'
         'base_url = "https://modal.example.test/v1"\n'
         'credential_env = "MODAL_KEY"\n'
@@ -36,12 +36,12 @@ def _catalog(*, extra: str = "") -> str:
         "confidence_threshold = 0.5\n"
         "recent_turn_window = 3\n\n"
         "[base.targets.efficient]\n"
-        'provider = "bifrost"\n'
+        'provider = "litellm"\n'
         'upstream_model = "google/gemini-3.7-flash"\n'
         'reasoning_effort = "medium"\n'
         "max_tokens = 65536\n\n"
         "[base.targets.capable]\n"
-        'provider = "bifrost"\n'
+        'provider = "litellm"\n'
         'upstream_model = "anthropic/claude-opus-5"\n'
         'reasoning_effort = "medium"\n'
         "max_tokens = 128000\n"
@@ -98,14 +98,12 @@ def test_openrouter_free_smoke_catalog_renders_distinct_targets():
 
 def test_render_quotes_dotted_provider_names(tmp_path):
     content = _catalog().replace(
-        '[base.targets.efficient]\n'
-        'provider = "bifrost"\n'
+        "[base.targets.efficient]\n"
+        'provider = "litellm"\n'
         'upstream_model = "google/gemini-3.7-flash"\n'
         'reasoning_effort = "medium"\n'
         "max_tokens = 65536\n",
-        '[base.targets.efficient]\n'
-        'provider = "modal.prod"\n'
-        'upstream_model = "vendor/fast"\n',
+        '[base.targets.efficient]\nprovider = "modal.prod"\nupstream_model = "vendor/fast"\n',
         1,
     )
     path = _write(tmp_path, content)
@@ -113,18 +111,18 @@ def test_render_quotes_dotted_provider_names(tmp_path):
     parsed = tomllib.loads(text)
     assert parsed["llm_clients"]["modal_prod"]["base_url"] == "https://modal.example.test/v1"
     assert parsed["targets"]["efficient"]["llm_client"] == "modal_prod"
-    assert parsed["targets"]["capable"]["llm_client"] == "bifrost"
+    assert parsed["targets"]["capable"]["llm_client"] == "litellm"
 
 
 def test_responses_format_capable_renders_responses_client(tmp_path):
     """A capable target on openai_responses renders its own client + body keys."""
     content = _catalog()
     content = content.replace(
-        '[base.targets.capable]\n'
-        'provider = "bifrost"\n'
+        "[base.targets.capable]\n"
+        'provider = "litellm"\n'
         'upstream_model = "anthropic/claude-opus-5"\n',
-        '[base.targets.capable]\n'
-        'provider = "bifrost"\n'
+        "[base.targets.capable]\n"
+        'provider = "litellm"\n'
         'format = "openai_responses"\n'
         'upstream_model = "vendor/strong"\n',
         1,
@@ -132,9 +130,9 @@ def test_responses_format_capable_renders_responses_client(tmp_path):
     path = _write(tmp_path, content)
     parsed = tomllib.loads(render_switchyard_toml(load_switchyard_route(path)))
     capable_client = parsed["targets"]["capable"]["llm_client"]
-    assert capable_client == "bifrost__openai_responses"
+    assert capable_client == "litellm__openai_responses"
     assert parsed["llm_clients"][capable_client]["format"] == "openai_responses"
-    assert parsed["llm_clients"]["bifrost"]["format"] == "openai_chat"
+    assert parsed["llm_clients"]["litellm"]["format"] == "openai_chat"
     assert parsed["targets"]["capable"]["extra_body"]["reasoning"] == {"effort": "medium"}
     assert parsed["targets"]["capable"]["extra_body"]["max_output_tokens"] == 128000
 
@@ -231,9 +229,7 @@ def test_rejects_unknown_picker():
 
 def test_rejects_unknown_target_role(tmp_path):
     extra = (
-        "\n[base.targets.mid]\n"
-        'provider = "bifrost"\n'
-        'upstream_model = "google/gemini-3.7-flash"\n'
+        '\n[base.targets.mid]\nprovider = "litellm"\nupstream_model = "google/gemini-3.7-flash"\n'
     )
     with pytest.raises(CatalogError, match="unknown roles"):
         load_switchyard_route(_write(tmp_path, _catalog(extra=extra)))
@@ -242,7 +238,7 @@ def test_rejects_unknown_target_role(tmp_path):
 def test_rejects_unknown_base_keys(tmp_path):
     content = _catalog().replace(
         "confidence_threshold = 0.5\n",
-        "confidence_threshold = 0.5\nalgorithm = \"stage_router\"\n",
+        'confidence_threshold = 0.5\nalgorithm = "stage_router"\n',
         1,
     )
     with pytest.raises(CatalogError, match="unknown keys"):
@@ -263,7 +259,7 @@ def test_rejects_legacy_protocols_on_base_target(tmp_path):
 def test_rejects_missing_efficient_target():
     content = _catalog().replace(
         "[base.targets.efficient]\n"
-        'provider = "bifrost"\n'
+        'provider = "litellm"\n'
         'upstream_model = "google/gemini-3.7-flash"\n'
         'reasoning_effort = "medium"\n'
         "max_tokens = 65536\n\n",
@@ -283,13 +279,13 @@ def test_capable_first_stage_router(tmp_path):
 
 def test_omits_extra_body_when_target_has_no_caps(tmp_path):
     content = _catalog().replace(
-        '[base.targets.efficient]\n'
-        'provider = "bifrost"\n'
+        "[base.targets.efficient]\n"
+        'provider = "litellm"\n'
         'upstream_model = "google/gemini-3.7-flash"\n'
         'reasoning_effort = "medium"\n'
         "max_tokens = 65536\n",
-        '[base.targets.efficient]\n'
-        'provider = "bifrost"\n'
+        "[base.targets.efficient]\n"
+        'provider = "litellm"\n'
         'upstream_model = "google/gemini-3.7-flash"\n',
         1,
     )
@@ -351,7 +347,7 @@ def test_rejects_catalog_version_other_than_1():
 
 def test_rejects_unknown_base_provider(tmp_path):
     content = _catalog().replace(
-        '[base.targets.efficient]\nprovider = "bifrost"',
+        '[base.targets.efficient]\nprovider = "litellm"',
         '[base.targets.efficient]\nprovider = "missing"',
         1,
     )
@@ -360,9 +356,7 @@ def test_rejects_unknown_base_provider(tmp_path):
 
 
 def test_rejects_confidence_outside_unit_interval(tmp_path):
-    content = _catalog().replace(
-        "confidence_threshold = 0.5\n", "confidence_threshold = 1.5\n"
-    )
+    content = _catalog().replace("confidence_threshold = 0.5\n", "confidence_threshold = 1.5\n")
     with pytest.raises(CatalogError, match="\\[0, 1\\]"):
         load_switchyard_route(_write(tmp_path, content))
 
@@ -386,10 +380,10 @@ def test_quotes_non_identifier_client_keys(tmp_path):
         'base_url = "https://edge.example.test/v1"\n'
         'credential_env = "EDGE_KEY"\n'
         'protocols = ["chat_completions"]\n\n'
-        "[providers.bifrost]\n"
+        "[providers.litellm]\n"
         'adapter = "openai-compatible"\n'
         'base_url = "http://127.0.0.1:8080/v1"\n'
-        'credential_env = "BIFROST_API_KEY"\n'
+        'credential_env = "LITELLM_API_KEY"\n'
         'protocols = ["chat_completions", "responses"]\n\n'
         "[base]\n"
         'picker = "efficient_first"\n'
@@ -398,7 +392,7 @@ def test_quotes_non_identifier_client_keys(tmp_path):
         'provider = "edge-fast"\n'
         'upstream_model = "vendor/fast"\n\n'
         "[base.targets.capable]\n"
-        'provider = "bifrost"\n'
+        'provider = "litellm"\n'
         'upstream_model = "anthropic/claude-opus-5"\n'
     )
     text = render_switchyard_toml(load_switchyard_route(_write(tmp_path, content)))
@@ -417,7 +411,7 @@ def test_shipped_base_route_is_efficient_first():
 def test_openai_responses_extra_body_uses_responses_params(tmp_path):
     content = (
         "version = 1\n\n"
-        '[providers.azure-foundry]\n'
+        "[providers.azure-foundry]\n"
         'adapter = "azure_ai"\n'
         'base_url = "https://example.services.ai.azure.com/api/projects/p/openai/v1"\n'
         'credential_env = "AZURE_API_KEY"\n'

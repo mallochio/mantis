@@ -13,7 +13,7 @@ directory.
 
 `router_eval.py` supports these arms:
 
-- `cheap-only`, `middle-only`, `expensive-only`: direct Bifrost calls pinned to
+- `cheap-only`, `middle-only`, `expensive-only`: direct LiteLLM calls pinned to
   the corresponding catalog `upstream_model`;
 - `mantis-direct`: the routed `model=mantis/base` endpoint;
 - `heuristic`: client-side prompt complexity selection;
@@ -25,7 +25,7 @@ Every routed request carries `X-Route-Session` and records route decision
 headers. `pi` (headless `--mode json`, from the `@earendil-works/pi-coding-agent`
 CLI) drives each task in a host worktree checked out at the instance's
 `base_commit`; its chat-completions calls go through a local header-recording
-proxy to Bifrost or Switchyard (no litellm or mini-SWE-agent involved).
+proxy to LiteLLM or Switchyard (no litellm SDK or mini-SWE-agent involved).
 The submitted `git diff` is graded in a fresh SWE-rebench container; `resolved`
 is true only when every `FAIL_TO_PASS` test passes and every `PASS_TO_PASS`
 test remains passing. Gold patches are never used by an arm. Each arm selects
@@ -67,7 +67,7 @@ uv run python eval/router_eval.py   --manifest eval/router_manifest.json   --pri
 ```
 
 - `--fixed-model NAME=PROVIDER/MODEL` (repeatable) declares a fixed arm pinned
-  to one Bifrost model; `--arms` then lists only those names. Fixed arms never
+  to one LiteLLM model; `--arms` then lists only those names. Fixed arms never
   resolve to `opencode-go/*` and never touch the live Mantis router.
 - `--cost-mode shadow` ignores `usage.cost` and prices token usage against the
   dated snapshot; `actual_cost_usd`, `actual_cost_method`, `shadow_cost_usd`,
@@ -79,8 +79,8 @@ uv run python eval/router_eval.py   --manifest eval/router_manifest.json   --pri
   episode; only a **global** budget abort stops the whole campaign, while
   timeouts and per-instance cap hits are recorded as per-episode failures.
 
-The recording proxy retries transient upstream failures (429/5xx and Bifrost's
-`400 FreeUsageLimitError` envelope) with exponential backoff plus jitter,
+The recording proxy retries transient upstream failures (429/5xx and
+rate-limit error envelopes surfaced as a `400` body) with exponential backoff plus jitter,
 honoring `Retry-After`. Tune it with `EVAL_PROXY_RETRIES` (default 8),
 `EVAL_PROXY_RETRY_BASE` (1.0s), `EVAL_PROXY_RETRY_MAX_WAIT` (60s), and
 `EVAL_PROXY_RETRY_ON_STATUS` (comma list; default `429,500,502,503,504`).
@@ -93,21 +93,21 @@ by the Zen gateway (`ModelError`) and is excluded from cost/quality tiers.
 The follow-on binary direct-router protocol is
 `plans/direct-binary-router-xroutebench.md`: it pairs Zen `hy3-free` with the
 subscription-backed `opencode-go/deepseek-v4-flash`, sends both explicit IDs
-through Bifrost, and trains a calibrated probability rather than forcing a
+through LiteLLM, and trains a calibrated probability rather than forcing a
 three-tier label. xRouteBench is used to compare offline router algorithms;
 its public test split is not a hyperparameter hill-climbing target.
 
 ## Cloud benchmark runs
 
 `launch/sky/zen-swe-rebench-*.yaml` define the GCP/SkyPilot tasks; the worker
-scripts under `scripts/zen_swe_rebench_*.sh` host a private Zen-only Bifrost on
+scripts under `scripts/zen_swe_rebench_*.sh` host a private Zen-only LiteLLM proxy on
 `127.0.0.1:8080` on each worker, verify the model allowlist, and upload results
 to `gs://your-eval-storage-bucket/<job-id>/` (upload-only; no GCS bucket is created).
 Phase 2 shards one cluster per fixed arm and fans results in to
 `gs://your-eval-storage-bucket/<run-id>/<arm>/results.jsonl`.
 
 ```bash
-sky launch -y -d --cluster zen-phase2-hy3 launch/sky/zen-swe-rebench-phase2.yaml   --env ARM=hy3 --env RUN_ID=job-<8hex>   --env OPENCODE_API_KEY=... --env BIFROST_API_KEY=... --env BIFROST_ENCRYPTION_KEY=...
+sky launch -y -d --cluster zen-phase2-hy3 launch/sky/zen-swe-rebench-phase2.yaml   --env ARM=hy3 --env RUN_ID=job-<8hex>   --env OPENCODE_API_KEY=... --env LITELLM_API_KEY=...
 ```
 
 Secrets are passed via `--env` and are never committed.
@@ -128,7 +128,7 @@ Secrets are passed via `--env` and are never committed.
 ## Regeneration commands
 
 ```
-# run a config through the local Bifrost or Mantis endpoint
+# run a config through the local LiteLLM or Mantis endpoint
 uv run python eval/run_eval.py --config direct --fixtures eval/fixtures.jsonl --output eval/results.jsonl
 # score raw results; writes <stem>-scored.jsonl and eval/report.md
 python3 eval/score.py --results eval/results.jsonl

@@ -9,7 +9,7 @@ Cost estimation method:
 - `config/worker-costs.json` gives a per-call USD estimate for each raw
   OpenRouter model id (assumes ~2K prompt + 1K completion tokens). These
   prices were fetched from /api/v1/models by update_pool.py.
-- `config/catalog.toml` maps Bifrost worker slots to upstream model ids.
+- `config/catalog.toml` maps LiteLLM worker slots to upstream model ids.
 - "direct": one call at the requested model's cost.
 - "trinity": parse fugu_trace (e.g. "Worker(3)->Thinker(1)->Verifier(1):...").
   Every "Role(slot)" arrow is one worker call; cost = sum(slot model cost).
@@ -44,10 +44,10 @@ def load_catalog_models(path: Path) -> tuple[list[str], str]:
     workers = mantis["workers"]
     models = [workers[slot]["upstream_model"] for slot in mantis["slot_order"]]
     cm = mantis["conductor_model"]
-    # strip any provider prefix for backwards compat (bifrost/, openrouter/, etc.)
-    for prefix in ("bifrost/", "openrouter/", "opencode-go/"):
+    # strip any provider prefix for backwards compat (litellm/, openrouter/, etc.)
+    for prefix in ("litellm/", "openrouter/", "opencode-go/"):
         if cm.startswith(prefix):
-            cm = cm[len(prefix):]
+            cm = cm[len(prefix) :]
             break
     return models, cm
 
@@ -68,10 +68,10 @@ def prepare_output(path: Path, *, append: bool) -> None:
 
 
 def _cost_key(model: str) -> str:
-    # strip any provider prefix (bifrost/, openrouter/, opencode-go/)
-    for prefix in ("bifrost/", "openrouter/", "opencode-go/"):
+    # strip any provider prefix (litellm/, openrouter/, opencode-go/)
+    for prefix in ("litellm/", "openrouter/", "opencode-go/"):
         if model.startswith(prefix):
-            return model[len(prefix):]
+            return model[len(prefix) :]
     return model
 
 
@@ -170,7 +170,7 @@ def main() -> None:
     parser.add_argument("--fixtures", default=str(REPO / "eval" / "fixtures.jsonl"))
     parser.add_argument("--output", default=str(REPO / "eval" / "results.jsonl"))
     parser.add_argument("--timeout", type=float, default=300.0)
-    parser.add_argument("--bifrost-url", default="http://127.0.0.1:8080/v1/chat/completions")
+    parser.add_argument("--litellm-url", default="http://127.0.0.1:8080/v1/chat/completions")
     parser.add_argument("--mantis-url", default="http://localhost:8088/v1/chat/completions")
     parser.add_argument(
         "--append",
@@ -179,11 +179,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--api-key",
-        default=os.environ.get("BIFROST_API_KEY") or os.environ.get("MANTIS_API_KEY"),
+        default=os.environ.get("LITELLM_API_KEY") or os.environ.get("MANTIS_API_KEY"),
     )
     args = parser.parse_args()
     if not args.api_key:
-        parser.error("set BIFROST_API_KEY or MANTIS_API_KEY in the environment")
+        parser.error("set LITELLM_API_KEY or MANTIS_API_KEY in the environment")
 
     costs = load_worker_costs(default_worker_costs_path())
     slot_models, conductor_model = load_catalog_models(REPO / "config" / "catalog.toml")
@@ -200,7 +200,7 @@ def main() -> None:
 
     # Map config to endpoint/model
     if args.config == "direct":
-        url = args.bifrost_url
+        url = args.litellm_url
         model = os.environ.get("DIRECT_MODEL", "deepseek-v4-flash")
     else:
         url = args.mantis_url

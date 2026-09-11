@@ -45,17 +45,17 @@ def _upstream_server(route_headers: dict | None = None):
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             length = int(self.headers.get("Content-Length", 0))
-            seen.append(
-                (self.path, dict(self.headers), json.loads(self.rfile.read(length)))
-            )
+            seen.append((self.path, dict(self.headers), json.loads(self.rfile.read(length))))
             body = {
                 "id": "fake",
                 "object": "chat.completion",
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "ok"},
-                    "finish_reason": "stop",
-                }],
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
                 "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.42},
             }
             payload = json.dumps(body).encode()
@@ -85,8 +85,11 @@ def _make_worktree(root: Path, instance_id: str = "demo-1") -> tuple[Path, str]:
     subprocess.run(["git", "add", "solve.py"], cwd=workdir, check=True)
     subprocess.run(["git", "commit", "-qm", "base"], cwd=workdir, check=True)
     head = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=workdir, check=True,
-        capture_output=True, text=True,
+        ["git", "rev-parse", "HEAD"],
+        cwd=workdir,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
     return workdir, head
 
@@ -98,14 +101,14 @@ def _fake_pi(tmp_path: Path) -> Path:
         'if [ -n "$EVAL_PROXY_BASE_URL" ]; then\n'
         '  curl -s -X POST "$EVAL_PROXY_BASE_URL/chat/completions" '
         "-H 'Content-Type: application/json' "
-        "-d '{\"model\":\"cheap\",\"messages\":[]}' >/dev/null 2>&1\n"
+        '-d \'{"model":"cheap","messages":[]}\' >/dev/null 2>&1\n'
         "fi\n"
-        "echo '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\","
-        "\"content\":[],\"usage\":{\"input\":10,\"output\":5,\"totalTokens\":15}}}'\n"
-        "echo '{\"type\":\"tool_execution_end\",\"toolName\":\"bash\","
-        "\"args\":{},\"result\":\"ok\",\"isError\":false}'\n"
-        "echo '{\"type\":\"agent_end\",\"messages\":[]}'\n"
-        "echo '{\"type\":\"agent_settled\"}'\n"
+        'echo \'{"type":"message_end","message":{"role":"assistant",'
+        '"content":[],"usage":{"input":10,"output":5,"totalTokens":15}}}\'\n'
+        'echo \'{"type":"tool_execution_end","toolName":"bash",'
+        '"args":{},"result":"ok","isError":false}\'\n'
+        'echo \'{"type":"agent_end","messages":[]}\'\n'
+        'echo \'{"type":"agent_settled"}\'\n'
         "printf 'def patched():\\n    return 1\\n' >> solve.py\n"
         "exit 0\n"
     )
@@ -128,16 +131,18 @@ def test_dry_run_separates_caps_and_price_table():
 def test_cost_priority_and_unknown_fallback():
     prices = {"cheap": {"input_per_token": 2.0, "output_per_token": 3.0}}
     assert harness.usage_cost({"cost": 0.4}, "cheap", prices) == (0.4, "usage.cost")
-    assert harness.usage_cost(
-        {"prompt_tokens": 10, "completion_tokens": 5}, "cheap", prices
-    ) == (35.0, "token_counts_x_price_table")
+    assert harness.usage_cost({"prompt_tokens": 10, "completion_tokens": 5}, "cheap", prices) == (
+        35.0,
+        "token_counts_x_price_table",
+    )
     assert harness.usage_cost({}, "missing", prices) == (None, "unknown")
 
 
 def test_grader_rejects_empty_and_runs_fresh_container(monkeypatch):
     calls = []
     monkeypatch.setattr(
-        harness, "_run_test_command",
+        harness,
+        "_run_test_command",
         lambda image, patch, command, test_patch="", install="", timeout=300, **kwargs: (
             calls.append((image, patch, command)) or (True, "PASS")
         ),
@@ -145,7 +150,8 @@ def test_grader_rejects_empty_and_runs_fresh_container(monkeypatch):
     assert harness.grade_patch(_instance(), "")["resolved"] is False
     assert harness.grade_patch(_instance(), "diff --git a/a b/a\n")["resolved"] is True
     assert {call[2].split("::")[-1] for call in calls} == {
-        "test_fix", "test_existing",
+        "test_fix",
+        "test_existing",
     }
 
 
@@ -197,7 +203,9 @@ def test_usage_from_sse_extracts_last_usage():
         "data: [DONE]\n\n"
     )
     assert harness._usage_from_sse(stream) == {
-        "prompt_tokens": 10, "completion_tokens": 5, "cost": 0.12,
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "cost": 0.12,
     }
 
 
@@ -221,7 +229,10 @@ def test_provider_extension_points_at_proxy(tmp_path):
     harness._render_provider_extension(
         ["cheap", "mantis/base", "mantis/trinity"],
         "http://127.0.0.1:1234/v1",
-        "sk-test", "router-eval-sess", 512, ext,
+        "sk-test",
+        "router-eval-sess",
+        512,
+        ext,
     )
     text = ext.read_text()
     assert 'baseUrl: "http://127.0.0.1:1234/v1"' in text
@@ -238,11 +249,16 @@ def test_proxy_forwards_and_records_route_headers():
     ledger = harness.CostLedger(total_limit=2.0, arm_limit=2.0)
     proxy = harness._RouteRecordingProxy(
         upstream=f"http://127.0.0.1:{upstream.server_port}/v1/chat/completions",
-        api_key="sk-test", ledger=ledger, instance_id="demo-1", arm="cheap-only",
+        api_key="sk-test",
+        ledger=ledger,
+        instance_id="demo-1",
+        arm="cheap-only",
         cap=2.0,
         prices={"cheap": {"input_per_token": 1.0, "output_per_token": 1.0}},
-        shadow_prices={}, cost_mode="actual",
-        model="cheap", session="router-eval-test",
+        shadow_prices={},
+        cost_mode="actual",
+        model="cheap",
+        session="router-eval-test",
     )
     try:
         resp = requests.post(
@@ -266,9 +282,16 @@ def test_proxy_aborts_on_arm_cap():
     ledger = harness.CostLedger(total_limit=5.0, arm_limit=1.0)
     proxy = harness._RouteRecordingProxy(
         upstream="http://127.0.0.1:1/v1/chat/completions",
-        api_key=None, ledger=ledger, instance_id="demo-1", arm="cheap-only",
-        cap=1.0, prices={}, shadow_prices={}, cost_mode="actual",
-        model="cheap", session="router-eval-test",
+        api_key=None,
+        ledger=ledger,
+        instance_id="demo-1",
+        arm="cheap-only",
+        cap=1.0,
+        prices={},
+        shadow_prices={},
+        cost_mode="actual",
+        model="cheap",
+        session="router-eval-test",
     )
     try:
         ledger.pair_costs[("demo-1", "cheap-only")] = 1.0
@@ -286,7 +309,8 @@ def test_run_pi_agent_end_to_end(tmp_path, monkeypatch):
         route_headers={"x-route-decision": "cheap", "x-route-model": "cheap"}
     )
     monkeypatch.setattr(
-        harness, "grade_patch",
+        harness,
+        "grade_patch",
         lambda instance, patch: {"resolved": True, "grader_output": "PASS"},
     )
     fake = _fake_pi(tmp_path)
@@ -297,12 +321,17 @@ def test_run_pi_agent_end_to_end(tmp_path, monkeypatch):
             endpoint=f"http://127.0.0.1:{upstream.server_port}/v1/chat/completions",
             tier_models={"cheap": "cheap", "middle": "middle", "expensive": "expensive"},
             prices={"cheap": {"input_per_token": 1.0, "output_per_token": 1.0}},
-            shadow_prices={}, cost_mode="actual", fixed_models={},
+            shadow_prices={},
+            cost_mode="actual",
+            fixed_models={},
             ledger=harness.CostLedger(total_limit=2.0, arm_limit=2.0),
             arm_cap=2.0,
-            rng=harness.random.Random(1), timeout=30, output_token_limit=32,
+            rng=harness.random.Random(1),
+            timeout=30,
+            output_token_limit=32,
             frequencies={"cheap": 1.0, "middle": 0.0, "expensive": 0.0},
-            worktrees_root=worktrees, pi_executable=(str(fake),),
+            worktrees_root=worktrees,
+            pi_executable=(str(fake),),
         )
     finally:
         upstream.shutdown()
@@ -327,11 +356,17 @@ def test_run_pi_agent_aborts_on_instance_budget(tmp_path):
         endpoint="http://127.0.0.1:1/v1/chat/completions",
         tier_models={"cheap": "cheap", "middle": "middle", "expensive": "expensive"},
         prices={"cheap": {"input_per_token": 1.0, "output_per_token": 1.0}},
-        shadow_prices={}, cost_mode="actual", fixed_models={},
-        ledger=ledger, arm_cap=1.0,
-        rng=harness.random.Random(1), timeout=30, output_token_limit=32,
+        shadow_prices={},
+        cost_mode="actual",
+        fixed_models={},
+        ledger=ledger,
+        arm_cap=1.0,
+        rng=harness.random.Random(1),
+        timeout=30,
+        output_token_limit=32,
         frequencies={"cheap": 1.0, "middle": 0.0, "expensive": 0.0},
-        worktrees_root=worktrees, pi_executable=(str(fake),),
+        worktrees_root=worktrees,
+        pi_executable=(str(fake),),
     )
     assert row["aborted"] is True
     assert row["abort_scope"] == "instance_arm"
@@ -350,15 +385,20 @@ def _status_sequence_server(statuses: list[int]):
             if status >= 400:
                 body = json.dumps({"error": {"message": "upstream", "type": "retry"}}).encode()
             else:
-                body = json.dumps({
-                    "id": "fake", "object": "chat.completion",
-                    "choices": [{
-                        "index": 0,
-                        "message": {"role": "assistant", "content": "ok"},
-                        "finish_reason": "stop",
-                    }],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.0},
-                }).encode()
+                body = json.dumps(
+                    {
+                        "id": "fake",
+                        "object": "chat.completion",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.0},
+                    }
+                ).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -381,9 +421,16 @@ def test_proxy_retries_transient_429_then_succeeds(monkeypatch):
     ledger = harness.CostLedger(total_limit=2.0, arm_limit=2.0)
     proxy = harness._RouteRecordingProxy(
         upstream=f"http://127.0.0.1:{upstream.server_port}/v1/chat/completions",
-        api_key=None, ledger=ledger, instance_id="demo-1", arm="cheap-only",
-        cap=2.0, prices={}, shadow_prices={}, cost_mode="actual",
-        model="cheap", session="router-eval-test",
+        api_key=None,
+        ledger=ledger,
+        instance_id="demo-1",
+        arm="cheap-only",
+        cap=2.0,
+        prices={},
+        shadow_prices={},
+        cost_mode="actual",
+        model="cheap",
+        session="router-eval-test",
     )
     try:
         resp = requests.post(f"{proxy.base_url()}/chat/completions", json={}, timeout=30)
@@ -404,9 +451,16 @@ def test_proxy_retries_persistent_429_then_fails(monkeypatch):
     ledger = harness.CostLedger(total_limit=2.0, arm_limit=2.0)
     proxy = harness._RouteRecordingProxy(
         upstream=f"http://127.0.0.1:{upstream.server_port}/v1/chat/completions",
-        api_key=None, ledger=ledger, instance_id="demo-1", arm="cheap-only",
-        cap=2.0, prices={}, shadow_prices={}, cost_mode="actual",
-        model="cheap", session="router-eval-test",
+        api_key=None,
+        ledger=ledger,
+        instance_id="demo-1",
+        arm="cheap-only",
+        cap=2.0,
+        prices={},
+        shadow_prices={},
+        cost_mode="actual",
+        model="cheap",
+        session="router-eval-test",
     )
     try:
         resp = requests.post(f"{proxy.base_url()}/chat/completions", json={}, timeout=30)
@@ -429,22 +483,31 @@ def _rate_limit_then_success_server():
             seen.append(len(seen) + 1)
             if len(seen) == 1:
                 status = 400
-                body = json.dumps({
-                    "type": "error",
-                    "error": {"type": "FreeUsageLimitError",
-                              "message": "Rate limit exceeded. Please try again later."},
-                }).encode()
+                body = json.dumps(
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "rate_limit_error",
+                            "message": "Rate limit exceeded. Please try again later.",
+                        },
+                    }
+                ).encode()
             else:
                 status = 200
-                body = json.dumps({
-                    "id": "fake", "object": "chat.completion",
-                    "choices": [{
-                        "index": 0,
-                        "message": {"role": "assistant", "content": "ok"},
-                        "finish_reason": "stop",
-                    }],
-                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.0},
-                }).encode()
+                body = json.dumps(
+                    {
+                        "id": "fake",
+                        "object": "chat.completion",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.0},
+                    }
+                ).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -459,7 +522,7 @@ def _rate_limit_then_success_server():
     return server, seen
 
 
-def test_proxy_retries_bifrost_400_rate_limit_envelope(monkeypatch):
+def test_proxy_retries_litellm_400_rate_limit_envelope(monkeypatch):
     monkeypatch.setenv("EVAL_PROXY_RETRIES", "3")
     monkeypatch.setenv("EVAL_PROXY_RETRY_BASE", "0.0")
     monkeypatch.setenv("EVAL_PROXY_RETRY_MAX_WAIT", "0.0")
@@ -467,9 +530,16 @@ def test_proxy_retries_bifrost_400_rate_limit_envelope(monkeypatch):
     ledger = harness.CostLedger(total_limit=2.0, arm_limit=2.0)
     proxy = harness._RouteRecordingProxy(
         upstream=f"http://127.0.0.1:{upstream.server_port}/v1/chat/completions",
-        api_key=None, ledger=ledger, instance_id="demo-1", arm="cheap-only",
-        cap=2.0, prices={}, shadow_prices={}, cost_mode="actual",
-        model="cheap", session="router-eval-test",
+        api_key=None,
+        ledger=ledger,
+        instance_id="demo-1",
+        arm="cheap-only",
+        cap=2.0,
+        prices={},
+        shadow_prices={},
+        cost_mode="actual",
+        model="cheap",
+        session="router-eval-test",
     )
     try:
         resp = requests.post(f"{proxy.base_url()}/chat/completions", json={}, timeout=30)
@@ -528,13 +598,21 @@ def test_run_pi_agent_records_worktree_setup_failure(tmp_path, monkeypatch):
 
     monkeypatch.setattr(harness, "_ensure_worktree", fail_worktree)
     row = harness.run_pi_agent(
-        _instance(), arm="setup-test",
+        _instance(),
+        arm="setup-test",
         endpoint="http://127.0.0.1:1/v1/chat/completions",
-        tier_models={}, prices={}, shadow_prices={}, cost_mode="shadow",
+        tier_models={},
+        prices={},
+        shadow_prices={},
+        cost_mode="shadow",
         fixed_models={"setup-test": "opencode-zen/hy3-free"},
-        ledger=harness.CostLedger(total_limit=2.0, arm_limit=2.0), arm_cap=2.0,
-        rng=harness.random.Random(1), timeout=30, output_token_limit=32,
-        frequencies={}, worktrees_root=tmp_path,
+        ledger=harness.CostLedger(total_limit=2.0, arm_limit=2.0),
+        arm_cap=2.0,
+        rng=harness.random.Random(1),
+        timeout=30,
+        output_token_limit=32,
+        frequencies={},
+        worktrees_root=tmp_path,
     )
     assert row["resolved"] is False
     assert "CalledProcessError" in row["error"]
@@ -545,22 +623,33 @@ def test_timeout_row_sums_recorded_shadow_cost(tmp_path, monkeypatch):
     worktrees = tmp_path / "worktrees"
     _, head = _make_worktree(worktrees)
     monkeypatch.setattr(
-        harness.subprocess, "run",
+        harness.subprocess,
+        "run",
         lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired(args[0], 1)),
     )
     # Preserve worktree reset calls by replacing setup with the already-created tree.
     monkeypatch.setattr(
-        harness, "_ensure_worktree",
+        harness,
+        "_ensure_worktree",
         lambda *_args: (worktrees / "demo-1", None, False),
     )
     ledger = harness.CostLedger(total_limit=2.0, arm_limit=2.0)
     row = harness.run_pi_agent(
-        _instance(base_commit=head), arm="timeout-test",
+        _instance(base_commit=head),
+        arm="timeout-test",
         endpoint="http://127.0.0.1:1/v1/chat/completions",
-        tier_models={}, prices={}, shadow_prices={}, cost_mode="shadow",
-        fixed_models={"timeout-test": "opencode-zen/hy3-free"}, ledger=ledger,
-        arm_cap=2.0, rng=harness.random.Random(1), timeout=1, output_token_limit=32,
-        frequencies={}, worktrees_root=worktrees,
+        tier_models={},
+        prices={},
+        shadow_prices={},
+        cost_mode="shadow",
+        fixed_models={"timeout-test": "opencode-zen/hy3-free"},
+        ledger=ledger,
+        arm_cap=2.0,
+        rng=harness.random.Random(1),
+        timeout=1,
+        output_token_limit=32,
+        frequencies={},
+        worktrees_root=worktrees,
     )
     assert row["abort_scope"] == "timeout"
     assert row["shadow_cost_usd"] is None

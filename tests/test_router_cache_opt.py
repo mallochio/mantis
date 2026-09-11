@@ -66,8 +66,13 @@ def _messages() -> list[dict]:
 
 def test_mixed_kimi_gpt_still_marks_openai(tmp_path, monkeypatch):
     catalog = _write_catalog(
-        tmp_path, "modal-kimi", "modal", "kimi-k3",
-        "openrouter", "openrouter", "openai/gpt-5.6-sol",
+        tmp_path,
+        "modal-kimi",
+        "modal",
+        "kimi-k3",
+        "openrouter",
+        "openrouter",
+        "openai/gpt-5.6-sol",
     )
     _use_catalog(monkeypatch, catalog)
     assert base_proxy._base_route_families() == frozenset({"openai"})
@@ -78,8 +83,13 @@ def test_mixed_kimi_gpt_still_marks_openai(tmp_path, monkeypatch):
 
 def test_mixed_claude_gpt_marks_both(tmp_path, monkeypatch):
     catalog = _write_catalog(
-        tmp_path, "openrouter", "openrouter", "anthropic/claude-sonnet-5",
-        "openrouter-cap", "openrouter", "openai/gpt-5.6-sol",
+        tmp_path,
+        "openrouter",
+        "openrouter",
+        "anthropic/claude-sonnet-5",
+        "openrouter-cap",
+        "openrouter",
+        "openai/gpt-5.6-sol",
     )
     _use_catalog(monkeypatch, catalog)
     assert base_proxy._base_route_families() == frozenset({"anthropic", "openai"})
@@ -91,8 +101,13 @@ def test_mixed_claude_gpt_marks_both(tmp_path, monkeypatch):
 
 def test_master_switch_disables_base_markers(tmp_path, monkeypatch):
     catalog = _write_catalog(
-        tmp_path, "modal-kimi", "modal", "kimi-k3",
-        "openrouter", "openrouter", "openai/gpt-5.6-sol",
+        tmp_path,
+        "modal-kimi",
+        "modal",
+        "kimi-k3",
+        "openrouter",
+        "openrouter",
+        "openai/gpt-5.6-sol",
     )
     _use_catalog(monkeypatch, catalog)
     monkeypatch.setenv("MANTIS_CACHE_BREAKPOINTS", "0")
@@ -102,31 +117,38 @@ def test_master_switch_disables_base_markers(tmp_path, monkeypatch):
 
 
 def test_litellm_adds_openai_breakpoints(monkeypatch):
-    monkeypatch.setenv("BIFROST_API_KEY", "k")
+    monkeypatch.setenv("LITELLM_API_KEY", "k")
     resolved = providers.ResolvedModelSpec(
         adapter="openai-compatible",
         model="openai/gpt-5.6-sol",
         effort=None,
         base_url="http://127.0.0.1:8080/v1",
-        credential_env="BIFROST_API_KEY",
+        credential_env="LITELLM_API_KEY",
         binding=None,
         protocols=("chat_completions",),
         slot=None,
     )
     kwargs = providers._litellm_kwargs(
-        resolved, _messages(), 100, 0.7, None, None, None, {},
+        resolved,
+        _messages(),
+        100,
+        0.7,
+        None,
+        None,
+        None,
+        {},
     )
     assert kwargs["messages"][0].get("prompt_cache_breakpoint") == {"mode": "explicit"}
 
 
 def test_litellm_preserves_client_openai_breakpoint(monkeypatch):
-    monkeypatch.setenv("BIFROST_API_KEY", "k")
+    monkeypatch.setenv("LITELLM_API_KEY", "k")
     resolved = providers.ResolvedModelSpec(
         adapter="openai-compatible",
         model="openai/gpt-5.6-sol",
         effort=None,
         base_url="http://127.0.0.1:8080/v1",
-        credential_env="BIFROST_API_KEY",
+        credential_env="LITELLM_API_KEY",
         binding=None,
         protocols=("chat_completions",),
         slot=None,
@@ -134,7 +156,14 @@ def test_litellm_preserves_client_openai_breakpoint(monkeypatch):
     messages = _messages()
     messages[0]["prompt_cache_breakpoint"] = {"mode": "explicit"}
     kwargs = providers._litellm_kwargs(
-        resolved, messages, 100, 0.7, None, None, None, {},
+        resolved,
+        messages,
+        100,
+        0.7,
+        None,
+        None,
+        None,
+        {},
     )
     assert kwargs["messages"][0].get("prompt_cache_breakpoint") == {"mode": "explicit"}
 
@@ -171,12 +200,16 @@ def test_synthetic_session_is_stable():
 
 
 def test_session_id_falls_back_to_synthetic():
-    body = type("R", (), {
-        "metadata": None,
-        "user": None,
-        "messages": [{"role": "user", "content": "hello"}],
-        "tools": None,
-    })()
+    body = type(
+        "R",
+        (),
+        {
+            "metadata": None,
+            "user": None,
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": None,
+        },
+    )()
     assert base_proxy.session_id({}, body).startswith("auto-")
 
 
@@ -187,25 +220,38 @@ def test_session_id_accepts_mantis_header():
 
 def test_router_headers_never_force_a_tier(monkeypatch):
     """Tier decisions belong to Switchyard; the forwarder sends no directives."""
-    body = type("R", (), {
-        "metadata": {"session_id": "s-9"},
-        "user": None,
-        "messages": [
-            {"role": "user", "content": "fix"},
-            {"role": "assistant", "tool_calls": [
-                {"function": {"name": "bash", "arguments": '{"cmd": "pytest -q"}'}},
-            ]},
-            {"role": "tool", "content": "Traceback: AssertionError"},
-            {"role": "assistant", "tool_calls": [
-                {"function": {"name": "bash", "arguments": '{"cmd": "pytest -q"}'}},
-            ]},
-            {"role": "tool", "content": "Traceback: AssertionError"},
-            {"role": "assistant", "tool_calls": [
-                {"function": {"name": "bash", "arguments": '{"cmd": "pytest -q"}'}},
-            ]},
-            {"role": "tool", "content": "Traceback: AssertionError"},
-        ],
-    })()
+    body = type(
+        "R",
+        (),
+        {
+            "metadata": {"session_id": "s-9"},
+            "user": None,
+            "messages": [
+                {"role": "user", "content": "fix"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"function": {"name": "bash", "arguments": '{"cmd": "pytest -q"}'}},
+                    ],
+                },
+                {"role": "tool", "content": "Traceback: AssertionError"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"function": {"name": "bash", "arguments": '{"cmd": "pytest -q"}'}},
+                    ],
+                },
+                {"role": "tool", "content": "Traceback: AssertionError"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"function": {"name": "bash", "arguments": '{"cmd": "pytest -q"}'}},
+                    ],
+                },
+                {"role": "tool", "content": "Traceback: AssertionError"},
+            ],
+        },
+    )()
     headers = base_proxy.router_headers({}, body)
     assert headers[base_proxy.SWITCHYARD_SESSION_HEADER] == "s-9"
     assert "x-switchyard-force-tier" not in headers
@@ -223,8 +269,7 @@ def test_trinity_reminder_uses_user_role():
             "role": "assistant",
             "content": "t",
             "tool_calls": [
-                {"id": "c0", "type": "function",
-                 "function": {"name": "bash", "arguments": "{}"}},
+                {"id": "c0", "type": "function", "function": {"name": "bash", "arguments": "{}"}},
             ],
         },
     }

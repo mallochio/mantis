@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Binary direct-router development shard: one fixed arm over the frozen 100-task
-# repository-disjoint manifest. All inference goes through private worker-local
-# Bifrost using an explicit provider-qualified model ID.
+# repository-disjoint manifest. All inference goes through a private worker-local
+# LiteLLM proxy using an explicit provider-qualified model ID.
 set -euo pipefail
 ARM="${ARM:?ARM is required (low or high)}"
 RUN_ID="${RUN_ID:?RUN_ID is required}"
@@ -13,11 +13,11 @@ esac
 EVAL_ROOT="/opt/mantis-eval"
 RESULT_DIR="/tmp/binary-router-results"
 LOG_DIR="$RESULT_DIR/logs"
-BIFROST_DIR="${BIFROST_DIR:-$HOME/.bifrost-data}"
+LITELLM_DIR="${LITELLM_DIR:-$HOME/.litellm-data}"
 OUT_FILE="$RESULT_DIR/results.jsonl"
 BUCKET_PREFIX="${GCS_EVAL_BUCKET:-gs://your-eval-storage-bucket}/${RUN_ID}/${ARM}"
-mkdir -p "$LOG_DIR" "$BIFROST_DIR"
-chmod 700 "$RESULT_DIR" "$BIFROST_DIR"
+mkdir -p "$LOG_DIR" "$LITELLM_DIR"
+chmod 700 "$RESULT_DIR" "$LITELLM_DIR"
 # Single-writer guard: refuse to start if another shard is already running.
 # A second concurrent worker would re-download OUT_FILE, replacing the inode
 # while the live worker appends to the old (then-deleted) inode, silently
@@ -31,27 +31,28 @@ export EVAL_PROXY_RETRIES="${EVAL_PROXY_RETRIES:-8}"
 export EVAL_PROXY_RETRY_BASE="${EVAL_PROXY_RETRY_BASE:-1.0}"
 export EVAL_PROXY_RETRY_MAX_WAIT="${EVAL_PROXY_RETRY_MAX_WAIT:-60.0}"
 [ -n "${OPENCODE_API_KEY:-}" ] || { echo "OPENCODE_API_KEY missing" >&2; exit 1; }
-[ -n "${BIFROST_API_KEY:-}" ] || { echo "BIFROST_API_KEY missing" >&2; exit 1; }
-[ -n "${BIFROST_ENCRYPTION_KEY:-}" ] || { echo "BIFROST_ENCRYPTION_KEY missing" >&2; exit 1; }
-cat > "$BIFROST_DIR/config.json" <<'EOF'
-{
-  "encryption_key": "env.BIFROST_ENCRYPTION_KEY",
-  "client": {"enforce_auth_on_inference": true, "enable_logging": false, "initial_pool_size": 50, "disable_content_logging": true},
-  "governance": {"virtual_keys": [{"id": "vk-binary-router", "name": "binary router development", "value": "env.BIFROST_API_KEY", "is_active": true, "provider_configs": [
-    {"provider": "opencode-zen", "weight": 1.0, "allowed_models": ["hy3-free"], "key_ids": ["*"]},
-    {"provider": "opencode-go", "weight": 1.0, "allowed_models": ["deepseek-v4-flash"], "key_ids": ["*"]}
-  ]}]},
-  "providers": {
-    "opencode-zen": {"keys": [{"name": "zen", "value": "env.OPENCODE_API_KEY", "models": ["hy3-free"], "weight": 1.0}], "store_raw_request_response": false},
-    "opencode-go": {"keys": [{"name": "go", "value": "env.OPENCODE_API_KEY", "models": ["deepseek-v4-flash"], "weight": 1.0}], "store_raw_request_response": false}
-  },
-  "source_of_truth": "config.json"
-}
+[ -n "${LITELLM_API_KEY:-}" ] || { echo "LITELLM_API_KEY missing" >&2; exit 1; }
+cat > "$LITELLM_DIR/config.yaml" <<'EOF'
+model_list:
+  - model_name: "opencode-zen/hy3-free"
+    litellm_params:
+      model: "openai/hy3-free"
+      api_base: "https://opencode.ai/zen/v1"
+      api_key: "os.environ/OPENCODE_API_KEY"
+  - model_name: "opencode-go/deepseek-v4-flash"
+    litellm_params:
+      model: "openai/deepseek-v4-flash"
+      api_base: "https://opencode.ai/zen/go/v1"
+      api_key: "os.environ/OPENCODE_API_KEY"
+general_settings:
+  master_key: "os.environ/LITELLM_API_KEY"
+litellm_settings:
+  drop_params: true
 EOF
-chmod 600 "$BIFROST_DIR/config.json"
-nohup npx -y @maximhq/bifrost -app-dir "$BIFROST_DIR" -host 127.0.0.1 -port 8080 -log-style pretty </dev/null >>"$LOG_DIR/bifrost.out" 2>>"$LOG_DIR/bifrost.err" &
+chmod 600 "$LITELLM_DIR/config.yaml"
+nohup litellm --config "$LITELLM_DIR/config.yaml" --host 127.0.0.1 --port 8080 </dev/null >>"$LOG_DIR/litellm.out" 2>>"$LOG_DIR/litellm.err" &
 for _ in $(seq 1 90); do
-  curl -sf -m 3 http://127.0.0.1:8080/v1/models -H "x-bf-vk: $BIFROST_API_KEY" -o "$LOG_DIR/models.json" && break
+  curl -sf -m 3 http://127.0.0.1:8080/v1/models -H "Authorization: Bearer $LITELLM_API_KEY" -o "$LOG_DIR/models.json" && break
   sleep 2
 done
 python3 - "$LOG_DIR/models.json" <<'PY'
@@ -73,7 +74,7 @@ python3 eval/router_eval.py \
  --prices eval/model_prices.json \
  --shadow-prices eval/prices/binary-hy3-deepseek-2026-08-15.json \
  --cost-mode shadow \
- --bifrost-endpoint http://127.0.0.1:8080/v1/chat/completions \
+ --litellm-endpoint http://127.0.0.1:8080/v1/chat/completions \
  --fixed-model "$ARM=$MODEL" --arms "$ARM" \
  --per-instance-cost 5.0 --budget-usd 500 --resume --timeout 1200 \
  --output-token-limit 4096 --worktrees-root /tmp/worktrees --keep-worktrees \

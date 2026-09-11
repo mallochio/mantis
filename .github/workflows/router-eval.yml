@@ -36,19 +36,19 @@ jobs:
       - name: Validate evaluation prerequisites
         if: ${{ !inputs.dry_run }}
         run: |
-          test -n "${BIFROST_API_KEY:-}" || (echo "BIFROST_API_KEY is required" && exit 1)
+          test -n "${LITELLM_API_KEY:-}" || (echo "LITELLM_API_KEY is required" && exit 1)
           test -n "${MANTIS_API_KEY:-}" || (echo "MANTIS_API_KEY is required" && exit 1)
           command -v docker
           docker info
           command -v pi
         env:
-          BIFROST_API_KEY: ${{ secrets.BIFROST_API_KEY }}
+          LITELLM_API_KEY: ${{ secrets.LITELLM_API_KEY }}
           MANTIS_API_KEY: ${{ secrets.MANTIS_API_KEY }}
       - name: Explicit evaluation run
         if: ${{ !inputs.dry_run }}
         run: uv run python eval/router_eval.py --budget-usd "${{ inputs.budget_usd }}"
         env:
-          BIFROST_API_KEY: ${{ secrets.BIFROST_API_KEY }}
+          LITELLM_API_KEY: ${{ secrets.LITELLM_API_KEY }}
           MANTIS_API_KEY: ${{ secrets.MANTIS_API_KEY }}
       - name: Upload evaluation results
         if: ${{ !inputs.dry_run && always() }}

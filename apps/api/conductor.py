@@ -304,7 +304,7 @@ class EnvLocalConductor:
 
 class EnvConductorCoordinator(ConductorCoordinator):
     """ConductorCoordinator that can use a local transformers checkpoint
-    (Llama-3.2-3B Conductor) or Bifrost for the planning call."""
+    (Llama-3.2-3B Conductor) or LiteLLM for the planning call."""
 
     def __init__(
         self,
@@ -350,9 +350,7 @@ def load_coordinator(mode: str):
     local_ckpt = os.environ.get("MANTIS_LOCAL_CONDUCTOR")
     conductor = EnvLocalConductor(local_ckpt) if local_ckpt else None
     catalog = _load_mantis_catalog()
-    worker.conductor_model = (
-        catalog.conductor_model if catalog is not None else None
-    )
+    worker.conductor_model = catalog.conductor_model if catalog is not None else None
     return EnvConductorCoordinator(
         worker, conductor=conductor, slot_labels=getattr(worker, "slot_models", None)
     )

@@ -2,7 +2,7 @@
 """Retrain the OpenFugu TRINITY router head for a new 7-slot worker pool.
 
 Usage (local):
-  export BIFROST_API_KEY=...
+  export LITELLM_API_KEY=...
   python scripts/retrain_router_pool.py \
     --pool "<7 model specs separated by commas, optional |reasoning_effort>" \
     --output-dir ./outputs/router_retrain
@@ -17,7 +17,7 @@ Usage (SkyPilot):
 What it does:
   1. Downloads a task dataset (default TerminalBench 2.1 mirror) and a small
      validation split.
-  2. Calls each worker in the pool for each task through the local Bifrost gateway. Responses
+  2. Calls each worker in the pool for each task through the local LiteLLM proxy. Responses
      are scored against the reference solution; the best worker becomes the gold
      worker label for that task.
   3. Runs the Qwen3-0.6B TRINITY backbone to extract penultimate-token hidden
@@ -37,8 +37,8 @@ Label modes:
              skipped.
 
 Environment:
-  BIFROST_API_KEY     required for worker calls
-  BIFROST_BASE_URL     OpenAI-compatible endpoint (default http://127.0.0.1:8080/v1)
+  LITELLM_API_KEY     required for worker calls
+  LITELLM_BASE_URL     OpenAI-compatible endpoint (default http://127.0.0.1:8080/v1)
   HF_TOKEN            optional, avoids HF rate limits / gates Qwen3-0.6B
   MANTIS_MODEL          Qwen3-0.6B dir or HF id (default Qwen/Qwen3-0.6B)
   MANTIS_VECTOR         existing TRINITY vector (default ./artifacts/model_iter_60.npy)
@@ -91,7 +91,7 @@ from mini import (
 from toolscale_data import SYSTEM, _parse_plan, _score
 
 # ---------------------------------------------------------------------------
-# Bifrost worker wrapper
+# LiteLLM worker wrapper
 # ---------------------------------------------------------------------------
 
 KNOWN_PREFIXES = {
@@ -113,7 +113,7 @@ REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 def split_model_spec(spec: str):
     """Parse 'model_id|reasoning_effort' into (model_id, effort).
 
-    Bifrost model ids like 'gpt-5.6-sol|medium' are supported.
+    LiteLLM model ids like 'gpt-5.6-sol|medium' are supported.
     Effort is optional; None means no reasoning_effort is sent.
     """
     spec = spec.strip()
@@ -136,8 +136,7 @@ def normalize_model_id(model: str) -> str:
         if model.lower().startswith(prefix):
             return provider + model
     raise ValueError(
-        f"Could not infer provider for '{model}'. "
-        f"Pass a full id like 'anthropic/claude-sonnet-5'."
+        f"Could not infer provider for '{model}'. Pass a full id like 'anthropic/claude-sonnet-5'."
     )
 
 
@@ -202,8 +201,8 @@ def _error_status(exc: Exception) -> str:
     return "error"
 
 
-class BifrostWorker:
-    """Call a heterogeneous worker pool through Bifrost Chat Completions."""
+class LiteLLMWorker:
+    """Call a heterogeneous worker pool through a LiteLLM proxy (Chat Completions)."""
 
     def __init__(
         self,
@@ -219,12 +218,14 @@ class BifrostWorker:
         per_model_concurrency: dict[str, int] | str | None = None,
     ):
         specs = [split_model_spec(m) for m in models]
-        self.models = [m.removeprefix("bifrost/") for m, _ in specs]
+        self.models = [m.removeprefix("litellm/") for m, _ in specs]
         self.efforts = [e for _, e in specs]
-        self.api_key = api_key or os.environ.get("BIFROST_API_KEY")
+        self.api_key = api_key or os.environ.get("LITELLM_API_KEY")
         if not self.api_key:
-            raise ValueError("BIFROST_API_KEY is required")
-        self.api_base = (api_base or os.environ.get("BIFROST_BASE_URL", "http://127.0.0.1:8080/v1")).rstrip("/")
+            raise ValueError("LITELLM_API_KEY is required")
+        self.api_base = (
+            api_base or os.environ.get("LITELLM_BASE_URL", "http://127.0.0.1:8080/v1")
+        ).rstrip("/")
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.timeout = timeout
@@ -602,7 +603,7 @@ def _write_events(events_path: Path, events: list[dict]) -> None:
 
 
 def _score_one_worker(
-    worker: BifrostWorker,
+    worker: LiteLLMWorker,
     task_idx: int,
     task: str,
     expected: str | list,
@@ -672,7 +673,7 @@ def _cheapest_eligible(
     def sort_key(item: tuple[int, float]) -> tuple[float, float, int]:
         i, score = item
         model, _ = split_model_spec(pool[i])
-        return (_model_cost(model.removeprefix("bifrost/"), costs), -score, i)
+        return (_model_cost(model.removeprefix("litellm/"), costs), -score, i)
 
     return min(eligible, key=sort_key)[0]
 
@@ -699,7 +700,7 @@ def _pick_best_worker(
     ratios: list[tuple[int, float]] = []
     for i, s in usable:
         model, _ = split_model_spec(pool[i])
-        cost = max(_model_cost(model.removeprefix("bifrost/"), costs), 1e-6)
+        cost = max(_model_cost(model.removeprefix("litellm/"), costs), 1e-6)
         ratios.append((i, s / cost))
     if not ratios:
         return -1
@@ -773,7 +774,7 @@ def _process_task_scores(
 
 
 def _score_worker_pool(
-    worker: BifrostWorker,
+    worker: LiteLLMWorker,
     pool: list[str],
     train_ds: list[dict],
     out_dir: Path,
@@ -803,7 +804,7 @@ def _score_worker_pool(
             system = row.get("system")
             for agent_id, spec in enumerate(pool):
                 model, _ = split_model_spec(spec)
-                model_id = model.removeprefix("bifrost/")
+                model_id = model.removeprefix("litellm/")
                 fut = executor.submit(
                     _score_one_worker,
                     worker,
@@ -878,7 +879,7 @@ def _label_distribution(
 def _resolve_costs(
     pool: list[str], fallback_path: str | Path, out_dir: Path
 ) -> tuple[dict[str, float], str]:
-    """Load the explicit shadow-cost table used for Bifrost-routed labels."""
+    """Load the explicit shadow-cost table used for LiteLLM-routed labels."""
     costs = _load_cost_table(fallback_path)
     snapshot = {"source": "cost_table", "pool": pool, "costs": costs}
     (out_dir / "pricing_snapshot.json").write_text(json.dumps(snapshot, indent=2))
@@ -903,7 +904,7 @@ def _parse_retrain_args(argv=None) -> argparse.Namespace:
         "--pool",
         default=os.environ.get("RETRAIN_WORKER_MODELS"),
         required=False,
-        help="Comma-separated Bifrost model ids. "
+        help="Comma-separated LiteLLM model ids. "
         "Append '|reasoning_effort' per model, e.g. openai/gpt-5.6-terra|xhigh",
     )
     ap.add_argument(
@@ -1077,7 +1078,7 @@ def _write_trained_vector(
 def _validate_router(
     router_val: FuguRouter,
     val_rows: list[dict],
-    worker: BifrostWorker,
+    worker: LiteLLMWorker,
 ) -> float:
     print("[retrain] running quick validation on held-out tasks...", flush=True)
     val_hits = 0.0
@@ -1150,7 +1151,7 @@ def main(argv=None) -> None:
     if args.per_model_concurrency:
         per_model_concurrency = json.loads(args.per_model_concurrency)
 
-    worker = BifrostWorker(
+    worker = LiteLLMWorker(
         pool,
         max_worker_concurrency=args.max_worker_concurrency,
         per_model_concurrency=per_model_concurrency,
