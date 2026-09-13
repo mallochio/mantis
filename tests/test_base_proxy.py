@@ -7,11 +7,14 @@ forwarding with mapped response headers.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 
 import base_proxy
 import httpx
 import providers
+import pytest
 
 
 def _request(
@@ -30,11 +33,49 @@ def _request(
 
     request = Request()
     request.messages = messages if messages is not None else []
-    request.tools = None
+    request.tools = (extra or {}).get("tools")
     request.metadata = metadata
     request.user = user
     request.stream = stream
     return request
+
+
+def _tool_trajectory() -> dict:
+    return {
+        "messages": [
+            {"role": "user", "content": "inspect the repository", "harness_tag": "keep-me"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path":"README.md"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "contents"},
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
+                },
+            }
+        ],
+        "tool_choice": "auto",
+    }
 
 
 def _make_request(data: dict) -> object:
@@ -50,7 +91,7 @@ def _make_request(data: dict) -> object:
 
 
 def test_session_id_prefers_switchyard_header():
-    request = _request(user=None)
+    request = _request([{"role": "user", "content": "do work"}], user=None)
     assert (
         base_proxy.session_id(
             {"x-switchyard-session-id": "switch", "x-route-session": "route"},
@@ -58,6 +99,20 @@ def test_session_id_prefers_switchyard_header():
         )
         == "switch"
     )
+
+
+def test_session_id_compatibility_header_precedence():
+    request = _request([{"role": "user", "content": "do work"}])
+    session = base_proxy.session_id(
+        {
+            "x-route-session": "route",
+            "x-opencode-session": "opencode",
+            "x-mantis-session-id": "mantis-id",
+            "x-mantis-session": "mantis",
+        },
+        request,
+    )
+    assert session is not None and session.startswith("route:auto-")
 
 
 def test_session_id_falls_back_to_metadata():
@@ -110,6 +165,24 @@ def test_router_headers_omit_session_without_identity(monkeypatch):
 # -- Body hygiene: catalog supremacy + stable prefix ---------------------------
 
 
+def test_router_body_preserves_openai_tool_trajectory():
+    trajectory = _tool_trajectory()
+    body = base_proxy.router_body(
+        _make_request(
+            {
+                "model": "mantis/base",
+                **trajectory,
+                "reasoning_effort": "high",
+            }
+        )
+    )
+
+    assert body["tools"] == trajectory["tools"]
+    assert body["tool_choice"] == "auto"
+    assert body["messages"] == trajectory["messages"]
+    assert "reasoning_effort" not in body
+
+
 def test_router_body_strips_endpoint_bound_reasoning_details():
     body = base_proxy.router_body(
         _make_request(
@@ -149,6 +222,62 @@ def test_router_body_drops_all_endpoint_bound_reasoning_details():
         )
     )
     assert "reasoning_details" not in body["messages"][0]
+
+
+def test_router_body_recursively_strips_provider_bound_metadata_but_keeps_portable_content():
+    body = base_proxy.router_body(
+        _make_request(
+            {
+                "model": "mantis/base",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "portable", "thinkingSignature": "opaque"},
+                            {"type": "tool_use", "id": "call_1", "name": "read_file", "input": {}},
+                            {"type": "compaction", "encrypted_content": "opaque"},
+                        ],
+                        "signature": "opaque",
+                        "provider_metadata": {
+                            "nested": {"encrypted_content": "opaque", "text": "must-not-survive"}
+                        },
+                        "reasoning_details": [
+                            {
+                                "type": "reasoning",
+                                "text": "portable summary",
+                                "signature": "opaque",
+                            },
+                            {"type": "reasoning", "encrypted_content": "opaque"},
+                        ],
+                        "nested": {
+                            "portable": {"text": "keep"},
+                            "_internal": "drop",
+                            "wrapper": {
+                                "thinkingSignature": "drop",
+                                "encrypted_payload": "drop",
+                                "text": "keep nested",
+                            },
+                        },
+                    }
+                ],
+            }
+        )
+    )
+
+    assert body["messages"] == [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "portable"},
+                {"type": "tool_use", "id": "call_1", "name": "read_file", "input": {}},
+            ],
+            "reasoning_details": [{"type": "reasoning", "text": "portable summary"}],
+            "nested": {
+                "portable": {"text": "keep"},
+                "wrapper": {"text": "keep nested"},
+            },
+        }
+    ]
 
 
 def test_router_body_drops_harness_reasoning_object():
@@ -283,6 +412,10 @@ def _switchyard_client(handler):
     return httpx.Client(transport=httpx.MockTransport(handler))
 
 
+def _async_switchyard_client(handler):
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
 def test_forward_serves_simple_turn_through_switchyard():
     def handler(request):
         assert request.headers["x-switchyard-session-id"] == "sess-1"
@@ -306,6 +439,140 @@ def test_forward_serves_simple_turn_through_switchyard():
     assert json.loads(response.body.decode())["choices"][0]["message"]["content"] == "glm-hi"
     assert response.headers["x-route-model"] == "zai-org/GLM-5.3"
     assert response.headers[base_proxy.SWITCHYARD_SESSION_HEADER] == "sess-1"
+
+
+def test_forward_reports_derived_session_when_router_does_not_echo_it():
+    def handler(request):
+        assert request.headers[base_proxy.SWITCHYARD_SESSION_HEADER] == "stable-session"
+        return httpx.Response(
+            200,
+            json={"id": "c", "choices": [{"message": {"content": "ok"}}]},
+            headers={base_proxy.SWITCHYARD_SELECTED_MODEL_HEADER: "provider/model"},
+        )
+
+    response, _ = base_proxy.forward(
+        _request([{"role": "user", "content": "hi"}], metadata={"session_id": "stable-session"}),
+        {},
+        "req-session",
+        lambda: _switchyard_client(handler),
+    )
+    assert response.headers[base_proxy.SWITCHYARD_SESSION_HEADER] == "stable-session"
+
+
+def test_forward_preserves_upstream_tool_calls_byte_for_byte():
+    upstream_body = {
+        "id": "chatcmpl-tools",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": _tool_trajectory()["messages"][1]["tool_calls"],
+                },
+            }
+        ],
+    }
+
+    def handler(_request):
+        return httpx.Response(
+            200,
+            json=upstream_body,
+            headers={
+                base_proxy.SWITCHYARD_SELECTED_MODEL_HEADER: "provider/model",
+                base_proxy.SWITCHYARD_SESSION_HEADER: "tools-session",
+                "x-upstream-private": "must-not-leak",
+            },
+        )
+
+    trajectory = _tool_trajectory()
+    response, handed_off = base_proxy.forward(
+        _request(
+            trajectory["messages"],
+            metadata={"session_id": "tools-session"},
+            extra={"tools": trajectory["tools"], "tool_choice": "auto"},
+        ),
+        {},
+        "req-tools",
+        lambda: _switchyard_client(handler),
+    )
+
+    assert handed_off is False
+    assert response.body == json.dumps(upstream_body, separators=(",", ":")).encode()
+    assert response.headers["x-route-model"] == "provider/model"
+    assert response.headers[base_proxy.SWITCHYARD_SESSION_HEADER] == "tools-session"
+    assert "x-upstream-private" not in response.headers
+
+
+def test_dispatch_routed_returns_tool_calls_and_route_diagnostics():
+    trajectory = _tool_trajectory()
+    seen: dict = {}
+
+    async def handler(request):
+        seen["body"] = json.loads(request.content.decode())
+        seen["session"] = request.headers[base_proxy.SWITCHYARD_SESSION_HEADER]
+        return httpx.Response(
+            200,
+            json={
+                "id": "routed",
+                "choices": [{"message": trajectory["messages"][1]}],
+                "usage": {"prompt_tokens": 10},
+            },
+            headers={base_proxy.SWITCHYARD_SELECTED_MODEL_HEADER: "provider/selected"},
+        )
+
+    result = base_proxy.dispatch_routed(
+        {"model": "mantis/base", **trajectory},
+        "run-1:main",
+        lambda: _async_switchyard_client(handler),
+    )
+
+    assert seen == {
+        "body": {"model": "mantis/base", **trajectory},
+        "session": "run-1:main",
+    }
+    assert (
+        result.body["choices"][0]["message"]["tool_calls"]
+        == trajectory["messages"][1]["tool_calls"]
+    )
+    assert result.selected_model == "provider/selected"
+    assert result.session_id == "run-1:main"
+
+
+def test_dispatch_routed_enforces_absolute_deadline_on_slow_trickle():
+    class TrickleStream(httpx.AsyncByteStream):
+        closed = False
+
+        async def __aiter__(self):
+            yield b'{"choices":['
+            for _ in range(20):
+                await asyncio.sleep(0.01)
+                yield b" "
+            yield b"]} "
+
+        async def aclose(self):
+            self.closed = True
+
+    stream = TrickleStream()
+
+    async def handler(_request):
+        return httpx.Response(200, stream=stream)
+
+    def client_factory():
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        base_proxy.dispatch_routed(
+            {"model": "mantis/base", "messages": [{"role": "user", "content": "hi"}]},
+            "deadline",
+            client_factory,
+            timeout_s=0.05,
+        )
+
+    assert time.monotonic() - started < 0.15
+    assert stream.closed is True
 
 
 def test_forward_strips_harness_reasoning_before_switchyard():
@@ -359,6 +626,43 @@ def test_forward_streams_through_switchyard():
     )
     assert handed_off is True
     assert response.media_type == "text/event-stream"
+
+
+def test_forward_stream_preserves_tool_call_chunks_and_diagnostics():
+    chunk = (
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1",'
+        b'"type":"function","function":{"name":"read_file","arguments":"{}"}}]}}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+
+    def handler(_request):
+        return httpx.Response(
+            200,
+            content=chunk,
+            headers={
+                "content-type": "text/event-stream",
+                base_proxy.SWITCHYARD_SELECTED_MODEL_HEADER: "provider/streamed",
+            },
+        )
+
+    response, handed_off = base_proxy.forward(
+        _request(
+            [{"role": "user", "content": "use a tool"}],
+            stream=True,
+            metadata={"session_id": "stream-session"},
+        ),
+        {},
+        "req-stream-tools",
+        lambda: _switchyard_client(handler),
+    )
+    assert handed_off is True
+
+    async def collect() -> bytes:
+        return b"".join([part async for part in response.body_iterator])
+
+    assert asyncio.run(collect()) == chunk
+    assert response.headers["x-route-model"] == "provider/streamed"
+    assert response.headers[base_proxy.SWITCHYARD_SESSION_HEADER] == "stream-session"
 
 
 # -- Cache families ------------------------------------------------------------------

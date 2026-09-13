@@ -65,6 +65,7 @@ BASE_TARGET_FIELDS = frozenset(
         "format",
     }
 )
+VIRTUAL_ROUTES = frozenset({"mantis/base"})
 
 
 class CatalogError(ValueError):
@@ -379,8 +380,32 @@ def _load_named_providers(providers_raw: Any, names: set[str]) -> dict[str, Prov
     return providers
 
 
+def validate_fusion_virtual_routes(root: Mapping[str, Any]) -> None:
+    """Reject misspelled Mantis virtual routes while allowing concrete slots."""
+    raw = root.get("fusion")
+    if raw is None:
+        return
+    section = _mapping(raw, "fusion")
+    for role in ("main", "sidekick"):
+        configured = section.get(role)
+        if configured is None:
+            continue
+        if isinstance(configured, str):
+            values = [configured]
+        elif isinstance(configured, list) and configured:
+            values = configured
+        else:
+            raise CatalogError(f"fusion.{role} must be a model name or non-empty model list")
+        if not all(isinstance(value, str) and value.strip() for value in values):
+            raise CatalogError(f"fusion.{role} must contain only non-empty model names")
+        for value in values:
+            if value.startswith("mantis/") and value not in VIRTUAL_ROUTES:
+                raise CatalogError(f"fusion.{role} uses unsupported virtual route {value}")
+
+
 def load_base_route(root: Mapping[str, Any]) -> BaseRoute:
     """Parse the catalog [base] stage-router used to generate Switchyard config."""
+    validate_fusion_virtual_routes(root)
     if root.get("version") != 1:
         raise CatalogError("catalog version must be 1 when base is configured")
     section = _mapping(root.get("base"), "base")

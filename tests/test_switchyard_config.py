@@ -227,6 +227,22 @@ def test_rejects_unknown_picker():
         load_base_route(tomllib.loads(content))
 
 
+def test_catalog_accepts_mantis_base_for_either_fusion_lane():
+    root = tomllib.loads(
+        _catalog(extra='\n[fusion]\nmain = "mantis/base"\nsidekick = "mantis/base"\n')
+    )
+    route = load_base_route(root)
+    assert route.efficient.upstream_model == "google/gemini-3.7-flash"
+
+
+def test_catalog_rejects_unknown_fusion_virtual_route():
+    root = tomllib.loads(
+        _catalog(extra='\n[fusion]\nmain = "mantis/unknown"\nsidekick = "mantis/base"\n')
+    )
+    with pytest.raises(CatalogError, match="unsupported virtual route mantis/unknown"):
+        load_base_route(root)
+
+
 def test_rejects_unknown_target_role(tmp_path):
     extra = (
         '\n[base.targets.mid]\nprovider = "litellm"\nupstream_model = "google/gemini-3.7-flash"\n'

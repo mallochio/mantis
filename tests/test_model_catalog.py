@@ -195,6 +195,16 @@ def test_catalog_requires_version_and_contract(tmp_path):
         model_catalog.load_mantis_catalog(path)
 
 
+@pytest.mark.parametrize("invalid", ["42", '["mantis/base", 42]', "[]"])
+def test_normal_catalog_loader_rejects_invalid_fusion_pool_types(tmp_path, invalid):
+    path = _write_catalog(
+        tmp_path,
+        _catalog() + f'\n[fusion]\nmain = {invalid}\nsidekick = "mantis/base"\n',
+    )
+    with pytest.raises(model_catalog.CatalogError, match="fusion.main"):
+        model_catalog.load_mantis_catalog(path, require_contract=False)
+
+
 def test_fingerprint_bootstraps_then_validate_and_render(tmp_path):
     path, fingerprint = _fingerprint(tmp_path)
     path.write_text(_catalog(fingerprint))

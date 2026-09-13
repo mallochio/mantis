@@ -30,6 +30,7 @@ from model_catalog_schema import (
     _string,
     _url,
     load_base_route,
+    validate_fusion_virtual_routes,
 )
 
 __all__ = [
@@ -170,6 +171,7 @@ def load_mantis_catalog(
             root = tomllib.load(handle)
     except tomllib.TOMLDecodeError as error:
         raise CatalogError(f"invalid TOML in Mantis catalog: {error}") from error
+    validate_fusion_virtual_routes(root)
     if root.get("mantis") is None:
         return None
     if root.get("version") != 1:

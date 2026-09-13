@@ -160,7 +160,51 @@ Trinity, Ultra, and Fusion keep using `[mantis.workers]` and `[fusion]` in the s
 
 ## Routing and cost control
 
-`mantis/base` uses Switchyard's stage router. Turns start on the efficient catalog target and escalate to the capable target when tool-result signals (errors, spinning, exploration vs production) clear `confidence_threshold`. Pass `x-switchyard-session-id`, `X-Route-Session`, or `metadata.session_id` so session state can stick across a coding loop.
+`mantis/base` is a harness-neutral OpenAI Chat Completions gateway backed by Switchyard's stage router. A compatible client only needs:
+
+```text
+base_url = http://<mantis-host>/v1
+model = mantis/base
+optional session = metadata.session_id or x-switchyard-session-id
+tools = normal OpenAI function-tool schema
+```
+
+Turns start on the efficient catalog target and escalate to the capable target when tool-result signals (errors, spinning, exploration vs production) clear `confidence_threshold`. Compatibility headers (`X-Route-Session`, `x-opencode-session`, `x-mantis-session-id`, and `x-mantis-session`) remain accepted. Responses expose the selected upstream model as `x-route-model` and the stable identity as `x-switchyard-session-id`.
+
+The calling harness executes tools. Send assistant `tool_calls` back unchanged, execute them locally, then append ordinary `role=tool` messages with the same `tool_call_id`:
+
+```bash
+curl http://localhost:8088/v1/chat/completions \
+  -H "Authorization: Bearer $MANTIS_API_KEY" \
+  -H "Content-Type: application/json" \
+  -H "x-switchyard-session-id: my-run" \
+  -d '{"model":"mantis/base","messages":[{"role":"user","content":"Read README.md"}],"tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]}'
+```
+
+```python
+from openai import OpenAI
+
+client = OpenAI(api_key="...", base_url="http://localhost:8088/v1")
+response = client.chat.completions.create(
+    model="mantis/base",
+    messages=[{"role": "user", "content": "Read README.md"}],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    }],
+)
+```
+
+`mantis/fusion` remains the optional built-in lead/sidekick orchestration harness. When a Fusion lane is configured as `mantis/base`, it uses the same Switchyard boundary with a separate stable session per lane; concrete Fusion slots and explicit fallback pools remain pinned provider paths.
+
+Comparative live evaluation is deferred. `scripts/evaluate_routed_harness.py` only validates the non-executable case manifest and summarizes externally produced records. Those records are observations, not trusted proof; no quality/cost claim or production default change is based on them.
 
 See the [Switchyard stage-router docs](https://github.com/NVIDIA-NeMo/Switchyard/blob/main/docs/routing_algorithms/stage_router_routing.md) for signal details.
 

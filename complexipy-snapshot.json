@@ -40,6 +40,10 @@
     "file_name": "fusion.py",
     "functions": [
       {
+        "name": "FusionCoordinator::_call_worker",
+        "complexity": 29
+      },
+      {
         "name": "_extract_reasoning_trace",
         "complexity": 56
       },

@@ -1138,6 +1138,11 @@ def _build_fusion_chat_response(
     headers = {"X-Request-Id": request_id}
     if run_id:
         headers["X-Mantis-Run-Id"] = run_id
+    slot_models = event.get("usage_models")
+    if isinstance(slot_models, dict) and slot_models:
+        headers["x-route-model"] = list(slot_models.keys())[-1]
+    elif isinstance(slot_models, list) and slot_models:
+        headers["x-route-model"] = str(slot_models[-1])
     return JSONResponse(
         {
             "id": request_id,

@@ -1,6 +1,6 @@
 # 005 — Fusion hardening
 
-**Status:** Active remediation plan  
+**Status:** Active remediation plan
 **Priority:** P0–P2, with deferred follow-on work
 
 ## Confirmed scope

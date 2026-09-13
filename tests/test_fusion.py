@@ -11,7 +11,9 @@ from pathlib import Path
 from typing import Any
 
 import api
+import base_proxy
 import fusion
+import httpx
 import providers
 import pytest
 import runs
@@ -2902,16 +2904,14 @@ def test_record_selected_slot_tracks_promotions():
     assert run.slot_models.count("main-strong") == 1
 
 
-def test_base_route_lead_resolves_to_capable_target():
-    """The lead runs through [base] so it can use an effort the ABI slot pins."""
+def test_base_route_remains_virtual_while_explicit_capable_target_resolves():
+    """Switchyard, not FusionRouter, resolves the dynamic mantis/base route."""
     catalog = Path(__file__).resolve().parent.parent / "config" / "catalog.toml"
     config = fusion.FusionRoutingConfig(main="mantis/base", sidekick="gpt-5_6-luna")
     router = fusion.FusionRouter.from_config(config, "main", catalog=catalog)
     spec = router.select(escalation_count=0)
-    assert spec.startswith("modal.kimi-k3/")
-    assert "Kimi-K3" in spec
-    assert spec.endswith("|max")
-    assert router.strongest() == spec
+    assert spec == "mantis/base"
+    assert router.strongest() == "mantis/base"
 
     coordinator = fusion.FusionCoordinator()
     assert coordinator._context_window_for(spec) == coordinator.context_window
@@ -2920,7 +2920,190 @@ def test_base_route_lead_resolves_to_capable_target():
         "main",
         catalog=catalog,
     )
-    assert explicit.select(escalation_count=0) == spec
+    assert explicit.select(escalation_count=0).startswith("modal.kimi-k3/")
+
+
+def test_virtual_worker_dispatches_complete_tool_trajectory_to_switchyard(monkeypatch):
+    trajectory = {
+        "messages": [
+            {"role": "user", "content": "inspect"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [_tool_call("call_1", "read_file", {"path": "README.md"})],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "contents"},
+        ],
+        "tools": [{"type": "function", "function": {"name": "read_file"}}],
+    }
+    seen: list[tuple[dict, str]] = []
+
+    async def handler(request):
+        seen.append(
+            (
+                json.loads(request.content.decode()),
+                request.headers[base_proxy.SWITCHYARD_SESSION_HEADER],
+            )
+        )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [_tool_call("next", "read_file", {"path": "x"})],
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 5},
+            },
+            headers={base_proxy.SWITCHYARD_SELECTED_MODEL_HEADER: "provider/chosen"},
+        )
+
+    monkeypatch.setattr(
+        base_proxy,
+        "routed_async_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    coordinator = fusion.FusionCoordinator()
+    with fusion._fusion_route_session("run-1:main"):
+        first, _ = coordinator._call_worker(
+            "mantis/base", trajectory["messages"], trajectory["tools"]
+        )
+    with fusion._fusion_route_session("run-1:main"):
+        coordinator._call_worker("mantis/base", trajectory["messages"], trajectory["tools"])
+    with fusion._fusion_route_session("run-1:sidekick"):
+        coordinator._call_worker("mantis/base", trajectory["messages"], trajectory["tools"])
+
+    assert [session for _, session in seen] == [
+        "run-1:main",
+        "run-1:main",
+        "run-1:sidekick",
+    ]
+    assert seen[0][0]["messages"] == trajectory["messages"]
+    assert seen[0][0]["tools"] == trajectory["tools"]
+    assert "max_tokens" not in seen[0][0]
+    assert first["tool_calls"] == [_tool_call("next", "read_file", {"path": "x"})]
+    assert "_mantis_model" not in first
+
+
+def test_virtual_worker_does_not_fit_to_a_fictional_route_context(monkeypatch):
+    monkeypatch.setattr(
+        fusion.FusionCoordinator,
+        "_fit_messages",
+        lambda *_args, **_kwargs: pytest.fail(
+            "virtual route must choose its target before fitting"
+        ),
+    )
+    async def handler(_request):
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]},
+        )
+
+    monkeypatch.setattr(
+        base_proxy,
+        "routed_async_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    fusion.FusionCoordinator()._call_worker(
+        "mantis/base", [{"role": "user", "content": "hi"}], None
+    )
+
+
+def test_virtual_worker_sanitizes_replayed_messages_before_every_request(monkeypatch):
+    requests: list[dict[str, Any]] = []
+
+    async def handler(request):
+        requests.append(json.loads(request.content.decode()))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "done",
+                            "reasoning_details": [
+                                {"type": "reasoning.encrypted", "data": "secret"},
+                                {"type": "reasoning", "text": "portable"},
+                            ],
+                            "_provider_private": "must not replay",
+                        }
+                    }
+                ]
+            },
+            headers={base_proxy.SWITCHYARD_SELECTED_MODEL_HEADER: "provider/chosen"},
+        )
+
+    monkeypatch.setattr(
+        base_proxy,
+        "routed_async_client",
+        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    messages = [{"role": "user", "content": "first"}]
+    coordinator = fusion.FusionCoordinator()
+    first, _ = coordinator._call_worker("mantis/base", messages, None)
+    messages.extend([first, {"role": "user", "content": "second"}])
+    coordinator._call_worker("mantis/base", messages, None)
+
+    replayed = requests[1]["messages"][1]
+    assert "_mantis_model" not in first
+    assert all(not key.startswith("_") for key in replayed)
+    assert replayed["reasoning_details"] == [{"type": "reasoning", "text": "portable"}]
+
+
+def test_virtual_worker_http_timeout_uses_remaining_fusion_budget(monkeypatch):
+    from types import SimpleNamespace
+
+    effective_timeouts: list[dict[str, float | None]] = []
+
+    async def handler(request):
+        effective_timeouts.append(request.extensions["timeout"])
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]},
+        )
+
+    monkeypatch.setattr(
+        base_proxy,
+        "routed_async_client",
+        lambda: httpx.AsyncClient(timeout=99, transport=httpx.MockTransport(handler)),
+    )
+    budget = SimpleNamespace(remaining_timeout_s=lambda: 1.25)
+    monkeypatch.setattr(
+        serve_config._history_context,
+        "active_run",
+        SimpleNamespace(budget=budget),
+        raising=False,
+    )
+
+    fusion.FusionCoordinator()._call_worker(
+        "mantis/base", [{"role": "user", "content": "hi"}], None
+    )
+
+    assert effective_timeouts == [
+        {"connect": 1.25, "read": 1.25, "write": 1.25, "pool": 1.25}
+    ]
+
+
+def test_concrete_worker_still_uses_provider_path(monkeypatch):
+    calls: list[str] = []
+
+    def provider(slot, *_args, **_kwargs):
+        calls.append(slot)
+        return {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+
+    monkeypatch.setattr(fusion.providers, "_provider_response", provider)
+    coordinator = fusion.FusionCoordinator()
+    message, _ = coordinator._call_worker(
+        "gpt-5_6-sol", [{"role": "user", "content": "hi"}], None
+    )
+    assert calls == ["gpt-5_6-sol"]
+    assert message["content"] == "ok"
 
 
 def test_base_route_lead_and_sidekick_have_distinct_provenance():
@@ -3083,6 +3266,45 @@ def test_fusion_router_reroutes_only_at_compaction():
     assert sidekick.select_at_compaction(0.5, "side-cheap", 1) == "side-strong"
 
 
+def test_virtual_route_is_not_rerouted_by_fusion_after_compaction():
+    config = fusion.FusionRoutingConfig(main="mantis/base", sidekick="mantis/base")
+    run = fusion.FusionRun("virtual-compaction", "goal")
+    run.main_router = fusion.FusionRouter(config, "main")
+    run.sidekick_router = fusion.FusionRouter(config, "sidekick")
+    run.main_slot = "mantis/base"
+    run.sidekick_slot = "mantis/base"
+    run.structured_plan = fusion.FusionPlan(complexity=0.1, main_task="verify")
+
+    run._reroute_after_compaction("main", "mantis/base")
+    run._reroute_after_compaction("sidekick", "mantis/base")
+
+    assert run.main_compaction_slot is None
+    assert run.sidekick_compaction_slot is None
+    assert not [entry for entry in run._activity if entry["type"] == "fusion_reroute"]
+
+
+def test_established_main_system_prefix_is_not_mutated_during_dispatch(monkeypatch):
+    run = fusion.FusionRun(
+        "stable-prefix",
+        "goal",
+        tool_options=fusion.FusionToolOptions(enabled=["files"]),
+    )
+    original = dict(run.main_messages[0])
+    coordinator = fusion.FusionCoordinator()
+    coordinator.worker_profiles["late-profile"] = fusion.FusionWorkerProfile(
+        name="late-profile", description="dynamic roster entry"
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_call_worker",
+        lambda *_args: ({"role": "assistant", "content": "ANSWER: done"}, {}),
+    )
+
+    run._call_lane(coordinator, "main")
+
+    assert run.main_messages[0] == original
+
+
 def test_fusion_run_records_compaction_reroute():
     config = fusion.FusionRoutingConfig(
         main=["main-cheap", "main-strong"],
@@ -3152,8 +3374,7 @@ def test_select_at_compaction_switches_when_cache_warm_but_failing():
     config = fusion.FusionRoutingConfig(main=["cheap", "strong"], sidekick="side")
     router = fusion.FusionRouter(config, "main")
     selected = router.select_at_compaction(0.5, "strong", failure_count=1, cache_warm=True)
-    assert selected != "strong" or selected == "strong"  # depends on complexity logic
-    # The key: cache_warm does not prevent reroute when failures > 0
+    assert selected == "cheap"
 
 
 def test_select_at_compaction_cold_cache_allows_reroute():

@@ -12,6 +12,7 @@ Run: ``uv run python scripts/measure_cache_gains.py``
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -124,6 +125,69 @@ def simulate_reasoning_trim(assistant_turns: int = 8) -> dict[str, int]:
     return {"before_tokens": before, "after_tokens": after}
 
 
+def _reusable_prefix_tokens(previous: list[dict], current: list[dict]) -> int:
+    """Estimate reusable serialized prefix tokens without provider calls."""
+    left = json.dumps(previous, sort_keys=True, separators=(",", ":"))
+    right = json.dumps(current, sort_keys=True, separators=(",", ":"))
+    common = 0
+    for old, new in zip(left, right, strict=False):
+        if old != new:
+            break
+        common += 1
+    return common // 4
+
+
+def simulate_gateway_prefixes() -> dict[str, int]:
+    """Compare stable, independent, compacted, and accidentally mutable prefixes."""
+    system: dict[str, Any] = {
+        "role": "system",
+        "content": "stable harness policy " + "s" * 1200,
+    }
+    first: list[dict[str, Any]] = [
+        system,
+        {"role": "user", "content": "inspect repository"},
+    ]
+    second: list[dict[str, Any]] = [
+        *first,
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path":"README.md"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "contents"},
+    ]
+    third = [*second, {"role": "user", "content": "summarize"}]
+    stable = _reusable_prefix_tokens(first, second) + _reusable_prefix_tokens(second, third)
+
+    main_first: list[dict[str, Any]] = [system, {"role": "user", "content": "main task"}]
+    main_next = [*main_first, {"role": "assistant", "content": "main update"}]
+    side_system: dict[str, Any] = {
+        "role": "system",
+        "content": "stable sidekick policy " + "k" * 900,
+    }
+    side_first = [side_system, {"role": "user", "content": "side task"}]
+    side_next = [*side_first, {"role": "assistant", "content": "side update"}]
+
+    compacted = [system, second[-2], second[-1], {"role": "user", "content": "continue"}]
+    mutated = [
+        {"role": "system", "content": "dynamic run=2 " + "s" * 1200},
+        *second[1:],
+    ]
+    return {
+        "stable_session_reused_tokens": stable,
+        "main_lane_reused_tokens": _reusable_prefix_tokens(main_first, main_next),
+        "sidekick_lane_reused_tokens": _reusable_prefix_tokens(side_first, side_next),
+        "compaction_reused_tokens": _reusable_prefix_tokens(second, compacted),
+        "mutable_prefix_reused_tokens": _reusable_prefix_tokens(second, mutated),
+    }
+
+
 def main() -> None:
     azure = simulate_azure_interleaved()
     azure_saved = azure["old_tokens_sent"] - azure["new_tokens_sent"]
@@ -132,6 +196,7 @@ def main() -> None:
     trim = simulate_reasoning_trim()
     trim_saved = trim["before_tokens"] - trim["after_tokens"]
     trim_pct = 100.0 * trim_saved / max(1, trim["before_tokens"])
+    gateway = simulate_gateway_prefixes()
     print("Azure-router interleaved 2x8 turns (estimated tokens sent)")
     print(f"  old shared key : {azure['old_tokens_sent']}")
     print(f"  new isolated   : {azure['new_tokens_sent']}")
@@ -143,6 +208,9 @@ def main() -> None:
     print(f"  before : {trim['before_tokens']}")
     print(f"  after  : {trim['after_tokens']}")
     print(f"  saved  : {trim_saved} ({trim_pct:.1f}%)")
+    print("Gateway/Fusion reusable-prefix estimates (not measured cost savings)")
+    for name, tokens in gateway.items():
+        print(f"  {name}: {tokens}")
 
 
 if __name__ == "__main__":

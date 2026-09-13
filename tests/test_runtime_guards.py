@@ -184,4 +184,3 @@ def test_fusion_planning_tool_budget_cap(monkeypatch):
     )
     assert run.planning_tool_rounds == 2
     assert run.plan == "p"
-

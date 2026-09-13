@@ -1,8 +1,8 @@
-"""mantis-fusion adaptive model selection.
+"""Explicit model and fallback-pool selection for mantis-fusion.
 
-Resolves catalog route references such as ``mantis/base`` or ``base:efficient``
-into concrete provider specs and can promote through a pool of slots when a
-sidekick escalates or fails.
+The dynamic ``mantis/base`` route remains virtual so Switchyard is its sole
+routing authority. Explicit ``base:efficient`` and ``base:capable`` references
+still resolve to concrete provider specs, as do ordinary worker slots.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from model_catalog_schema import BaseRoute, load_base_route
 
 
 class FusionRouter:
-    """Pick a concrete model spec for one Fusion lane per turn."""
+    """Pick a virtual route or concrete model spec for one Fusion lane."""
 
     def __init__(
         self,
@@ -134,9 +134,9 @@ class FusionRouter:
         if not spec:
             raise ValueError(f"fusion {self.role} slot is empty")
 
-        # Direct references to the base stage router.
+        # Keep the dynamic base route virtual; Switchyard resolves it per turn.
         if spec in ("mantis/base", "base"):
-            return self._resolve_base("capable" if self.role == "main" else "efficient")
+            return "mantis/base"
 
         if spec.startswith("base:"):
             return self._resolve_base(spec.split(":", 1)[1].strip())

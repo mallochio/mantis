@@ -24,12 +24,14 @@ Switchyard-servable, so there are no direct LiteLLM legs.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import json
 import logging
 import os
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Protocol
 
@@ -95,6 +97,68 @@ def router_client() -> httpx.Client:
     return httpx.Client(timeout=float(os.environ.get("MANTIS_ROUTER_TIMEOUT_S", "300")))
 
 
+def routed_async_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=float(os.environ.get("MANTIS_ROUTER_TIMEOUT_S", "300")))
+
+
+@dataclass(frozen=True)
+class RoutedResponse:
+    body: dict[str, Any]
+    selected_model: str | None
+    session_id: str | None
+
+
+def _post_routed(
+    body: dict[str, Any],
+    headers: dict[str, str],
+    client_factory: Callable[[], httpx.Client] | None = None,
+    timeout_s: float | None = None,
+) -> httpx.Response:
+    url = os.environ.get("MANTIS_ROUTER_URL", DEFAULT_ROUTER_URL) + "/chat/completions"
+    with (client_factory or router_client)() as client:
+        kwargs = {"timeout": timeout_s} if timeout_s is not None else {}
+        return client.post(url, headers=headers, json=body, **kwargs)
+
+
+async def _post_routed_with_deadline(
+    body: dict[str, Any],
+    headers: dict[str, str],
+    client_factory: Callable[[], httpx.AsyncClient] | None,
+    timeout_s: float | None,
+) -> httpx.Response:
+    """Post and fully read a routed response within one wall-clock budget."""
+    url = os.environ.get("MANTIS_ROUTER_URL", DEFAULT_ROUTER_URL) + "/chat/completions"
+    async with (client_factory or routed_async_client)() as client:
+        async with asyncio.timeout(timeout_s):
+            return await client.post(url, headers=headers, json=body, timeout=timeout_s)
+
+
+def dispatch_routed(
+    body: dict[str, Any],
+    session: str | None,
+    client_factory: Callable[[], httpx.AsyncClient] | None = None,
+    timeout_s: float | None = None,
+) -> RoutedResponse:
+    """Send one non-streaming OpenAI chat body through Switchyard."""
+    body = sanitize_routed_body(body)
+    headers: dict[str, str] = {}
+    key = os.environ.get("MANTIS_ROUTER_KEY")
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    if session:
+        headers[SWITCHYARD_SESSION_HEADER] = session
+    upstream = asyncio.run(_post_routed_with_deadline(body, headers, client_factory, timeout_s))
+    upstream.raise_for_status()
+    payload = upstream.json()
+    if not isinstance(payload, dict) or "choices" not in payload:
+        raise ValueError("router returned a non-chat payload")
+    return RoutedResponse(
+        body=payload,
+        selected_model=upstream.headers.get(SWITCHYARD_SELECTED_MODEL_HEADER),
+        session_id=upstream.headers.get(SWITCHYARD_SESSION_HEADER) or session,
+    )
+
+
 def session_id(headers: dict[str, str], body: BaseChatRequest) -> str | None:
     """Session identity for Switchyard stage-router stickiness.
 
@@ -106,9 +170,11 @@ def session_id(headers: dict[str, str], body: BaseChatRequest) -> str | None:
     share one Switchyard session and evict each other's prefix cache.
     Only ``x-switchyard-session-id`` is sent upstream.
     """
+    switchyard_session = headers.get(SWITCHYARD_SESSION_HEADER)
+    if switchyard_session:
+        return switchyard_session
     session = (
-        headers.get(SWITCHYARD_SESSION_HEADER)
-        or headers.get("x-route-session")
+        headers.get("x-route-session")
         or headers.get("x-opencode-session")
         or headers.get("x-mantis-session-id")
         or headers.get("x-mantis-session")
@@ -172,20 +238,55 @@ def _coerce_max_completion_tokens(body: dict[str, Any]) -> dict[str, Any]:
     return body
 
 
-def _strip_endpoint_bound_reasoning(body: dict[str, Any]) -> dict[str, Any]:
-    """Drop encrypted reasoning that cannot cross Switchyard model targets.
+_DROP = object()
+def _metadata_key(key: str) -> str:
+    return "".join(character for character in key.lower() if character.isalnum())
 
-    OpenAI-compatible reasoning payloads may contain endpoint-bound encrypted
-    items. The stage router can switch between efficient and capable targets,
-    so replaying those items to a different target yields an upstream 404.
-    Plain reasoning summaries remain useful and portable.
-    """
+
+def _is_endpoint_bound_key(key: str) -> bool:
+    normalized = _metadata_key(key)
+    return (
+        "encrypted" in normalized
+        or "compaction" in normalized
+        or normalized.endswith("signature")
+        or normalized == "providermetadata"
+    )
+
+
+def _portable_message_value(value: Any) -> Any:
+    """Recursively remove opaque provider state while preserving chat/tool data."""
+    if isinstance(value, list):
+        return [clean for item in value if (clean := _portable_message_value(item)) is not _DROP]
+    if not isinstance(value, dict):
+        return value
+    for discriminator in ("type", "format"):
+        kind = value.get(discriminator)
+        if isinstance(kind, str) and any(
+            word in kind.lower() for word in ("encrypted", "compaction")
+        ):
+            return _DROP
+    removed_opaque = False
+    cleaned: dict[str, Any] = {}
+    for key, item in value.items():
+        if key.startswith("_") or _is_endpoint_bound_key(key):
+            removed_opaque = True
+            continue
+        portable = _portable_message_value(item)
+        if portable is not _DROP and not (key == "reasoning_details" and portable == []):
+            cleaned[key] = portable
+    if removed_opaque and set(cleaned) <= {"type", "format"}:
+        return _DROP
+    return cleaned
+
+
+def _strip_endpoint_bound_reasoning(body: dict[str, Any]) -> dict[str, Any]:
+    """Recursively drop endpoint-bound state from dynamically routed messages."""
     messages = body.get("messages")
     if not isinstance(messages, list):
         return body
-    for message in messages:
-        if isinstance(message, dict):
-            providers._portable_reasoning_details(message)
+    body["messages"] = [
+        clean for message in messages if (clean := _portable_message_value(message)) is not _DROP
+    ]
     return body
 
 
@@ -264,20 +365,34 @@ def router_body(request: BaseChatRequest) -> dict[str, Any]:
     long sessions and surfaces as a silently stopped conversation.
     """
     body = request.model_dump(exclude_none=True, exclude={"user", "metadata"})
+    return sanitize_routed_body(body)
+
+
+def sanitize_routed_body(body: dict[str, Any]) -> dict[str, Any]:
+    """Copy and sanitize any body crossing the dynamic routing boundary."""
+    body = {key: value for key, value in body.items() if not key.startswith("_")}
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        body["messages"] = [
+            {key: value for key, value in message.items() if not key.startswith("_")}
+            if isinstance(message, dict)
+            else message
+            for message in messages
+        ]
     body = _drop_client_reasoning(body)
     body = _coerce_max_completion_tokens(body)
     body = _strip_endpoint_bound_reasoning(body)
     return _apply_base_cache_markers(body)
 
 
-def router_response_headers(upstream: httpx.Response) -> dict[str, str]:
+def router_response_headers(upstream: httpx.Response, session: str | None = None) -> dict[str, str]:
     mapped: dict[str, str] = {}
     selected = upstream.headers.get(SWITCHYARD_SELECTED_MODEL_HEADER)
     if selected:
         mapped["x-route-model"] = selected
-    session = upstream.headers.get(SWITCHYARD_SESSION_HEADER)
-    if session:
-        mapped[SWITCHYARD_SESSION_HEADER] = session
+    stable_session = upstream.headers.get(SWITCHYARD_SESSION_HEADER) or session
+    if stable_session:
+        mapped[SWITCHYARD_SESSION_HEADER] = stable_session
     return mapped
 
 
@@ -397,6 +512,7 @@ def forward(
     """
     outbound_body = router_body(request)
     outbound_headers = router_headers(headers, request)
+    stable_session = outbound_headers.get(SWITCHYARD_SESSION_HEADER)
     client = client_factory()
     url = os.environ.get("MANTIS_ROUTER_URL", DEFAULT_ROUTER_URL) + "/chat/completions"
     if request.stream:
@@ -411,12 +527,14 @@ def forward(
             StreamingResponse(
                 _router_stream(client, stream, upstream, on_close=on_close),
                 media_type="text/event-stream",
-                headers={"X-Request-Id": request_id, **router_response_headers(upstream)},
+                headers={
+                    "X-Request-Id": request_id,
+                    **router_response_headers(upstream, stable_session),
+                },
             ),
             True,
         )
-    with client:
-        upstream = client.post(url, headers=outbound_headers, json=outbound_body)
+    upstream = _post_routed(outbound_body, outbound_headers, lambda: client)
     try:
         body = upstream.json()
     except ValueError:
@@ -445,7 +563,10 @@ def forward(
     return (
         JSONResponse(
             body,
-            headers={"X-Request-Id": request_id, **router_response_headers(upstream)},
+            headers={
+                "X-Request-Id": request_id,
+                **router_response_headers(upstream, stable_session),
+            },
         ),
         False,
     )

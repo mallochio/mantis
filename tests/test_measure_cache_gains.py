@@ -19,3 +19,12 @@ def test_base_isolation_scopes_sessions_per_conversation():
 def test_reasoning_trim_saves_tokens():
     result = gains.simulate_reasoning_trim(assistant_turns=4)
     assert result["after_tokens"] < result["before_tokens"]
+
+
+def test_gateway_prefix_scenarios_favor_stable_independent_lanes():
+    result = gains.simulate_gateway_prefixes()
+    assert result["stable_session_reused_tokens"] > 0
+    assert result["main_lane_reused_tokens"] > 0
+    assert result["sidekick_lane_reused_tokens"] > 0
+    assert result["compaction_reused_tokens"] > 0
+    assert result["stable_session_reused_tokens"] > result["mutable_prefix_reused_tokens"]

@@ -9,10 +9,11 @@ import threading
 import tomllib
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from pathlib import Path
 from typing import Any, cast
 
+import base_proxy
 import litellm
 import model_catalog
 import providers
@@ -50,6 +51,22 @@ __all__ = [
 FUSION_STATUS = frozenset(
     {"main_planning", "sidekick_pending", "awaiting_tools", "main_review", "completed", "error"}
 )
+
+
+@contextmanager
+def _fusion_route_session(session_id: str):
+    """Bind a stable Switchyard identity to the current Fusion lane thread."""
+    context = serve_config._history_context
+    previous = getattr(context, "fusion_route_session_id", None)
+    context.fusion_route_session_id = session_id
+    try:
+        yield
+    finally:
+        if previous is None:
+            with suppress(AttributeError):
+                del context.fusion_route_session_id
+        else:
+            context.fusion_route_session_id = previous
 
 MAIN_PREAMBLE = (
     "You are the lead engineer on a software task. Plan the work, delegate execution to "
@@ -331,9 +348,9 @@ class FusionConfig:
             return 4096
 
     def main_routing(self) -> FusionRoutingConfig:
-        return FusionRoutingConfig.model_validate(  # type: ignore[no-any-return]
-            {k: v for k, v in (self._load() or {}).items() if k in FusionRoutingConfig.model_fields}
-        )
+        fields = FusionRoutingConfig.model_fields
+        data = {k: v for k, v in (self._load() or {}).items() if k in fields}
+        return cast(FusionRoutingConfig, FusionRoutingConfig.model_validate(data))
 
     def main_router(self) -> FusionRouter:
         return FusionRouter.from_config(self.main_routing(), "main")
@@ -348,10 +365,14 @@ class FusionConfig:
         return [FusionWorkerProfile.model_validate(item) for item in raw]
 
     def default_budget(self) -> FusionRunBudget:
-        return FusionRunBudget.model_validate(self._load().get("budget") or {})  # type: ignore[no-any-return]
+        raw_budget = self._load().get("budget") or {}
+        payload = dict(raw_budget) if isinstance(raw_budget, dict) else {}
+        return cast(FusionRunBudget, FusionRunBudget.model_validate(payload))
 
     def tool_options(self) -> FusionToolOptions:
-        return FusionToolOptions.model_validate(self._load().get("tool_options") or {})  # type: ignore[no-any-return]
+        raw_tools = self._load().get("tool_options") or self._load().get("tools") or {}
+        payload = dict(raw_tools) if isinstance(raw_tools, dict) else {}
+        return cast(FusionToolOptions, FusionToolOptions.model_validate(payload))
 
 
 _FUSION_CONFIG = FusionConfig()
@@ -493,7 +514,7 @@ class FusionCoordinator:
 
     def select(self, role: str, turn_index: int, escalation_count: int) -> str:
         router = self.main_router if role == "main" else self.sidekick_router
-        return router.select(turn_index, escalation_count)
+        return cast(str, router.select(turn_index, escalation_count))
 
     # JSON includes replay-only reasoning metadata and tool schemas that
     # LiteLLM's chat-message counter intentionally ignores. Tokenize the full
@@ -661,7 +682,7 @@ class FusionCoordinator:
     def _upstream_model_for(self, slot: str) -> str:
         """Return the upstream model name a slot resolves to, or the slot itself."""
         try:
-            return providers._resolve_model_spec(slot).model
+            return cast(str, providers._resolve_model_spec(slot).model)
         except (RuntimeError, ValueError, AttributeError):
             return slot
 
@@ -688,42 +709,77 @@ class FusionCoordinator:
         as ``reasoning``, ``reasoning_details``, ``_anthropic_content`` and
         ``_anthropic_tool_ids`` so that later turns can replay required state.
         """
-        model_cap = self._output_tokens_for(slot)
-        output_tokens = min(self.max_output_tokens, model_cap)
-        input_budget = max(0, self._context_window_for(slot) - output_tokens)
+        routed = slot == "mantis/base"
         serve_config._history_context.fusion_compacted = False
-        before_tokens = self._token_sum(messages)
-        fitted = self._fit_messages(slot, messages, tools, input_budget)
-        if fitted is not messages and self._token_sum(fitted) < before_tokens:
-            # Persist the fitted history so trimming is not recomputed (and tool
-            # bodies are not re-sent in full) on every later provider call.
-            after_tokens = self._token_sum(fitted)
-            messages[:] = fitted
-            serve_config._history_context.fusion_compacted = True
-            providers._emit_progress(
-                {
-                    "type": "fusion_context_trimmed",
-                    "model": slot,
-                    "input_budget": input_budget,
-                    "tokens_before": before_tokens,
-                    "tokens_after": after_tokens,
-                    "tokens_dropped": before_tokens - after_tokens,
-                }
-            )
+        serve_config._history_context.fusion_selected_model = None
+        if routed:
+            # The virtual route has no single context window or output cap.
+            # Switchyard applies the selected target's catalog-owned limits.
+            fitted = messages
+            output_tokens = None
+        else:
+            model_cap = self._output_tokens_for(slot)
+            output_tokens = min(self.max_output_tokens, model_cap)
+            input_budget = max(0, self._context_window_for(slot) - output_tokens)
+            before_tokens = self._token_sum(messages)
+            fitted = self._fit_messages(slot, messages, tools, input_budget)
+            if fitted is not messages and self._token_sum(fitted) < before_tokens:
+                # Persist the fitted history so trimming is not recomputed (and tool
+                # bodies are not re-sent in full) on every later provider call.
+                after_tokens = self._token_sum(fitted)
+                messages[:] = fitted
+                serve_config._history_context.fusion_compacted = True
+                providers._emit_progress(
+                    {
+                        "type": "fusion_context_trimmed",
+                        "model": slot,
+                        "input_budget": input_budget,
+                        "tokens_before": before_tokens,
+                        "tokens_after": after_tokens,
+                        "tokens_dropped": before_tokens - after_tokens,
+                    }
+                )
         run = getattr(serve_config._history_context, "active_run", None)
         budget = getattr(run, "budget", None)
         timeout_s = budget.remaining_timeout_s() if budget is not None else None
-        if timeout_s is None:
-            data = providers._provider_response(slot, fitted, output_tokens, 0.7, tools)
+        selected_model: str | None = None
+        safe_tokens = output_tokens if output_tokens is not None else 4096
+        if routed:
+            body = {
+                "model": "mantis/base",
+                "messages": fitted,
+                "temperature": 0.7,
+            }
+            if tools:
+                body["tools"] = tools
+            result = base_proxy.dispatch_routed(
+                body,
+                getattr(serve_config._history_context, "fusion_route_session_id", None),
+                timeout_s=timeout_s,
+            )
+            data = result.body
+            selected_model = result.selected_model
+        elif timeout_s is None:
+            data = providers._provider_response(slot, fitted, safe_tokens, 0.7, tools)
         else:
             data = providers._provider_response(
-                slot, fitted, output_tokens, 0.7, tools, timeout_s=timeout_s
+                slot, fitted, safe_tokens, 0.7, tools, timeout_s=timeout_s
             )
         msg = dict(data["choices"][0]["message"])
         msg.setdefault("role", "assistant")
         msg["content"] = str(msg.get("content") or "")
-        msg["_mantis_model"] = self._upstream_model_for(slot)
+        actual_model = selected_model or self._upstream_model_for(slot)
+        if routed:
+            serve_config._history_context.fusion_selected_model = actual_model
+        else:
+            msg["_mantis_model"] = actual_model
         tcs = msg.get("tool_calls") or []
+        if routed:
+            if tcs:
+                msg["tool_calls"] = tcs
+            else:
+                msg.pop("tool_calls", None)
+            return msg, data.get("usage") or {}
         calls: list[dict[str, Any]] = []
         for tc in tcs:
             fn = tc.get("function", {})
@@ -788,11 +844,12 @@ class ExecutionLane:
                 instructions += "\n\n" + self.profile.instructions
             messages = self.shared_messages or self.run.main_messages
             self.shared_messages = messages
-            if messages and messages[0].get("role") == "system":
-                messages[0]["content"] = instructions
-            else:
-                messages.insert(0, {"role": "system", "content": instructions})
-            messages.append({"role": "user", "content": f"Task: {self.assignment.task}"})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"{instructions}\n\nTask: {self.assignment.task}",
+                }
+            )
             return messages
         system = SIDEKICK_PREAMBLE
         if self.profile.instructions:
@@ -827,7 +884,7 @@ class ExecutionLane:
                 config = FusionRoutingConfig(sidekick=self.profile.model)
                 base_route = self.coordinator.sidekick_router.base_route
             router = FusionRouter(config, self.role, base_route)
-            return router.select(self.run.follow_up_count, self.run.follow_up_count)
+            return cast(str, router.select(self.run.follow_up_count, self.run.follow_up_count))
         compaction_slot = (
             self.run.main_compaction_slot
             if self.role == "main"
@@ -840,7 +897,7 @@ class ExecutionLane:
             if self.role == "main"
             else self.coordinator.sidekick_router
         )
-        return router.select(self.run.follow_up_count, self.run.follow_up_count)
+        return cast(str, router.select(self.run.follow_up_count, self.run.follow_up_count))
 
     def step(self, tool_results: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         if self.error:
@@ -862,7 +919,12 @@ class ExecutionLane:
         slot = self._select_slot()
         self.run._record_selected_slot(self.role, slot, primary=self.role == "main")
         tools = self._tools_for_lane()
-        message, usage = self.coordinator._call_worker(slot, self.messages, tools)
+        with _fusion_route_session(f"{self.run.run_id}:{self.lane_id}"):
+            message, usage = self.coordinator._call_worker(slot, self.messages, tools)
+        selected = getattr(serve_config._history_context, "fusion_selected_model", None)
+        self.run._record_selected_slot(
+            self.role, str(selected or message.get("_mantis_model") or slot), primary=False
+        )
         if self.profile.model is None and getattr(
             serve_config._history_context, "fusion_compacted", False
         ):
@@ -1050,7 +1112,7 @@ class FusionRun(NativeRun):
     def __setstate__(self, state: dict[str, Any]) -> None:
         super().__setstate__(state)
         # Ensure new fields are present for forward compatibility.
-        for key, default_value in {  # type: ignore[var-annotated]
+        default_fields: dict[str, Any] = {
             "plan": "",
             "sidekick_brief": "",
             "follow_up_count": 0,
@@ -1085,7 +1147,8 @@ class FusionRun(NativeRun):
             "main_lane": None,
             "sidekick_lanes": [],
             "sidekick_reports": [],
-        }.items():
+        }
+        for key, default_value in default_fields.items():
             if not hasattr(self, key):
                 setattr(self, key, default_value)
         if not hasattr(self, "repeat_guard"):
@@ -1149,12 +1212,6 @@ class FusionRun(NativeRun):
             )
         self._record_selected_slot(role, slot)
         messages = self.main_messages if role == "main" else self.sidekick_messages
-        if role == "main" and messages and messages[0].get("role") == "system":
-            preamble = _main_preamble(
-                self.structured, self.worker_profiles, coordinator.worker_profiles
-            )
-            if messages[0].get("content") != preamble:
-                messages[0]["content"] = preamble
         if prompt is not None:
             messages.append({"role": "user", "content": prompt})
         self.cache_namespace = providers._prompt_cache_namespace(
@@ -1162,7 +1219,12 @@ class FusionRun(NativeRun):
         )
         if self.budget is not None:
             self.budget.check_timeout()
-        message, usage = coordinator._call_worker(slot, messages, tools)
+        with _fusion_route_session(f"{self.run_id}:{role}"):
+            message, usage = coordinator._call_worker(slot, messages, tools)
+        selected = getattr(serve_config._history_context, "fusion_selected_model", None)
+        self._record_selected_slot(
+            role, str(selected or message.get("_mantis_model") or slot), primary=False
+        )
         if getattr(serve_config._history_context, "fusion_compacted", False):
             self._reroute_after_compaction(
                 role, slot, cache_warm=self._has_cache_hits(usage),
@@ -1234,11 +1296,17 @@ class FusionRun(NativeRun):
         )
 
     def _parse_main_answer(self, text: str) -> str | None:
-        match = re.match(r"^\s*ANSWER:\s*(.*)\s*$", text.strip(), re.DOTALL | re.IGNORECASE)
-        if not match:
-            return None
-        answer = match.group(1).strip()
-        return answer or None
+        stripped = text.strip()
+        match = re.match(r"^\s*ANSWER:\s*(.*)\s*$", stripped, re.DOTALL | re.IGNORECASE)
+        if match:
+            answer = match.group(1).strip()
+            return answer or None
+        # Heuristic fallback: if the output is not a PLAN/BRIEF/ESCALATE/FOLLOW_UP
+        # or tool call, treat direct user-facing answers as valid direct answers.
+        control_pattern = r"^\s*(PLAN|BRIEF|ESCALATE_TO_MAIN|FOLLOW_UP):"
+        if not re.search(control_pattern, stripped, re.MULTILINE | re.IGNORECASE):
+            return stripped or None
+        return None
 
     def _parse_main_plan(self, text: str) -> tuple[str, str]:
         plan_match = re.search(r"PLAN:(.*?)(?:BRIEF:|$)", text, re.DOTALL)
@@ -1403,7 +1471,7 @@ class FusionRun(NativeRun):
             )
         }
         validated.sort(key=lambda r: id_order.get(str(r.get("tool_call_id")), 999))
-        return validated
+        return cast(list[dict[str, Any]], validated)
 
     def _error_event(self, exc: Exception, request_id: str | None) -> dict[str, Any]:
         self.status = "error"
@@ -1473,7 +1541,7 @@ class FusionRun(NativeRun):
             return FusionWorkerProfile(name="frontier", model=model)
         skill = utils._load_skill_profile(name)
         if skill is not None:
-            return skill  # type: ignore[no-any-return]
+            return cast(FusionWorkerProfile, skill)
         return FusionWorkerProfile(name=name)
 
     def _filter_tools(self) -> list[dict[str, Any]]:
@@ -1489,7 +1557,7 @@ class FusionRun(NativeRun):
             ]
             self.server_tool_names = {str(schema["function"]["name"]) for schema in injected}
             tools.extend(injected)
-        return tools
+        return cast(list[dict[str, Any]], tools)
 
     def _can_execute_server_side(self, calls: list[dict[str, Any]]) -> bool:
         allowed = self.server_tool_names
@@ -1502,12 +1570,12 @@ class FusionRun(NativeRun):
 
     def _server_tool_results(self, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
         workspace = tool_exec.workspace_for(self.run_id)
-        return tool_exec.execute_calls(calls, workspace)
+        return cast(list[dict[str, Any]], tool_exec.execute_calls(calls, workspace))
 
     def _parse_plan_text(self, text: str) -> FusionPlan | None:
         """Parse a structured FusionPlan from JSON or legacy PLAN:/BRIEF: text."""
         with suppress(ValueError, json.JSONDecodeError):
-            return FusionPlan.model_validate_json(text)  # type: ignore[no-any-return]
+            return cast(FusionPlan, FusionPlan.model_validate_json(text))
         answer = self._parse_main_answer(text)
         if answer is not None:
             return FusionPlan(

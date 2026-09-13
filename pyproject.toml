@@ -122,7 +122,6 @@ ignore = [
 "scripts/retrain_router_pool.py" = ["E402"]
 "scripts/learn_router.py" = ["E402"]
 "scripts/retrain_conductor.py" = ["E402", "I001", "C901"]
-"scripts/fx_gateway_proxy.py" = ["C901"]
 "scripts/model_catalog_abi.py" = ["C901"]
 "scripts/toolscale_data.py" = ["ALL"]
 "tests/test_serve.py" = ["E501", "S310"]
