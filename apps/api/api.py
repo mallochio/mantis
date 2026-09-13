@@ -299,6 +299,19 @@ def _fusion_return_reasoning(headers: dict[str, str] | None) -> bool:
     return fusion._return_reasoning_by_default()
 
 
+def _fusion_trace_scope(headers: dict[str, str] | None) -> str:
+    """Return the requested trace scope: 'sidekick' (default) or 'orchestration'."""
+    val = (headers or {}).get("x-mantis-trace-scope", "").strip().lower()
+    if not val:
+        val = (headers or {}).get("x-mantis-fusion-trace", "").strip().lower()
+    if val in ("full", "orchestration", "meta"):
+        return "orchestration"
+    if val in ("sidekick", "worker"):
+        return "sidekick"
+    env_default = os.environ.get("MANTIS_FUSION_TRACE_SCOPE", "sidekick").strip().lower()
+    return "orchestration" if env_default in ("full", "orchestration", "meta") else "sidekick"
+
+
 def _mantis_headers(mantis: dict[str, Any], body: dict[str, Any]) -> dict[str, str]:
     headers = {
         "X-Mantis-Run-Id": str(mantis.get("run_id", "")),
@@ -1350,10 +1363,11 @@ def _run_fusion_chat(
     if event.get("run_id"):
         run_obj = fusion.get_run(event["run_id"])
         if isinstance(run_obj, fusion.FusionRun):
-            # Plans and delegation briefs are public orchestration output.
-            # Only provider summaries are gated by the existing opt-in.
+            trace_scope = _fusion_trace_scope(headers)
             event["reasoning_trace"] = fusion._orchestration_trace(
-                run_obj, include_reasoning=return_reasoning
+                run_obj,
+                include_reasoning=return_reasoning,
+                trace_scope=trace_scope,
             )
     return event
 

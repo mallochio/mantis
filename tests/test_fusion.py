@@ -934,6 +934,7 @@ def test_fusion_chat_returns_reasoning_when_requested(client, fake_worker):
     assert message.get("finish_reason") == "tool_calls" or "tool_calls" in message
     assert "reasoning" in message
     assert "I will call bash" in message["reasoning"]
+    assert "Fusion · Planning" not in message["reasoning"]
 
 
 def test_fusion_plan_and_brief_match_streaming_and_non_streaming(client, fake_worker):
@@ -942,12 +943,21 @@ def test_fusion_plan_and_brief_match_streaming_and_non_streaming(client, fake_wo
         "messages": [{"role": "user", "content": "write a hello world script"}],
         "tools": [{"type": "function", "function": {"name": "bash", "parameters": {}}}],
     }
-    regular = client.post("/v1/chat/completions", headers=_headers(), json=payload)
     fake_worker.sidekick_calls = 0
     fake_worker.main_calls = 0
     fake_worker.reviews = 0
     stream = client.post(
-        "/v1/chat/completions", headers=_headers(), json={**payload, "stream": True}
+        "/v1/chat/completions",
+        headers={**_headers(), "X-Mantis-Trace-Scope": "orchestration"},
+        json={**payload, "stream": True},
+    )
+    fake_worker.sidekick_calls = 0
+    fake_worker.main_calls = 0
+    fake_worker.reviews = 0
+    regular = client.post(
+        "/v1/chat/completions",
+        headers={**_headers(), "X-Mantis-Trace-Scope": "orchestration"},
+        json=payload,
     )
     trace = regular.json()["choices"][0]["message"]["reasoning"]
     streamed = "".join(
@@ -1019,6 +1029,7 @@ def test_fusion_chat_no_reasoning_by_default(client, fake_worker):
             },
         }
     ]
+    # In default 'sidekick' trace scope, the sidekick reasoning is emitted directly
     response = client.post(
         "/v1/chat/completions",
         headers=_headers(),
@@ -1031,9 +1042,26 @@ def test_fusion_chat_no_reasoning_by_default(client, fake_worker):
     assert response.status_code == 200
     message = response.json()["choices"][0]["message"]
     assert "reasoning" in message
-    assert "implement and test the brief" in message["reasoning"]
-    assert "implement, run tests, and lint" in message["reasoning"]
-    assert "I will call bash" not in message["reasoning"]
+    assert "I will call bash to verify the environment." in message["reasoning"]
+    assert "Fusion · Planning" not in message["reasoning"]
+
+    # When explicitly requesting orchestration scope, the full meta breakdown is returned
+    headers_orch = _headers()
+    headers_orch["X-Mantis-Trace-Scope"] = "orchestration"
+    resp_orch = client.post(
+        "/v1/chat/completions",
+        headers=headers_orch,
+        json={
+            "model": "mantis/fusion",
+            "messages": [{"role": "user", "content": "write a hello world script"}],
+            "tools": tools,
+        },
+    )
+    assert resp_orch.status_code == 200
+    msg_orch = resp_orch.json()["choices"][0]["message"]
+    assert "implement and test the brief" in msg_orch["reasoning"]
+    assert "implement, run tests, and lint" in msg_orch["reasoning"]
+    assert "Fusion · Planning" in msg_orch["reasoning"]
 
 
 def test_fusion_reasoning_not_exposed_to_other_providers():

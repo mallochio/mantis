@@ -454,8 +454,24 @@ def _model_label(slot: str) -> str:
     return slot.replace("_", ".", 1)
 
 
-def _orchestration_trace(run: FusionRun, include_reasoning: bool = False) -> str:
-    """Build Fusion's public, chronological orchestration trace."""
+def _orchestration_trace(
+    run: FusionRun,
+    include_reasoning: bool = False,
+    trace_scope: str = "orchestration",
+) -> str:
+    """Build Fusion's public trace.
+
+    When trace_scope is "sidekick", emits only the sidekick's active
+    reasoning or brief without outer orchestration wrappers.
+    """
+    if trace_scope == "sidekick":
+        sidekick_reasoning = _extract_reasoning_trace(run.sidekick_messages)
+        if sidekick_reasoning:
+            return sidekick_reasoning
+        if run.sidekick_brief:
+            return run.sidekick_brief
+        return ""
+
     main_slot = getattr(run, "main_slot", "gpt-5_6-sol")
     sidekick_slot = getattr(run, "sidekick_slot", "gpt-5_6-luna")
     lines = [f"Fusion · Planning · {_model_label(main_slot)}"]
