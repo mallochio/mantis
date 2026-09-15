@@ -202,7 +202,7 @@ response = client.chat.completions.create(
 )
 ```
 
-`mantis/fusion` remains the optional built-in lead/sidekick orchestration harness. When a Fusion lane is configured as `mantis/base`, it uses the same Switchyard boundary with a separate stable session per lane; concrete Fusion slots and explicit fallback pools remain pinned provider paths.
+`mantis/fusion` remains the optional built-in lead/sidekick orchestration harness. When a Fusion lane is configured as `mantis/base`, it uses the same Switchyard boundary with a separate stable session per lane; concrete Fusion slots and explicit fallback pools remain pinned provider paths. Fusion assigns `sidekick_max_tool_rounds` (default 0, unlimited; positive values cap one subtask) and `sidekick_max_follow_ups` (default 2, inherited from `max_follow_ups`) per delegated subtask, while `run_max_turns` (default 64) is the hard run guard.
 
 Comparative live evaluation is deferred. `scripts/evaluate_routed_harness.py` only validates the non-executable case manifest and summarizes externally produced records. Those records are observations, not trusted proof; no quality/cost claim or production default change is based on them.
 

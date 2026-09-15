@@ -1349,6 +1349,7 @@ def _fusion_run_id_from_messages(messages: list[Any]) -> str | None:
 
 def _run_fusion_chat(
     request: ChatRequest,
+    request_id: str,
     return_reasoning: bool = False,
     headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
@@ -1380,6 +1381,7 @@ def _run_fusion_chat(
     if run_id is not None and tool_results:
         event = fusion.advance_fusion_run(
             run_id,
+            request_id=request_id,
             tool_results=tool_results,
         )
     else:
@@ -1391,9 +1393,11 @@ def _run_fusion_chat(
         if not brief:
             raise ValueError("mantis/fusion requires at least one user message")
 
-        resume_id = _fusion_run_id_from_headers(headers) or _fusion_run_id_from_messages(
-            request.messages
-        )
+        # Only an explicit run header may continue a live non-tool turn.
+        # Tool-call IDs from old history are reserved for the trailing-tool
+        # continuation path above; scraping them here can revive an unrelated
+        # completed conversation.
+        resume_id = _fusion_run_id_from_headers(headers)
         resumed = fusion.try_get_fusion_run(resume_id) if resume_id else None
         if resumed is not None:
             # A live run owns the session: when it is awaiting_tools the
@@ -1402,7 +1406,11 @@ def _run_fusion_chat(
                 fusion.refresh_fusion_run_tools(
                     resumed, [tool.model_dump() for tool in request.tools]
                 )
-            event = fusion.advance_fusion_run(resumed.run_id, message=brief)
+            event = fusion.advance_fusion_run(
+                resumed.run_id,
+                request_id=request_id,
+                message=brief,
+            )
         else:
             tools = [tool.model_dump() for tool in (request.tools or [])]
             messages = [msg.model_dump(exclude_none=True) for msg in request.messages]
@@ -1415,7 +1423,7 @@ def _run_fusion_chat(
                 budget=request.budget,
                 tool_options=request.tool_options,
             )
-            event = fusion.advance_fusion_run(run.run_id)
+            event = fusion.advance_fusion_run(run.run_id, request_id=request_id)
 
     _attach_fusion_trace(event, return_reasoning, headers)
     return event
@@ -1516,7 +1524,12 @@ def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Respons
     if request.model == "mantis/fusion":
         return_reasoning = _fusion_return_reasoning(headers)
         try:
-            event = _run_fusion_chat(request, return_reasoning=return_reasoning, headers=headers)
+            event = _run_fusion_chat(
+                request,
+                request_id,
+                return_reasoning=return_reasoning,
+                headers=headers,
+            )
         except Exception as exc:  # noqa: BLE001 - chat adapter error boundary
             _capacity.release()
             return _error(500, f"fusion chat failed: {exc}", "upstream_error")

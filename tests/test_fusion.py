@@ -236,6 +236,9 @@ def _fusion_config_file(
     *,
     main_tools: str = "plan+review",
     max_follow_ups: int = 2,
+    sidekick_max_follow_ups: int | None = None,
+    sidekick_max_tool_rounds: int = 16,
+    run_max_turns: int = 64,
     main: str = "gpt-5_6-sol",
     sidekick: str = "deepseek-v4-flash",
 ):
@@ -247,6 +250,13 @@ def _fusion_config_file(
         f'sidekick = "{sidekick}"\n'
         f'main_tools = "{main_tools}"\n'
         f"max_follow_ups = {max_follow_ups}\n"
+        + (
+            f"sidekick_max_follow_ups = {sidekick_max_follow_ups}\n"
+            if sidekick_max_follow_ups is not None
+            else ""
+        )
+        + f"sidekick_max_tool_rounds = {sidekick_max_tool_rounds}\n"
+        + f"run_max_turns = {run_max_turns}\n"
     )
     return fusion.FusionConfig(path)
 
@@ -1640,29 +1650,169 @@ def test_fusion_structured_brief_packet(monkeypatch):
     assert run.latest_user == "latest ask"
 
 
-def test_fusion_follow_up_cap_and_event_telemetry(monkeypatch, tmp_path):
+def test_fusion_follow_up_cap_redelegates_and_reports_new_subtask(monkeypatch, tmp_path):
     worker = SequenceWorker(
         [
             ("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE),
-            ("FOLLOW_UP: revise", None, DEFAULT_USAGE),
+            ("FOLLOW_UP: narrow", None, DEFAULT_USAGE),
+            ("PLAN: narrowed\nBRIEF: one item", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
         ],
-        [("report", None, DEFAULT_USAGE)],
+        [("report", None, DEFAULT_USAGE), ("narrowed report", None, DEFAULT_USAGE)],
     )
     monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
-    config = _fusion_config_file(tmp_path, main_tools="none", max_follow_ups=1)
+    config = _fusion_config_file(
+        tmp_path, main_tools="none", max_follow_ups=1, sidekick_max_follow_ups=0
+    )
     monkeypatch.setattr(fusion, "_FUSION_CONFIG", config)
     run = fusion.FusionRun("capped", "goal")
 
     event = run.advance(coordinator=fusion.FusionCoordinator(config))
 
     assert event["status"] == "completed"
-    assert event["follow_up_capped"] is True
-    assert event["follow_up_count"] == 1
+    assert event["follow_up_capped"] is False
+    assert run.subtask_counter == 2
+    assert event["report"] == "narrowed report"
     assert {"usage_models", "cost", "follow_up_count"} <= event.keys()
-    follow_ups = [m["content"] for m in run.sidekick_messages if m.get("role") == "user"][1:]
-    assert len(follow_ups) == 1  # only one follow-up was actually sent
-    assert follow_ups[0].startswith(fusion.FUSION_FOLLOW_UP_OPEN)
-    assert follow_ups[0].endswith(fusion.FUSION_FOLLOW_UP_CLOSE)
+
+
+def test_fusion_tool_budget_redelegates_with_fresh_subtask(monkeypatch, tmp_path):
+    worker = SequenceWorker(
+        [
+            ("PLAN: broad\nBRIEF: inspect all items", None, DEFAULT_USAGE),
+            ("PLAN: narrow\nBRIEF: inspect one item", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
+        ],
+        [
+            ("", BASH_CALL, DEFAULT_USAGE),
+            ("ESCALATE_TO_MAIN: narrow the remaining work", None, DEFAULT_USAGE),
+            ("fresh narrowed report", None, DEFAULT_USAGE),
+        ],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    config = _fusion_config_file(
+        tmp_path,
+        main_tools="none",
+        sidekick_max_tool_rounds=1,
+        sidekick_max_follow_ups=0,
+    )
+    monkeypatch.setattr(fusion, "_FUSION_CONFIG", config)
+    run = fusion.FusionRun("tool-budget", "goal", tools=[BASH_TOOL])
+    coordinator = fusion.FusionCoordinator(config)
+
+    first = run.advance(coordinator=coordinator)
+    assert first["status"] == "awaiting_tools"
+    second = run.advance(
+        tool_results=[{"tool_call_id": "call_0", "content": "ok"}],
+        coordinator=coordinator,
+    )
+
+    assert second["status"] == "completed"
+    assert run.subtask_counter == 2
+    assert run.active_subtask_id == "subtask-2"
+    assert second["report"] == "fresh narrowed report"
+    assert run.subtask_rounds == 0
+
+
+def test_fusion_mantis_event_exposes_subtask_accounting(monkeypatch):
+    worker = SequenceWorker(
+        [("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE), ("ACCEPT", None, DEFAULT_USAGE)],
+        [("report", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    run = fusion.FusionRun("accounting", "goal")
+    run.advance()
+
+    metadata = fusion._orchestration_metadata(run)
+
+    assert metadata["active_subtask_id"] == "subtask-1"
+    assert metadata["subtask_index"] == 1
+    assert metadata["subtask_round_limit"] is None
+    assert metadata["subtask_follow_up_limit"] == 2
+    assert metadata["run_guard_remaining"]["turns"] is not None
+
+
+def test_fusion_unlimited_sidekick_exceeds_previous_16_round_cap(monkeypatch, tmp_path):
+    worker = SequenceWorker(
+        [("PLAN: p\nBRIEF: keep working", None, DEFAULT_USAGE), ("ACCEPT", None, DEFAULT_USAGE)],
+        [("", BASH_CALL, DEFAULT_USAGE)] * 17 + [("done after 17", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    config = _fusion_config_file(
+        tmp_path, sidekick_max_tool_rounds=0, run_max_turns=64
+    )
+    monkeypatch.setattr(fusion, "_FUSION_CONFIG", config)
+    run = fusion.FusionRun("unlimited-rounds", "goal", tools=[BASH_TOOL])
+    coordinator = fusion.FusionCoordinator(config)
+
+    event = run.advance(coordinator=coordinator)
+    for _ in range(17):
+        event = run.advance(
+            tool_results=[{"tool_call_id": "call_0", "content": "ok"}],
+            coordinator=coordinator,
+        )
+
+    assert event["status"] == "completed"
+    assert worker.sidekick_idx == 18
+    assert run.subtask_rounds == 17
+    assert event["report"] == "done after 17"
+
+
+def test_fusion_run_guard_stops_unproductive_unlimited_sidekick(monkeypatch, tmp_path):
+    worker = SequenceWorker(
+        [
+            ("PLAN: p\nBRIEF: keep working", None, DEFAULT_USAGE),
+            ("ANSWER: synthesized after run guard", None, DEFAULT_USAGE),
+        ],
+        [("", BASH_CALL, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    config = _fusion_config_file(
+        tmp_path, sidekick_max_tool_rounds=0, run_max_turns=5
+    )
+    monkeypatch.setattr(fusion, "_FUSION_CONFIG", config)
+    run = fusion.FusionRun("unproductive", "goal", tools=[BASH_TOOL])
+    coordinator = fusion.FusionCoordinator(config)
+
+    event = run.advance(coordinator=coordinator)
+    for _ in range(10):
+        if event["status"] == "completed":
+            break
+        event = run.advance(
+            tool_results=[{"tool_call_id": "call_0", "content": "same result"}],
+            coordinator=coordinator,
+        )
+
+    assert event["status"] == "completed"
+    assert run.completed_via == "budget"
+    assert "synthesized after run guard" in event["report"]
+    assert run.subtask_rounds < 16
+
+
+def test_fusion_structured_exhausted_lane_gets_new_identity(monkeypatch):
+    run = fusion.FusionRun(
+        "structured-budget",
+        "goal",
+        worker_profiles=[fusion.FusionWorkerProfile(name="default")],
+    )
+    coordinator = fusion.FusionCoordinator()
+    first = fusion.ExecutionLane(
+        "lane0",
+        run,
+        coordinator,
+        fusion.FusionSidekickAssignment(task="broad task"),
+        fusion.FusionWorkerProfile(name="default"),
+    )
+    first.exhausted = True
+    first.complete = True
+    run.sidekick_lanes = [first]
+
+    run._replace_exhausted_lanes("narrow task", coordinator)
+
+    assert run.sidekick_lanes[0] is not first
+    assert run.sidekick_lanes[0].lane_id == "lane0-narrowed"
+    assert run.sidekick_lanes[0].tool_rounds == 0
+    assert run.sidekick_lanes[0].follow_up_count == 0
 
 
 def test_fusion_lane_cache_namespaces(monkeypatch):
@@ -2044,7 +2194,7 @@ def test_fusion_message_resume_answers_without_sidekick(monkeypatch):
     assert worker.sidekick_idx == sidekick_before
 
 
-def test_fusion_chat_resume_via_run_id_header(client, monkeypatch):
+def test_fusion_chat_completed_run_header_starts_new_run(client, monkeypatch):
     worker = SequenceWorker(
         [
             ("ANSWER: first", None, DEFAULT_USAGE),
@@ -2079,7 +2229,7 @@ def test_fusion_chat_resume_via_run_id_header(client, monkeypatch):
         },
     )
     assert second.status_code == 200
-    assert second.headers.get("X-Mantis-Run-Id") == run_id
+    assert second.headers.get("X-Mantis-Run-Id") != run_id
     assert second.json()["choices"][0]["message"]["content"] == "second"
     assert worker.sidekick_idx == 0
 
@@ -2089,7 +2239,7 @@ def test_fusion_chat_resume_via_encoded_tool_call_id(client, monkeypatch):
         [
             ("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE),
             ("ACCEPT", None, DEFAULT_USAGE),
-            ("ANSWER: from history", None, DEFAULT_USAGE),
+            ("ANSWER: fresh ordinary turn", None, DEFAULT_USAGE),
         ],
         [("", BASH_CALL, DEFAULT_USAGE), ("Done.", None, DEFAULT_USAGE)],
     )
@@ -2126,6 +2276,7 @@ def test_fusion_chat_resume_via_encoded_tool_call_id(client, monkeypatch):
         },
     )
     assert second.status_code == 200
+    assert second.headers.get("X-Mantis-Run-Id") == run_id
     assert "Done." in second.json()["choices"][0]["message"]["content"]
 
     third = client.post(
@@ -2148,8 +2299,123 @@ def test_fusion_chat_resume_via_encoded_tool_call_id(client, monkeypatch):
         },
     )
     assert third.status_code == 200
-    assert third.headers.get("X-Mantis-Run-Id") == run_id
-    assert third.json()["choices"][0]["message"]["content"] == "from history"
+    assert third.headers.get("X-Mantis-Run-Id") != run_id
+    assert third.json()["choices"][0]["message"]["content"] == "fresh ordinary turn"
+
+
+def test_fusion_chat_three_turns_return_fresh_report(client, monkeypatch):
+    worker = SequenceWorker(
+        [
+            ("PLAN: p1\nBRIEF: b1", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
+            ("PLAN: p2\nBRIEF: b2", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
+            ("PLAN: p3\nBRIEF: b3", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
+        ],
+        [
+            ("TURN 1 REPORT", None, DEFAULT_USAGE),
+            ("TURN 2 REPORT", None, DEFAULT_USAGE),
+            ("TURN 3 FRESH REPORT", None, DEFAULT_USAGE),
+        ],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+
+    def send(messages, run_id=None):
+        headers = _headers()
+        if run_id:
+            headers["X-Mantis-Run-Id"] = run_id
+        return client.post(
+            "/v1/chat/completions",
+            headers=headers,
+            json={"model": "mantis/fusion", "messages": messages},
+        )
+
+    first = send([{"role": "user", "content": "turn one"}])
+    first_run_id = first.headers["X-Mantis-Run-Id"]
+    second = send(
+        [
+            {"role": "user", "content": "turn one"},
+            first.json()["choices"][0]["message"],
+            {"role": "user", "content": "turn two"},
+        ],
+        first_run_id,
+    )
+    second_run_id = second.headers["X-Mantis-Run-Id"]
+    third = send(
+        [
+            {"role": "user", "content": "turn one"},
+            first.json()["choices"][0]["message"],
+            {"role": "user", "content": "turn two"},
+            second.json()["choices"][0]["message"],
+            {"role": "user", "content": "turn three"},
+        ],
+        second_run_id,
+    )
+
+    assert first.status_code == second.status_code == third.status_code == 200
+    assert len({first_run_id, second_run_id, third.headers["X-Mantis-Run-Id"]}) == 3
+    assert first.json()["choices"][0]["message"]["content"] == "TURN 1 REPORT"
+    assert second.json()["choices"][0]["message"]["content"] == "TURN 2 REPORT"
+    assert third.json()["choices"][0]["message"]["content"] == "TURN 3 FRESH REPORT"
+    assert "TURN 2 REPORT" not in third.json()["choices"][0]["message"]["content"]
+    for run_id in (first_run_id, second_run_id, third.headers["X-Mantis-Run-Id"]):
+        serve_config._runs.pop(run_id, None)
+
+
+def test_resumed_run_clears_report_before_new_review(monkeypatch):
+    worker = SequenceWorker(
+        [
+            ("PLAN: fresh plan\nBRIEF: fresh brief", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
+        ],
+        [("FRESH REVIEW REPORT", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    run = fusion.FusionRun("stale-report", "old task", delegation_mode="available")
+    run.report = "STALE REPORT"
+    run.status = "completed"
+
+    event = run.advance(message="new task")
+
+    assert event["status"] == "completed"
+    assert event["report"] == "FRESH REVIEW REPORT"
+    assert "STALE REPORT" not in event["report"]
+
+
+def test_orchestration_cursor_emits_fresh_third_turn_reasoning():
+    run = fusion.FusionRun("reasoning-turns", "first")
+    run.plan = "first plan"
+    run.sidekick_brief = "first brief"
+    run.sidekick_messages.append(
+        {"role": "assistant", "content": "", "reasoning": "first reasoning"}
+    )
+    first = fusion._orchestration_trace(run, trace_scope="orchestration")
+    run.sidekick_messages.append(
+        {"role": "assistant", "content": "", "reasoning": "fresh third reasoning"}
+    )
+    second = fusion._orchestration_trace(run, trace_scope="orchestration")
+
+    assert "first reasoning" in first
+    assert "fresh third reasoning" in second
+    assert "first reasoning" not in second
+
+
+def test_repeated_request_id_returns_cached_event_without_advancing(monkeypatch):
+    worker = SequenceWorker(
+        [("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE), ("ACCEPT", None, DEFAULT_USAGE)],
+        [("FRESH REPORT", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    run = fusion.create_fusion_run("request cache", delegation_mode="available")
+
+    first = fusion.advance_fusion_run(run.run_id, request_id="request-1")
+    call_count = len(worker.calls)
+    second = fusion.advance_fusion_run(run.run_id, request_id="request-1")
+
+    assert second == first
+    assert len(worker.calls) == call_count
+    serve_config._runs.pop(run.run_id, None)
 
 
 def test_fusion_chat_missing_run_id_starts_new_available_run(client, monkeypatch):
@@ -2244,58 +2510,56 @@ def test_fusion_sidekick_tool_round_cap_escalates(monkeypatch, tmp_path):
     assert run.sidekick_tool_rounds == 2
 
 
-def test_fusion_escalate_at_cap_synthesizes_answer(monkeypatch, tmp_path):
-    """An escalation at the follow-up cap ends in a synthesized user-facing
-    answer, not the raw ESCALATE_TO_MAIN protocol text."""
+def test_fusion_escalate_at_cap_redelegates(monkeypatch, tmp_path):
     worker = SequenceWorker(
         [
             ("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE),
             ("PLAN: p2\nBRIEF: b2", None, DEFAULT_USAGE),
-            ("ANSWER: final synthesized answer", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
         ],
         [
-            ("ESCALATE_TO_MAIN: first escalation", None, DEFAULT_USAGE),
-            ("ESCALATE_TO_MAIN: second escalation", None, DEFAULT_USAGE),
+            ("ESCALATE_TO_MAIN: narrow this", None, DEFAULT_USAGE),
+            ("fresh report", None, DEFAULT_USAGE),
         ],
     )
     monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
-    config = _fusion_config_file(tmp_path, main_tools="none", max_follow_ups=1)
+    config = _fusion_config_file(
+        tmp_path, main_tools="none", max_follow_ups=1, sidekick_max_follow_ups=0
+    )
     monkeypatch.setattr(fusion, "_FUSION_CONFIG", config)
     run = fusion.FusionRun("cap-escalate", "goal", delegation_mode="available")
 
     event = run.advance(coordinator=fusion.FusionCoordinator(config))
 
     assert event["status"] == "completed"
-    assert event["follow_up_capped"] is True
-    assert run.completed_via == "capped"
-    assert event["report"] == "final synthesized answer"
+    assert event["follow_up_capped"] is False
+    assert run.subtask_counter == 2
+    assert event["report"] == "fresh report"
 
 
-def test_fusion_review_reject_at_cap_synthesizes_answer(monkeypatch, tmp_path):
-    """A rejected review at the follow-up cap synthesizes a final answer
-    instead of returning the unreviewed sidekick report."""
+def test_fusion_review_reject_at_cap_redelegates(monkeypatch, tmp_path):
     worker = SequenceWorker(
         [
             ("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE),
-            ("FOLLOW_UP: fix", None, DEFAULT_USAGE),
-            ("FOLLOW_UP: still bad", None, DEFAULT_USAGE),
-            ("ANSWER: synthesized from reports", None, DEFAULT_USAGE),
+            ("FOLLOW_UP: narrow", None, DEFAULT_USAGE),
+            ("PLAN: p2\nBRIEF: b2", None, DEFAULT_USAGE),
+            ("ACCEPT", None, DEFAULT_USAGE),
         ],
-        [
-            ("report v1", None, DEFAULT_USAGE),
-            ("report v2", None, DEFAULT_USAGE),
-        ],
+        [("report v1", None, DEFAULT_USAGE), ("report v2", None, DEFAULT_USAGE)],
     )
     monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
-    config = _fusion_config_file(tmp_path, main_tools="none", max_follow_ups=1)
+    config = _fusion_config_file(
+        tmp_path, main_tools="none", max_follow_ups=1, sidekick_max_follow_ups=0
+    )
     monkeypatch.setattr(fusion, "_FUSION_CONFIG", config)
     run = fusion.FusionRun("cap-review", "goal", delegation_mode="available")
 
     event = run.advance(coordinator=fusion.FusionCoordinator(config))
 
     assert event["status"] == "completed"
-    assert event["follow_up_capped"] is True
-    assert event["report"] == "synthesized from reports"
+    assert event["follow_up_capped"] is False
+    assert run.subtask_counter == 2
+    assert event["report"] == "report v2"
 
 
 def test_orchestration_trace_sidekick_delta():
@@ -2647,7 +2911,7 @@ def test_fusion_run_budget_enforces_max_turns(monkeypatch):
     worker = SequenceWorker(
         [
             ("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE),
-            ("ACCEPT", None, DEFAULT_USAGE),
+            ("ANSWER: synthesized by run guard", None, DEFAULT_USAGE),
         ],
         [("done", None, DEFAULT_USAGE)],
     )
@@ -2661,8 +2925,9 @@ def test_fusion_run_budget_enforces_max_turns(monkeypatch):
 
     event = run.advance()
 
-    assert event["status"] == "error"
-    assert "turn budget" in event["report"].lower()
+    assert event["status"] == "completed"
+    assert run.completed_via == "budget"
+    assert "synthesized by run guard" in event["report"]
 
 
 def test_filter_tools_by_options_uses_bundles():

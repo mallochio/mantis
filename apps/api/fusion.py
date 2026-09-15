@@ -20,7 +20,7 @@ import providers
 import serve_config
 import tool_exec
 import utils
-from fusion_budget import FusionBudgetGuard
+from fusion_budget import FusionBudgetExceededError, FusionBudgetGuard
 from fusion_router import FusionRouter
 from fusion_types import (
     FusionPlan,
@@ -178,8 +178,8 @@ ESCALATE_PROMPT = (
 )
 
 TERMINAL_SYNTHESIS_PROMPT = (
-    "The delegation and follow-up budget is exhausted; no further sidekick "
-    "work or review is possible. Write the final user-facing answer now from "
+    "The Fusion run guard is exhausted; no further sidekick work or review is "
+    "possible. Write the final user-facing answer now from "
     "the material below: give the best verified result available, and state "
     "clearly what remains unfinished or unverified. "
     "Reply with exactly 'ANSWER:' followed by the answer.\n"
@@ -213,9 +213,18 @@ PLAN_TOOL_BUDGET_PROMPT = (
 )
 
 SIDEKICK_TOOL_BUDGET_PROMPT = (
-    "You have used the allowed sidekick tool budget. "
+    "You have used the allowed sidekick tool-round limit for this delegated subtask. "
     "Stop calling tools. Either finish with a concise final report, or reply with "
     "exactly 'ESCALATE_TO_MAIN:' followed by a concise reason."
+)
+
+REDELEGATE_PROMPT = (
+    "The delegated subtask reached its local follow-up or tool-round limit. "
+    "Do not stop the overall run. "
+    "Narrow the work to the smallest unfinished unit and reply with exactly 'PLAN:' "
+    "and 'BRIEF:' for a fresh sidekick subtask, or reply with exactly 'ANSWER:' if "
+    "you can finish from the verified material. Broad multi-item work must be split "
+    "into small delegations.\n\nReason:\n"
 )
 
 PLAN_UNKNOWN_TOOL_PROMPT = (
@@ -331,11 +340,31 @@ class FusionConfig:
             return 3
 
     def sidekick_max_tool_rounds(self) -> int:
-        raw = self._load().get("sidekick_max_tool_rounds") or "16"
+        raw = self._load().get("sidekick_max_tool_rounds")
+        if raw is None or raw == "":
+            return 0
         try:
             value = int(raw)
         except (TypeError, ValueError):
-            return 16
+            return 0
+        return max(0, value)
+
+    def sidekick_max_follow_ups(self) -> int:
+        raw = self._load().get("sidekick_max_follow_ups")
+        if raw is None:
+            raw = self._load().get("max_follow_ups") or "2"
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return self.max_follow_ups()
+        return max(0, value)
+
+    def run_max_turns(self) -> int:
+        raw = self._load().get("run_max_turns") or "64"
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 64
         return max(1, value)
 
     def context_window(self) -> int:
@@ -541,6 +570,20 @@ def _orchestration_metadata(run: FusionRun) -> dict[str, Any]:
         for msg in run.sidekick_messages
         if msg.get("role") == "assistant"
     )
+    guard = run.budget
+    run_remaining = {
+        "turns": (
+            max(0, guard.max_turns - guard.turns)
+            if guard is not None and guard.max_turns is not None
+            else None
+        ),
+        "tokens": (
+            max(0, guard.max_tokens - guard.tokens)
+            if guard is not None and guard.max_tokens is not None
+            else None
+        ),
+        "timeout_ms": guard.timeout_ms if guard is not None else None,
+    }
     return {
         "run_id": run.run_id,
         "status": run.status,
@@ -550,6 +593,13 @@ def _orchestration_metadata(run: FusionRun) -> dict[str, Any]:
         "sidekick_brief": run.sidekick_brief or None,
         "tool_count": tool_count,
         "tool_results": sum(msg.get("role") == "tool" for msg in run.sidekick_messages),
+        "active_subtask_id": run.active_subtask_id or None,
+        "subtask_index": run.active_subtask_index or None,
+        "subtask_rounds_used": run.subtask_rounds,
+        "subtask_round_limit": run.sidekick_max_tool_rounds or None,
+        "subtask_follow_ups_used": run.subtask_follow_ups,
+        "subtask_follow_up_limit": run.sidekick_max_follow_ups,
+        "run_guard_remaining": run_remaining,
         "review": (
             "accepted"
             if run.status == "completed"
@@ -589,6 +639,8 @@ class FusionCoordinator:
         self.sidekick_slot = self.select("sidekick", 0, 0)
         self.max_follow_ups = self.config.max_follow_ups()
         self.sidekick_max_tool_rounds = self.config.sidekick_max_tool_rounds()
+        self.sidekick_max_follow_ups = self.config.sidekick_max_follow_ups()
+        self.run_max_turns = self.config.run_max_turns()
         self.context_window = self.config.context_window()
         self.max_output_tokens = self.config.max_output_tokens()
         self.worker_profiles = {p.name: p for p in self.config.worker_profiles()}
@@ -914,6 +966,8 @@ class ExecutionLane:
         self.role = role
         self.shared_messages = shared_messages
         self.tool_rounds = 0
+        self.follow_up_count = 0
+        self.exhausted = False
         self.pending_tool_calls: list[dict[str, Any]] = []
         self.report: str | None = None
         self.error: str | None = None
@@ -982,7 +1036,19 @@ class ExecutionLane:
         )
         return cast(str, router.select(self.run.follow_up_count, self.run.follow_up_count))
 
+    def _record_subtask_state(self) -> None:
+        if self.role != "sidekick":
+            return
+        self.run.active_subtask_id = self.lane_id
+        self.run.active_subtask_index = next(
+            (index + 1 for index, lane in enumerate(self.run.sidekick_lanes) if lane is self),
+            0,
+        )
+        self.run.subtask_rounds = self.tool_rounds
+        self.run.subtask_follow_ups = self.follow_up_count
+
     def step(self, tool_results: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        self._record_subtask_state()
         if self.error:
             return self._status()
         if self.complete:
@@ -990,7 +1056,11 @@ class ExecutionLane:
         if tool_results:
             self._append_tool_results(tool_results)
             self.pending_tool_calls = []
-        if self.tool_rounds >= self.coordinator.sidekick_max_tool_rounds:
+        if (
+            self.coordinator.sidekick_max_tool_rounds > 0
+            and self.tool_rounds >= self.coordinator.sidekick_max_tool_rounds
+        ):
+            self.exhausted = True
             self.report = (
                 "ESCALATE_TO_MAIN: sidekick exceeded tool budget"
                 if self.role == "sidekick"
@@ -1098,13 +1168,18 @@ class ExecutionLane:
             "error": self.error,
         }
 
-    def apply_follow_up(self, feedback: str) -> None:
-        """Reset a completed lane so it can revise with feedback."""
-        if not self.complete or self.error:
-            return
+    def apply_follow_up(self, feedback: str) -> bool:
+        """Continue only when this lane still has local follow-up budget."""
+        if not self.complete or self.error or self.exhausted:
+            return False
+        if self.follow_up_count >= self.coordinator.sidekick_max_follow_ups:
+            self.exhausted = True
+            return False
+        self.follow_up_count += 1
         self.complete = False
         self.report = None
         self.messages.append({"role": "user", "content": _format_fusion_follow_up(feedback)})
+        return True
 
 
 class FusionRun(NativeRun):
@@ -1127,7 +1202,6 @@ class FusionRun(NativeRun):
         mode = delegation_mode if delegation_mode in DELEGATION_MODES else "forced"
         self.delegation_mode = mode
         self.worker_profiles = {p.name: p for p in (worker_profiles or [])}
-        self.budget = FusionBudgetGuard(**budget.model_dump()) if budget is not None else None
         self.tool_options = tool_options or FusionToolOptions()
         goal, latest_user = _user_message_texts(messages, brief)
         self.goal = goal
@@ -1135,10 +1209,16 @@ class FusionRun(NativeRun):
         # Feeds the learning record's task/task_hash (redacted by runs.py).
         self.query = goal
         coordinator = FusionCoordinator()
+        budget_values = budget.model_dump() if budget is not None else {}
+        budget_values.setdefault("max_turns", coordinator.run_max_turns)
+        self.budget = FusionBudgetGuard(**budget_values)
         # Keep the slots with the run so status/trace responses remain stable
         # if the catalog is changed while a run is in progress.
         self.main_slot = coordinator.main_slot
         self.sidekick_slot = coordinator.sidekick_slot
+        self.sidekick_max_tool_rounds = coordinator.sidekick_max_tool_rounds
+        self.sidekick_max_follow_ups = coordinator.sidekick_max_follow_ups
+        self.run_max_turns = coordinator.run_max_turns
         self.main_router = coordinator.main_router
         self.sidekick_router = coordinator.sidekick_router
         self.main_compaction_slot: str | None = None
@@ -1154,7 +1234,7 @@ class FusionRun(NativeRun):
             bool(self.worker_profiles)
             or bool(self.tool_options.enabled)
             or self.tool_options.server_execution
-            or self.budget is not None
+            or budget is not None
             or bool(coordinator.worker_profiles)
         )
         preamble = _main_preamble(
@@ -1177,6 +1257,13 @@ class FusionRun(NativeRun):
         self.pending_tool_calls: list[dict[str, Any]] = []
         self.planning_tool_rounds = 0
         self.sidekick_tool_rounds = 0
+        self.subtask_counter = 0
+        self.active_subtask_id = ""
+        self.active_subtask_index = 0
+        self.subtask_rounds = 0
+        self.subtask_follow_ups = 0
+        self.subtask_report: str | None = None
+        self.subtask_history: list[dict[str, Any]] = []
         self.repeat_guard = utils.RepeatToolGuard()
         self.report: str | None = None
         self.plan: str = ""
@@ -1212,6 +1299,18 @@ class FusionRun(NativeRun):
             "turns": [],
             "planning_tool_rounds": 0,
             "sidekick_tool_rounds": 0,
+            "subtask_counter": 0,
+            "active_subtask_id": "",
+            "active_subtask_index": 0,
+            "subtask_rounds": 0,
+            "subtask_follow_ups": 0,
+            "subtask_report": None,
+            "subtask_history": [],
+            # 0 means unlimited sidekick tool rounds; the run-level guard is the
+            # only ceiling, so restored runs must not inherit an old cap.
+            "sidekick_max_tool_rounds": 0,
+            "sidekick_max_follow_ups": 2,
+            "run_max_turns": 64,
             "server_tool_names": set(),
             "active_role": "main",
             "main_slot": "gpt-5_6-sol",
@@ -1447,6 +1546,22 @@ class FusionRun(NativeRun):
                 ),
             }
         )
+        self.subtask_counter += 1
+        self.active_subtask_index = self.subtask_counter
+        self.active_subtask_id = f"subtask-{self.subtask_counter}"
+        self.subtask_rounds = 0
+        self.subtask_follow_ups = 0
+        if self.active_subtask_id:
+            self.subtask_history.append(
+                {
+                    "id": self.active_subtask_id,
+                    "index": self.active_subtask_index,
+                    "rounds_used": self.subtask_rounds,
+                    "follow_ups_used": self.subtask_follow_ups,
+                    "report": self.subtask_report,
+                }
+            )
+        self.subtask_report = None
         self.sidekick_tool_rounds = 0
         self.status = "sidekick_pending"
 
@@ -1456,17 +1571,27 @@ class FusionRun(NativeRun):
         self.status = "completed"
 
     def _apply_user_message(self, message: str) -> None:
-        """Redirect the run to main planning for a new user instruction."""
+        """Reset turn state before planning a new live-run instruction."""
         self.latest_user = message
         self.main_messages.append({"role": "user", "content": message})
         self.pending_tool_calls = []
         self.planning_tool_rounds = 0
-        if self.structured:
-            self.structured_plan = None
-            self.main_lane = None
-            self.sidekick_lanes = []
-            self.sidekick_reports = []
-            self.follow_up_count = 0
+        self.report = None
+        self.completed_via = ""
+        self.follow_up_capped = False
+        self.plan = ""
+        self.sidekick_brief = ""
+        self.structured_plan = None
+        self.main_lane = None
+        self.sidekick_lanes = []
+        self.sidekick_reports = []
+        self.sidekick_messages = [{"role": "system", "content": SIDEKICK_PREAMBLE}]
+        self.sidekick_tool_rounds = 0
+        self.follow_up_count = 0
+        self.main_compaction_slot = None
+        self.sidekick_compaction_slot = None
+        self.main_compaction_pending = None
+        self.active_role = "main"
         self.status = "main_planning"
         self._resume_allows_answer = True
 
@@ -1761,6 +1886,28 @@ class FusionRun(NativeRun):
             return self._advance_structured(tool_results, request_id, message, coordinator)
         return self._advance_legacy(tool_results, request_id, message, coordinator)
 
+    def _finish_run_budget(
+        self,
+        coordinator: FusionCoordinator,
+        error: Exception,
+        request_id: str | None,
+    ) -> dict[str, Any]:
+        fallback = self.report or self.subtask_report or "Fusion stopped before a final report."
+        previous_budget = self.budget
+        self.budget = None
+        try:
+            self.report = self._synthesize_final_answer(
+                coordinator,
+                context=self._synthesis_context("Run budget exhausted", str(error)),
+                fallback=fallback,
+            )
+        finally:
+            self.budget = previous_budget
+        self.completed_via = "budget"
+        self.follow_up_capped = True
+        self.status = "completed"
+        return self._ok_event(request_id)
+
     def advance(
         self,
         tool_results: list[dict[str, Any]] | None = None,
@@ -1780,6 +1927,8 @@ class FusionRun(NativeRun):
                     self.pending_user_messages.append(message)
                 return self._ok_event(request_id)
             return self._advance(tool_results, request_id, message, coordinator)
+        except FusionBudgetExceededError as exc:
+            return self._finish_run_budget(coordinator, exc, request_id)
         except Exception as exc:  # noqa: BLE001 - catch-all guard for worker/state errors
             return self._error_event(exc, request_id)
 
@@ -1839,6 +1988,102 @@ class FusionRun(NativeRun):
                 # FOLLOW_UP response); drop it so the new prompt is the tail.
                 del self.main_messages[previous_index:]
         self.main_messages.append({"role": "user", "content": review_prompt})
+
+    def _redelegate_after_exhaustion(
+        self,
+        coordinator: FusionCoordinator,
+        reason: str,
+    ) -> None:
+        self.main_messages.append({"role": "user", "content": f"{REDELEGATE_PROMPT}{reason}"})
+        self.active_role = "main"
+        main_text, main_calls, _ = self._call_lane(coordinator, "main", tools=None)
+        if main_calls:
+            main_text = self._retry_main_without_tools(coordinator, main_calls)
+        self._handle_main_planning_text(
+            coordinator,
+            main_text,
+            allow_retry=True,
+            allow_answer=True,
+        )
+
+    def _legacy_sidekick_step(self, coordinator: FusionCoordinator) -> bool:
+        self.active_role = "sidekick"
+        at_budget = (
+            coordinator.sidekick_max_tool_rounds > 0
+            and self.subtask_rounds >= coordinator.sidekick_max_tool_rounds
+        )
+        tools = None if at_budget else self.tools
+        sidekick_text, sidekick_calls, _ = self._call_lane(
+            coordinator, "sidekick", tools=tools
+        )
+        if sidekick_calls and at_budget:
+            sidekick_text, sidekick_calls, _ = self._call_lane(
+                coordinator,
+                "sidekick",
+                prompt=SIDEKICK_TOOL_BUDGET_PROMPT,
+                tools=None,
+            )
+            if sidekick_calls:
+                sidekick_text = "ESCALATE_TO_MAIN: sidekick kept calling tools after budget"
+        elif sidekick_calls:
+            self.subtask_rounds += 1
+            self.sidekick_tool_rounds = self.subtask_rounds
+            self.pending_tool_calls = sidekick_calls
+            self.status = "awaiting_tools"
+            return True
+        reason = self._parse_sidekick_escalate(sidekick_text)
+        if reason is not None:
+            self.subtask_report = reason
+            if self.subtask_follow_ups >= coordinator.sidekick_max_follow_ups:
+                self._redelegate_after_exhaustion(coordinator, reason)
+                return self.status == "completed"
+            self.subtask_follow_ups += 1
+            self.follow_up_count += 1
+            self.main_messages.append({"role": "user", "content": f"{ESCALATE_PROMPT}{reason}"})
+            self.active_role = "main"
+            text, calls, _ = self._call_lane(coordinator, "main", tools=None)
+            if calls:
+                text = self._retry_main_without_tools(coordinator, calls)
+            self._handle_main_planning_text(coordinator, text, allow_retry=True, allow_answer=True)
+            return self.status == "completed"
+        self.subtask_report = sidekick_text
+        remaining = coordinator.sidekick_max_follow_ups - self.subtask_follow_ups
+        review_prompt = (
+            f"{REVIEW_PROMPT}Tool Activity by Sidekick:\n"
+            f"{self._summarize_sidekick_tool_history()}\n\nReport:\n{sidekick_text}\n\n"
+            f"Follow-up budget remaining: {remaining} of {coordinator.sidekick_max_follow_ups}."
+        )
+        self._queue_review_prompt(review_prompt)
+        self.status = "main_review"
+        return False
+
+    def _legacy_review_step(self, coordinator: FusionCoordinator) -> bool:
+        self.active_role = "main"
+        review_text, review_calls, _ = self._call_lane(
+            coordinator,
+            "main",
+            tools=self.tools if "review" in self.main_tools_policy else None,
+        )
+        if review_calls:
+            self.pending_tool_calls = review_calls
+            self.status = "awaiting_tools"
+            return True
+        accepted, feedback = self._parse_main_review(review_text)
+        if accepted:
+            self.report = self.sidekick_messages[-1].get("content", "")
+            self.completed_via = "accept"
+            self.status = "completed"
+            return True
+        if self.subtask_follow_ups >= coordinator.sidekick_max_follow_ups:
+            self._redelegate_after_exhaustion(coordinator, feedback)
+            return self.status == "completed"
+        self.subtask_follow_ups += 1
+        self.follow_up_count += 1
+        self.sidekick_messages.append(
+            {"role": "user", "content": _format_fusion_follow_up(feedback)}
+        )
+        self.status = "sidekick_pending"
+        return False
 
     def _advance_legacy(
         self,
@@ -1942,122 +2187,37 @@ class FusionRun(NativeRun):
                 return self._ok_event(request_id)
 
         # Bounded sidekick-main loop.
-        max_iterations = max(1, coordinator.max_follow_ups + 1)
-        for _ in range(max_iterations * 4):  # generous step ceiling
+        for _ in range(coordinator.run_max_turns):
             if self.status == "sidekick_pending":
-                self.active_role = "sidekick"
-                at_tool_budget = self.sidekick_tool_rounds >= coordinator.sidekick_max_tool_rounds
-                tools_allowed = None if at_tool_budget else self.tools
-                sidekick_text, sidekick_calls, _ = self._call_lane(
-                    coordinator, "sidekick", tools=tools_allowed
-                )
-                if sidekick_calls:
-                    if at_tool_budget:
-                        sidekick_text, sidekick_calls, _ = self._call_lane(
-                            coordinator,
-                            "sidekick",
-                            prompt=SIDEKICK_TOOL_BUDGET_PROMPT,
-                            tools=None,
-                        )
-                        if sidekick_calls:
-                            sidekick_text = (
-                                "ESCALATE_TO_MAIN: sidekick kept calling tools "
-                                "after the tool budget was exhausted"
-                            )
-                            sidekick_calls = []
-                    else:
-                        self.sidekick_tool_rounds += 1
-                        self.pending_tool_calls = sidekick_calls
-                        self.status = "awaiting_tools"
-                        break
-
-                escalate_reason = self._parse_sidekick_escalate(sidekick_text)
-                if escalate_reason is not None:
-                    if self.follow_up_count >= coordinator.max_follow_ups:
-                        self.follow_up_capped = True
-                        self.report = self.report or self._synthesize_final_answer(
-                            coordinator,
-                            context=self._synthesis_context("Sidekick escalation", escalate_reason),
-                            fallback=escalate_reason,
-                        )
-                        self.completed_via = "capped"
-                        self.status = "completed"
-                        break
-                    self.follow_up_count += 1
-                    self.main_messages.append(
-                        {
-                            "role": "user",
-                            "content": f"{ESCALATE_PROMPT}{escalate_reason}",
-                        }
-                    )
-                    self.active_role = "main"
-                    esc_text, esc_calls, _ = self._call_lane(coordinator, "main", tools=None)
-                    if esc_calls:
-                        esc_text = self._retry_main_without_tools(coordinator, esc_calls)
-                    self._handle_main_planning_text(
-                        coordinator,
-                        esc_text,
-                        allow_retry=True,
-                        allow_answer=True,
-                    )
-                    if self.status == "completed":
-                        break
-                    continue
-
-                # Queue the report for the single review state. Keeping the prompt in
-                # main_messages also lets a tool-assisted review resume without a
-                # separate first-review branch. Follow-up rounds replace the
-                # previous review prompt so cumulative tool history is not
-                # re-embedded into the main context on every round.
-                remaining = coordinator.max_follow_ups - self.follow_up_count
-                review_prompt = (
-                    f"{REVIEW_PROMPT}"
-                    f"Tool Activity by Sidekick:\n{self._summarize_sidekick_tool_history()}\n\n"
-                    f"Report:\n{sidekick_text}\n\n"
-                    f"Follow-up budget remaining: {remaining} of {coordinator.max_follow_ups}."
-                )
-                self._queue_review_prompt(review_prompt)
-                self.status = "main_review"
+                if self._legacy_sidekick_step(coordinator):
+                    break
                 continue
             if self.status == "main_review":
-                self.active_role = "main"
-                review_text, review_calls, _ = self._call_lane(
-                    coordinator,
-                    "main",
-                    tools=self.tools if "review" in self.main_tools_policy else None,
-                )
-                if review_calls:
-                    self.pending_tool_calls = review_calls
-                    self.status = "awaiting_tools"
+                if self._legacy_review_step(coordinator):
                     break
-                accepted, feedback = self._parse_main_review(review_text)
-                if accepted:
-                    last_sidekick_text = self.sidekick_messages[-1].get("content", "")
-                    self.report = self.report or last_sidekick_text
-                    self.completed_via = "accept"
-                    self.status = "completed"
-                    break
-                if self.follow_up_count >= coordinator.max_follow_ups:
-                    self.follow_up_capped = True
-                    last_sidekick_text = self.sidekick_messages[-1].get("content", "")
-                    self.report = self.report or self._synthesize_final_answer(
-                        coordinator,
-                        context=self._synthesis_context("Sidekick report", last_sidekick_text),
-                        fallback=last_sidekick_text,
-                    )
-                    self.completed_via = "capped"
-                    self.status = "completed"
-                    break
-                self.follow_up_count += 1
-                self.sidekick_messages.append(
-                    {"role": "user", "content": _format_fusion_follow_up(feedback)}
-                )
-                self.status = "sidekick_pending"
                 continue
             if self.status in ("completed", "awaiting_tools", "error"):
                 break
 
         return self._ok_event(request_id)
+
+    def _replace_exhausted_lanes(
+        self,
+        feedback: str,
+        coordinator: FusionCoordinator,
+    ) -> None:
+        lanes: list[ExecutionLane] = []
+        for lane in self.sidekick_lanes:
+            if lane.exhausted or not lane.apply_follow_up(feedback):
+                lane = ExecutionLane(
+                    f"{lane.lane_id}-narrowed",
+                    self,
+                    coordinator,
+                    FusionSidekickAssignment(task=feedback),
+                    lane.profile,
+                )
+            lanes.append(lane)
+        self.sidekick_lanes = lanes
 
     def _advance_structured(
         self,
@@ -2166,16 +2326,12 @@ class FusionRun(NativeRun):
                 self.sidekick_lanes.append(lane)
             self.status = "sidekick_pending"
 
-        max_iterations = max(1, coordinator.max_follow_ups + 1)
-        # Server-executed tool rounds consume loop iterations, so the ceiling
-        # must cover a lane's full tool budget, not just client round-trips.
+        # The FusionBudgetGuard is the hard run-level ceiling. This loop only
+        # prevents a malformed state from spinning without consuming a turn.
         execution_lanes = (
             [self.main_lane] if self.main_lane is not None else []
         ) + self.sidekick_lanes
-        step_ceiling = max_iterations * 4 + coordinator.sidekick_max_tool_rounds * max(
-            1, len(execution_lanes)
-        )
-        for _ in range(step_ceiling):
+        for _ in range(coordinator.run_max_turns):
             if self.budget is not None:
                 self.budget.check_timeout()
 
@@ -2301,8 +2457,10 @@ class FusionRun(NativeRun):
                     return self._ok_event(request_id)
 
                 self.follow_up_count += 1
-                for lane in self.sidekick_lanes:
-                    lane.apply_follow_up(feedback)
+                self._replace_exhausted_lanes(feedback, coordinator)
+                execution_lanes = (
+                    [self.main_lane] if self.main_lane is not None else []
+                ) + self.sidekick_lanes
                 self.status = "sidekick_pending"
                 continue
 
@@ -2431,14 +2589,14 @@ def refresh_fusion_run_tools(run: FusionRun, tools: list[dict[str, Any]]) -> Non
 
 
 def try_get_fusion_run(run_id: str) -> FusionRun | None:
-    """Return a non-error FusionRun if present; otherwise None."""
+    """Return a live FusionRun eligible for non-tool continuation."""
     try:
         run = get_run(run_id)
     except KeyError:
         return None
     if not isinstance(run, FusionRun):
         return None
-    if run.status == "error":
+    if run.status in {"completed", "error"} or run.cancelled or run.finished:
         return None
     return run
 

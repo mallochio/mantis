@@ -13,7 +13,7 @@
       },
       {
         "name": "_run_fusion_chat",
-        "complexity": 38
+        "complexity": 37
       },
       {
         "name": "_stream",
@@ -45,11 +45,11 @@
       },
       {
         "name": "FusionRun::_advance_legacy",
-        "complexity": 110
+        "complexity": 73
       },
       {
         "name": "FusionRun::_advance_structured",
-        "complexity": 126
+        "complexity": 123
       }
     ]
   },

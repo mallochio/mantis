@@ -158,7 +158,12 @@ main = "openrouter/openai/gpt-6-astra|low"
 sidekick = "openrouter/openrouter/pareto-code|medium"
 fallback_on_escalate = true
 max_follow_ups = 2
-sidekick_max_tool_rounds = 16
+# Per-delegated-subtask follow-up cap; defaults to max_follow_ups when omitted.
+sidekick_max_follow_ups = 2
+# Per-delegated-subtask tool-round limit; 0 means unlimited.
+sidekick_max_tool_rounds = 0
+# Hard Fusion run guard, enforced through FusionBudgetGuard.
+run_max_turns = 64
 main_tools = "none"
 context_token_limit = 262144
 max_output_tokens = 4096
