@@ -762,6 +762,58 @@ def _text_chunks(text: str, size: int = 64) -> Iterator[str]:
         yield text
 
 
+def _remember_reasoning_text(part: Any, seen: set[str]) -> bool:
+    text = part.get("text") if isinstance(part, dict) else None
+    if not isinstance(text, str) or not text.strip():
+        return True
+    normalized = text.strip()
+    if normalized in seen:
+        return False
+    seen.add(normalized)
+    return True
+
+
+def _dedupe_reasoning_detail(detail: Any, seen: set[str]) -> Any:
+    if not isinstance(detail, dict):
+        return detail
+    item = dict(detail)
+    summary = item.get("summary")
+    if isinstance(summary, list):
+        filtered = [part for part in summary if _remember_reasoning_text(part, seen)]
+        if filtered:
+            item["summary"] = filtered
+        else:
+            item.pop("summary", None)
+    text = item.get("text")
+    if isinstance(text, str) and text.strip() in seen:
+        item.pop("text", None)
+    elif isinstance(text, str) and text.strip():
+        seen.add(text.strip())
+    return item
+
+
+def _dedupe_reasoning_details(
+    reasoning: str | None,
+    details: list[Any],
+) -> list[Any]:
+    seen = {reasoning.strip()} if isinstance(reasoning, str) and reasoning.strip() else set()
+    return [_dedupe_reasoning_detail(detail, seen) for detail in details]
+
+
+def _reasoning_deltas(message: dict[str, Any]) -> list[dict[str, Any]]:
+    reasoning = message.get("reasoning")
+    reasoning_text = reasoning if isinstance(reasoning, str) and reasoning else None
+    deltas: list[dict[str, Any]] = []
+    if reasoning_text:
+        deltas.append({"reasoning": reasoning_text})
+    details = message.get("reasoning_details")
+    if isinstance(details, list) and details:
+        deduped_details = _dedupe_reasoning_details(reasoning_text, details)
+        if deduped_details:
+            deltas.append({"reasoning_details": deduped_details})
+    return deltas
+
+
 def _sse(body: dict[str, Any], include_usage: bool) -> Iterator[bytes]:
     choice = body["choices"][0]
     message = choice["message"]
@@ -786,13 +838,7 @@ def _sse(body: dict[str, Any], include_usage: bool) -> Iterator[bytes]:
             }
         )
     else:
-        deltas: list[dict[str, Any]] = []
-        reasoning = message.get("reasoning")
-        if isinstance(reasoning, str) and reasoning:
-            deltas.append({"reasoning": reasoning})
-        details = message.get("reasoning_details")
-        if isinstance(details, list) and details:
-            deltas.append({"reasoning_details": details})
+        deltas = _reasoning_deltas(message)
         deltas.extend(
             {key: message[key]} for key in ("annotations", "citations") if message.get(key)
         )
@@ -1151,6 +1197,7 @@ def _build_fusion_chat_response(
     reasoning_trace = event.get("reasoning_trace")
     if reasoning_trace:
         message["reasoning"] = reasoning_trace
+    fusion_event = event.get("mantis_event")
     usage = utils._request_usage(messages, completion_text)
     headers = {"X-Request-Id": request_id}
     if run_id:
@@ -1174,6 +1221,7 @@ def _build_fusion_chat_response(
                 }
             ],
             "usage": usage,
+            **({"mantis_event": fusion_event} if fusion_event else {}),
         },
         headers=headers,
     )
@@ -1191,6 +1239,9 @@ def _iter_fusion_chat_event(
         "created": _MODEL_CREATED,
         "model": "mantis/fusion",
     }
+    fusion_event = event.get("mantis_event")
+    if fusion_event:
+        base["mantis_event"] = fusion_event
     try:
         status = event.get("status")
 
@@ -1387,11 +1438,16 @@ def _attach_fusion_trace(
         run_obj = fusion.get_run(str(run_id))
         if not isinstance(run_obj, fusion.FusionRun):
             return
+        trace_scope = _fusion_trace_scope(headers)
         event["reasoning_trace"] = fusion._orchestration_trace(
             run_obj,
             include_reasoning=return_reasoning,
-            trace_scope=_fusion_trace_scope(headers),
+            trace_scope=trace_scope,
         )
+        event["mantis_event"] = {
+            **fusion._orchestration_metadata(run_obj),
+            "trace_scope": trace_scope,
+        }
         fusion._put_run(run_obj)
 
 

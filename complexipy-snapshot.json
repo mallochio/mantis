@@ -8,10 +8,6 @@
         "complexity": 21
       },
       {
-        "name": "_sse",
-        "complexity": 24
-      },
-      {
         "name": "_fusion_run_id_from_messages",
         "complexity": 35
       },

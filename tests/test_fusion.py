@@ -970,6 +970,135 @@ def test_fusion_plan_and_brief_match_streaming_and_non_streaming(client, fake_wo
     assert trace == streamed
 
 
+def _stream_reasoning(response):
+    return [
+        json.loads(line[6:])["choices"][0]["delta"]["reasoning"]
+        for line in response.text.splitlines()
+        if line.startswith("data: {")
+        and "reasoning" in json.loads(line[6:])["choices"][0]["delta"]
+    ]
+
+
+def test_orchestration_stream_reasoning_is_incremental_across_tool_follow_up(
+    client, fake_worker
+):
+    payload = {
+        "model": "mantis/fusion",
+        "messages": [{"role": "user", "content": "write a hello world script"}],
+        "tools": [{"type": "function", "function": {"name": "bash", "parameters": {}}}],
+        "stream": True,
+    }
+    headers = {**_headers(), "X-Mantis-Trace-Scope": "orchestration"}
+    first = client.post("/v1/chat/completions", headers=headers, json=payload)
+    first_reasoning = _stream_reasoning(first)
+    first_tool_chunk = next(
+        json.loads(line[6:])["choices"][0]["delta"]
+        for line in first.text.splitlines()
+        if line.startswith("data: {")
+        and "tool_calls" in json.loads(line[6:])["choices"][0]["delta"]
+    )
+    call = first_tool_chunk["tool_calls"][0]
+    follow_up = {
+        **payload,
+        "messages": payload["messages"]
+        + [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{key: value for key, value in call.items() if key != "index"}],
+            },
+            {"role": "tool", "tool_call_id": call["id"], "content": "hello"},
+        ],
+    }
+    second = client.post("/v1/chat/completions", headers=headers, json=follow_up)
+    second_reasoning = _stream_reasoning(second)
+
+    assert first.status_code == second.status_code == 200
+    assert len(first_reasoning) == len(second_reasoning) == 1
+    assert "implement and test the brief" in first_reasoning[0]
+    assert "implement, run tests, and lint" in first_reasoning[0]
+    assert "implement and test the brief" not in second_reasoning[0]
+    assert "implement, run tests, and lint" not in second_reasoning[0]
+    assert "Tool result received" not in first_reasoning[0]
+    assert "Tool result received" not in second_reasoning[0]
+    second_event = next(
+        json.loads(line[6:])["mantis_event"]
+        for line in second.text.splitlines()
+        if line.startswith("data: {") and "mantis_event" in json.loads(line[6:])
+    )
+    assert second_event["tool_results"] == 1
+    assert second_event["status"] == "completed"
+
+
+def test_orchestration_non_streaming_plan_and_brief_are_sent_once(client, fake_worker):
+    payload = {
+        "model": "mantis/fusion",
+        "messages": [{"role": "user", "content": "write a hello world script"}],
+        "tools": [{"type": "function", "function": {"name": "bash", "parameters": {}}}],
+    }
+    headers = {**_headers(), "X-Mantis-Trace-Scope": "orchestration"}
+    first = client.post("/v1/chat/completions", headers=headers, json=payload)
+    first_message = first.json()["choices"][0]["message"]
+    call = first_message["tool_calls"][0]
+    follow_up = {
+        **payload,
+        "messages": payload["messages"]
+        + [
+            {"role": "assistant", "content": "", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": call["id"], "content": "hello"},
+        ],
+    }
+    second = client.post("/v1/chat/completions", headers=headers, json=follow_up)
+    first_trace = first_message["reasoning"]
+    second_trace = second.json()["choices"][0]["message"].get("reasoning", "")
+
+    assert first_trace.count("implement and test the brief") == 1
+    assert first_trace.count("implement, run tests, and lint") == 1
+    assert "implement and test the brief" not in second_trace
+    assert "implement, run tests, and lint" not in second_trace
+    assert second.json()["mantis_event"]["status"] == "completed"
+    assert second.json()["mantis_event"]["plan"] == "implement and test the brief"
+
+
+def test_generic_sse_dedupes_reasoning_text_and_details():
+    body = {
+        "id": "completion-1",
+        "created": 1,
+        "model": "test",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "done",
+                    "reasoning": "shared summary",
+                    "reasoning_details": [
+                        {
+                            "type": "reasoning.summary",
+                            "summary": [
+                                {"type": "summary_text", "text": "shared summary"},
+                                {"type": "summary_text", "text": "new detail"},
+                            ],
+                        }
+                    ],
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {},
+    }
+    chunks = [
+        json.loads(chunk.decode()[6:])
+        for chunk in api._sse(body, include_usage=False)
+        if chunk.startswith(b"data: {")
+    ]
+    deltas = [chunk["choices"][0]["delta"] for chunk in chunks]
+    reasoning = [delta["reasoning"] for delta in deltas if "reasoning" in delta]
+    details = [delta["reasoning_details"] for delta in deltas if "reasoning_details" in delta]
+
+    assert reasoning == ["shared summary"]
+    assert details[0][0]["summary"] == [{"type": "summary_text", "text": "new detail"}]
+
+
 def test_fusion_trace_excludes_opaque_metadata(client, fake_worker, monkeypatch):
     opaque_values = {
         "signature": "signed-provider-signature-123",
@@ -2183,6 +2312,46 @@ def test_orchestration_trace_sidekick_delta():
         {"role": "assistant", "content": "", "reasoning": "second thought"}
     )
     assert fusion._orchestration_trace(run, trace_scope="sidekick") == "second thought"
+
+
+def test_orchestration_cursor_recovers_and_metadata_tracks_state():
+    run = fusion.FusionRun("cursor", "goal")
+    run.plan = "plan"
+    run.sidekick_brief = "brief"
+    run.trace_cursors["orchestration"] = {"main": -1, "sidekick": "bad", "preamble": -1}
+    assert "Plan:\nplan" in fusion._orchestration_trace(run)
+    assert fusion._orchestration_trace(run) == ""
+
+    run.sidekick_messages.append({"role": "tool", "content": "ok"})
+    run.status = "error"
+    metadata = fusion._orchestration_metadata(run)
+    assert metadata["tool_results"] == 1
+    assert metadata["review"] == "failed"
+
+    run.status = "completed"
+    assert fusion._orchestration_metadata(run)["review"] == "accepted"
+
+
+def test_orchestration_trace_without_preamble_is_idempotent():
+    run = fusion.FusionRun("empty-trace", "goal")
+    assert fusion._orchestration_trace(run, include_reasoning=True) == ""
+    assert fusion._orchestration_trace(run, include_reasoning=True) == ""
+
+
+def test_generic_reasoning_detail_filter_handles_unique_and_non_text_items():
+    details = api._dedupe_reasoning_details(
+        "same",
+        [
+            {"type": "reasoning.summary", "summary": [{"text": "same"}]},
+            {"type": "reasoning.summary", "summary": [{"text": "new"}]},
+            {"type": "reasoning.encrypted", "data": "opaque"},
+            "not a mapping",
+        ],
+    )
+    assert details[0] == {"type": "reasoning.summary"}
+    assert details[1]["summary"] == [{"text": "new"}]
+    assert details[2]["data"] == "opaque"
+    assert details[3] == "not a mapping"
 
 
 def test_extract_reasoning_trace_dedupes():

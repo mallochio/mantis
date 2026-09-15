@@ -487,19 +487,36 @@ def _sidekick_trace_delta(run: FusionRun) -> str:
     return ""
 
 
-def _orchestration_trace(
-    run: FusionRun,
-    include_reasoning: bool = False,
-    trace_scope: str = "orchestration",
-) -> str:
-    """Build Fusion's public trace.
+def _orchestration_positions(run: FusionRun) -> dict[str, int]:
+    cursor = run.trace_cursors.get("orchestration")
+    if not isinstance(cursor, dict):
+        cursor = {"main": 0, "sidekick": 0, "preamble": 0}
+        run.trace_cursors["orchestration"] = cursor
+    for lane in ("main", "sidekick"):
+        if not isinstance(cursor.get(lane), int) or cursor[lane] < 0:
+            cursor[lane] = 0
+    if not isinstance(cursor.get("preamble"), int) or cursor["preamble"] < 0:
+        cursor["preamble"] = 0
+    return cursor
 
-    When trace_scope is "sidekick", emits only the sidekick's active
-    reasoning or brief without outer orchestration wrappers.
-    """
-    if trace_scope == "sidekick":
-        return _sidekick_trace_delta(run)
 
+def _orchestration_provider_delta(run: FusionRun) -> str:
+    cursor = _orchestration_positions(run)
+    main_start = min(cursor["main"], len(run.main_messages))
+    sidekick_start = min(cursor["sidekick"], len(run.sidekick_messages))
+    provider = _extract_reasoning_trace(
+        run.main_messages[main_start:] + run.sidekick_messages[sidekick_start:]
+    )
+    cursor["main"] = len(run.main_messages)
+    cursor["sidekick"] = len(run.sidekick_messages)
+    return provider
+
+
+def _orchestration_preamble(run: FusionRun) -> str:
+    cursor = _orchestration_positions(run)
+    if cursor["preamble"] or not (run.plan or run.sidekick_brief):
+        return ""
+    cursor["preamble"] = 1
     main_slot = getattr(run, "main_slot", "gpt-5_6-sol")
     sidekick_slot = getattr(run, "sidekick_slot", "gpt-5_6-luna")
     lines = [f"Fusion · Planning · {_model_label(main_slot)}"]
@@ -515,28 +532,50 @@ def _orchestration_trace(
                 run.sidekick_brief,
             ]
         )
+    return "\n".join(lines)
+
+
+def _orchestration_metadata(run: FusionRun) -> dict[str, Any]:
     tool_count = sum(
         len(msg.get("tool_calls") or [])
         for msg in run.sidekick_messages
         if msg.get("role") == "assistant"
     )
-    if tool_count:
-        lines.extend(["", f"Fusion · Sidekick requested {tool_count} tools"])
-        lines.extend(
-            "Fusion · Tool result received"
-            for msg in run.sidekick_messages
-            if msg.get("role") == "tool"
-        )
-    lines.extend(["", "Fusion · Reviewing sidekick report"])
-    if run.status == "completed":
-        lines.append("Fusion · Accepted")
-    elif run.status == "error":
-        lines.append("Fusion · Orchestration failed")
-    if include_reasoning:
-        provider = _extract_reasoning_trace(run.main_messages + run.sidekick_messages)
-        if provider:
-            lines.extend(["", "Provider summary:", provider])
-    return "\n".join(lines)
+    return {
+        "run_id": run.run_id,
+        "status": run.status,
+        "main_model": _model_label(getattr(run, "main_slot", "gpt-5_6-sol")),
+        "sidekick_model": _model_label(getattr(run, "sidekick_slot", "gpt-5_6-luna")),
+        "plan": run.plan or None,
+        "sidekick_brief": run.sidekick_brief or None,
+        "tool_count": tool_count,
+        "tool_results": sum(msg.get("role") == "tool" for msg in run.sidekick_messages),
+        "review": (
+            "accepted"
+            if run.status == "completed"
+            else "failed"
+            if run.status == "error"
+            else "pending"
+        ),
+    }
+
+
+def _orchestration_trace(
+    run: FusionRun,
+    include_reasoning: bool = False,
+    trace_scope: str = "orchestration",
+) -> str:
+    """Return only reasoning not sent in an earlier response for this run."""
+    if trace_scope == "sidekick":
+        return _sidekick_trace_delta(run)
+    parts = [
+        part
+        for part in (_orchestration_preamble(run), _orchestration_provider_delta(run))
+        if part
+    ]
+    if include_reasoning and not parts:
+        return ""
+    return "\n\n".join(parts)
 
 
 class FusionCoordinator:
