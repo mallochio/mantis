@@ -2115,6 +2115,199 @@ def test_fusion_sidekick_tool_round_cap_escalates(monkeypatch, tmp_path):
     assert run.sidekick_tool_rounds == 2
 
 
+def test_fusion_escalate_at_cap_synthesizes_answer(monkeypatch, tmp_path):
+    """An escalation at the follow-up cap ends in a synthesized user-facing
+    answer, not the raw ESCALATE_TO_MAIN protocol text."""
+    worker = SequenceWorker(
+        [
+            ("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE),
+            ("PLAN: p2\nBRIEF: b2", None, DEFAULT_USAGE),
+            ("ANSWER: final synthesized answer", None, DEFAULT_USAGE),
+        ],
+        [
+            ("ESCALATE_TO_MAIN: first escalation", None, DEFAULT_USAGE),
+            ("ESCALATE_TO_MAIN: second escalation", None, DEFAULT_USAGE),
+        ],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    config = _fusion_config_file(tmp_path, main_tools="none", max_follow_ups=1)
+    monkeypatch.setattr(fusion, "_FUSION_CONFIG", config)
+    run = fusion.FusionRun("cap-escalate", "goal", delegation_mode="available")
+
+    event = run.advance(coordinator=fusion.FusionCoordinator(config))
+
+    assert event["status"] == "completed"
+    assert event["follow_up_capped"] is True
+    assert run.completed_via == "capped"
+    assert event["report"] == "final synthesized answer"
+
+
+def test_fusion_review_reject_at_cap_synthesizes_answer(monkeypatch, tmp_path):
+    """A rejected review at the follow-up cap synthesizes a final answer
+    instead of returning the unreviewed sidekick report."""
+    worker = SequenceWorker(
+        [
+            ("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE),
+            ("FOLLOW_UP: fix", None, DEFAULT_USAGE),
+            ("FOLLOW_UP: still bad", None, DEFAULT_USAGE),
+            ("ANSWER: synthesized from reports", None, DEFAULT_USAGE),
+        ],
+        [
+            ("report v1", None, DEFAULT_USAGE),
+            ("report v2", None, DEFAULT_USAGE),
+        ],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    config = _fusion_config_file(tmp_path, main_tools="none", max_follow_ups=1)
+    monkeypatch.setattr(fusion, "_FUSION_CONFIG", config)
+    run = fusion.FusionRun("cap-review", "goal", delegation_mode="available")
+
+    event = run.advance(coordinator=fusion.FusionCoordinator(config))
+
+    assert event["status"] == "completed"
+    assert event["follow_up_capped"] is True
+    assert event["report"] == "synthesized from reports"
+
+
+def test_orchestration_trace_sidekick_delta():
+    """The sidekick-scope trace emits only reasoning added since the previous
+    response; the same trace is never replayed to the client."""
+    run = fusion.FusionRun("delta", "goal")
+    run.sidekick_messages = [
+        {"role": "system", "content": "s"},
+        {"role": "assistant", "content": "", "reasoning": "first thought"},
+    ]
+    assert fusion._orchestration_trace(run, trace_scope="sidekick") == "first thought"
+    assert fusion._orchestration_trace(run, trace_scope="sidekick") == ""
+    run.sidekick_messages.append(
+        {"role": "assistant", "content": "", "reasoning": "second thought"}
+    )
+    assert fusion._orchestration_trace(run, trace_scope="sidekick") == "second thought"
+
+
+def test_extract_reasoning_trace_dedupes():
+    """A summary mirrored under multiple reasoning keys appears once."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning": "shared summary",
+            "reasoning_details": [
+                {
+                    "type": "reasoning.summary",
+                    "summary": [{"type": "summary_text", "text": "shared summary"}],
+                }
+            ],
+        }
+    ]
+    trace = fusion._extract_reasoning_trace(messages)
+    assert trace.count("shared summary") == 1
+
+
+def test_fusion_message_queued_while_awaiting_tools(monkeypatch):
+    """A user message while awaiting_tools queues on the live run and is
+    applied when tool results arrive, instead of forking a new run."""
+    worker = SequenceWorker(
+        [
+            ("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE),
+            ("ANSWER: handled queued note", None, DEFAULT_USAGE),
+        ],
+        [
+            (
+                "",
+                [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{}"},
+                    }
+                ],
+                DEFAULT_USAGE,
+            )
+        ],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    run = fusion.FusionRun("queued", "goal", tools=[BASH_TOOL], delegation_mode="available")
+
+    event = run.advance()
+    assert event["status"] == "awaiting_tools"
+    assert event["pending_tool_calls"]
+
+    # An empty retry re-emits the outstanding calls instead of erroring.
+    event = run.advance()
+    assert event["status"] == "awaiting_tools"
+    assert event["pending_tool_calls"]
+
+    event = run.advance(message="shell note")
+    assert event["status"] == "awaiting_tools"
+    assert event["pending_tool_calls"]
+    assert run.pending_user_messages == ["shell note"]
+
+    event = run.advance(tool_results=[{"tool_call_id": "call_1", "content": "ok"}])
+    assert run.pending_user_messages == []
+    assert run.latest_user == "shell note"
+    assert any(
+        msg.get("role") == "user" and msg.get("content") == "shell note"
+        for msg in run.main_messages
+    )
+    assert event["status"] == "completed"
+    assert event["report"] == "handled queued note"
+
+
+def test_fusion_chat_queues_message_for_awaiting_tools_run(monkeypatch, client):
+    """A plain user message routed to an awaiting_tools run must resume that
+    run (queued), never fork a new one."""
+    worker = SequenceWorker(
+        [("PLAN: p\nBRIEF: b", None, DEFAULT_USAGE)],
+        [
+            (
+                "",
+                [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{}"},
+                    }
+                ],
+                DEFAULT_USAGE,
+            )
+        ],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    response = client.post(
+        "/v1/chat/completions",
+        headers=_headers(),
+        json={
+            "model": "mantis/fusion",
+            "messages": [{"role": "user", "content": "task"}],
+            "tools": [BASH_TOOL],
+        },
+    )
+    assert response.status_code == 200
+    run_id = response.headers["X-Mantis-Run-Id"]
+    pending = response.json()["choices"][0]["message"]["tool_calls"]
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={**_headers(), "X-Mantis-Run-Id": run_id},
+        json={
+            "model": "mantis/fusion",
+            "messages": [
+                {"role": "user", "content": "task"},
+                {"role": "assistant", "content": "", "tool_calls": pending},
+                {"role": "user", "content": "shell note"},
+            ],
+            "tools": [BASH_TOOL],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["X-Mantis-Run-Id"] == run_id
+    assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
+    run = runs.get_run(run_id)
+    assert run.pending_user_messages == ["shell note"]
+
+
 def test_fusion_old_pickle_restores_continuity_defaults():
     run = fusion.FusionRun("old-continuity", "goal")
     state = run.__dict__.copy()
@@ -3025,6 +3218,7 @@ def test_virtual_worker_does_not_fit_to_a_fictional_route_context(monkeypatch):
             "virtual route must choose its target before fitting"
         ),
     )
+
     async def handler(_request):
         return httpx.Response(
             200,
@@ -3113,9 +3307,7 @@ def test_virtual_worker_http_timeout_uses_remaining_fusion_budget(monkeypatch):
         "mantis/base", [{"role": "user", "content": "hi"}], None
     )
 
-    assert effective_timeouts == [
-        {"connect": 1.25, "read": 1.25, "write": 1.25, "pool": 1.25}
-    ]
+    assert effective_timeouts == [{"connect": 1.25, "read": 1.25, "write": 1.25, "pool": 1.25}]
 
 
 def test_concrete_worker_still_uses_provider_path(monkeypatch):
@@ -3127,9 +3319,7 @@ def test_concrete_worker_still_uses_provider_path(monkeypatch):
 
     monkeypatch.setattr(fusion.providers, "_provider_response", provider)
     coordinator = fusion.FusionCoordinator()
-    message, _ = coordinator._call_worker(
-        "gpt-5_6-sol", [{"role": "user", "content": "hi"}], None
-    )
+    message, _ = coordinator._call_worker("gpt-5_6-sol", [{"role": "user", "content": "hi"}], None)
     assert calls == ["gpt-5_6-sol"]
     assert message["content"] == "ok"
 

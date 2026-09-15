@@ -109,6 +109,54 @@ def test_multiturn_tool_loop_via_litellm(monkeypatch):
         serve_config._history_context.active_run = None
 
 
+def test_openrouter_native_id_litellm_model(monkeypatch):
+    _setup_catalog(monkeypatch)
+    resolved = providers._resolve_model_spec("openrouter/openrouter/pareto-code|medium")
+    assert resolved.model == "openrouter/pareto-code"
+    assert resolved.effort == "medium"
+    # LiteLLM strips one provider prefix; the wire model must remain
+    # "openrouter/pareto-code", so the litellm form carries both prefixes.
+    assert providers._litellm_model(resolved) == "openrouter/openrouter/pareto-code"
+    kwargs = providers._litellm_kwargs(
+        resolved, [{"role": "user", "content": "hi"}], 100, 0.7, None, None, None, {},
+    )
+    # Unregistered OpenRouter ids reject reasoning_effort; the native
+    # reasoning object goes through extra_body instead.
+    assert "reasoning_effort" not in kwargs
+    assert kwargs["extra_body"]["reasoning"] == {"effort": "medium"}
+
+
+def test_openrouter_sticky_session_id_in_extra_body(monkeypatch):
+    _setup_catalog(monkeypatch)
+    serve_config._history_context.fusion_route_session_id = "run-9:sidekick"
+    try:
+        resolved = providers._resolve_model_spec("openrouter/openrouter/pareto-code|medium")
+        kwargs = providers._litellm_kwargs(
+            resolved, [{"role": "user", "content": "hi"}], 100, 0.7, None, None, None, {},
+        )
+        assert kwargs["extra_body"]["session_id"] == "run-9:sidekick"
+        assert kwargs["extra_body"]["reasoning"] == {"effort": "medium"}
+        # non-openrouter specs do not emit a session key
+        ds = providers._resolve_model_spec("deepseek-v4-flash")
+        other = providers._litellm_kwargs(
+            ds, [{"role": "user", "content": "hi"}], 100, 0.7, None, None, None, {},
+        )
+        assert "session_id" not in (other.get("extra_body") or {})
+    finally:
+        del serve_config._history_context.fusion_route_session_id
+
+
+def test_openrouter_registered_model_keeps_reasoning_effort(monkeypatch):
+    _setup_catalog(monkeypatch)
+    resolved = providers._resolve_model_spec("openrouter/openai/gpt-5.6-luna|high")
+    assert providers._litellm_model(resolved) == "openrouter/openai/gpt-5.6-luna"
+    kwargs = providers._litellm_kwargs(
+        resolved, [{"role": "user", "content": "hi"}], 100, 0.7, None, None, None, {},
+    )
+    assert kwargs["reasoning_effort"] == "high"
+    assert "extra_body" not in kwargs
+
+
 def test_azure_foundry_router_litellm_kwargs(monkeypatch):
     _setup_catalog(monkeypatch)
     monkeypatch.setenv("AZURE_API_KEY", "test-key")

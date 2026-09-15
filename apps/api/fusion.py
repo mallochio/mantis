@@ -68,6 +68,7 @@ def _fusion_route_session(session_id: str):
         else:
             context.fusion_route_session_id = previous
 
+
 MAIN_PREAMBLE = (
     "You are the lead engineer on a software task. Plan the work, delegate execution to "
     "a sidekick, and review the sidekick's output. "
@@ -174,6 +175,14 @@ ESCALATE_PROMPT = (
     "The sidekick escalated back to you. Reply with exactly 'ANSWER:' and a "
     "user-facing reply, or with 'PLAN:' and 'BRIEF:' to redelegate. "
     "Do not call tools.\n\nEscalation:\n"
+)
+
+TERMINAL_SYNTHESIS_PROMPT = (
+    "The delegation and follow-up budget is exhausted; no further sidekick "
+    "work or review is possible. Write the final user-facing answer now from "
+    "the material below: give the best verified result available, and state "
+    "clearly what remains unfinished or unverified. "
+    "Reply with exactly 'ANSWER:' followed by the answer.\n"
 )
 
 PLAN_REMINDER_PROMPT = (
@@ -395,7 +404,11 @@ def _extract_reasoning_trace(
     messages: list[dict[str, Any]],
     max_chars: int = 8192,
 ) -> str:
-    """Return safe textual provider summaries, excluding replay-only metadata."""
+    """Return safe textual provider summaries, excluding replay-only metadata.
+
+    Identical pieces are emitted once: providers can mirror the same summary
+    under ``reasoning``, ``reasoning_details`` and ``_anthropic_content``.
+    """
     pieces: list[str] = []
     length = 0
 
@@ -446,12 +459,32 @@ def _extract_reasoning_trace(
                     and not add(block["thinking"])
                 ):
                     break
-    return "\n\n".join(pieces)
+    return "\n\n".join(dict.fromkeys(pieces))
 
 
 def _model_label(slot: str) -> str:
     """Use a readable catalog label without exposing provider internals."""
     return slot.replace("_", ".", 1)
+
+
+def _sidekick_trace_delta(run: FusionRun) -> str:
+    """Return the sidekick reasoning added since the previous trace.
+
+    The cursor is persisted on the run so each response carries new thinking
+    rather than replaying the accumulated history. The brief is emitted once
+    as a fallback when the worker produced no reasoning.
+    """
+    cursor = run.trace_cursors.get("sidekick", 0)
+    if cursor > len(run.sidekick_messages):
+        cursor = 0
+    reasoning = _extract_reasoning_trace(run.sidekick_messages[cursor:])
+    run.trace_cursors["sidekick"] = len(run.sidekick_messages)
+    if reasoning:
+        return reasoning
+    if run.sidekick_brief and not run.trace_cursors.get("brief"):
+        run.trace_cursors["brief"] = 1
+        return run.sidekick_brief
+    return ""
 
 
 def _orchestration_trace(
@@ -465,12 +498,7 @@ def _orchestration_trace(
     reasoning or brief without outer orchestration wrappers.
     """
     if trace_scope == "sidekick":
-        sidekick_reasoning = _extract_reasoning_trace(run.sidekick_messages)
-        if sidekick_reasoning:
-            return sidekick_reasoning
-        if run.sidekick_brief:
-            return run.sidekick_brief
-        return ""
+        return _sidekick_trace_delta(run)
 
     main_slot = getattr(run, "main_slot", "gpt-5_6-sol")
     sidekick_slot = getattr(run, "sidekick_slot", "gpt-5_6-luna")
@@ -945,7 +973,9 @@ class ExecutionLane:
             serve_config._history_context, "fusion_compacted", False
         ):
             self.run._reroute_after_compaction(
-                self.role, slot, cache_warm=self.run._has_cache_hits(usage),
+                self.role,
+                slot,
+                cache_warm=self.run._has_cache_hits(usage),
             )
         if self.run.budget is not None:
             self.run.budget.consume_tokens(usage)
@@ -1123,6 +1153,8 @@ class FusionRun(NativeRun):
         self.main_lane: ExecutionLane | None = None
         self.sidekick_lanes: list[ExecutionLane] = []
         self.sidekick_reports: list[str] = []
+        self.pending_user_messages: list[str] = []
+        self.trace_cursors: dict[str, int] = {}
         self.status = "main_planning"
 
     def __setstate__(self, state: dict[str, Any]) -> None:
@@ -1163,6 +1195,8 @@ class FusionRun(NativeRun):
             "main_lane": None,
             "sidekick_lanes": [],
             "sidekick_reports": [],
+            "pending_user_messages": [],
+            "trace_cursors": {},
         }
         for key, default_value in default_fields.items():
             if not hasattr(self, key):
@@ -1243,7 +1277,9 @@ class FusionRun(NativeRun):
         )
         if getattr(serve_config._history_context, "fusion_compacted", False):
             self._reroute_after_compaction(
-                role, slot, cache_warm=self._has_cache_hits(usage),
+                role,
+                slot,
+                cache_warm=self._has_cache_hits(usage),
             )
         messages.append(message)
         if self.budget is not None:
@@ -1281,9 +1317,7 @@ class FusionRun(NativeRun):
             return isinstance(cached, int) and cached > 0
         return False
 
-    def _reroute_after_compaction(
-        self, role: str, previous: str, cache_warm: bool = False
-    ) -> None:
+    def _reroute_after_compaction(self, role: str, previous: str, cache_warm: bool = False) -> None:
         if role == "main" and self.structured and self.structured_plan is None:
             self.main_compaction_pending = previous
             return
@@ -1292,7 +1326,10 @@ class FusionRun(NativeRun):
             return
         complexity = self.structured_plan.complexity if self.structured_plan else 1.0
         selected = router.select_at_compaction(
-            complexity, previous, self.follow_up_count, cache_warm=cache_warm,
+            complexity,
+            previous,
+            self.follow_up_count,
+            cache_warm=cache_warm,
         )
         if selected == previous:
             return
@@ -1378,6 +1415,60 @@ class FusionRun(NativeRun):
         self.report = answer
         self.completed_via = "answer"
         self.status = "completed"
+
+    def _apply_user_message(self, message: str) -> None:
+        """Redirect the run to main planning for a new user instruction."""
+        self.latest_user = message
+        self.main_messages.append({"role": "user", "content": message})
+        self.pending_tool_calls = []
+        self.planning_tool_rounds = 0
+        if self.structured:
+            self.structured_plan = None
+            self.main_lane = None
+            self.sidekick_lanes = []
+            self.sidekick_reports = []
+            self.follow_up_count = 0
+        self.status = "main_planning"
+        self._resume_allows_answer = True
+
+    def _drain_pending_user_messages(self) -> None:
+        """Apply user messages queued while the run awaited tool results."""
+        if not self.pending_user_messages:
+            return
+        queued = self.pending_user_messages
+        self.pending_user_messages = []
+        for text in queued:
+            self._apply_user_message(text)
+
+    def _synthesize_final_answer(
+        self,
+        coordinator: FusionCoordinator,
+        *,
+        context: str,
+        fallback: str,
+    ) -> str:
+        """Ask the main lane for the terminal user-facing answer.
+
+        The run must end with a synthesized reply, not raw worker protocol
+        text. Any failure falls back to the best available report text.
+        """
+        self.main_messages.append({"role": "user", "content": context})
+        try:
+            text, calls, _ = self._call_lane(coordinator, "main", tools=None)
+            if calls:
+                text = self._retry_main_without_tools(coordinator, calls)
+            answer = self._parse_main_answer(text)
+        except Exception:  # noqa: BLE001 - terminal synthesis must not lose the run
+            return fallback
+        return answer or fallback
+
+    def _synthesis_context(self, label: str, material: str) -> str:
+        return (
+            f"{TERMINAL_SYNTHESIS_PROMPT}\n\n"
+            f"Goal:\n{self.goal}\n\n"
+            f"{label}:\n{material}\n\n"
+            f"Sidekick tool activity:\n{self._summarize_sidekick_tool_history()}"
+        )
 
     def _handle_main_planning_text(
         self,
@@ -1642,6 +1733,13 @@ class FusionRun(NativeRun):
         coordinator = coordinator or FusionCoordinator()
         tool_results = tool_results or []
         try:
+            if self.status == "awaiting_tools" and not tool_results and not self.cancelled:
+                # A live run owns the session: queue any instruction and
+                # re-emit the outstanding calls instead of forking a new
+                # run or erroring on an empty retry.
+                if message is not None:
+                    self.pending_user_messages.append(message)
+                return self._ok_event(request_id)
             return self._advance(tool_results, request_id, message, coordinator)
         except Exception as exc:  # noqa: BLE001 - catch-all guard for worker/state errors
             return self._error_event(exc, request_id)
@@ -1721,12 +1819,7 @@ class FusionRun(NativeRun):
                 raise ValueError("message follow-up is invalid while awaiting_tools")
             if self.status == "error":
                 raise ValueError("cannot follow up an errored fusion run")
-            self.latest_user = message
-            self.main_messages.append({"role": "user", "content": message})
-            self.pending_tool_calls = []
-            self.planning_tool_rounds = 0
-            self.status = "main_planning"
-            self._resume_allows_answer = True
+            self._apply_user_message(message)
 
         # Apply client tool results only when awaiting tools.
         if self.status == "awaiting_tools":
@@ -1737,6 +1830,7 @@ class FusionRun(NativeRun):
                 self.status = "main_planning" if not self.plan else "main_review"
             else:
                 self.status = "sidekick_pending"
+            self._drain_pending_user_messages()
         elif tool_results:
             raise ValueError("tool_results are only valid when status is awaiting_tools")
 
@@ -1842,7 +1936,11 @@ class FusionRun(NativeRun):
                 if escalate_reason is not None:
                     if self.follow_up_count >= coordinator.max_follow_ups:
                         self.follow_up_capped = True
-                        self.report = self.report or sidekick_text
+                        self.report = self.report or self._synthesize_final_answer(
+                            coordinator,
+                            context=self._synthesis_context("Sidekick escalation", escalate_reason),
+                            fallback=escalate_reason,
+                        )
                         self.completed_via = "capped"
                         self.status = "completed"
                         break
@@ -1903,7 +2001,11 @@ class FusionRun(NativeRun):
                 if self.follow_up_count >= coordinator.max_follow_ups:
                     self.follow_up_capped = True
                     last_sidekick_text = self.sidekick_messages[-1].get("content", "")
-                    self.report = self.report or last_sidekick_text
+                    self.report = self.report or self._synthesize_final_answer(
+                        coordinator,
+                        context=self._synthesis_context("Sidekick report", last_sidekick_text),
+                        fallback=last_sidekick_text,
+                    )
                     self.completed_via = "capped"
                     self.status = "completed"
                     break
@@ -1937,16 +2039,7 @@ class FusionRun(NativeRun):
                 raise ValueError("message follow-up is invalid while awaiting_tools")
             if self.status == "error":
                 raise ValueError("cannot follow up an errored fusion run")
-            self.latest_user = message
-            self.main_messages.append({"role": "user", "content": message})
-            self.structured_plan = None
-            self.main_lane = None
-            self.sidekick_lanes = []
-            self.sidekick_reports = []
-            self.pending_tool_calls = []
-            self.follow_up_count = 0
-            self.status = "main_planning"
-            self._resume_allows_answer = True
+            self._apply_user_message(message)
 
         if self.budget is not None:
             self.budget.check_timeout()
@@ -1974,6 +2067,7 @@ class FusionRun(NativeRun):
             else:
                 self.pending_tool_calls = []
                 self.status = "sidekick_pending"
+            self._drain_pending_user_messages()
         elif tool_results:
             raise ValueError("tool_results are only valid when status is awaiting_tools")
 
@@ -2155,8 +2249,13 @@ class FusionRun(NativeRun):
 
                 if self.follow_up_count >= coordinator.max_follow_ups:
                     self.follow_up_capped = True
-                    self.report = main_result or next(
+                    fallback = main_result or next(
                         (r for r in self.sidekick_reports if r), review_text
+                    )
+                    self.report = self._synthesize_final_answer(
+                        coordinator,
+                        context=self._synthesis_context("Worker reports", reports),
+                        fallback=fallback,
                     )
                     self.completed_via = "capped"
                     self.status = "completed"

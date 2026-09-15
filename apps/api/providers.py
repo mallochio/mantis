@@ -610,10 +610,45 @@ def _is_anthropic_spec(resolved: ResolvedModelSpec) -> bool:
     )
 
 
+def _apply_openrouter_session(kwargs: dict[str, Any], resolved: ResolvedModelSpec) -> None:
+    """Sticky-routing key for OpenRouter (``session_id`` body field).
+
+    Pins provider/model selection to the run lane so upstream prompt caches
+    stay warm across turns. Equivalent to the ``x-session-id`` header and
+    takes precedence over it.
+    """
+    if resolved.adapter != "openrouter":
+        return
+    context = serve_config._history_context
+    session = getattr(context, "fusion_route_session_id", None) or getattr(
+        getattr(context, "active_run", None), "run_id", None
+    )
+    if session:
+        kwargs.setdefault("extra_body", {}).setdefault("session_id", str(session)[:256])
+
+
+def _openrouter_reasoning_capable(resolved: ResolvedModelSpec) -> bool:
+    try:
+        model = _litellm_model(resolved)
+        return bool(
+            litellm.supports_reasoning(model=model, custom_llm_provider="openrouter")
+            or litellm.supports_reasoning(model=model)
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _set_reasoning_kwarg(kwargs: dict[str, Any], resolved: ResolvedModelSpec, coerced: str) -> None:
     if resolved.adapter == "azure_ai":
         # Azure AI Foundry Responses API accepts reasoning as a nested object.
         kwargs["reasoning"] = {"effort": coerced}
+    elif resolved.adapter == "openrouter" and not _openrouter_reasoning_capable(resolved):
+        # LiteLLM accepts reasoning_effort only for registry-flagged models.
+        # Unregistered OpenRouter ids (e.g. openrouter/pareto-code) still take
+        # the native reasoning object; extra_body bypasses param filtering.
+        extra_body = dict(kwargs.get("extra_body") or {})
+        extra_body.setdefault("reasoning", {})["effort"] = coerced
+        kwargs["extra_body"] = extra_body
     else:
         kwargs["reasoning_effort"] = coerced
 
@@ -629,8 +664,13 @@ def _litellm_model(resolved: ResolvedModelSpec) -> str:
                 return f"azure_ai/{resolved.model}"
             return f"azure_ai/model_router/{resolved.model}"
         prefix = "vertex_ai" if resolved.adapter == "vertex" else resolved.adapter
-        # don’t double-prefix if upstream_model already provider-qualified
-        if resolved.model.startswith(f"{prefix}/"):
+        # don’t double-prefix if upstream_model already provider-qualified.
+        # OpenRouter publishes native "openrouter/<name>" ids (pareto-code,
+        # auto): one slash is an upstream id, not a litellm prefix, so those
+        # still get prefixed to keep the openrouter/ namespace on the wire.
+        if resolved.model.startswith(f"{prefix}/") and (
+            resolved.adapter != "openrouter" or resolved.model.count("/") >= 2
+        ):
             return resolved.model
         return f"{prefix}/{resolved.model}"
     # openai-compatible: strip any leading vendor prefix, use openai handler
@@ -687,6 +727,8 @@ def _litellm_kwargs(
         # "Invalid API Key format". Only a real Bedrock API key passes through.
         if key and (resolved.adapter != "bedrock" or key.startswith("bedrock-api-key")):
             kwargs["api_key"] = key
+
+    _apply_openrouter_session(kwargs, resolved)
 
     # temperature: omit when reasoning is active
     if not coerced and not _is_reasoning_model(resolved.model):

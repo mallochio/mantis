@@ -154,8 +154,8 @@ reasoning_effort = "high"
 protocols = ["chat_completions"]
 
 [fusion]
-main = "gpt-5_6-sol"
-sidekick = "gpt-5_6-luna"
+main = "openrouter/openai/gpt-6-astra|low"
+sidekick = "openrouter/openrouter/pareto-code|medium"
 fallback_on_escalate = true
 max_follow_ups = 2
 sidekick_max_tool_rounds = 16

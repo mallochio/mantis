@@ -450,7 +450,9 @@ def _azure_content_item(role: str, part: TextPart | ImagePart) -> dict[str, Any]
     return {"type": "input_text", "text": str(part)}
 
 
-def _azure_canonical_content(role: str, content: str | list[TextPart | ImagePart] | None) -> str | list[dict[str, Any]] | None:
+def _azure_canonical_content(
+    role: str, content: str | list[TextPart | ImagePart] | None
+) -> str | list[dict[str, Any]] | None:
     """Return Azure Responses-compatible content for a message role.
 
     System and developer messages are sent as a single text string.
@@ -467,11 +469,7 @@ def _azure_canonical_content(role: str, content: str | list[TextPart | ImagePart
         part_type = "output_text" if role == "assistant" else "input_text"
         return [{"type": part_type, "text": content}]
     parts = [_azure_content_item(role, p) for p in content]
-    parts = [
-        p
-        for p in parts
-        if p.get("type") == "input_image" or str(p.get("text") or "")
-    ]
+    parts = [p for p in parts if p.get("type") == "input_image" or str(p.get("text") or "")]
     if not parts:
         return None
     if role in ("system", "developer"):
@@ -562,7 +560,11 @@ def _azure_input_for_request(
         return input_messages, None
     previous_id, previous_messages = previous
     previous_len = len(previous_messages)
-    if previous_len and previous_len < len(input_messages) and input_messages[:previous_len] == previous_messages:
+    if (
+        previous_len
+        and previous_len < len(input_messages)
+        and input_messages[:previous_len] == previous_messages
+    ):
         return input_messages[previous_len:], previous_id
     return input_messages, None
 
@@ -579,15 +581,13 @@ def _azure_output_reasoning(item: openai.types.responses.ResponseOutputMessage) 
         if part.type != "reasoning" or not hasattr(part, "summary"):
             continue
         summaries = getattr(part, "summary", []) or []
-        parts.extend(
-            s.text
-            for s in summaries
-            if s.type == "summary_text" and hasattr(s, "text")
-        )
+        parts.extend(s.text for s in summaries if s.type == "summary_text" and hasattr(s, "text"))
     return "\n".join(parts)
 
 
-def _azure_response_to_chat_completion(model: str, resp: openai.types.responses.Response) -> dict[str, Any]:
+def _azure_response_to_chat_completion(
+    model: str, resp: openai.types.responses.Response
+) -> dict[str, Any]:
     text_parts: list[str] = []
     reasoning_parts: list[str] = []
     for item in resp.output:
@@ -630,7 +630,9 @@ def _azure_store_session(
 
 def _complete_direct(request: ChatRequest, headers: dict[str, str] | None = None) -> dict[str, Any]:
     resolved = providers._resolve_model_spec(_azure_router_spec(request))
-    key = providers._provider_keys().get(_AZURE_ROUTER_PROVIDER) or os.environ.get(resolved.credential_env)
+    key = providers._provider_keys().get(_AZURE_ROUTER_PROVIDER) or os.environ.get(
+        resolved.credential_env
+    )
     client = openai.OpenAI(
         base_url=resolved.base_url,
         api_key=key or "",
@@ -653,7 +655,9 @@ def _complete_direct(request: ChatRequest, headers: dict[str, str] | None = None
     assistant = body["choices"][0]["message"]
     assistant_content = _azure_canonical_content(assistant["role"], assistant["content"])
     if assistant_content:
-        full_messages.append({"type": "message", "role": assistant["role"], "content": assistant_content})
+        full_messages.append(
+            {"type": "message", "role": assistant["role"], "content": assistant_content}
+        )
     _azure_store_session(request, headers, full_messages, resp.id)
     return body
 
@@ -1340,7 +1344,9 @@ def _run_fusion_chat(
             request.messages
         )
         resumed = fusion.try_get_fusion_run(resume_id) if resume_id else None
-        if resumed is not None and resumed.status != "awaiting_tools":
+        if resumed is not None:
+            # A live run owns the session: when it is awaiting_tools the
+            # message is queued on the run rather than forking a new one.
             if request.tools is not None:
                 fusion.refresh_fusion_run_tools(
                     resumed, [tool.model_dump() for tool in request.tools]
@@ -1360,16 +1366,33 @@ def _run_fusion_chat(
             )
             event = fusion.advance_fusion_run(run.run_id)
 
-    if event.get("run_id"):
-        run_obj = fusion.get_run(event["run_id"])
-        if isinstance(run_obj, fusion.FusionRun):
-            trace_scope = _fusion_trace_scope(headers)
-            event["reasoning_trace"] = fusion._orchestration_trace(
-                run_obj,
-                include_reasoning=return_reasoning,
-                trace_scope=trace_scope,
-            )
+    _attach_fusion_trace(event, return_reasoning, headers)
     return event
+
+
+def _attach_fusion_trace(
+    event: dict[str, Any],
+    return_reasoning: bool,
+    headers: dict[str, str] | None,
+) -> None:
+    """Build and attach the run's reasoning trace to the response event.
+
+    The trace cursor is run state: read, build, and persist under the run
+    lock so concurrent advances cannot interleave.
+    """
+    run_id = event.get("run_id")
+    if not run_id:
+        return
+    with fusion._run_lock(str(run_id)):
+        run_obj = fusion.get_run(str(run_id))
+        if not isinstance(run_obj, fusion.FusionRun):
+            return
+        event["reasoning_trace"] = fusion._orchestration_trace(
+            run_obj,
+            include_reasoning=return_reasoning,
+            trace_scope=_fusion_trace_scope(headers),
+        )
+        fusion._put_run(run_obj)
 
 
 _EXPERIMENTAL_MODELS = {"mantis/trinity", "mantis/ultra"}
