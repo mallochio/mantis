@@ -178,6 +178,12 @@ def test_accepts_same_model_with_different_reasoning_effort(tmp_path):
     assert parsed["targets"]["capable"]["id"] == "google/gemini-3.7-flash"
     assert parsed["targets"]["efficient"]["extra_body"]["reasoning_effort"] == "medium"
     assert parsed["targets"]["capable"]["extra_body"]["reasoning_effort"] == "high"
+    # switchyard keeps one target per (llm_client, model id); the same model on
+    # the same client needs a duplicate client entry or a target is dropped.
+    capable_client = parsed["targets"]["capable"]["llm_client"]
+    assert parsed["targets"]["efficient"]["llm_client"] == "litellm"
+    assert capable_client == "litellm__capable"
+    assert parsed["llm_clients"][capable_client] == parsed["llm_clients"]["litellm"]
 
 
 def test_rejects_inverted_reasoning_effort_for_same_model(tmp_path):

@@ -64,7 +64,7 @@ recent_turn_window = 3
 
 [base.targets.efficient]
 provider = "openrouter"
-reasoning_effort = "low"
+reasoning_effort = "medium"
 max_tokens = 128000
 upstream_model = "~openai/gpt-sol-latest"
 
@@ -151,8 +151,10 @@ reasoning_effort = "high"
 protocols = ["chat_completions"]
 
 [fusion]
-main = "openrouter/openai/gpt-6-astra|low"
-sidekick = "openrouter/openrouter/pareto-code|medium"
+main = "openrouter/~openai/gpt-astra-latest"
+main_reasoning = "low"
+sidekick = "openrouter/~openai/gpt-luna-latest"
+sidekick_reasoning = "high"
 fallback_on_escalate = true
 max_follow_ups = 2
 # Per-delegated-subtask follow-up cap; defaults to max_follow_ups when omitted.

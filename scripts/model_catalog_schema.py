@@ -226,10 +226,7 @@ def _validate_effort_ordering(efficient: BaseTarget, capable: BaseTarget) -> Non
     high effort can cost less per turn than a strong model at medium), so the
     guard is skipped there.
     """
-    if (
-        efficient.upstream_model != capable.upstream_model
-        or efficient.provider != capable.provider
-    ):
+    if efficient.upstream_model != capable.upstream_model or efficient.provider != capable.provider:
         return
     if efficient.reasoning_effort is None or capable.reasoning_effort is None:
         return
@@ -247,9 +244,7 @@ def _validate_effort_ordering(efficient: BaseTarget, capable: BaseTarget) -> Non
         )
 
 
-def _validate_token_limits(
-    max_tokens: int | None, context_window: int | None, label: str
-) -> None:
+def _validate_token_limits(max_tokens: int | None, context_window: int | None, label: str) -> None:
     """Reject an output cap larger than the model's own context window."""
     if max_tokens is not None and context_window is not None and max_tokens > context_window:
         raise CatalogError(
@@ -387,6 +382,7 @@ def validate_fusion_virtual_routes(root: Mapping[str, Any]) -> None:
         return
     section = _mapping(raw, "fusion")
     for role in ("main", "sidekick"):
+        _reasoning_effort(section.get(f"{role}_reasoning"), f"fusion.{role}_reasoning")
         configured = section.get(role)
         if configured is None:
             continue
@@ -416,9 +412,7 @@ def load_base_route(root: Mapping[str, Any]) -> BaseRoute:
     targets = _mapping(section.get("targets"), "base.targets")
     unknown_targets = sorted(set(targets) - set(BASE_TARGET_ROLES))
     if unknown_targets:
-        raise CatalogError(
-            f"base.targets contains unknown roles: {', '.join(unknown_targets)}"
-        )
+        raise CatalogError(f"base.targets contains unknown roles: {', '.join(unknown_targets)}")
     missing = [role for role in BASE_TARGET_ROLES if role not in targets]
     if missing:
         raise CatalogError("base.targets must define efficient and capable")

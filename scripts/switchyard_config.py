@@ -56,10 +56,7 @@ def load_switchyard_route(path: str | Path | None = None) -> BaseRoute:
 
 def _toml_str(value: str) -> str:
     escaped = (
-        value.replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("\n", "\\n")
-        .replace("\t", "\\t")
+        value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\t", "\\t")
     )
     return f'"{escaped}"'
 
@@ -148,6 +145,14 @@ def render_switchyard_toml(route: BaseRoute) -> str:
         role: _client_key_for(target.provider, route.providers[target.provider], target.wire_format)
         for role, target in (("efficient", route.efficient), ("capable", route.capable))
     }
+    # Switchyard keeps one target per (llm_client, model id). Same model on the
+    # same client with different extra_body (e.g. effort tiers) would drop one
+    # target, so the second rides a duplicate client entry.
+    if (
+        keys["efficient"] == keys["capable"]
+        and route.efficient.upstream_model == route.capable.upstream_model
+    ):
+        keys["capable"] = f"{keys['capable']}__capable"
     route_block = "\n".join(
         [
             "[routes.mantis_base]",

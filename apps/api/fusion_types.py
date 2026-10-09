@@ -66,5 +66,7 @@ class FusionRoutingConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     main: str | list[str] = "gpt-5_6-sol"
+    main_reasoning: str | None = None
     sidekick: str | list[str] = "gpt-5_6-luna"
+    sidekick_reasoning: str | None = None
     fallback_on_escalate: bool = True

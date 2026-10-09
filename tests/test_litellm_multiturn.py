@@ -1,4 +1,5 @@
 """LiteLLM multi-turn: provider mix, tool loop, cache/cost via mocked litellm."""
+
 from __future__ import annotations
 
 import json
@@ -31,7 +32,9 @@ def _mock_resp(content: str | None, tool_calls=None, cached=0, cost=0.0001):
     msg.annotations = None
     choice = MagicMock(message=msg, finish_reason="tool_calls" if tool_calls else "stop")
     usage = MagicMock(
-        prompt_tokens=20, completion_tokens=10, total_tokens=30,
+        prompt_tokens=20,
+        completion_tokens=10,
+        total_tokens=30,
         prompt_tokens_details=MagicMock(cached_tokens=cached),
     )
     resp = MagicMock(choices=[choice], usage=usage, _hidden_params={"response_cost": cost})
@@ -56,7 +59,14 @@ def test_litellm_kwargs_per_model_thinking(monkeypatch):
     for slot in ("deepseek-v4-flash", "gpt-5_6-luna", "claude-opus-5"):
         resolved = providers._resolve_model_spec(slot)
         kwargs = providers._litellm_kwargs(
-            resolved, [{"role": "user", "content": "hi"}], 100, 0.7, None, None, None, {},
+            resolved,
+            [{"role": "user", "content": "hi"}],
+            100,
+            0.7,
+            None,
+            None,
+            None,
+            {},
         )
         assert "model" in kwargs and "messages" in kwargs
         assert "api_key" in kwargs
@@ -76,8 +86,11 @@ def test_multiturn_tool_loop_via_litellm(monkeypatch):
 
     monkeypatch.setattr(providers, "_litellm_completion", fake_completion)
     run = SimpleNamespace(
-        usage_models={}, capture_metadata=False,
-        active_tool_choice=None, active_response_format=None, active_controls={},
+        usage_models={},
+        capture_metadata=False,
+        active_tool_choice=None,
+        active_response_format=None,
+        active_controls={},
         record_activity=lambda *a, **k: None,
         add_usage=lambda usage, model=None: run.usage_models.update(
             {model: {"prompt_tokens": 20, "completion_tokens": 10, "cached_tokens": 0}}
@@ -86,7 +99,10 @@ def test_multiturn_tool_loop_via_litellm(monkeypatch):
     serve_config._history_context.active_run = run
     try:
         data = providers._provider_response(
-            "deepseek-v4-flash", [{"role": "user", "content": "do it"}], 100, 0.7,
+            "deepseek-v4-flash",
+            [{"role": "user", "content": "do it"}],
+            100,
+            0.7,
         )
         assert data["choices"][0]["message"].get("tool_calls")
         data2 = providers._provider_response(
@@ -101,7 +117,8 @@ def test_multiturn_tool_loop_via_litellm(monkeypatch):
                 },
                 {"role": "tool", "tool_call_id": "call_0", "content": "hi"},
             ],
-            100, 0.7,
+            100,
+            0.7,
         )
         assert data2["choices"][0]["message"]["content"] == "Final answer: done"
         assert len(calls) == 2
@@ -118,7 +135,14 @@ def test_openrouter_native_id_litellm_model(monkeypatch):
     # "openrouter/pareto-code", so the litellm form carries both prefixes.
     assert providers._litellm_model(resolved) == "openrouter/openrouter/pareto-code"
     kwargs = providers._litellm_kwargs(
-        resolved, [{"role": "user", "content": "hi"}], 100, 0.7, None, None, None, {},
+        resolved,
+        [{"role": "user", "content": "hi"}],
+        100,
+        0.7,
+        None,
+        None,
+        None,
+        {},
     )
     # Unregistered OpenRouter ids reject reasoning_effort; the native
     # reasoning object goes through extra_body instead.
@@ -132,18 +156,43 @@ def test_openrouter_sticky_session_id_in_extra_body(monkeypatch):
     try:
         resolved = providers._resolve_model_spec("openrouter/openrouter/pareto-code|medium")
         kwargs = providers._litellm_kwargs(
-            resolved, [{"role": "user", "content": "hi"}], 100, 0.7, None, None, None, {},
+            resolved,
+            [{"role": "user", "content": "hi"}],
+            100,
+            0.7,
+            None,
+            None,
+            None,
+            {},
         )
         assert kwargs["extra_body"]["session_id"] == "run-9:sidekick"
         assert kwargs["extra_body"]["reasoning"] == {"effort": "medium"}
         # non-openrouter specs do not emit a session key
         ds = providers._resolve_model_spec("deepseek-v4-flash")
         other = providers._litellm_kwargs(
-            ds, [{"role": "user", "content": "hi"}], 100, 0.7, None, None, None, {},
+            ds,
+            [{"role": "user", "content": "hi"}],
+            100,
+            0.7,
+            None,
+            None,
+            None,
+            {},
         )
         assert "session_id" not in (other.get("extra_body") or {})
     finally:
         del serve_config._history_context.fusion_route_session_id
+
+
+def test_slot_effort_suffix_overrides_worker_binding(monkeypatch):
+    _setup_catalog(monkeypatch)
+    resolved = providers._resolve_model_spec("gpt-5_6-luna|low")
+    assert resolved.slot == "gpt-5_6-luna"
+    assert resolved.effort == "low"
+    assert resolved.model == "openai/gpt-5.6-luna"
+    # The binding default (xhigh) applies only without the suffix.
+    assert providers._resolve_model_spec("gpt-5_6-luna").effort == "xhigh"
+    assert providers._resolve_model_spec("gpt-5_6-luna|none").effort is None
 
 
 def test_openrouter_registered_model_keeps_reasoning_effort(monkeypatch):
@@ -151,7 +200,14 @@ def test_openrouter_registered_model_keeps_reasoning_effort(monkeypatch):
     resolved = providers._resolve_model_spec("openrouter/openai/gpt-5.6-luna|high")
     assert providers._litellm_model(resolved) == "openrouter/openai/gpt-5.6-luna"
     kwargs = providers._litellm_kwargs(
-        resolved, [{"role": "user", "content": "hi"}], 100, 0.7, None, None, None, {},
+        resolved,
+        [{"role": "user", "content": "hi"}],
+        100,
+        0.7,
+        None,
+        None,
+        None,
+        {},
     )
     assert kwargs["reasoning_effort"] == "high"
     assert "extra_body" not in kwargs
@@ -173,7 +229,14 @@ def test_azure_foundry_router_litellm_kwargs(monkeypatch):
     )
     assert providers._litellm_model(resolved) == "azure_ai/model_router/model-router"
     kwargs = providers._litellm_kwargs(
-        resolved, [{"role": "user", "content": "hi"}], 100, 0.7, None, None, None, {},
+        resolved,
+        [{"role": "user", "content": "hi"}],
+        100,
+        0.7,
+        None,
+        None,
+        None,
+        {},
     )
     assert kwargs["model"] == "azure_ai/model_router/model-router"
     assert kwargs["api_key"] == "test-key"
@@ -187,8 +250,11 @@ def test_cache_and_cost_via_litellm(monkeypatch):
         providers, "_litellm_completion", lambda **k: _mock_resp("hi", cached=15, cost=0.0002)
     )
     run = SimpleNamespace(
-        usage_models={}, capture_metadata=False,
-        active_tool_choice=None, active_response_format=None, active_controls={},
+        usage_models={},
+        capture_metadata=False,
+        active_tool_choice=None,
+        active_response_format=None,
+        active_controls={},
         record_activity=lambda *a, **k: None,
         add_usage=lambda usage, model=None: run.usage_models.update(
             {model: {"prompt_tokens": 20, "completion_tokens": 10, "cached_tokens": 15}}

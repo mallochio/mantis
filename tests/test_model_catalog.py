@@ -29,9 +29,7 @@ def _catalog(contract: str = "") -> str:
     for index, slot in enumerate(abi.slot_order):
         provider = "router" if index != 3 else "code"
         model = f"vendor/{slot}"
-        protocols = (
-            '["responses"]' if slot == abi.conductor else '["chat_completions"]'
-        )
+        protocols = '["responses"]' if slot == abi.conductor else '["chat_completions"]'
         identity, effort = abi.workers[slot]
         lines = [
             f"[mantis.workers.{slot}]",
@@ -59,8 +57,7 @@ def _catalog(contract: str = "") -> str:
         "[mantis]\n"
         f"slot_order = {json.dumps(list(abi.slot_order))}\n"
         f'conductor = "{abi.conductor}"\n'
-        f"{expected}\n"
-        + "\n".join(workers)
+        f"{expected}\n" + "\n".join(workers)
     )
 
 
@@ -68,8 +65,13 @@ def _shared_catalog(contract: str) -> str:
     """Combined fixture for the Mantis workers and Switchyard Base consumers."""
     abi = model_catalog.load_abi_manifest()
     provider_order = [
-        "modal.prod", "generic.openai", "code", "router",
-        "router", "generic.openai", "generic.openai",
+        "modal.prod",
+        "generic.openai",
+        "code",
+        "router",
+        "router",
+        "generic.openai",
+        "generic.openai",
     ]
     # The conductor slot speaks responses; route it through a responses-capable
     # provider (openrouter) regardless of its position in the slot order.
@@ -102,11 +104,11 @@ def _shared_catalog(contract: str) -> str:
         'base_url = "https://code.example.test/v1"\n'
         'credential_env = "CODE_KEY"\n'
         'protocols = ["chat_completions"]\n\n'
-        "[providers.\"modal.prod\"]\n"
+        '[providers."modal.prod"]\n'
         'adapter = "modal"\n'
         'base_url = "https://modal.example.test/v1"\n'
         'credential_env = "MODAL_KEY"\n\n'
-        "[providers.\"generic.openai\"]\n"
+        '[providers."generic.openai"]\n'
         'adapter = "openai-compatible"\n'
         'base_url = "https://generic.example.test/v1"\n'
         'credential_env = "GENERIC_KEY"\n\n'
@@ -124,8 +126,7 @@ def _shared_catalog(contract: str) -> str:
         "[mantis]\n"
         f"slot_order = {json.dumps(list(abi.slot_order))}\n"
         f'conductor = "{abi.conductor}"\n'
-        f'trained_slot_contract = "{contract}"\n'
-        + "\n".join(workers)
+        f'trained_slot_contract = "{contract}"\n' + "\n".join(workers)
     )
 
 
@@ -205,6 +206,25 @@ def test_normal_catalog_loader_rejects_invalid_fusion_pool_types(tmp_path, inval
         model_catalog.load_mantis_catalog(path, require_contract=False)
 
 
+def test_fusion_reasoning_fields_are_validated(tmp_path):
+    path = _write_catalog(
+        tmp_path,
+        _catalog()
+        + '\n[fusion]\nmain = "mantis/base"\nmain_reasoning = "turbo"\n'
+        + 'sidekick = "mantis/base"\nsidekick_reasoning = "high"\n',
+    )
+    with pytest.raises(model_catalog.CatalogError, match="fusion.main_reasoning"):
+        model_catalog.load_mantis_catalog(path, require_contract=False)
+
+    path = _write_catalog(
+        tmp_path,
+        _catalog()
+        + '\n[fusion]\nmain = "mantis/base"\nmain_reasoning = "low"\n'
+        + 'sidekick = "mantis/base"\nsidekick_reasoning = "high"\n',
+    )
+    assert model_catalog.load_mantis_catalog(path, require_contract=False) is not None
+
+
 def test_fingerprint_bootstraps_then_validate_and_render(tmp_path):
     path, fingerprint = _fingerprint(tmp_path)
     path.write_text(_catalog(fingerprint))
@@ -222,10 +242,13 @@ def test_endpoint_provider_or_transport_model_swap_preserves_explicit_identity(t
     baseline = model_catalog.identity_fingerprint(
         model_catalog.load_mantis_catalog(baseline_path, require_contract=False)
     )
-    changed = _catalog(fingerprint).replace(
-        "https://router.example.test/v1", "https://new-router.example.test/v1"
-    ).replace('provider = "router"', 'provider = "alternate"', 1).replace(
-        f'upstream_model = "vendor/{CONDUCTOR}"', 'upstream_model = "endpoint/luna-alias"', 1
+    changed = (
+        _catalog(fingerprint)
+        .replace("https://router.example.test/v1", "https://new-router.example.test/v1")
+        .replace('provider = "router"', 'provider = "alternate"', 1)
+        .replace(
+            f'upstream_model = "vendor/{CONDUCTOR}"', 'upstream_model = "endpoint/luna-alias"', 1
+        )
     )
     changed += (
         "\n[providers.alternate]\n"
@@ -315,9 +338,12 @@ def test_regenerated_contract_cannot_bypass_manifest(tmp_path):
         f'model_identity = "{CONDUCTOR_IDENTITY}"', 'model_identity = "logical/sneaky"', 1
     )
     regenerated = model_catalog.identity_fingerprint(_unchecked_catalog(mutated))
-    path = _write_catalog(tmp_path, _catalog(regenerated).replace(
-        f'model_identity = "{CONDUCTOR_IDENTITY}"', 'model_identity = "logical/sneaky"', 1
-    ))
+    path = _write_catalog(
+        tmp_path,
+        _catalog(regenerated).replace(
+            f'model_identity = "{CONDUCTOR_IDENTITY}"', 'model_identity = "logical/sneaky"', 1
+        ),
+    )
     with pytest.raises(model_catalog.CatalogError, match="retraining"):
         model_catalog.load_mantis_catalog(path)
 
@@ -339,9 +365,7 @@ def test_manifest_artifact_fingerprint_mismatch_rejected(tmp_path):
         "training_artifact_sha256": "0" * 64,
         "slot_order": list(SLOTS),
         "conductor": CONDUCTOR,
-        "workers": {
-            slot: {"model_identity": f"logical/{slot}"} for slot in SLOTS
-        },
+        "workers": {slot: {"model_identity": f"logical/{slot}"} for slot in SLOTS},
     }
     path = tmp_path / "abi_manifest.json"
     path.write_text(json.dumps(manifest))
@@ -352,23 +376,27 @@ def test_manifest_artifact_fingerprint_mismatch_rejected(tmp_path):
 def test_adapter_protocol_incompatibility_rejected(tmp_path):
     # Worker asks for responses on an opencode-go adapter even though the
     # provider declares no protocols: the adapter capability check must fire.
-    worker_mismatch = _catalog().replace(
-        "[providers.code]\n"
-        'adapter = "opencode-go"\n'
-        'base_url = "https://code.example.test/v1"\n'
-        'credential_env = "CODE_KEY"\n'
-        'protocols = ["chat_completions"]',
-        "[providers.code]\n"
-        'adapter = "opencode-go"\n'
-        'base_url = "https://code.example.test/v1"\n'
-        'credential_env = "CODE_KEY"',
-        1,
-    ).replace(
-        f'provider = "code"\nupstream_model = "vendor/{DEEPSEEK}"\n'
-        f'model_identity = "{DEEPSEEK_IDENTITY}"\nprotocols = ["chat_completions"]',
-        f'provider = "code"\nupstream_model = "vendor/{DEEPSEEK}"\n'
-        f'model_identity = "{DEEPSEEK_IDENTITY}"\nprotocols = ["responses"]',
-        1,
+    worker_mismatch = (
+        _catalog()
+        .replace(
+            "[providers.code]\n"
+            'adapter = "opencode-go"\n'
+            'base_url = "https://code.example.test/v1"\n'
+            'credential_env = "CODE_KEY"\n'
+            'protocols = ["chat_completions"]',
+            "[providers.code]\n"
+            'adapter = "opencode-go"\n'
+            'base_url = "https://code.example.test/v1"\n'
+            'credential_env = "CODE_KEY"',
+            1,
+        )
+        .replace(
+            f'provider = "code"\nupstream_model = "vendor/{DEEPSEEK}"\n'
+            f'model_identity = "{DEEPSEEK_IDENTITY}"\nprotocols = ["chat_completions"]',
+            f'provider = "code"\nupstream_model = "vendor/{DEEPSEEK}"\n'
+            f'model_identity = "{DEEPSEEK_IDENTITY}"\nprotocols = ["responses"]',
+            1,
+        )
     )
     path = _write_catalog(tmp_path, worker_mismatch)
     with pytest.raises(model_catalog.CatalogError, match="exceeds adapter capabilities"):
@@ -395,8 +423,13 @@ def test_router_provider_ids_and_identifier_grammar_accepted(tmp_path):
     """Modal and openai-compatible adapters are shared ids."""
     abi = model_catalog.load_abi_manifest()
     provider_order = [
-        "modal.prod", "generic.openai", "code", "router",
-        "router", "generic.openai", "generic.openai",
+        "modal.prod",
+        "generic.openai",
+        "code",
+        "router",
+        "router",
+        "generic.openai",
+        "generic.openai",
     ]
     # The conductor slot speaks responses; route it through a responses-capable
     # provider (openrouter) regardless of its position in the slot order.
@@ -427,18 +460,17 @@ def test_router_provider_ids_and_identifier_grammar_accepted(tmp_path):
         'adapter = "opencode-go"\n'
         'base_url = "https://code.example.test/v1"\n'
         'credential_env = "CODE_KEY"\n\n'
-        "[providers.\"modal.prod\"]\n"
+        '[providers."modal.prod"]\n'
         'adapter = "modal"\n'
         'base_url = "https://modal.example.test/v1"\n'
         'credential_env = "MODAL_KEY"\n\n'
-        "[providers.\"generic.openai\"]\n"
+        '[providers."generic.openai"]\n'
         'adapter = "openai-compatible"\n'
         'base_url = "https://generic.example.test/v1"\n'
         'credential_env = "GENERIC_KEY"\n\n'
         "[mantis]\n"
         f"slot_order = {json.dumps(list(abi.slot_order))}\n"
-        f'conductor = "{abi.conductor}"\n'
-        + "\n".join(workers)
+        f'conductor = "{abi.conductor}"\n' + "\n".join(workers)
     )
     path = _write_catalog(tmp_path, content)
     catalog = model_catalog.load_mantis_catalog(path, require_contract=False)
@@ -453,9 +485,9 @@ def test_router_provider_ids_and_identifier_grammar_accepted(tmp_path):
 
 
 def test_shared_catalog_fixture_both_consumers_parse(tmp_path):
-    path = _write_catalog(tmp_path, _shared_catalog(model_catalog.abi_contract(
-        model_catalog.load_abi_manifest()
-    )))
+    path = _write_catalog(
+        tmp_path, _shared_catalog(model_catalog.abi_contract(model_catalog.load_abi_manifest()))
+    )
     catalog = model_catalog.load_mantis_catalog(path)
     assert catalog is not None
     assert {binding.adapter for binding in catalog.bindings.providers.values()} >= {
@@ -567,9 +599,7 @@ def test_runtime_bindings_reject_identity_drift(monkeypatch):
     bindings = model_catalog._runtime_bindings(
         json.loads(json.dumps(providers)), json.loads(json.dumps(workers))
     )
-    contract = model_catalog_runtime._runtime_contract_hash(
-        bindings, tuple(SLOTS), CONDUCTOR
-    )
+    contract = model_catalog_runtime._runtime_contract_hash(bindings, tuple(SLOTS), CONDUCTOR)
     _set_runtime_env(monkeypatch, providers, workers, contract=contract)
     mutated = copy.deepcopy(workers)
     mutated[CONDUCTOR]["model_identity"] = "logical/sneaky"
@@ -756,11 +786,3 @@ def test_base_target_providers_are_in_runtime_bindings(tmp_path):
     assert catalog is not None
     assert "azure-foundry" in catalog.bindings.providers
     assert catalog.bindings.providers["azure-foundry"].adapter == "azure_ai"
-
-
-
-
-
-
-
-

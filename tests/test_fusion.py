@@ -984,14 +984,11 @@ def _stream_reasoning(response):
     return [
         json.loads(line[6:])["choices"][0]["delta"]["reasoning"]
         for line in response.text.splitlines()
-        if line.startswith("data: {")
-        and "reasoning" in json.loads(line[6:])["choices"][0]["delta"]
+        if line.startswith("data: {") and "reasoning" in json.loads(line[6:])["choices"][0]["delta"]
     ]
 
 
-def test_orchestration_stream_reasoning_is_incremental_across_tool_follow_up(
-    client, fake_worker
-):
+def test_orchestration_stream_reasoning_is_incremental_across_tool_follow_up(client, fake_worker):
     payload = {
         "model": "mantis/fusion",
         "messages": [{"role": "user", "content": "write a hello world script"}],
@@ -1738,9 +1735,7 @@ def test_fusion_unlimited_sidekick_exceeds_previous_16_round_cap(monkeypatch, tm
         [("", BASH_CALL, DEFAULT_USAGE)] * 17 + [("done after 17", None, DEFAULT_USAGE)],
     )
     monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
-    config = _fusion_config_file(
-        tmp_path, sidekick_max_tool_rounds=0, run_max_turns=64
-    )
+    config = _fusion_config_file(tmp_path, sidekick_max_tool_rounds=0, run_max_turns=64)
     monkeypatch.setattr(fusion, "_FUSION_CONFIG", config)
     run = fusion.FusionRun("unlimited-rounds", "goal", tools=[BASH_TOOL])
     coordinator = fusion.FusionCoordinator(config)
@@ -1767,9 +1762,7 @@ def test_fusion_run_guard_stops_unproductive_unlimited_sidekick(monkeypatch, tmp
         [("", BASH_CALL, DEFAULT_USAGE)],
     )
     monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
-    config = _fusion_config_file(
-        tmp_path, sidekick_max_tool_rounds=0, run_max_turns=5
-    )
+    config = _fusion_config_file(tmp_path, sidekick_max_tool_rounds=0, run_max_turns=5)
     monkeypatch.setattr(fusion, "_FUSION_CONFIG", config)
     run = fusion.FusionRun("unproductive", "goal", tools=[BASH_TOOL])
     coordinator = fusion.FusionCoordinator(config)
@@ -3502,6 +3495,42 @@ def test_fusion_router_pools_are_cheapest_first_for_every_role():
     assert main.select(escalation_count=1) == "main-strong"
     assert sidekick.select(escalation_count=0) == "side-cheap"
     assert sidekick.select(escalation_count=1) == "side-strong"
+
+
+def test_fusion_role_reasoning_fields_annotate_resolved_specs():
+    """main_reasoning/sidekick_reasoning become the spec's |effort suffix."""
+    config = fusion.FusionRoutingConfig(
+        main="openrouter/openai/gpt-5.6-sol",
+        main_reasoning="low",
+        sidekick="openrouter/openai/gpt-5.6-luna",
+        sidekick_reasoning="high",
+    )
+    assert fusion.FusionRouter(config, "main").select() == "openrouter/openai/gpt-5.6-sol|low"
+    assert fusion.FusionRouter(config, "sidekick").select() == "openrouter/openai/gpt-5.6-luna|high"
+
+
+def test_fusion_role_reasoning_is_only_a_default():
+    """An explicit |suffix or the virtual route ignores the role field."""
+    config = fusion.FusionRoutingConfig(
+        main=["openrouter/openai/gpt-5.6-sol|xhigh", "openrouter/openai/gpt-5.6-luna"],
+        main_reasoning="low",
+        sidekick="mantis/base",
+        sidekick_reasoning="low",
+    )
+    main = fusion.FusionRouter(config, "main")
+    assert main.select(escalation_count=0) == "openrouter/openai/gpt-5.6-sol|xhigh"
+    assert main.select(escalation_count=1) == "openrouter/openai/gpt-5.6-luna|low"
+    assert fusion.FusionRouter(config, "sidekick").select() == "mantis/base"
+
+
+def test_fusion_role_reasoning_keeps_base_target_effort():
+    """A base: route already carries its target's effort; the field yields."""
+    catalog = Path(__file__).resolve().parent.parent / "config" / "catalog.toml"
+    config = fusion.FusionRoutingConfig(
+        main="base:capable", main_reasoning="low", sidekick="gpt-5_6-luna"
+    )
+    router = fusion.FusionRouter.from_config(config, "main", catalog=catalog)
+    assert router.select() == "openrouter/~openai/gpt-sol-latest|high"
 
 
 def test_server_execution_does_not_hijack_a_client_declared_tool():

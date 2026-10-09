@@ -28,6 +28,7 @@ class FusionRouter:
         self.config = config
         self.role = role
         self.base_route = base_route
+        self.effort = config.main_reasoning if role == "main" else config.sidekick_reasoning
 
     @staticmethod
     def _load_base_route(catalog: str | Path | None = None) -> BaseRoute | None:
@@ -139,15 +140,25 @@ class FusionRouter:
             return "mantis/base"
 
         if spec.startswith("base:"):
-            return self._resolve_base(spec.split(":", 1)[1].strip())
+            return self._apply_effort(self._resolve_base(spec.split(":", 1)[1].strip()))
 
         # Bare "efficient" or "capable" only make sense when the base route
         # is configured; otherwise treat them as literal slot names.
         if spec in ("efficient", "capable") and self.base_route is not None:
-            return self._resolve_base(spec)
+            return self._apply_effort(self._resolve_base(spec))
 
         # Plain slot or provider/model spec.
-        return spec
+        return self._apply_effort(spec)
+
+    def _apply_effort(self, spec: str) -> str:
+        """Attach the role's default reasoning effort to a resolved spec.
+
+        An explicit ``|effort`` suffix — including one carried by a resolved
+        ``base:`` target — always wins over the role default.
+        """
+        if not self.effort or "|" in spec:
+            return spec
+        return f"{spec}|{self.effort}"
 
     def _resolve_base(self, role: str) -> str:
         if self.base_route is None:

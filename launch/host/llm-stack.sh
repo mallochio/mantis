@@ -222,16 +222,29 @@ def _slot_str(slot):
     return ", ".join(slot) if isinstance(slot, list) else str(slot)
 
 
-def _slot_effort(slot):
+def _slot_effort(slot, field=None):
     if isinstance(slot, list):
         slot = slot[0] if slot else None
-    return (workers.get(slot) or {}).get("reasoning_effort") or "none" if slot else "none"
+    if not slot:
+        return "none"
+    if slot in ("mantis/base", "base"):
+        return "dynamic"
+    role = slot.split(":", 1)[1].strip() if slot.startswith("base:") else slot
+    if role in ("efficient", "capable") and base:
+        target_eff = (targets.get(role) or {}).get("reasoning_effort")
+        return (target_eff if target_eff and target_eff != "none" else field) or "none"
+    worker = workers.get(slot)
+    if worker is not None:
+        return field or worker.get("reasoning_effort") or "none"
+    if "|" in slot:
+        return slot.rsplit("|", 1)[1].strip() or "none"
+    return field or "none"
 
 
 main_slot = fusion.get("main", "?")
 side_slot = fusion.get("sidekick", "?")
-main_eff = _slot_effort(main_slot)
-side_eff = _slot_effort(side_slot)
+main_eff = _slot_effort(main_slot, fusion.get("main_reasoning"))
+side_eff = _slot_effort(side_slot, fusion.get("sidekick_reasoning"))
 print(f"  Base:          {picker}")
 print(f"    efficient:   {eff_model} (reasoning={eff_effort}, max_tokens={eff_tokens})")
 print(f"    capable:     {cap_model} (reasoning={cap_effort}, max_tokens={cap_tokens})")

@@ -75,22 +75,27 @@ class ResolvedModelSpec:
 
 def _resolve_model_spec(spec: str, bindings: RuntimeBindings | None = None) -> ResolvedModelSpec:
     bindings = _runtime_bindings() if bindings is None else bindings
-    worker = bindings.workers.get(spec) if bindings is not None else None
+    slot_name, marker, slot_effort = spec.partition("|")
+    worker = bindings.workers.get(slot_name) if bindings is not None else None
     provider_name: str | None = None
     if worker is not None:
         provider_name = worker.provider
         provider = bindings.providers.get(provider_name) if bindings is not None else None
         if provider is None:
             raise ValueError(f"catalog worker {spec} has no provider binding")
+        # A "|effort" suffix on a slot name overrides the binding effort.
+        effort = worker.reasoning_effort if not marker else slot_effort or None
+        if effort == "none":
+            effort = None
         return ResolvedModelSpec(
             provider.adapter,
             worker.upstream_model,
-            worker.reasoning_effort,
+            effort,
             provider.base_url,
             provider.credential_env,
             provider_name,
             worker.protocols,
-            spec,
+            slot_name,
             worker.max_tokens,
             worker.context_window,
         )
@@ -249,7 +254,6 @@ def _coerce_reasoning_effort(model: str, effort: str | None) -> str | None:
     return effort
 
 
-
 def _cache_breakpoints_enabled() -> bool:
     return os.environ.get("MANTIS_CACHE_BREAKPOINTS", "1").lower() not in {
         "0",
@@ -324,12 +328,9 @@ def _normalize_upstream_tool_ids(messages: list[dict[str, Any]]) -> list[dict[st
             m["tool_call_id"] = alias(result_id)
         raw_ids = original.get("_anthropic_tool_ids")
         if isinstance(raw_ids, dict):
-            m["_anthropic_tool_ids"] = {
-                alias(str(k)): str(v) for k, v in raw_ids.items()
-            }
+            m["_anthropic_tool_ids"] = {alias(str(k)): str(v) for k, v in raw_ids.items()}
         out.append(m)
     return out
-
 
 
 _REASONING_FIELDS = frozenset(
@@ -461,8 +462,7 @@ def _sanitize_messages(
                         dict(p)
                         for p in content
                         if isinstance(p, dict)
-                        and p.get("type")
-                        not in ("thinking", "reasoning", "reasoning_content")
+                        and p.get("type") not in ("thinking", "reasoning", "reasoning_content")
                     ]
             if keep_reasoning:
                 _portable_reasoning_details(msg)
@@ -485,11 +485,13 @@ def _sanitize_messages(
                     msg["content"] = f"{prefix}\n{existing}" if existing else prefix
                 # Emit telemetry for each reasoning drop.
                 if dropped_fields and produced_by:
-                    reasoning_dropped.append({
-                        "source_model": str(produced_by),
-                        "target_model": model,
-                        "fields": ",".join(sorted(dropped_fields)),
-                    })
+                    reasoning_dropped.append(
+                        {
+                            "source_model": str(produced_by),
+                            "target_model": model,
+                            "fields": ",".join(sorted(dropped_fields)),
+                        }
+                    )
             if not is_anthropic:
                 for k in ("_anthropic_content", "_anthropic_tool_ids"):
                     msg.pop(k, None)
@@ -502,12 +504,14 @@ def _sanitize_messages(
         sanitized.append(msg)
     # Telemetry: emit progress events for reasoning drops (Improvement 5).
     for drop in reasoning_dropped:
-        _emit_progress({
-            "type": "reasoning_dropped",
-            "source_model": drop["source_model"],
-            "target_model": drop["target_model"],
-            "fields": drop["fields"],
-        })
+        _emit_progress(
+            {
+                "type": "reasoning_dropped",
+                "source_model": drop["source_model"],
+                "target_model": drop["target_model"],
+                "fields": drop["fields"],
+            }
+        )
     return sanitized
 
 
@@ -547,8 +551,7 @@ def _clear_thinking(
     if keep < 0:
         return messages
     assistant_indices = [
-        i for i, m in enumerate(messages)
-        if isinstance(m, dict) and m.get("role") == "assistant"
+        i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "assistant"
     ]
     if len(assistant_indices) <= keep:
         return messages
@@ -564,8 +567,12 @@ def _clear_thinking(
             content = msg.get("content")
             if isinstance(content, list):
                 msg["content"] = [
-                    p for p in content
-                    if not (isinstance(p, dict) and p.get("type") in ("thinking", "reasoning", "reasoning_content"))
+                    p
+                    for p in content
+                    if not (
+                        isinstance(p, dict)
+                        and p.get("type") in ("thinking", "reasoning", "reasoning_content")
+                    )
                 ]
             for k in ("_anthropic_content",):
                 msg.pop(k, None)
@@ -703,14 +710,18 @@ def _litellm_kwargs(
 
     # sanitize + cache
     is_anthropic = _is_anthropic_spec(resolved)
-    sanitized = _sanitize_messages(_normalize_upstream_tool_ids(messages), resolved.model, is_anthropic, False)
+    sanitized = _sanitize_messages(
+        _normalize_upstream_tool_ids(messages), resolved.model, is_anthropic, False
+    )
     # LiteLLM translates cache_control; keep mantis policy for explicit dialects.
     sanitized = _apply_litellm_cache_markers(sanitized, resolved, is_anthropic)
 
     kwargs: dict[str, Any] = {
         "model": model,
         "messages": sanitized,
-        "max_tokens": max_tokens if resolved.max_tokens is None else min(max_tokens, resolved.max_tokens),
+        "max_tokens": max_tokens
+        if resolved.max_tokens is None
+        else min(max_tokens, resolved.max_tokens),
     }
     # api base / key for openai-compatible
     if resolved.adapter not in _LITELLM_KNOWN:
@@ -787,20 +798,31 @@ def _build_request(
     # for test assertions (model, messages, headers).
     key = None
     if resolved.binding:
-        key = _provider_keys().get(resolved.binding) or __import__("os").environ.get(resolved.credential_env)
+        key = _provider_keys().get(resolved.binding) or __import__("os").environ.get(
+            resolved.credential_env
+        )
     else:
         key = __import__("os").environ.get(resolved.credential_env)
     if not key:
         key = "test-key"
     # build minimal legacy body that tests inspect
-    kwargs = _litellm_kwargs(resolved, messages, max_tokens, temperature, tools, tool_choice, response_format, controls or {})
+    kwargs = _litellm_kwargs(
+        resolved,
+        messages,
+        max_tokens,
+        temperature,
+        tools,
+        tool_choice,
+        response_format,
+        controls or {},
+    )
     # legacy url shape: base_url + /chat/completions or /responses
     is_anthropic = _is_anthropic_spec(resolved)
     # old tests check for /responses when model is openai on openrouter or when
     # the worker declares responses protocol
-    use_responses = (
-        resolved.adapter == "openrouter" and resolved.model.startswith("openai/")
-    ) or (resolved.protocols is not None and "responses" in resolved.protocols)
+    use_responses = (resolved.adapter == "openrouter" and resolved.model.startswith("openai/")) or (
+        resolved.protocols is not None and "responses" in resolved.protocols
+    )
     if is_anthropic:
         path = "v1/messages"
     elif use_responses:
@@ -810,11 +832,24 @@ def _build_request(
     url = f"{resolved.base_url}/{path}"
     headers: dict[str, str]
     if is_anthropic:
-        headers = {"x-api-key": key, "anthropic-version": "2023-06-01", "Content-Type": "application/json", "User-Agent": "Mantis"}
+        headers = {
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+            "User-Agent": "Mantis",
+        }
     else:
-        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json", "User-Agent": "OpenAI/Python"}
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "User-Agent": "OpenAI/Python",
+        }
     # body for assertions: include model, messages (possibly cache-marked), tools
-    body: dict[str, Any] = {"model": resolved.model, "messages": kwargs.get("messages", messages), "max_tokens": kwargs.get("max_tokens", max_tokens)}
+    body: dict[str, Any] = {
+        "model": resolved.model,
+        "messages": kwargs.get("messages", messages),
+        "max_tokens": kwargs.get("max_tokens", max_tokens),
+    }
     if kwargs.get("tools"):
         body["tools"] = kwargs["tools"]
     if kwargs.get("tool_choice") is not None:
@@ -872,7 +907,11 @@ def _response_to_dict(resp: Any) -> dict[str, Any]:
         if isinstance(annotations, list) and annotations:
             msg_dict["annotations"] = annotations
         # preserve anthropic replay metadata if present on raw response
-        raw_msg = getattr(resp, "_hidden_params", {}).get("original_response") if hasattr(resp, "_hidden_params") else None
+        raw_msg = (
+            getattr(resp, "_hidden_params", {}).get("original_response")
+            if hasattr(resp, "_hidden_params")
+            else None
+        )
         if isinstance(raw_msg, dict):
             for k in ("_anthropic_content", "_anthropic_tool_ids"):
                 if k in msg:
@@ -884,7 +923,9 @@ def _response_to_dict(resp: Any) -> dict[str, Any]:
     if u is not None:
         if isinstance(u, dict):
             usage = {
-                k: u[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens") if isinstance(u.get(k), int)
+                k: u[k]
+                for k in ("prompt_tokens", "completion_tokens", "total_tokens")
+                if isinstance(u.get(k), int)
             }
             details = u.get("prompt_tokens_details") or {}
             if isinstance(details, dict) and isinstance(details.get("cached_tokens"), int):
@@ -897,7 +938,11 @@ def _response_to_dict(resp: Any) -> dict[str, Any]:
             }
             details = getattr(u, "prompt_tokens_details", None)
             if details is not None:
-                cached = getattr(details, "cached_tokens", None) if not isinstance(details, dict) else details.get("cached_tokens")
+                cached = (
+                    getattr(details, "cached_tokens", None)
+                    if not isinstance(details, dict)
+                    else details.get("cached_tokens")
+                )
                 if isinstance(cached, int):
                     usage["prompt_tokens_details"] = {"cached_tokens": cached}
             # fallback: litellm sometimes puts cached_tokens top-level
@@ -906,7 +951,10 @@ def _response_to_dict(resp: Any) -> dict[str, Any]:
                 if isinstance(cached, int):
                     usage["prompt_tokens_details"] = {"cached_tokens": cached}
 
-    out: dict[str, Any] = {"choices": choices or [{"message": {"role": "assistant", "content": None}}], "usage": usage}
+    out: dict[str, Any] = {
+        "choices": choices or [{"message": {"role": "assistant", "content": None}}],
+        "usage": usage,
+    }
     # surface litellm cost if available
     hidden = getattr(resp, "_hidden_params", None)
     if isinstance(hidden, dict) and isinstance(hidden.get("response_cost"), (int, float)):
@@ -920,6 +968,7 @@ def _litellm_completion(**kwargs: Any) -> Any:
 
 
 # -- Public seam ------------------------------------------------------------
+
 
 def _failover_attempts(spec: str, bindings: RuntimeBindings | None = None) -> list[str]:
     try:
@@ -965,40 +1014,80 @@ def _provider_response(
         try:
             resolved = _resolve_model_spec(attempt, bindings)
             kwargs = _litellm_kwargs(
-                resolved, messages, max_tokens, temperature, tools, tool_choice, response_format, controls
+                resolved,
+                messages,
+                max_tokens,
+                temperature,
+                tools,
+                tool_choice,
+                response_format,
+                controls,
             )
             if timeout_s is not None:
                 # litellm respects timeout via kwargs; compute remaining
                 remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
                 if remaining is not None and remaining <= 0:
-                    raise Timeout(message="Fusion provider deadline exceeded", model=attempt, llm_provider=resolved.adapter)
+                    raise Timeout(
+                        message="Fusion provider deadline exceeded",
+                        model=attempt,
+                        llm_provider=resolved.adapter,
+                    )
                 kwargs["timeout"] = remaining
-            _emit_progress({"type": "provider", "status": "started", "model": attempt, "attempt": index + 1, "summary": "Calling a model"})
+            _emit_progress(
+                {
+                    "type": "provider",
+                    "status": "started",
+                    "model": attempt,
+                    "attempt": index + 1,
+                    "summary": "Calling a model",
+                }
+            )
             resp = _litellm_completion(**kwargs)
             data = _response_to_dict(resp)
             break
         except Exception as error:  # noqa: BLE001
             # classify transient vs fatal
-            transient = isinstance(error, (RateLimitError, APIConnectionError, ServiceUnavailableError, Timeout, APIError))
+            transient = isinstance(
+                error,
+                (RateLimitError, APIConnectionError, ServiceUnavailableError, Timeout, APIError),
+            )
             status = getattr(error, "status_code", None)
             if status is None and hasattr(error, "response"):
                 try:
                     status = getattr(error.response, "status_code", None)
                 except Exception:
                     status = None
-            if isinstance(error, RateLimitError) or (isinstance(status, int) and status in _TRANSIENT_STATUSES):
+            if isinstance(error, RateLimitError) or (
+                isinstance(status, int) and status in _TRANSIENT_STATUSES
+            ):
                 transient = True
             if transient:
                 failures.append(f"{attempt}: {type(error).__name__}")
                 rec = getattr(serve_config._history_context, "active_run", None)
                 if rec is not None:
-                    rec.record_activity("failover", model=attempt, status="failed", attempt=index + 1, detail=str(error)[:300])
+                    rec.record_activity(
+                        "failover",
+                        model=attempt,
+                        status="failed",
+                        attempt=index + 1,
+                        detail=str(error)[:300],
+                    )
                 # try next attempt
                 if index == len(_failover_attempts(spec, bindings)) - 1:
-                    raise RuntimeError(f"{spec} failed on every pool worker: " + "; ".join(failures)) from error
+                    raise RuntimeError(
+                        f"{spec} failed on every pool worker: " + "; ".join(failures)
+                    ) from error
                 continue
             # fatal: surface immediately
-            _emit_progress({"type": "provider", "status": "failed", "model": attempt, "attempt": index + 1, "summary": f"Model call failed: {error}"})
+            _emit_progress(
+                {
+                    "type": "provider",
+                    "status": "failed",
+                    "model": attempt,
+                    "attempt": index + 1,
+                    "summary": f"Model call failed: {error}",
+                }
+            )
             raise RuntimeError(f"{attempt} failed: {error}") from error
     else:
         raise RuntimeError(f"{spec} failed on every pool worker: " + "; ".join(failures))
@@ -1019,19 +1108,29 @@ def _provider_response(
         message = (data.get("choices") or [{}])[0].get("message", {})
         if run.capture_metadata and isinstance(message, dict):
             run.response_metadata = {
-                key: message[key] for key in ("reasoning", "reasoning_details", "annotations", "citations") if message.get(key) is not None
+                key: message[key]
+                for key in ("reasoning", "reasoning_details", "annotations", "citations")
+                if message.get(key) is not None
             }
     prompt_details = usage.get("prompt_tokens_details")
-    cached_tokens = prompt_details.get("cached_tokens", 0) if isinstance(prompt_details, dict) else 0
+    cached_tokens = (
+        prompt_details.get("cached_tokens", 0) if isinstance(prompt_details, dict) else 0
+    )
     _emit_progress(
         {
             "type": "provider",
             "status": "completed",
             "model": attempt,
             "attempt": index + 1,
-            "usage": {k: usage[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens") if isinstance(usage.get(k), int)},
+            "usage": {
+                k: usage[k]
+                for k in ("prompt_tokens", "completion_tokens", "total_tokens")
+                if isinstance(usage.get(k), int)
+            },
             "cached_tokens": cached_tokens,
-            "summary": f"Model call completed ({cached_tokens} cached input tokens)" if cached_tokens else "Model call completed",
+            "summary": f"Model call completed ({cached_tokens} cached input tokens)"
+            if cached_tokens
+            else "Model call completed",
         }
     )
     # strip internal helper key before returning to callers
@@ -1049,12 +1148,17 @@ def _direct_completion(
 
 # -- Cost (kept for reporting; prefers litellm hidden cost, falls back to price table) --
 
+
 def _price_entry(entry: Any) -> tuple[str, tuple[float, float], float | None] | None:
     try:
         pricing = entry["pricing"]
         cache_read = pricing.get("input_cache_read")
         cache_price = None if cache_read in (None, "") else float(cache_read)
-        return (str(entry["id"]), (float(pricing["prompt"]), float(pricing["completion"])), cache_price)
+        return (
+            str(entry["id"]),
+            (float(pricing["prompt"]), float(pricing["completion"])),
+            cache_price,
+        )
     except (AttributeError, KeyError, TypeError, ValueError):
         return None
 
@@ -1117,7 +1221,9 @@ def _price_key(model: str, prices: dict[str, tuple[float, float]]) -> str | None
     return None
 
 
-def _model_cost(model: str, tokens: dict[str, int], prices: dict[str, tuple[float, float]]) -> float | None:
+def _model_cost(
+    model: str, tokens: dict[str, int], prices: dict[str, tuple[float, float]]
+) -> float | None:
     key = _price_key(model, prices)
     if key is None:
         return None
@@ -1144,7 +1250,12 @@ def _usage_cost(usage_models: dict[str, dict[str, int]]) -> float | None:
 
 def _activity_summary(activity_type: str, role: str | None = None) -> str:
     label = {
-        "step": {"Planner": "Planned the workflow", "Thinker": "Analyzed the task", "Verifier": "Verified the answer", "Worker": "Drafted the answer"}.get(role or "", "Called a model"),
+        "step": {
+            "Planner": "Planned the workflow",
+            "Thinker": "Analyzed the task",
+            "Verifier": "Verified the answer",
+            "Worker": "Drafted the answer",
+        }.get(role or "", "Called a model"),
         "tool_call": "Requested a tool call",
         "tool_result": "Processed a tool result",
         "failover": "Provider failed; switched to the next configured model",
@@ -1161,7 +1272,12 @@ def _activity_summary(activity_type: str, role: str | None = None) -> str:
 
 
 def _running_summary(role: str) -> str:
-    return {"Planner": "Planning the workflow", "Thinker": "Analyzing the task", "Verifier": "Checking the draft", "Worker": "Drafting an answer"}.get(role, "Calling a model")
+    return {
+        "Planner": "Planning the workflow",
+        "Thinker": "Analyzing the task",
+        "Verifier": "Checking the draft",
+        "Worker": "Drafting an answer",
+    }.get(role, "Calling a model")
 
 
 def _cost_breakdown(usage_models: dict[str, dict[str, int]]) -> dict[str, Any]:
@@ -1201,13 +1317,17 @@ def _cost_breakdown(usage_models: dict[str, dict[str, int]]) -> dict[str, Any]:
                 "cached_tokens": cached,
                 "cache_hit_ratio": round(cached / prompt, 4) if prompt else 0.0,
                 "cost": round(model_cost, 6) if model_cost is not None else None,
-                "source": "litellm" if isinstance(litellm_cost, (int, float)) else ("price_table" if model_cost is not None else "unknown"),
+                "source": "litellm"
+                if isinstance(litellm_cost, (int, float))
+                else ("price_table" if model_cost is not None else "unknown"),
             }
         )
     return {
         "total": round(total, 6) if known else None,
         "known": known,
-        "source": "litellm" if isinstance(litellm_costs, dict) and known else ("price_table" if known else "partial"),
+        "source": "litellm"
+        if isinstance(litellm_costs, dict) and known
+        else ("price_table" if known else "partial"),
         "prompt_tokens": total_prompt,
         "cached_tokens": total_cached,
         "cache_hit_ratio": round(total_cached / total_prompt, 4) if total_prompt else 0.0,
@@ -1221,11 +1341,21 @@ def _run_mantis_details(run: Any, level: str) -> dict[str, Any]:
     activity: list[dict[str, Any]] = []
     if recorded:
         keep = None if level == "debug" else ("type", "role", "model", "status", "summary")
-        activity = [dict(e) if keep is None else {k: v for k, v in e.items() if k in keep} for e in recorded if any(v is not None for v in e.values())]
+        activity = [
+            dict(e) if keep is None else {k: v for k, v in e.items() if k in keep}
+            for e in recorded
+            if any(v is not None for v in e.values())
+        ]
     else:
         for step in steps:
             role = str(step.get("role", ""))
-            entry = {"type": "step", "role": role, "model": step.get("model_name"), "status": "completed", "summary": _activity_summary("step", role)}
+            entry = {
+                "type": "step",
+                "role": role,
+                "model": step.get("model_name"),
+                "status": "completed",
+                "summary": _activity_summary("step", role),
+            }
             activity.append(entry)
     usage = _cost_breakdown(getattr(run, "usage_models", {}))
     details: dict[str, Any] = {"activity": activity, "usage": usage}
