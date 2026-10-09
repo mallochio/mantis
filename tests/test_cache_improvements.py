@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import api
 import base_proxy
 
 
@@ -13,76 +12,6 @@ class _BaseBody:
         self.metadata = metadata
         self.user = user
         self.stream = False
-
-
-def _azure_request(first: str, second: str | None = None):
-    msgs = [api.Message(role="user", content=first)]
-    if second is not None:
-        msgs.append(api.Message(role="assistant", content="ok"))
-        msgs.append(api.Message(role="user", content=second))
-    return api.ChatRequest(model="mantis/azure-router", messages=msgs)
-
-
-def test_azure_session_key_isolates_conversations_sharing_harness_header():
-    headers = {"x-mantis-session-id": "opencode"}
-    first = _azure_request("fix failing test")
-    second = _azure_request("write migration docs")
-    key_first = api._azure_session_key(first, headers)
-    key_second = api._azure_session_key(second, headers)
-    assert key_first is not None and key_second is not None
-    assert key_first != key_second
-    assert key_first.startswith("explicit:opencode:")
-    assert key_second.startswith("explicit:opencode:")
-
-
-def test_azure_session_key_stable_across_turns():
-    headers = {"x-mantis-session-id": "opencode"}
-    turn_one = _azure_request("fix failing test")
-    turn_two = _azure_request("fix failing test", "run pytest again")
-    assert api._azure_session_key(turn_one, headers) == api._azure_session_key(
-        turn_two, headers
-    )
-
-
-def test_azure_tail_only_send_with_isolated_key():
-    api._azure_sessions.clear()
-    try:
-        headers = {"x-mantis-session-id": "prime-agent"}
-        first = _azure_request("remember falcon")
-        full_first = [
-            m
-            for m in (api._azure_canonical_message(m) for m in first.messages)
-            if m
-        ]
-        full_first.append(
-            {
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": "ok"}],
-            }
-        )
-        api._azure_sessions[api._azure_session_key(first, headers)] = (
-            "resp-1",
-            full_first,
-        )
-        second = api.ChatRequest(
-            model="mantis/azure-router",
-            messages=[
-                api.Message(role="user", content="remember falcon"),
-                api.Message(role="assistant", content="ok"),
-                api.Message(role="user", content="which word?"),
-            ],
-        )
-        tail, previous = api._azure_input_for_request(second, headers)
-        assert previous == "resp-1"
-        assert len(tail) == 1
-    finally:
-        api._azure_sessions.clear()
-
-
-def test_azure_max_tokens_cap_matches_harness():
-    request = _azure_request("hi")
-    assert api._azure_router_max_tokens(request) == 131072
 
 
 def test_base_session_id_isolates_shared_harness_header():

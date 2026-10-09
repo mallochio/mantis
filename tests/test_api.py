@@ -4,7 +4,6 @@ import json
 import threading
 import time
 from types import SimpleNamespace
-from typing import Any
 
 import api
 import providers
@@ -1240,7 +1239,6 @@ def test_experimental_modes_are_hidden_and_rejected_by_default(client, monkeypat
     models = client.get("/v1/models", headers=_headers()).json()["data"]
     assert [(item["id"], item["status"]) for item in models] == [
         ("mantis/base", "stable"),
-        ("mantis/azure-router", "stable"),
         ("mantis/fusion", "stable"),
     ]
 
@@ -1281,7 +1279,6 @@ def test_experimental_startup_exposes_and_allows_trinity_and_ultra(client, monke
     models = client.get("/v1/models", headers=_headers()).json()["data"]
     assert [(item["id"], item["status"]) for item in models] == [
         ("mantis/base", "stable"),
-        ("mantis/azure-router", "stable"),
         ("mantis/trinity", "experimental"),
         ("mantis/ultra", "experimental"),
         ("mantis/fusion", "stable"),
@@ -1516,155 +1513,3 @@ def test_sanitize_messages_no_telemetry_for_untagged():
         assert len(dropped) == 0
     finally:
         serve_config._history_context.event_sink = None
-
-
-def test_azure_router_complete_direct_uses_previous_response_id(monkeypatch):
-    """The direct Azure call sends previous_response_id when a session exists."""
-    from types import SimpleNamespace
-
-    calls: list[dict[str, Any]] = []
-
-    def fake_create(**kwargs: Any) -> SimpleNamespace:
-        calls.append(kwargs)
-        return SimpleNamespace(
-            id="resp-2",
-            output=[
-                SimpleNamespace(
-                    type="message",
-                    content=[SimpleNamespace(type="output_text", text=" Falcon.")],
-                )
-            ],
-            usage=SimpleNamespace(input_tokens=5, output_tokens=2, total_tokens=7),
-            created_at=1234567890,
-        )
-
-    fake_client = SimpleNamespace(responses=SimpleNamespace(create=fake_create))
-    monkeypatch.setattr(api.openai, "OpenAI", lambda **_: fake_client)
-    resolved = SimpleNamespace(
-        base_url="https://example.openai.azure.com",
-        credential_env="AZURE_API_KEY",
-        model="model-router",
-    )
-    monkeypatch.setattr(api.providers, "_resolve_model_spec", lambda _: resolved)
-    monkeypatch.setattr(api.providers, "_provider_keys", lambda: {})
-    monkeypatch.setenv("AZURE_API_KEY", "test-key")
-
-    first = api.ChatRequest(
-        model="mantis/azure-router",
-        messages=[api.Message(role="user", content="remember falcon")],
-        user="u2",
-    )
-    body1 = api._complete_direct(first, None)
-    assert body1["choices"][0]["message"]["content"] == " Falcon."
-    assert "previous_response_id" not in calls[-1]
-
-    second = api.ChatRequest(
-        model="mantis/azure-router",
-        messages=[
-            api.Message(role="user", content="remember falcon"),
-            api.Message(role="assistant", content=" Falcon."),
-            api.Message(role="user", content="which word?"),
-        ],
-        user="u2",
-    )
-    body2 = api._complete_direct(second, None)
-    assert body2["choices"][0]["message"]["content"] == " Falcon."
-    assert calls[-1]["previous_response_id"] == "resp-2"
-    api._azure_sessions.clear()
-
-
-def test_azure_router_session_reuses_previous_response_id():
-    """Extending an Azure session sends only new input with previous_response_id."""
-    api._azure_sessions.clear()
-    req1 = api.ChatRequest(
-        model="mantis/azure-router",
-        messages=[api.Message(role="user", content="first")],
-        user="u1",
-    )
-    input1, prev1 = api._azure_input_for_request(req1, None)
-    first_text = [{"type": "input_text", "text": "first"}]
-    expected_user = {"type": "message", "role": "user", "content": first_text}
-    assert input1 == [expected_user]
-    assert prev1 is None
-    full1 = [m for m in (api._azure_canonical_message(m) for m in req1.messages) if m]
-    assistant_response = [{"type": "output_text", "text": "ok"}]
-    full1.append({"type": "message", "role": "assistant", "content": assistant_response})
-    api._azure_store_session(req1, None, full1, "resp-1")
-
-    req2 = api.ChatRequest(
-        model="mantis/azure-router",
-        messages=[
-            api.Message(role="user", content="first"),
-            api.Message(role="assistant", content="ok"),
-            api.Message(role="user", content="second"),
-        ],
-        user="u1",
-    )
-    input2, prev2 = api._azure_input_for_request(req2, None)
-    second_text = [{"type": "input_text", "text": "second"}]
-    expected_second = {"type": "message", "role": "user", "content": second_text}
-    assert input2 == [expected_second]
-    assert prev2 == "resp-1"
-
-    # Shortening the conversation resets the cached prefix.
-    req3 = api.ChatRequest(
-        model="mantis/azure-router",
-        messages=[api.Message(role="user", content="first")],
-        user="u1",
-    )
-    input3, prev3 = api._azure_input_for_request(req3, None)
-    assert input3 == [
-        expected_user,
-    ]
-    assert prev3 is None
-    api._azure_sessions.clear()
-
-
-def test_azure_router_converts_tool_history_to_responses_items():
-    """Tool rounds map to function_call items; no `tool` message role is sent."""
-    api._azure_sessions.clear()
-    req = api.ChatRequest(
-        model="mantis/azure-router",
-        messages=[
-            api.Message(role="user", content="list files"),
-            api.Message(
-                role="assistant",
-                content="",
-                tool_calls=[
-                    {
-                        "id": "call-1",
-                        "type": "function",
-                        "function": {"name": "bash", "arguments": '{"cmd": "ls"}'},
-                    }
-                ],
-            ),
-            api.Message(role="tool", tool_call_id="call-1", content="a.txt"),
-            api.Message(role="user", content="done?"),
-        ],
-        user="u-tool",
-    )
-    input_items, prev = api._azure_input_for_request(req, None)
-    assert prev is None
-    user_first = {
-        "type": "message",
-        "role": "user",
-        "content": [{"type": "input_text", "text": "list files"}],
-    }
-    call = {
-        "type": "function_call",
-        "call_id": "call-1",
-        "name": "bash",
-        "arguments": '{"cmd": "ls"}',
-    }
-    assert input_items == [
-        user_first,
-        call,
-        {"type": "function_call_output", "call_id": "call-1", "output": "a.txt"},
-        {
-            "type": "message",
-            "role": "user",
-            "content": [{"type": "input_text", "text": "done?"}],
-        },
-    ]
-    assert all(item.get("role") != "tool" for item in input_items)
-    api._azure_sessions.clear()

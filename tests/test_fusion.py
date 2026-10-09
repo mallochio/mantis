@@ -3575,7 +3575,7 @@ def test_base_route_remains_virtual_while_explicit_capable_target_resolves():
         "main",
         catalog=catalog,
     )
-    assert explicit.select(escalation_count=0).startswith("modal.kimi-k3/")
+    assert explicit.select(escalation_count=0).startswith("openrouter/openai/gpt-sol-latest")
 
 
 def test_virtual_worker_dispatches_complete_tool_trajectory_to_switchyard(monkeypatch):

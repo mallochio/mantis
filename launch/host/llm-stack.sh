@@ -232,8 +232,6 @@ main_slot = fusion.get("main", "?")
 side_slot = fusion.get("sidekick", "?")
 main_eff = _slot_effort(main_slot)
 side_eff = _slot_effort(side_slot)
-az_set = bool(os.environ.get("MANTIS_AZURE_ROUTER_BASE_URL"))
-
 print(f"  Base:          {picker}")
 print(f"    efficient:   {eff_model} (reasoning={eff_effort}, max_tokens={eff_tokens})")
 print(f"    capable:     {cap_model} (reasoning={cap_effort}, max_tokens={cap_tokens})")
@@ -241,8 +239,6 @@ print(
     f"  Fusion:        main={_slot_str(main_slot)} (reasoning={main_eff}), "
     f"sidekick={_slot_str(side_slot)} (reasoning={side_eff})"
 )
-print(f"  Azure-router:  mantis/azure-router -> model-router (reasoning=medium, context=256000)")
-print("    endpoint:    local override set" if az_set else "    endpoint:    not set (export MANTIS_AZURE_ROUTER_BASE_URL)")
 PY
   )" || output=""
   if [ -n "$output" ]; then
