@@ -154,7 +154,7 @@ def dispatch_routed(
         raise ValueError("router returned a non-chat payload")
     return RoutedResponse(
         body=payload,
-        selected_model=upstream.headers.get(SWITCHYARD_SELECTED_MODEL_HEADER),
+        selected_model=_selected_model(upstream),
         session_id=upstream.headers.get(SWITCHYARD_SESSION_HEADER) or session,
     )
 
@@ -385,9 +385,20 @@ def sanitize_routed_body(body: dict[str, Any]) -> dict[str, Any]:
     return _apply_base_cache_markers(body)
 
 
+def _selected_model(upstream: httpx.Response) -> str | None:
+    """Reported tier model with any render-time disambiguation tag removed."""
+    selected: str | None = upstream.headers.get(SWITCHYARD_SELECTED_MODEL_HEADER)
+    try:
+        from switchyard_config import strip_render_tag
+
+        return strip_render_tag(selected)
+    except Exception:  # noqa: BLE001 - reporting only; never fail the response
+        return selected
+
+
 def router_response_headers(upstream: httpx.Response, session: str | None = None) -> dict[str, str]:
     mapped: dict[str, str] = {}
-    selected = upstream.headers.get(SWITCHYARD_SELECTED_MODEL_HEADER)
+    selected = _selected_model(upstream)
     if selected:
         mapped["x-route-model"] = selected
     stable_session = upstream.headers.get(SWITCHYARD_SESSION_HEADER) or session

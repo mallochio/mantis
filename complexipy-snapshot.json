@@ -36,6 +36,10 @@
     "file_name": "fusion.py",
     "functions": [
       {
+        "name": "_main_trace_delta",
+        "complexity": 24
+      },
+      {
         "name": "FusionCoordinator::_call_worker",
         "complexity": 27
       },

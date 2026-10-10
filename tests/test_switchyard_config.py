@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import io
+import os
+import shutil
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -15,6 +18,35 @@ from switchyard_config import (
     render_switchyard_toml,
     write_switchyard_toml,
 )
+
+
+def _switchyard_binary() -> str | None:
+    configured = os.environ.get("SWITCHYARD_BIN")
+    if configured and Path(configured).is_file():
+        return configured
+    return shutil.which("switchyard-server") or str(
+        Path.home() / ".cargo" / "bin" / "switchyard-server"
+    )
+
+
+def _dry_run(tmp_path: Path, text: str) -> None:
+    """Validate a rendered routes.toml with the switchyard-server dry-run."""
+    binary = _switchyard_binary()
+    if binary is None or not Path(binary).is_file():
+        pytest.skip("switchyard-server binary not installed")
+    rendered = tmp_path / "routes.toml"
+    rendered.write_text(text)
+    env = dict(os.environ)
+    for client in tomllib.loads(text).get("llm_clients", {}).values():
+        env.setdefault(client["api_key_env"], "dry-run-key")
+    result = subprocess.run(
+        [binary, "--config", str(rendered), "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def _catalog(*, extra: str = "") -> str:
@@ -80,7 +112,13 @@ def test_shipped_catalog_renders_stage_router():
         rendered_target = parsed["targets"][role]
         rendered_client = parsed["llm_clients"][rendered_target["llm_client"]]
 
-        assert rendered_target["id"] == target["upstream_model"]
+        expected_id = target["upstream_model"]
+        if (
+            role == "capable"
+            and base["targets"]["efficient"]["upstream_model"] == target["upstream_model"]
+        ):
+            expected_id += ":capable"
+        assert rendered_target["id"] == expected_id
         assert rendered_client["api_key_env"] == provider["credential_env"]
         assert rendered_client["base_url"] == provider["base_url"]
 
@@ -152,12 +190,12 @@ def test_rejects_identical_efficient_and_capable(tmp_path):
         )
     )
     path = _write(tmp_path, content)
-    with pytest.raises(CatalogError, match="distinct"):
+    with pytest.raises(CatalogError, match="distinct targets"):
         load_switchyard_route(path)
 
 
-def test_rejects_same_model_with_different_reasoning_effort(tmp_path):
-    """Switchyard keys execution by model id, so both tiers need distinct ids."""
+def test_same_model_tiers_render_tagged_and_pass_switchyard_dry_run(tmp_path):
+    """Duplicate catalog ids stay clean in the catalog and render distinct."""
     content = (
         _catalog()
         .replace(
@@ -172,7 +210,47 @@ def test_rejects_same_model_with_different_reasoning_effort(tmp_path):
         )
     )
     path = _write(tmp_path, content)
-    with pytest.raises(CatalogError, match="distinct upstream_model"):
+    route = load_switchyard_route(path)
+    assert route.efficient.upstream_model == route.capable.upstream_model
+    text = render_switchyard_toml(route)
+    parsed = tomllib.loads(text)
+    assert parsed["targets"]["efficient"]["id"] == "google/gemini-3.7-flash"
+    assert parsed["targets"]["capable"]["id"] == "google/gemini-3.7-flash:capable"
+    assert parsed["targets"]["efficient"]["llm_client"] == "litellm"
+    assert parsed["targets"]["capable"]["llm_client"] == "litellm"
+    assert parsed["targets"]["efficient"]["extra_body"]["reasoning_effort"] == "medium"
+    assert parsed["targets"]["capable"]["extra_body"]["reasoning_effort"] == "high"
+    _dry_run(tmp_path, text)
+
+
+def test_shipped_catalog_duplicate_ids_pass_switchyard_dry_run(tmp_path):
+    _dry_run(
+        tmp_path,
+        render_switchyard_toml(load_switchyard_route(Path("config/catalog.toml"))),
+    )
+
+
+def test_rejects_inverted_reasoning_effort_for_same_model(tmp_path):
+    content = (
+        _catalog()
+        .replace(
+            'upstream_model = "anthropic/claude-opus-5"',
+            'upstream_model = "google/gemini-3.7-flash"',
+            1,
+        )
+        .replace(
+            'reasoning_effort = "medium"\nmax_tokens = 65536\n',
+            'reasoning_effort = "high"\nmax_tokens = 65536\n',
+            1,
+        )
+        .replace(
+            'reasoning_effort = "medium"\nmax_tokens = 128000\n',
+            'reasoning_effort = "low"\nmax_tokens = 65536\n',
+            1,
+        )
+    )
+    path = _write(tmp_path, content)
+    with pytest.raises(CatalogError, match="must not exceed"):
         load_switchyard_route(path)
 
 

@@ -27,6 +27,7 @@ from model_catalog_schema import (
 )
 
 SWITCHYARD_ROUTE_ID = "mantis/base"
+RENDER_TAG_ROLES = ("capable", "efficient")
 
 
 def load_catalog_root(path: str | Path | None = None) -> tuple[Path, dict[str, Any]]:
@@ -52,6 +53,32 @@ def load_catalog_root(path: str | Path | None = None) -> tuple[Path, dict[str, A
 def load_switchyard_route(path: str | Path | None = None) -> BaseRoute:
     _selected, root = load_catalog_root(path)
     return load_base_route(root)
+
+
+def render_target_id(route: BaseRoute, role: str) -> str:
+    """Target id as rendered into routes.toml, tier-tagged only on collision.
+
+    Switchyard keys execution by model id within one route, so two tiers that
+    share the catalog's upstream_model id still need distinct rendered ids to
+    keep their own extra_body. The tag rides the ``:`` slug-suffix syntax the
+    upstream resolves like the untagged id, and is stripped from ids reported
+    back to callers by :func:`strip_render_tag`.
+    """
+    target = route.efficient if role == "efficient" else route.capable
+    if role == "capable" and route.efficient.upstream_model == route.capable.upstream_model:
+        return f"{target.upstream_model}:{role}"
+    return target.upstream_model
+
+
+def strip_render_tag(model_id: str | None) -> str | None:
+    """Remove a render-time tier tag from a Switchyard-reported model id."""
+    if not isinstance(model_id, str) or not model_id:
+        return model_id
+    for role in RENDER_TAG_ROLES:
+        suffix = f":{role}"
+        if len(model_id) > len(suffix) and model_id.endswith(suffix):
+            return model_id[: -len(suffix)]
+    return model_id
 
 
 def _toml_str(value: str) -> str:
@@ -130,13 +157,23 @@ def _render_client(key: str, provider: ProviderBinding, wire_format: str) -> str
     )
 
 
-def _render_target(target: BaseTarget, client_key: str) -> str:
+def _render_target(target: BaseTarget, client_key: str, target_id: str) -> str:
     return (
         f"[targets.{target.role}]\n"
-        f"id = {_toml_str(target.upstream_model)}\n"
+        f"id = {_toml_str(target_id)}\n"
         f"llm_client = {_toml_str(client_key)}\n"
         f"{_target_extra_body(target)}"
     )
+
+
+def _render_targets(route: BaseRoute, keys: dict[str, str]) -> str:
+    """Render both tier targets with render-disambiguated ids."""
+    roles = (("efficient", route.efficient), ("capable", route.capable))
+    rendered = (
+        _render_target(target, keys[role], render_target_id(route, role))
+        for role, target in roles
+    )
+    return "".join(rendered)
 
 
 def render_switchyard_toml(route: BaseRoute) -> str:
@@ -145,9 +182,8 @@ def render_switchyard_toml(route: BaseRoute) -> str:
         role: _client_key_for(target.provider, route.providers[target.provider], target.wire_format)
         for role, target in (("efficient", route.efficient), ("capable", route.capable))
     }
-    # Switchyard keys execution by model id, so catalog validation already
-    # guarantees the two tiers carry distinct upstream_model ids; both can
-    # safely share one llm_client entry when they ride the same provider.
+    # Duplicate catalog ids are tier-tagged by render_target_id, so both tiers
+    # can safely share one llm_client entry when they ride the same provider.
     route_block = "\n".join(
         [
             "[routes.mantis_base]",
@@ -166,8 +202,7 @@ def render_switchyard_toml(route: BaseRoute) -> str:
         f"# generated from catalog [base] revision {route.revision}\n"
         "\n"
         f"{_render_clients(route, keys)}"
-        f"{_render_target(route.efficient, keys['efficient'])}"
-        f"{_render_target(route.capable, keys['capable'])}"
+        f"{_render_targets(route, keys)}"
         f"{route_block}"
     )
 

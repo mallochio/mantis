@@ -540,6 +540,34 @@ def test_dispatch_routed_returns_tool_calls_and_route_diagnostics():
     assert result.session_id == "run-1:main"
 
 
+def test_dispatch_routed_strips_render_tag_from_selected_model():
+    """Duplicate-id routes render tier-tagged ids; reporting stays catalog-clean."""
+
+    async def handler(_request):
+        return httpx.Response(
+            200,
+            json={"id": "routed", "choices": [{"message": {"content": "ok"}}]},
+            headers={
+                base_proxy.SWITCHYARD_SELECTED_MODEL_HEADER: "~openai/gpt-sol-latest:capable"
+            },
+        )
+
+    result = base_proxy.dispatch_routed(
+        {"model": "mantis/base", "messages": [{"role": "user", "content": "hi"}]},
+        None,
+        lambda: _async_switchyard_client(handler),
+    )
+    assert result.selected_model == "~openai/gpt-sol-latest"
+
+
+def test_router_response_headers_strips_render_tag():
+    upstream = httpx.Response(
+        200,
+        headers={base_proxy.SWITCHYARD_SELECTED_MODEL_HEADER: "vendor/model:efficient"},
+    )
+    assert base_proxy.router_response_headers(upstream)["x-route-model"] == "vendor/model"
+
+
 def test_dispatch_routed_enforces_absolute_deadline_on_slow_trickle():
     class TrickleStream(httpx.AsyncByteStream):
         closed = False
@@ -709,7 +737,7 @@ def test_shipped_catalog_routes_gpt_sol_latest_low_high(monkeypatch):
     assert route.efficient.upstream_model == "~openai/gpt-sol-latest"
     assert route.efficient.reasoning_effort == "medium"
     assert route.capable.provider == "openrouter"
-    assert route.capable.upstream_model == "openai/gpt-6.1-sol"
+    assert route.capable.upstream_model == "~openai/gpt-sol-latest"
     assert route.capable.reasoning_effort == "high"
     assert route.capable.wire_format == "openai_chat"
 

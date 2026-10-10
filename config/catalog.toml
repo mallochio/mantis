@@ -57,9 +57,8 @@ protocols = ["chat_completions"]
 [base]
 # Switchyard stage-router for mantis/base
 # Swap efficient/capable models or their providers here; launch regenerates routes.toml.
-# Switchyard keys execution by model id, so the tiers need distinct upstream_model
-# ids. The capable tier pins the concrete version the ~openai/gpt-sol-latest alias
-# currently resolves to; bump it when the family moves to a new version.
+# Identical upstream_model ids across the tiers are fine; the routes.toml
+# renderer disambiguates them without changing what the upstream resolves.
 revision = "gpt-sol-latest-medium-high-2026-10-10"
 picker = "efficient_first"
 confidence_threshold = 0.5
@@ -75,7 +74,7 @@ upstream_model = "~openai/gpt-sol-latest"
 provider = "openrouter"
 reasoning_effort = "high"
 max_tokens = 128000
-upstream_model = "openai/gpt-6.1-sol"
+upstream_model = "~openai/gpt-sol-latest"
 
 [mantis]
 slot_order = [

@@ -19,6 +19,9 @@ _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _CONTRACT = re.compile(r"[0-9a-f]{64}\Z")
 PROTOCOLS = frozenset({"chat_completions", "responses", "anthropic_messages"})
 EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
+# Ordered weakest to strongest. Reasoning tokens bill as output tokens, so this
+# is a cost ordering when the upstream model is the same for both targets.
+_EFFORT_RANK = ("none", "low", "medium", "high", "xhigh", "max")
 # Adapter -> supported wire protocols. The Anthropic adapter retains signed
 # thinking blocks across tool continuations for Claude on Bedrock.
 ADAPTER_PROTOCOLS = {
@@ -215,6 +218,32 @@ def _max_tokens(value: Any, label: str) -> int | None:
     return value
 
 
+def _validate_effort_ordering(efficient: BaseTarget, capable: BaseTarget) -> None:
+    """Reject an efficient target that reasons harder than the capable one.
+
+    Only applies when both targets route to the same upstream model. Across
+    different models, effort is not a reliable cost signal (a cheap model at
+    high effort can cost less per turn than a strong model at medium), so the
+    guard is skipped there.
+    """
+    if efficient.upstream_model != capable.upstream_model or efficient.provider != capable.provider:
+        return
+    if efficient.reasoning_effort is None or capable.reasoning_effort is None:
+        return
+    try:
+        low = _EFFORT_RANK.index(efficient.reasoning_effort)
+        high = _EFFORT_RANK.index(capable.reasoning_effort)
+    except ValueError:  # pragma: no cover - EFFORTS already validated upstream
+        return
+    if low > high:
+        raise CatalogError(
+            "base.targets.efficient.reasoning_effort "
+            f"({efficient.reasoning_effort}) must not exceed "
+            f"base.targets.capable.reasoning_effort ({capable.reasoning_effort}); "
+            "reasoning tokens bill as output, so this inverts the cost tiers"
+        )
+
+
 def _validate_token_limits(max_tokens: int | None, context_window: int | None, label: str) -> None:
     """Reject an output cap larger than the model's own context window."""
     if max_tokens is not None and context_window is not None and max_tokens > context_window:
@@ -397,12 +426,15 @@ def load_base_route(root: Mapping[str, Any]) -> BaseRoute:
     providers = _load_named_providers(root.get("providers"), provider_names)
     efficient = _base_target(targets["efficient"], "efficient", providers)
     capable = _base_target(targets["capable"], "capable", providers)
-    if efficient.upstream_model == capable.upstream_model:
-        raise CatalogError(
-            "base.targets.efficient and capable must use distinct upstream_model "
-            "ids: Switchyard keys execution by model id within one route. Pin "
-            "one tier to a concrete version slug instead of duplicating the id."
-        )
+    if (
+        efficient.provider == capable.provider
+        and efficient.upstream_model == capable.upstream_model
+        and efficient.reasoning_effort == capable.reasoning_effort
+        and efficient.max_tokens == capable.max_tokens
+        and efficient.wire_format == capable.wire_format
+    ):
+        raise CatalogError("base.targets.efficient and capable must be distinct targets")
+    _validate_effort_ordering(efficient, capable)
     typed_picker: Literal["efficient_first", "capable_first"]
     match picker:
         case "efficient_first":
