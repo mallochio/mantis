@@ -717,6 +717,8 @@ _MODEL_ALIASES = {
     "ultra": "mantis/ultra",
     "mantis-fusion": "mantis/fusion",
     "fusion": "mantis/fusion",
+    "mantis-fusion-router": "mantis/fusion",
+    "fusion-router": "mantis/fusion",
 }
 _SUPPORTED_PARAMETERS = [
     "tools",
