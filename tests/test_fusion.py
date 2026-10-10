@@ -930,6 +930,7 @@ def test_fusion_chat_returns_reasoning_when_requested(client, fake_worker):
     ]
     headers = _headers()
     headers["X-Mantis-Return-Reasoning"] = "true"
+    headers["X-Mantis-Trace-Scope"] = "sidekick"
     response = client.post(
         "/v1/chat/completions",
         headers=headers,
@@ -1154,7 +1155,7 @@ def test_fusion_trace_excludes_opaque_metadata(client, fake_worker, monkeypatch)
         assert value not in public_trace
 
 
-def test_fusion_chat_no_reasoning_by_default(client, fake_worker):
+def test_fusion_chat_no_sidekick_reasoning_by_default(client, fake_worker):
     tools = [
         {
             "type": "function",
@@ -1165,7 +1166,6 @@ def test_fusion_chat_no_reasoning_by_default(client, fake_worker):
             },
         }
     ]
-    # In default 'sidekick' trace scope, the sidekick reasoning is emitted directly
     response = client.post(
         "/v1/chat/completions",
         headers=_headers(),
@@ -1177,11 +1177,34 @@ def test_fusion_chat_no_reasoning_by_default(client, fake_worker):
     )
     assert response.status_code == 200
     message = response.json()["choices"][0]["message"]
-    assert "reasoning" in message
-    assert "I will call bash to verify the environment." in message["reasoning"]
-    assert "Fusion · Planning" not in message["reasoning"]
+    reasoning = message.get("reasoning", "")
+    assert "I will call bash to verify the environment." not in reasoning
+    assert "Fusion · Planning" not in reasoning
+    assert "implement, run tests, and lint" not in reasoning
+
+    fake_worker.sidekick_calls = 0
+    fake_worker.main_calls = 0
+    fake_worker.reviews = 0
+    headers_side = _headers()
+    headers_side["X-Mantis-Trace-Scope"] = "sidekick"
+    resp_side = client.post(
+        "/v1/chat/completions",
+        headers=headers_side,
+        json={
+            "model": "mantis/fusion",
+            "messages": [{"role": "user", "content": "write a hello world script"}],
+            "tools": tools,
+        },
+    )
+    assert resp_side.status_code == 200
+    msg_side = resp_side.json()["choices"][0]["message"]
+    assert "I will call bash to verify the environment." in msg_side["reasoning"]
+    assert "Fusion · Planning" not in msg_side["reasoning"]
 
     # When explicitly requesting orchestration scope, the full meta breakdown is returned
+    fake_worker.sidekick_calls = 0
+    fake_worker.main_calls = 0
+    fake_worker.reviews = 0
     headers_orch = _headers()
     headers_orch["X-Mantis-Trace-Scope"] = "orchestration"
     resp_orch = client.post(
@@ -3532,7 +3555,7 @@ def test_fusion_role_reasoning_keeps_base_target_effort():
         main="base:capable", main_reasoning="low", sidekick="gpt-5_6-luna"
     )
     router = fusion.FusionRouter.from_config(config, "main", catalog=catalog)
-    assert router.select() == "openrouter/openai/gpt-6.1-sol|high"
+    assert router.select() == "openrouter/~openai/gpt-sol-latest|high"
 
 
 def test_server_execution_does_not_hijack_a_client_declared_tool():
@@ -3606,7 +3629,7 @@ def test_base_route_remains_virtual_while_explicit_capable_target_resolves():
         "main",
         catalog=catalog,
     )
-    assert explicit.select(escalation_count=0) == "openrouter/openai/gpt-6.1-sol|high"
+    assert explicit.select(escalation_count=0) == "openrouter/~openai/gpt-sol-latest|high"
 
 
 def test_virtual_worker_dispatches_complete_tool_trajectory_to_switchyard(monkeypatch):

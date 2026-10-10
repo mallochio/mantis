@@ -558,6 +558,9 @@ class FusionConfig:
         return cast(FusionToolOptions, FusionToolOptions.model_validate(payload))
 
 
+_MAIN_TRACE_MAX_CHARS = 8192
+
+
 _FUSION_CONFIG = FusionConfig()
 
 
@@ -805,12 +808,60 @@ def _orchestration_metadata(run: FusionRun) -> dict[str, Any]:
     }
 
 
+def _main_trace_delta(run: FusionRun) -> str:
+    """Return the main lane's own reasoning and tool activity since the last trace."""
+    cursor = run.trace_cursors.get("main", 0)
+    if not isinstance(cursor, int) or cursor < 0 or cursor > len(run.main_messages):
+        cursor = 0
+    delta = run.main_messages[cursor:]
+    run.trace_cursors["main"] = len(run.main_messages)
+    parts: list[str] = []
+    length = 0
+
+    def add(piece: str) -> bool:
+        nonlocal length
+        piece = piece.strip()
+        if not piece:
+            return True
+        if length + len(piece) + 2 > _MAIN_TRACE_MAX_CHARS:
+            remaining = _MAIN_TRACE_MAX_CHARS - length
+            if remaining > 0:
+                parts.append(piece[:remaining] + "\n...")
+            return False
+        parts.append(piece)
+        length += len(piece) + 2
+        return True
+
+    for message in delta:
+        role = message.get("role")
+        if role == "assistant":
+            reasoning = _extract_reasoning_trace([message])
+            if reasoning:
+                add(reasoning)
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") or {}
+                name = str(function.get("name") or "")
+                arguments = str(function.get("arguments") or "")
+                add(f"Tool call: {name} {arguments}".strip())
+        elif role == "tool":
+            content = utils.prune_tool_result(
+                str(message.get("content") or ""),
+                max_chars=2048,
+                head_chars=1536,
+                tail_chars=384,
+            )
+            add(f"Tool result ({message.get('tool_call_id', '')}):\n{content}")
+    return "\n\n".join(parts)
+
+
 def _orchestration_trace(
     run: FusionRun,
     include_reasoning: bool = False,
     trace_scope: str = "orchestration",
 ) -> str:
     """Return only reasoning not sent in an earlier response for this run."""
+    if trace_scope == "main":
+        return _main_trace_delta(run)
     if trace_scope == "sidekick":
         return _sidekick_trace_delta(run)
     parts = [

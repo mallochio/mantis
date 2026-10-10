@@ -298,7 +298,7 @@ def _fusion_return_reasoning(headers: dict[str, str] | None) -> bool:
 
 
 def _fusion_trace_scope(headers: dict[str, str] | None) -> str:
-    """Return the requested trace scope: 'sidekick' (default) or 'orchestration'."""
+    """Return the requested trace scope: 'main' (default), 'sidekick', or 'orchestration'."""
     val = (headers or {}).get("x-mantis-trace-scope", "").strip().lower()
     if not val:
         val = (headers or {}).get("x-mantis-fusion-trace", "").strip().lower()
@@ -306,8 +306,14 @@ def _fusion_trace_scope(headers: dict[str, str] | None) -> str:
         return "orchestration"
     if val in ("sidekick", "worker"):
         return "sidekick"
-    env_default = os.environ.get("MANTIS_FUSION_TRACE_SCOPE", "sidekick").strip().lower()
-    return "orchestration" if env_default in ("full", "orchestration", "meta") else "sidekick"
+    if val in ("main", "single", "model"):
+        return "main"
+    env_default = os.environ.get("MANTIS_FUSION_TRACE_SCOPE", "main").strip().lower()
+    if env_default in ("full", "orchestration", "meta"):
+        return "orchestration"
+    if env_default in ("sidekick", "worker"):
+        return "sidekick"
+    return "main"
 
 
 def _mantis_headers(mantis: dict[str, Any], body: dict[str, Any]) -> dict[str, str]:
