@@ -3532,7 +3532,7 @@ def test_fusion_role_reasoning_keeps_base_target_effort():
         main="base:capable", main_reasoning="low", sidekick="gpt-5_6-luna"
     )
     router = fusion.FusionRouter.from_config(config, "main", catalog=catalog)
-    assert router.select() == "openrouter/~openai/gpt-sol-latest|high"
+    assert router.select() == "openrouter/openai/gpt-6.1-sol|high"
 
 
 def test_server_execution_does_not_hijack_a_client_declared_tool():
@@ -3606,7 +3606,7 @@ def test_base_route_remains_virtual_while_explicit_capable_target_resolves():
         "main",
         catalog=catalog,
     )
-    assert explicit.select(escalation_count=0) == "openrouter/~openai/gpt-sol-latest|high"
+    assert explicit.select(escalation_count=0) == "openrouter/openai/gpt-6.1-sol|high"
 
 
 def test_virtual_worker_dispatches_complete_tool_trajectory_to_switchyard(monkeypatch):

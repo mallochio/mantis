@@ -32,7 +32,7 @@ def test_request_plan_maps_every_variant():
     assert efficient["model"] == "~openai/gpt-sol-latest"
     assert efficient["base_url"] == OPENROUTER_BASE_URL
     assert efficient["reasoning_effort"] == "medium"
-    assert capable["model"] == "~openai/gpt-sol-latest"
+    assert capable["model"] == "openai/gpt-6.1-sol"
     assert capable["reasoning_effort"] == "high"
     assert runner.request_plan("mantis-base", catalog) == {"model": "mantis/base"}
     pinned = runner.request_plan("fusion-pinned", catalog)

@@ -145,14 +145,9 @@ def render_switchyard_toml(route: BaseRoute) -> str:
         role: _client_key_for(target.provider, route.providers[target.provider], target.wire_format)
         for role, target in (("efficient", route.efficient), ("capable", route.capable))
     }
-    # Switchyard keeps one target per (llm_client, model id). Same model on the
-    # same client with different extra_body (e.g. effort tiers) would drop one
-    # target, so the second rides a duplicate client entry.
-    if (
-        keys["efficient"] == keys["capable"]
-        and route.efficient.upstream_model == route.capable.upstream_model
-    ):
-        keys["capable"] = f"{keys['capable']}__capable"
+    # Switchyard keys execution by model id, so catalog validation already
+    # guarantees the two tiers carry distinct upstream_model ids; both can
+    # safely share one llm_client entry when they ride the same provider.
     route_block = "\n".join(
         [
             "[routes.mantis_base]",

@@ -156,7 +156,8 @@ def test_rejects_identical_efficient_and_capable(tmp_path):
         load_switchyard_route(path)
 
 
-def test_accepts_same_model_with_different_reasoning_effort(tmp_path):
+def test_rejects_same_model_with_different_reasoning_effort(tmp_path):
+    """Switchyard keys execution by model id, so both tiers need distinct ids."""
     content = (
         _catalog()
         .replace(
@@ -165,48 +166,13 @@ def test_accepts_same_model_with_different_reasoning_effort(tmp_path):
             1,
         )
         .replace(
-            'reasoning_effort = "medium"\nmax_tokens = 128000\n',
-            'reasoning_effort = "high"\nmax_tokens = 65536\n',
+            "reasoning_effort = \"medium\"\nmax_tokens = 128000\n",
+            "reasoning_effort = \"high\"\nmax_tokens = 65536\n",
             1,
         )
     )
     path = _write(tmp_path, content)
-    route = load_switchyard_route(path)
-    text = render_switchyard_toml(route)
-    parsed = tomllib.loads(text)
-    assert parsed["targets"]["efficient"]["id"] == "google/gemini-3.7-flash"
-    assert parsed["targets"]["capable"]["id"] == "google/gemini-3.7-flash"
-    assert parsed["targets"]["efficient"]["extra_body"]["reasoning_effort"] == "medium"
-    assert parsed["targets"]["capable"]["extra_body"]["reasoning_effort"] == "high"
-    # switchyard keeps one target per (llm_client, model id); the same model on
-    # the same client needs a duplicate client entry or a target is dropped.
-    capable_client = parsed["targets"]["capable"]["llm_client"]
-    assert parsed["targets"]["efficient"]["llm_client"] == "litellm"
-    assert capable_client == "litellm__capable"
-    assert parsed["llm_clients"][capable_client] == parsed["llm_clients"]["litellm"]
-
-
-def test_rejects_inverted_reasoning_effort_for_same_model(tmp_path):
-    content = (
-        _catalog()
-        .replace(
-            'upstream_model = "anthropic/claude-opus-5"',
-            'upstream_model = "google/gemini-3.7-flash"',
-            1,
-        )
-        .replace(
-            'reasoning_effort = "medium"\nmax_tokens = 65536\n',
-            'reasoning_effort = "high"\nmax_tokens = 65536\n',
-            1,
-        )
-        .replace(
-            'reasoning_effort = "medium"\nmax_tokens = 128000\n',
-            'reasoning_effort = "low"\nmax_tokens = 65536\n',
-            1,
-        )
-    )
-    path = _write(tmp_path, content)
-    with pytest.raises(CatalogError, match="must not exceed"):
+    with pytest.raises(CatalogError, match="distinct upstream_model"):
         load_switchyard_route(path)
 
 
@@ -448,7 +414,7 @@ def test_openai_responses_extra_body_uses_responses_params(tmp_path):
         "max_tokens = 64000\n\n"
         "[base.targets.capable]\n"
         'provider = "azure-foundry"\n'
-        'upstream_model = "model-router"\n'
+        'upstream_model = "model-router-capable"\n'
         'reasoning_effort = "medium"\n'
         "max_tokens = 128000\n"
     )
