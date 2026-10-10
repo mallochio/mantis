@@ -276,7 +276,9 @@ def main(argv: list[str] | None = None) -> int:
     out_path = args.out
     out_path.parent.mkdir(parents=True, exist_ok=True)
     total = 0
-    with httpx.Client(timeout=args.timeout) as client:
+    api_key = os.environ.get("MANTIS_API_KEY", "")
+    auth = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    with httpx.Client(timeout=args.timeout, headers=auth) as client:
         for variant in variants:
             total += run_variant(
                 client,
