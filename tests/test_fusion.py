@@ -3764,7 +3764,7 @@ def test_virtual_worker_http_timeout_uses_remaining_fusion_budget(monkeypatch):
     monkeypatch.setattr(
         serve_config._history_context,
         "active_run",
-        SimpleNamespace(budget=budget),
+        SimpleNamespace(budget=budget, add_usage=lambda *a, **k: None),
         raising=False,
     )
 
