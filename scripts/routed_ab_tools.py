@@ -245,12 +245,16 @@ def priced_cost(usage: dict[str, Any], models: dict[str, Any], prices: dict[str,
         return 0.0
     total = 0.0
     for label, tokens in (models or {}).items():
-        rates = card.get(str(label).split("|")[0])
+        name = str(label).split("|")[0]
+        rates = card.get(name) or card.get(name.split("/", 1)[-1])
         if not isinstance(rates, dict) or not isinstance(tokens, dict):
             continue
         prompt = int(tokens.get("prompt_tokens") or 0)
+        cached = min(int(tokens.get("cached_tokens") or 0), prompt)
         output = int(tokens.get("completion_tokens") or 0)
-        total += prompt * float(rates.get("input_per_token") or 0.0)
+        total += (prompt - cached) * float(rates.get("input_per_token") or 0.0)
+        cached_rate = rates.get("cached_input_per_token") or rates.get("input_per_token") or 0.0
+        total += cached * float(cached_rate)
         total += output * float(rates.get("output_per_token") or 0.0)
     return round(total, 6)
 

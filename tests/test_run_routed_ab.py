@@ -259,6 +259,7 @@ def test_priced_cost_uses_rate_card_and_strips_effort_suffix():
         "models": {
             "~openai/gpt-astra-latest": {
                 "input_per_token": 2e-06,
+                "cached_input_per_token": 1e-07,
                 "output_per_token": 1e-05,
             }
         }
@@ -266,6 +267,18 @@ def test_priced_cost_uses_rate_card_and_strips_effort_suffix():
     usage = {"prompt_tokens": 0, "completion_tokens": 0}
     models = {"~openai/gpt-astra-latest|low": {"prompt_tokens": 1000, "completion_tokens": 10}}
     assert priced_cost(usage, models, prices) == pytest.approx(0.0021)
+    prefixed = {
+        "openrouter/~openai/gpt-astra-latest": {"prompt_tokens": 1000, "completion_tokens": 10}
+    }
+    assert priced_cost(usage, prefixed, prices) == pytest.approx(0.0021)
+    cached = {
+        "~openai/gpt-astra-latest": {
+            "prompt_tokens": 1000,
+            "cached_tokens": 750,
+            "completion_tokens": 10,
+        }
+    }
+    assert priced_cost(usage, cached, prices) == pytest.approx(0.000675)
 
 
 def test_auto_judge_accepts_fusion_answer_prefix():
