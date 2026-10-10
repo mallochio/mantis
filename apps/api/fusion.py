@@ -748,6 +748,25 @@ def _role_usage_totals(role_usage: dict[str, dict[str, dict[str, int]]]) -> tupl
     return usage, models
 
 
+def _merge_native_usage(metadata: dict[str, Any], models: dict[str, Any]) -> dict[str, Any]:
+    """Fold serve-layer per-model usage into run metadata when lanes recorded none."""
+    prompt = completion = cached = 0
+    for tokens in models.values():
+        if not isinstance(tokens, dict):
+            continue
+        prompt += int(tokens.get("prompt_tokens") or 0)
+        completion += int(tokens.get("completion_tokens") or 0)
+        cached += int(tokens.get("cached_tokens") or 0)
+    metadata = {**metadata}
+    metadata["usage"] = {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "prompt_tokens_details": {"cached_tokens": cached},
+    }
+    metadata["usage_models"] = models
+    return metadata
+
+
 def _orchestration_metadata(run: FusionRun) -> dict[str, Any]:
     tool_count = sum(
         len(msg.get("tool_calls") or [])

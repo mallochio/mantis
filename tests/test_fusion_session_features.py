@@ -271,3 +271,23 @@ def test_orchestration_metadata_exports_role_usage():
     )
     assert sorted(metadata["usage_models"]) == expected
     assert metadata["usage_models"][fusion._model_label("gpt-5_6-sol")]["prompt_tokens"] == 10
+
+def test_merge_native_usage_folds_serve_layer_models():
+    """Serve-layer usage fills metadata when lane accounting stayed empty."""
+    metadata = {
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "prompt_tokens_details": {"cached_tokens": 0},
+        },
+        "usage_models": {},
+    }
+    models = {"m|low": {"prompt_tokens": 10, "completion_tokens": 2, "cached_tokens": 4}}
+
+    merged = fusion._merge_native_usage(metadata, models)
+
+    assert merged["usage"]["prompt_tokens"] == 10
+    assert merged["usage"]["completion_tokens"] == 2
+    assert merged["usage"]["prompt_tokens_details"]["cached_tokens"] == 4
+    assert merged["usage_models"] == models
+    assert metadata["usage"]["prompt_tokens"] == 0

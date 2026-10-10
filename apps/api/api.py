@@ -1061,10 +1061,11 @@ def _attach_fusion_trace(
             include_reasoning=return_reasoning,
             trace_scope=trace_scope,
         )
-        event["mantis_event"] = {
-            **fusion._orchestration_metadata(run_obj),
-            "trace_scope": trace_scope,
-        }
+        metadata = fusion._orchestration_metadata(run_obj)
+        native_models = event.get("usage_models")
+        if isinstance(native_models, dict) and native_models and not metadata["usage_models"]:
+            metadata = fusion._merge_native_usage(metadata, native_models)
+        event["mantis_event"] = {**metadata, "trace_scope": trace_scope}
         fusion._put_run(run_obj)
 
 
