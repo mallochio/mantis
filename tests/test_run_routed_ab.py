@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 import run_routed_ab as runner
 from evaluate_routed_harness import EvalCase, _validate_record, aggregate_records
-from routed_ab_tools import OPENROUTER_BASE_URL, usage_totals
+from routed_ab_tools import OPENROUTER_BASE_URL, priced_cost, usage_totals
 
 
 def _catalog() -> dict[str, Any]:
@@ -148,6 +148,7 @@ def test_usage_numbers_falls_back_to_response_usage():
         "output_tokens": 5,
         "cache_read_tokens": 4,
         "provider_cost": 0.0,
+        "cost_basis": "priced_estimate",
     }
     empty = runner.usage_numbers(None, {})
     assert empty["input_tokens"] == 0
@@ -245,10 +246,29 @@ def test_drive_case_sums_usage_across_direct_rounds(tmp_path: Path):
                 },
             }
         ],
-        "usage": {"prompt_tokens": 5, "completion_tokens": 1},
+        "usage": {"prompt_tokens": 5, "completion_tokens": 1, "is_byok": True},
     }
     client = _FakeClient([tool_call, _usage_payload(10, 2, 0.5)])
     observation = runner.drive_case(client, "https://example.invalid", plan, "do it", tmp_path, 4)
     assert observation["content"] == "done"
     assert observation["event"]["usage"]["prompt_tokens"] == 15
     assert observation["event"]["cost"] == 0.5
+
+def test_priced_cost_uses_rate_card_and_strips_effort_suffix():
+    prices = {
+        "models": {
+            "~openai/gpt-astra-latest": {
+                "input_per_token": 2e-06,
+                "output_per_token": 1e-05,
+            }
+        }
+    }
+    usage = {"prompt_tokens": 0, "completion_tokens": 0}
+    models = {"~openai/gpt-astra-latest|low": {"prompt_tokens": 1000, "completion_tokens": 10}}
+    assert priced_cost(usage, models, prices) == pytest.approx(0.0021)
+
+
+def test_auto_judge_accepts_fusion_answer_prefix():
+    assert runner.auto_judge("no-tool-chat", "ANSWER:\nROUTING_OK", 0) is True
+    assert runner.auto_judge("no-tool-chat", "ROUTING_OK", 0) is True
+    assert runner.auto_judge("no-tool-chat", "ANSWER:\nSomething else", 0) is False

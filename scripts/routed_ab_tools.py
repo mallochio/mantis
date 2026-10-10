@@ -14,6 +14,8 @@ import httpx
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api"
 
+TOOL_OUTPUT_LIMIT = 100_000
+
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -114,7 +116,10 @@ def _run_bash(args: dict[str, Any], workspace: Path) -> str:
         text=True,
         timeout=120,
     )
-    return f"exit={completed.returncode}\n{completed.stdout}{completed.stderr}"
+    output = f"exit={completed.returncode}\n{completed.stdout}{completed.stderr}"
+    if len(output) <= TOOL_OUTPUT_LIMIT:
+        return output
+    return output[:TOOL_OUTPUT_LIMIT] + "\n[output truncated]"
 
 
 def _read(args: dict[str, Any], workspace: Path) -> str:
@@ -193,25 +198,61 @@ def request_body(plan: dict[str, Any], messages: list[dict[str, Any]]) -> dict[s
     return body
 
 
+def _provider_usage(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a payload's usage only when it carries real provider fields."""
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    if "cost_details" not in usage and "is_byok" not in usage:
+        return None
+    return usage
+
+
 def usage_totals(payloads: list[dict[str, Any]]) -> dict[str, Any]:
-    """Aggregate per-round usage and upstream cost for direct-transport runs."""
+    """Aggregate real per-round usage, cost, and models across a case."""
     prompt = completion = cached = 0
     cost = 0.0
-    for usage in [p.get("usage") or {} for p in payloads]:
+    models: dict[str, dict[str, int]] = {}
+    for payload in payloads:
+        usage = _provider_usage(payload)
+        if usage is None:
+            continue
         prompt += int(usage.get("prompt_tokens") or 0)
         completion += int(usage.get("completion_tokens") or 0)
         details = usage.get("prompt_tokens_details")
         cached += details.get("cached_tokens", 0) if isinstance(details, dict) else 0
         details = usage.get("cost_details")
         cost += details.get("upstream_inference_cost", 0.0) if isinstance(details, dict) else 0.0
+        label = str(payload.get("model") or "")
+        merged = models.setdefault(label, {"prompt_tokens": 0, "completion_tokens": 0})
+        merged["prompt_tokens"] += int(usage.get("prompt_tokens") or 0)
+        merged["completion_tokens"] += int(usage.get("completion_tokens") or 0)
     return {
         "usage": {
             "prompt_tokens": prompt,
             "completion_tokens": completion,
             "prompt_tokens_details": {"cached_tokens": cached},
         },
+        "usage_models": models,
         "cost": round(cost, 6),
     }
+
+
+def priced_cost(usage: dict[str, Any], models: dict[str, Any], prices: dict[str, Any]) -> float:
+    """Price token usage from a public rate card when no billed cost exists."""
+    card = prices.get("models") if isinstance(prices, dict) else None
+    if not isinstance(card, dict):
+        return 0.0
+    total = 0.0
+    for label, tokens in (models or {}).items():
+        rates = card.get(str(label).split("|")[0])
+        if not isinstance(rates, dict) or not isinstance(tokens, dict):
+            continue
+        prompt = int(tokens.get("prompt_tokens") or 0)
+        output = int(tokens.get("completion_tokens") or 0)
+        total += prompt * float(rates.get("input_per_token") or 0.0)
+        total += output * float(rates.get("output_per_token") or 0.0)
+    return round(total, 6)
 
 
 def case_observation(
@@ -223,7 +264,9 @@ def case_observation(
 ) -> dict[str, Any]:
     """Assemble the observation envelope for one completed case."""
     payload = payloads[-1] if payloads else {}
-    event = payload.get("mantis_event") or (usage_totals(payloads) if plan.get("base_url") else {})
+    event = payload.get("mantis_event") or {}
+    if not (isinstance(event, dict) and event.get("usage")):
+        event = {**event, **usage_totals(payloads)}
     return {
         "content": str(message.get("content") or ""),
         "event": event,

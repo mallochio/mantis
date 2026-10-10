@@ -727,13 +727,37 @@ def _run_guard_remaining(run: FusionRun) -> dict[str, Any]:
     }
 
 
+def _role_usage_totals(role_usage: dict[str, dict[str, dict[str, int]]]) -> tuple[dict, dict]:
+    """Flatten per-role usage into run totals and per-model token counts."""
+    prompt = completion = cached = 0
+    models: dict[str, dict[str, int]] = {}
+    for per_model in role_usage.values():
+        for slot, tokens in per_model.items():
+            label = _model_label(slot)
+            merged = models.setdefault(label, {"prompt_tokens": 0, "completion_tokens": 0})
+            merged["prompt_tokens"] += int(tokens.get("prompt_tokens") or 0)
+            merged["completion_tokens"] += int(tokens.get("completion_tokens") or 0)
+            prompt += int(tokens.get("prompt_tokens") or 0)
+            completion += int(tokens.get("completion_tokens") or 0)
+            cached += int(tokens.get("cached_tokens") or 0)
+    usage = {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "prompt_tokens_details": {"cached_tokens": cached},
+    }
+    return usage, models
+
+
 def _orchestration_metadata(run: FusionRun) -> dict[str, Any]:
     tool_count = sum(
         len(msg.get("tool_calls") or [])
         for msg in run.sidekick_messages
         if msg.get("role") == "assistant"
     )
+    usage, usage_models = _role_usage_totals(run.role_usage)
     return {
+        "usage": usage,
+        "usage_models": usage_models,
         "run_id": run.run_id,
         "status": run.status,
         "main_model": _model_label(getattr(run, "main_slot", "gpt-5_6-sol")),
@@ -1652,11 +1676,17 @@ class FusionRun(NativeRun):
         if not isinstance(usage, dict):
             return
         models = self.role_usage.setdefault(role, {})
-        tokens = models.setdefault(slot, {"prompt_tokens": 0, "completion_tokens": 0})
+        tokens = models.setdefault(
+            slot, {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0}
+        )
         for key in ("prompt_tokens", "completion_tokens"):
             value = usage.get(key)
             if isinstance(value, int) and value >= 0:
                 tokens[key] += value
+        details = usage.get("prompt_tokens_details")
+        cached = details.get("cached_tokens") if isinstance(details, dict) else None
+        if isinstance(cached, int) and cached >= 0:
+            tokens["cached_tokens"] += cached
 
     def _fusion_savings_usd(self) -> float | None:
         """Estimate savings: sidekick tokens priced at the main slot's rates."""

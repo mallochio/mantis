@@ -31,6 +31,7 @@ if not (_HERE / "mini.py").exists():
     if _OPENFUGU.exists():
         sys.path.insert(0, str(_OPENFUGU))
 
+import direct_completion
 import serve_config
 import utils
 from model_catalog import CatalogError, RuntimeBindings, load_runtime_bindings
@@ -1141,9 +1142,8 @@ def _provider_response(
 def _direct_completion(
     spec: str, messages: list[dict[str, str]], max_tokens: int, temperature: float, timeout: float
 ) -> str:
-    del timeout
-    data = _provider_response(spec, messages, max_tokens, temperature)
-    return str(data["choices"][0]["message"].get("content") or "")
+    """Return text from a direct worker or the shared virtual route."""
+    return direct_completion.complete(spec, messages, max_tokens, temperature, timeout)
 
 
 # -- Cost (kept for reporting; prefers litellm hidden cost, falls back to price table) --

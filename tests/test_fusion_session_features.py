@@ -246,3 +246,28 @@ def test_advance_fusion_run_manages_keepalive(monkeypatch: pytest.MonkeyPatch):
     finally:
         fusion.serve_config._runs.pop(run.run_id, None)
         fusion._KEEPALIVE_PINGS.pop(run.run_id, None)
+
+def test_orchestration_metadata_exports_role_usage():
+    """Metadata reports real cumulative tokens and per-model usage."""
+    run = fusion.FusionRun("history", "goal")
+    run._add_role_usage(
+        "main",
+        "gpt-5_6-sol",
+        {
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "prompt_tokens_details": {"cached_tokens": 4},
+        },
+    )
+    run._add_role_usage("sidekick", "gpt-5_6-luna", {"prompt_tokens": 5, "completion_tokens": 1})
+
+    metadata = fusion._orchestration_metadata(run)
+
+    assert metadata["usage"]["prompt_tokens"] == 15
+    assert metadata["usage"]["completion_tokens"] == 3
+    assert metadata["usage"]["prompt_tokens_details"]["cached_tokens"] == 4
+    expected = sorted(
+        [fusion._model_label("gpt-5_6-sol"), fusion._model_label("gpt-5_6-luna")]
+    )
+    assert sorted(metadata["usage_models"]) == expected
+    assert metadata["usage_models"][fusion._model_label("gpt-5_6-sol")]["prompt_tokens"] == 10

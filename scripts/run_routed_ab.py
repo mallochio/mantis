@@ -23,6 +23,7 @@ from routed_ab_tools import (
     execute_tool_call,
     openrouter_headers,
     post_round,
+    priced_cost,
     request_body,
 )
 
@@ -32,6 +33,7 @@ DEFAULT_CATALOG = REPO / "config" / "catalog.toml"
 DEFAULT_CASES = EVAL / "routed-harness-cases.jsonl"
 DEFAULT_OUT = EVAL / "results-routed-ab.jsonl"
 DEFAULT_TRANSCRIPTS = EVAL / "runs" / "routed-ab"
+DEFAULT_PRICES = EVAL / "model_prices.json"
 
 
 def load_catalog(path: Path) -> dict[str, Any]:
@@ -80,24 +82,38 @@ def request_plan(variant: str, catalog: dict[str, Any]) -> dict[str, Any]:
 def auto_judge(case_id: str, content: str, tool_rounds: int) -> bool | None:
     """Return a machine verdict where the case allows one, else None."""
     if case_id == "no-tool-chat":
-        return content.strip() == "ROUTING_OK" and tool_rounds == 0
+        answer = content.strip().removeprefix("ANSWER:").strip()
+        return answer == "ROUTING_OK" and tool_rounds == 0
     return None
 
 
-def usage_numbers(event: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
+def usage_numbers(
+    event: dict[str, Any],
+    response: dict[str, Any],
+    prices: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Extract run token usage and cost from the response envelope."""
     usage = event.get("usage") if isinstance(event, dict) else None
-    if not isinstance(usage, dict):
+    if not isinstance(usage, dict) or not usage:
         usage = response.get("usage") if isinstance(response, dict) else {}
     usage = usage if isinstance(usage, dict) else {}
     details = usage.get("prompt_tokens_details")
     cached = details.get("cached_tokens", 0) if isinstance(details, dict) else 0
     cost = event.get("cost") if isinstance(event, dict) else None
+    models = event.get("usage_models") if isinstance(event, dict) else None
+    if not isinstance(models, dict):
+        models = {}
+    if not isinstance(cost, (int, float)) or float(cost) == 0.0:
+        cost = priced_cost(usage, models, prices or {})
+        basis = "priced_estimate"
+    else:
+        basis = "upstream_billed"
     return {
         "input_tokens": int(usage.get("prompt_tokens") or 0),
         "output_tokens": int(usage.get("completion_tokens") or 0),
         "cache_read_tokens": int(cached or 0),
-        "provider_cost": float(cost) if isinstance(cost, (int, float)) else 0.0,
+        "provider_cost": float(cost),
+        "cost_basis": basis,
     }
 
 
@@ -158,7 +174,9 @@ def drive_case(
     )
 
 
-def build_record(variant: str, case: Any, obs: dict, plan: dict) -> dict:
+def build_record(
+    variant: str, case: Any, obs: dict, plan: dict, prices: dict[str, Any] | None = None
+) -> dict:
     """Assemble one summarize-compatible run record."""
     event = obs["event"]
     verdict = auto_judge(case.case_id, obs["content"], obs["tool_rounds"])
@@ -168,7 +186,7 @@ def build_record(variant: str, case: Any, obs: dict, plan: dict) -> dict:
         "passed": bool(verdict) if verdict is not None else False,
         "needs_review": verdict is None,
         "selected_models": selected_models(event, plan),
-        **usage_numbers(event, obs["response"]),
+        **usage_numbers(event, obs["response"], prices),
         "tool_rounds": int(obs["tool_rounds"]),
         "wall_time_s": round(float(obs["wall_time_s"]), 6),
         "report": obs["content"],
@@ -211,6 +229,7 @@ def run_variant(
     transcripts_dir: Path,
     workspace_root: Path,
     max_rounds: int,
+    prices: dict[str, Any] | None = None,
 ) -> int:
     """Execute every case under one variant and append records."""
     plan = request_plan(variant, catalog)
@@ -223,11 +242,18 @@ def run_variant(
         observation = drive_case(
             client, plan_url, plan, case.prompt, workspace, max_rounds, plan_auth
         )
-        record = build_record(variant, case, observation, plan)
+        record = build_record(variant, case, observation, plan, prices)
         _persist_run(record, observation, case, out_path, transcripts_dir)
         count += 1
         print(f"{variant} {case.case_id}: {record['passed']} ({record['provider_cost']:.6f} USD)")
     return count
+
+
+def load_prices(path: Path) -> dict[str, Any]:
+    """Load the public model price card."""
+    with path.open() as handle:
+        data: dict[str, Any] = json.load(handle)
+    return data
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -240,6 +266,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--variants", default=",".join(VARIANTS))
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--transcripts-dir", type=Path, default=DEFAULT_TRANSCRIPTS)
+    parser.add_argument("--prices", type=Path, default=DEFAULT_PRICES)
     parser.add_argument("--workspace-root", type=Path, default=REPO / ".scratch" / "routed-ab")
     parser.add_argument("--max-rounds", type=int, default=24)
     parser.add_argument("--timeout", type=float, default=600.0)
@@ -255,6 +282,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"unknown variants: {', '.join(unknown)}")
     cases = load_cases(args.cases)
     catalog = load_catalog(args.catalog)
+    prices = load_prices(args.prices)
     out_path = args.out
     out_path.parent.mkdir(parents=True, exist_ok=True)
     total = 0
@@ -272,6 +300,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.transcripts_dir,
                 args.workspace_root,
                 args.max_rounds,
+                prices,
             )
     print(f"runs={total} records={out_path}")
     return 0

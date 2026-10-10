@@ -24,6 +24,8 @@ import uuid
 from pathlib import Path
 from typing import Any, cast
 
+import direct_completion
+
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 # When running from the repo's orchestration runtime, also find upstream OpenFugu.
@@ -35,9 +37,7 @@ if not (_HERE / "mini.py").exists():
 import providers
 import runs
 import serve_config
-from mini import (
-    DEFAULT_SLOT_LABELS,
-)
+from mini import DEFAULT_SLOT_LABELS
 from serve_config import (
     _INTERNAL_TOOL_ID,
     _PUBLIC_RUN_TOKEN_LENGTH,
@@ -351,8 +351,8 @@ def _model_completion(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Call the selected provider directly; return (text, tool_calls)."""
-    data = providers._provider_response(model, messages, 4096, 0.7, tools)
+    """Call a direct worker or the shared virtual route; return text and tools."""
+    data = direct_completion.model_response(model, messages, tools)
     msg = data["choices"][0]["message"]
     text = str(msg.get("content") or "")
     tcs = msg.get("tool_calls") or []
