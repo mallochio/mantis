@@ -37,6 +37,18 @@ repos:
         types_or: [python]
         args: ["--failed"]
 
+  # Shared lint policy hooks (mallochio/lint-policy), pinned at v0.2.0.
+  - repo: https://github.com/mallochio/lint-policy
+    rev: v0.4.1
+    hooks:
+      - id: no-comments
+      - id: require-docstrings
+      - id: line-limits
+      - id: numeric-guards
+      - id: suppression-ratchet
+      - id: top-level-order
+      - id: reinvention-guard
+
   # Type check with the same invocation as CI so local and CI agree.
   - repo: local
     hooks:

@@ -181,3 +181,7 @@ exclude_lines = [
     "pragma: no cover",
     "raise NotImplementedError",
 ]
+
+[tool.lintpolicy]
+source-roots = ["apps/api", "scripts"]
+test-roots = ["tests"]
