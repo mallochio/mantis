@@ -1489,7 +1489,9 @@ def test_fusion_retries_malformed_plan(monkeypatch):
     worker = SequenceWorker(main_outputs, sidekick_outputs)
     monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
 
-    run = fusion.FusionRun("retry-run", "spin out Cerberus", tools=[BASH_TOOL])
+    run = fusion.FusionRun(
+        "retry-run", "spin out Cerberus", tools=[BASH_TOOL], delegation_mode="forced"
+    )
     event = run.advance(coordinator=fusion.FusionCoordinator())
     assert event["status"] == "awaiting_tools"
     assert worker.main_idx == 2  # bad plan + retry produced a good plan
@@ -3604,7 +3606,7 @@ def test_base_route_remains_virtual_while_explicit_capable_target_resolves():
         "main",
         catalog=catalog,
     )
-    assert explicit.select(escalation_count=0).startswith("openrouter/openai/gpt-sol-latest")
+    assert explicit.select(escalation_count=0) == "openrouter/~openai/gpt-sol-latest|high"
 
 
 def test_virtual_worker_dispatches_complete_tool_trajectory_to_switchyard(monkeypatch):
@@ -4051,11 +4053,38 @@ def test_select_at_compaction_stays_when_cache_warm():
 
 
 def test_select_at_compaction_switches_when_cache_warm_but_failing():
-    """Even with warm cache, failures should force a reroute."""
-    config = fusion.FusionRoutingConfig(main=["cheap", "strong"], sidekick="side")
+    """Even with warm cache, failures should force a promotion."""
+    config = fusion.FusionRoutingConfig(
+        main=["cheap", "strong", "strongest"], sidekick="side"
+    )
     router = fusion.FusionRouter(config, "main")
     selected = router.select_at_compaction(0.5, "strong", failure_count=1, cache_warm=True)
-    assert selected == "cheap"
+    assert selected == "strongest"
+
+
+def test_select_at_compaction_promotes_cheap_main_on_high_complexity():
+    config = fusion.FusionRoutingConfig(main=["cheap", "strong"], sidekick="side")
+    router = fusion.FusionRouter(config, "main")
+    assert router.select_at_compaction(0.95, "cheap") == "strong"
+    assert router.select_at_compaction(0.95, "strong") == "strong"
+
+
+def test_select_at_compaction_never_demotes_sidekick():
+    config = fusion.FusionRoutingConfig(
+        main="main", sidekick=["side-cheap", "side-mid", "side-strong"]
+    )
+    router = fusion.FusionRouter(config, "sidekick")
+    assert router.select_at_compaction(0.9, "side-strong") == "side-strong"
+    assert router.select_at_compaction(0.2, "side-mid") == "side-mid"
+
+
+def test_select_at_compaction_promotes_sidekick_past_second_slot_on_failure():
+    config = fusion.FusionRoutingConfig(
+        main="main", sidekick=["side-cheap", "side-mid", "side-strong"]
+    )
+    router = fusion.FusionRouter(config, "sidekick")
+    selected = router.select_at_compaction(0.5, "side-mid", failure_count=1)
+    assert selected == "side-strong"
 
 
 def test_select_at_compaction_cold_cache_allows_reroute():
@@ -4065,6 +4094,259 @@ def test_select_at_compaction_cold_cache_allows_reroute():
     selected = router.select_at_compaction(0.3, "strong", failure_count=0, cache_warm=False)
     # Low complexity (0.3 < 0.85) → should pick cheap
     assert selected == "cheap"
+
+
+def test_base_route_rejects_unknown_role():
+    catalog = Path(__file__).resolve().parent.parent / "config" / "catalog.toml"
+    config = fusion.FusionRoutingConfig(main="base:typo", sidekick="gpt-5_6-luna")
+    router = fusion.FusionRouter.from_config(config, "main", catalog=catalog)
+    with pytest.raises(ValueError, match="unknown base route role"):
+        router.select()
+
+
+def test_fusion_pool_ordering_rejects_known_price_regression(monkeypatch):
+    prices = {
+        "cheap-model": (1.0, 2.0),
+        "strong-model": (5.0, 10.0),
+    }
+    monkeypatch.setattr(providers, "_price_map", lambda: prices)
+    bad = fusion.FusionRoutingConfig(
+        main=["strong-model", "cheap-model"], sidekick="side"
+    )
+    with pytest.raises(ValueError, match="not cheapest-first"):
+        fusion._validate_pool_ordering(bad)
+    good = fusion.FusionRoutingConfig(
+        main=["cheap-model", "strong-model"], sidekick="side"
+    )
+    fusion._validate_pool_ordering(good)
+
+
+def test_fusion_pool_ordering_skips_unpriced_slots(monkeypatch):
+    monkeypatch.setattr(providers, "_price_map", lambda: {"cheap-model": (1.0, 2.0)})
+    config = fusion.FusionRoutingConfig(
+        main=["cheap-model", "mystery-model"], sidekick="side"
+    )
+    fusion._validate_pool_ordering(config)
+
+
+def test_fusion_run_defaults_to_available_delegation():
+    run = fusion.FusionRun("default-mode", "goal")
+    assert run.delegation_mode == "available"
+    created = fusion.create_fusion_run("created default")
+    assert created.delegation_mode == "available"
+    fusion.serve_config._runs.pop(created.run_id, None)
+
+
+def test_trailing_error_streak_counts_tail_failures_only():
+    messages = [
+        {"role": "system", "content": "s"},
+        {"role": "tool", "tool_call_id": "a", "content": "ok"},
+        {"role": "assistant", "content": "", "tool_calls": []},
+        {"role": "tool", "tool_call_id": "b", "content": "bad", "is_error": True},
+        {"role": "tool", "tool_call_id": "c", "content": "bad", "is_error": True},
+    ]
+    assert fusion._trailing_error_streak(messages) == 2
+    assert fusion._trailing_error_streak(messages[:2]) == 0
+    assert fusion._trailing_error_streak([]) == 0
+
+
+def test_execution_lane_escalates_on_consecutive_errors():
+    run = fusion.FusionRun("error-streak", "goal")
+    coordinator = fusion.FusionCoordinator()
+    lane = fusion.ExecutionLane(
+        "lane0",
+        run,
+        coordinator,
+        fusion.FusionSidekickAssignment(task="broad task"),
+        fusion.FusionWorkerProfile(name="default"),
+    )
+    cap = coordinator.sidekick_max_consecutive_errors
+    assert cap > 0
+    for i in range(cap - 1):
+        lane.messages.append(
+            {"role": "tool", "tool_call_id": f"c{i}", "content": "boom", "is_error": True}
+        )
+    status = lane.step(
+        [{"tool_call_id": f"c{cap - 1}", "content": "boom", "is_error": True}]
+    )
+    assert lane.complete
+    assert lane.exhausted
+    assert status["status"] == "completed"
+    assert status["report"] is not None
+    assert status["report"].startswith("ESCALATE_TO_MAIN:")
+
+
+def test_execution_lane_error_cap_zero_disables_streak_gate(monkeypatch, tmp_path):
+    path = tmp_path / "catalog.toml"
+    path.write_text('[fusion]\nsidekick_max_consecutive_errors = 0\n')
+    config = fusion.FusionConfig(path)
+    monkeypatch.setattr(fusion, "_FUSION_CONFIG", config)
+    run = fusion.FusionRun("no-error-cap", "goal")
+    coordinator = fusion.FusionCoordinator(config)
+    monkeypatch.setattr(
+        fusion.FusionCoordinator,
+        "_call_worker",
+        lambda self, slot, messages, tools: (
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [_tool_call("loop", "bash", {"command": "false"})],
+            },
+            DEFAULT_USAGE,
+        ),
+    )
+    lane = fusion.ExecutionLane(
+        "lane0",
+        run,
+        coordinator,
+        fusion.FusionSidekickAssignment(task="broad task"),
+        fusion.FusionWorkerProfile(name="default"),
+    )
+    for i in range(5):
+        lane.messages.append(
+            {"role": "tool", "tool_call_id": f"c{i}", "content": "boom", "is_error": True}
+        )
+        status = lane.step()
+        assert status["status"] == "awaiting_tools"
+        assert not lane.complete
+
+
+def test_legacy_sidekick_step_escalates_on_consecutive_errors(monkeypatch):
+    worker = SequenceWorker(
+        [("ANSWER: handled by main", None, DEFAULT_USAGE)],
+        [("never called", None, DEFAULT_USAGE)],
+    )
+    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    run = fusion.FusionRun("legacy-streak", "goal")
+    run.status = "awaiting_tools"
+    run.active_role = "sidekick"
+    cap = fusion.FusionCoordinator().sidekick_max_consecutive_errors
+    run.pending_tool_calls = [
+        _tool_call(f"c{i}", "bash", {"command": "false"}) for i in range(cap)
+    ]
+    run._append_tool_results(
+        [
+            {"tool_call_id": f"c{i}", "content": "boom", "is_error": True}
+            for i in range(cap)
+        ]
+    )
+    run.pending_tool_calls = []
+    run.status = "sidekick_pending"
+
+    coordinator = fusion.FusionCoordinator()
+    completed = run._legacy_sidekick_step(coordinator)
+
+    assert run.subtask_report == "sidekick hit 3 consecutive failed tool results"
+    assert worker.sidekick_idx == 0
+    assert any(
+        fusion.ESCALATE_PROMPT in m.get("content", "") for m in run.main_messages
+    )
+    assert completed is True
+    assert run.status == "completed"
+    assert run.report == "handled by main"
+
+
+def test_replace_exhausted_lane_carries_over_context():
+    run = fusion.FusionRun("carryover", "goal")
+    coordinator = fusion.FusionCoordinator()
+    first = fusion.ExecutionLane(
+        "lane0",
+        run,
+        coordinator,
+        fusion.FusionSidekickAssignment(task="broad task"),
+        fusion.FusionWorkerProfile(name="default"),
+    )
+    first.exhausted = True
+    first.complete = True
+    run.sidekick_lanes = [first]
+
+    run._replace_exhausted_lanes("narrow task", coordinator)
+
+    replacement = run.sidekick_lanes[0]
+    assert replacement is not first
+    assert replacement.lane_id == "lane0-narrowed"
+    assert replacement.tool_rounds == 0
+    assert replacement.follow_up_count == 0
+    contents = [str(m.get("content")) for m in replacement.messages]
+    assert any("broad task" in c for c in contents)
+    assert any("narrow task" in c for c in contents)
+    assert replacement.messages[0]["role"] == "system"
+
+
+def test_fusion_savings_prices_sidekick_tokens_at_main_rate(monkeypatch):
+    prices = {
+        "main-model": (10.0, 20.0),
+        "side-model": (1.0, 2.0),
+    }
+    monkeypatch.setattr(providers, "_price_map", lambda: prices)
+    monkeypatch.setattr(providers, "_cache_read_prices", lambda: {})
+    run = fusion.FusionRun("savings", "goal")
+    run.main_slot = "main-model"
+    run._add_role_usage("sidekick", "side-model", {"prompt_tokens": 100, "completion_tokens": 50})
+    run._add_role_usage("main", "main-model", {"prompt_tokens": 999, "completion_tokens": 999})
+
+    savings = run._fusion_savings_usd()
+
+    assert savings is not None
+    assert savings == 100 * 10.0 + 50 * 20.0 - (100 * 1.0 + 50 * 2.0)
+
+
+def test_fusion_savings_none_without_sidekick_usage(monkeypatch):
+    monkeypatch.setattr(providers, "_price_map", lambda: {"main-model": (10.0, 20.0)})
+    run = fusion.FusionRun("no-savings", "goal")
+    run.main_slot = "main-model"
+    assert run._fusion_savings_usd() is None
+
+
+def test_fusion_savings_none_when_prices_unknown(monkeypatch):
+    monkeypatch.setattr(providers, "_price_map", lambda: {"main-model": (10.0, 20.0)})
+    run = fusion.FusionRun("unknown-prices", "goal")
+    run.main_slot = "main-model"
+    run._add_role_usage("sidekick", "mystery", {"prompt_tokens": 10, "completion_tokens": 5})
+    assert run._fusion_savings_usd() is None
+
+
+def test_ok_event_reports_fusion_savings(monkeypatch):
+    prices = {
+        "main-model": (10.0, 20.0),
+        "side-model": (1.0, 2.0),
+    }
+    monkeypatch.setattr(providers, "_price_map", lambda: prices)
+    monkeypatch.setattr(providers, "_cache_read_prices", lambda: {})
+    monkeypatch.setattr(providers, "_usage_cost", lambda usage_models: 0.0)
+    run = fusion.FusionRun("savings-event", "goal")
+    run.main_slot = "main-model"
+    run._add_role_usage("sidekick", "side-model", {"prompt_tokens": 100, "completion_tokens": 50})
+
+    event = run._ok_event(None)
+
+    assert event["fusion_savings_usd"] == 100 * 10.0 + 50 * 20.0 - (100 * 1.0 + 50 * 2.0)
+
+
+def test_reroute_after_compaction_counts_error_streak_as_failure():
+    config = fusion.FusionRoutingConfig(
+        main=["main-cheap", "main-strong"],
+        sidekick=["side-cheap", "side-strong"],
+    )
+    run = fusion.FusionRun(
+        "streak-reroute",
+        "goal",
+        budget=fusion.FusionRunBudget(max_turns=10),
+    )
+    run.main_router = fusion.FusionRouter(config, "main")
+    run.sidekick_router = fusion.FusionRouter(config, "sidekick")
+    run.main_slot = "main-cheap"
+    run.sidekick_slot = "side-cheap"
+    run.structured_plan = fusion.FusionPlan(complexity=0.5, main_task="verify")
+    run.follow_up_count = 0
+    run.sidekick_messages = [
+        {"role": "system", "content": fusion.SIDEKICK_PREAMBLE},
+        {"role": "tool", "tool_call_id": "x", "content": "bad", "is_error": True},
+    ]
+
+    run._reroute_after_compaction("sidekick", "side-cheap")
+
+    assert run.sidekick_compaction_slot == "side-strong"
 
 
 def test_has_cache_hits_true():

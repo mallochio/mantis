@@ -706,10 +706,10 @@ def test_shipped_catalog_routes_gpt_sol_latest_low_high(monkeypatch):
     route = base_proxy._load_base_route()
     assert route is not None
     assert route.efficient.provider == "openrouter"
-    assert route.efficient.upstream_model == "openai/gpt-sol-latest"
-    assert route.efficient.reasoning_effort == "low"
+    assert route.efficient.upstream_model == "~openai/gpt-sol-latest"
+    assert route.efficient.reasoning_effort == "medium"
     assert route.capable.provider == "openrouter"
-    assert route.capable.upstream_model == "openai/gpt-sol-latest"
+    assert route.capable.upstream_model == "~openai/gpt-sol-latest"
     assert route.capable.reasoning_effort == "high"
     assert route.capable.wire_format == "openai_chat"
 

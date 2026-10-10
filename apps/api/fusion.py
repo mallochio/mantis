@@ -70,19 +70,32 @@ def _fusion_route_session(session_id: str):
 
 
 MAIN_PREAMBLE = (
-    "You are the lead engineer on a software task. Plan the work, delegate execution to "
-    "a sidekick, and review the sidekick's output. "
+    "You are the lead engineer on a software task, paired with a cheap coding "
+    "sidekick whose turns cost a small fraction of yours. Plan the work, "
+    "delegate implementation and its verification to the sidekick by default, "
+    "and review the sidekick's output. Implement a step yourself only when it "
+    "is trivially small (1-2 turns), when authoring or checking it is "
+    "correctness-critical (data analysis, measurement, eval harnesses), or "
+    "when it needs complex rendered-browser work; otherwise hand it to the "
+    "sidekick, because a good brief protects quality while the sidekick's "
+    "cheaper turns carry the cost. "
     "When you can fully resolve the user request without code changes or tool use "
     "(clarifications, trivia, nothing-to-do, or answers already in context), reply with "
     "exactly one section: 'ANSWER:' followed by the user-facing reply and nothing else. "
     "Otherwise respond with exactly two sections: 'PLAN:' containing the high-level plan, "
     "and 'BRIEF:' containing a self-contained brief for the sidekick. The brief must state "
     "the goal, the files to touch, hard constraints and edge cases, and the exact "
-    "verification commands to run; require the sidekick to report the changes made, "
-    "the commands it ran, and their results. When reviewing a sidekick report, reply "
-    "exactly 'ACCEPT' if the report is satisfactory. Otherwise reply 'FOLLOW_UP:' "
-    "followed by concise, specific feedback. After an escalation from the sidekick, "
-    "reply with 'ANSWER:' or a new 'PLAN:' and 'BRIEF:'."
+    "verification commands to run; specify the change as code (a snippet when that is "
+    "clearest), never as prose the sidekick must interpret, and never leave alternatives "
+    "for the sidekick to pick between; keep open questions and lead-only actions (user "
+    "messages, approvals, commits) out of the brief, because the sidekick cannot "
+    "perform them and silently drops them; reserve a full test-suite run for at most "
+    "one final gate instead of re-gating unchanged work. Require the sidekick to report "
+    "the changes made, the commands it ran, and their results. When reviewing a sidekick "
+    "report, reply exactly 'ACCEPT' if the report is satisfactory. Otherwise reply "
+    "'FOLLOW_UP:' followed by concise, specific feedback that covers every issue you "
+    "found, so one revision round fixes all of them. After an escalation from the "
+    "sidekick, reply with 'ANSWER:' or a new 'PLAN:' and 'BRIEF:'."
 )
 
 SIDEKICK_PREAMBLE = (
@@ -91,6 +104,8 @@ SIDEKICK_PREAMBLE = (
     "as the current narrowing ask; obey 'brief:' for what to do. Do not redesign the "
     "work. If the brief is impossible, needs frontier judgment, or you are over budget, "
     "reply with exactly 'ESCALATE_TO_MAIN:' followed by a concise reason and stop. "
+    "After two or three failed attempts at the same failure without a clear next step, "
+    "escalate with what you tried and your best diagnosis instead of retrying. "
     "You may use the provided tools. When finished successfully, return a concise final "
     "report listing the changes made, the verification commands you ran with their real "
     "output, and any remaining issues."
@@ -165,10 +180,44 @@ def _user_message_texts(messages: list[dict[str, Any]] | None, brief: str) -> tu
     return brief_text, brief_text
 
 
+def _trailing_error_streak(messages: list[dict[str, Any]]) -> int:
+    """Count consecutive failed tool results at the tail of a lane transcript."""
+    streak = 0
+    for message in reversed(messages):
+        if message.get("role") != "tool":
+            continue
+        if not message.get("is_error"):
+            break
+        streak += 1
+    return streak
+
+
+def _validate_pool_ordering(config: FusionRoutingConfig) -> None:
+    """Reject role pools whose known prices are not cheapest-first."""
+    prices = providers._price_map()
+    if not prices:
+        return
+    for role in ("main", "sidekick"):
+        pool = getattr(config, role)
+        if not isinstance(pool, list) or len(pool) < 2:
+            continue
+        raw_keys = [providers._price_key(str(slot), prices) for slot in pool]
+        keys = [key for key in raw_keys if key is not None]
+        if len(keys) != len(raw_keys):
+            continue
+        for earlier, later in zip(keys, keys[1:], strict=False):
+            if prices[later][0] < prices[earlier][0]:
+                raise ValueError(
+                    f"fusion {role} pool is not cheapest-first: {later} is cheaper "
+                    f"than {earlier} before it"
+                )
+
+
 REVIEW_PROMPT = (
     "The sidekick produced the following report. Review it. If it is satisfactory, "
-    "reply exactly 'ACCEPT'. Otherwise reply 'FOLLOW_UP:' followed by concise feedback "
-    "so the sidekick can revise.\n\nReport:\n"
+    "reply exactly 'ACCEPT'. Otherwise reply 'FOLLOW_UP:' followed by concise, specific "
+    "feedback that covers every issue you found, so the sidekick can fix all of them "
+    "in one revision round.\n\nReport:\n"
 )
 
 ESCALATE_PROMPT = (
@@ -349,6 +398,15 @@ class FusionConfig:
             return 0
         return max(0, value)
 
+    def sidekick_max_consecutive_errors(self) -> int:
+        raw = self._load().get("sidekick_max_consecutive_errors")
+        if raw is None or raw == "":
+            return 3
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 3
+
     def sidekick_max_follow_ups(self) -> int:
         raw = self._load().get("sidekick_max_follow_ups")
         if raw is None:
@@ -388,7 +446,9 @@ class FusionConfig:
     def main_routing(self) -> FusionRoutingConfig:
         fields = FusionRoutingConfig.model_fields
         data = {k: v for k, v in (self._load() or {}).items() if k in fields}
-        return cast(FusionRoutingConfig, FusionRoutingConfig.model_validate(data))
+        config = cast(FusionRoutingConfig, FusionRoutingConfig.model_validate(data))
+        _validate_pool_ordering(config)
+        return config
 
     def main_router(self) -> FusionRouter:
         return FusionRouter.from_config(self.main_routing(), "main")
@@ -599,6 +659,7 @@ def _orchestration_metadata(run: FusionRun) -> dict[str, Any]:
         "subtask_round_limit": run.sidekick_max_tool_rounds or None,
         "subtask_follow_ups_used": run.subtask_follow_ups,
         "subtask_follow_up_limit": run.sidekick_max_follow_ups,
+        "fusion_savings_usd": run._fusion_savings_usd(),
         "run_guard_remaining": run_remaining,
         "review": (
             "accepted"
@@ -635,10 +696,11 @@ class FusionCoordinator:
         self.config = config or _fusion_config()
         self.main_router = self.config.main_router()
         self.sidekick_router = self.config.sidekick_router()
-        self.main_slot = self.select("main", 0, 0)
-        self.sidekick_slot = self.select("sidekick", 0, 0)
+        self.main_slot = self.select("main")
+        self.sidekick_slot = self.select("sidekick")
         self.max_follow_ups = self.config.max_follow_ups()
         self.sidekick_max_tool_rounds = self.config.sidekick_max_tool_rounds()
+        self.sidekick_max_consecutive_errors = self.config.sidekick_max_consecutive_errors()
         self.sidekick_max_follow_ups = self.config.sidekick_max_follow_ups()
         self.run_max_turns = self.config.run_max_turns()
         self.context_window = self.config.context_window()
@@ -647,9 +709,9 @@ class FusionCoordinator:
         self.default_tool_options = self.config.tool_options()
         self.default_budget = self.config.default_budget()
 
-    def select(self, role: str, turn_index: int, escalation_count: int) -> str:
+    def select(self, role: str, escalation_count: int = 0) -> str:
         router = self.main_router if role == "main" else self.sidekick_router
-        return cast(str, router.select(turn_index, escalation_count))
+        return cast(str, router.select(escalation_count))
 
     # JSON includes replay-only reasoning metadata and tool schemas that
     # LiteLLM's chat-message counter intentionally ignores. Tokenize the full
@@ -998,10 +1060,9 @@ class ExecutionLane:
             plan,
             self.assignment.task,
         )
-        return [
-            {"role": "system", "content": system},
-            {"role": "user", "content": brief},
-        ]
+        messages = list(self.shared_messages or [])
+        messages.append({"role": "user", "content": brief})
+        return [{"role": "system", "content": system}, *messages]
 
     def _tools_for_lane(self) -> list[dict[str, Any]] | None:
         tools = list(self.run.tools or [])
@@ -1021,7 +1082,7 @@ class ExecutionLane:
                 config = FusionRoutingConfig(sidekick=self.profile.model)
                 base_route = self.coordinator.sidekick_router.base_route
             router = FusionRouter(config, self.role, base_route)
-            return cast(str, router.select(self.run.follow_up_count, self.run.follow_up_count))
+            return cast(str, router.select(self.run.follow_up_count))
         compaction_slot = (
             self.run.main_compaction_slot
             if self.role == "main"
@@ -1034,7 +1095,7 @@ class ExecutionLane:
             if self.role == "main"
             else self.coordinator.sidekick_router
         )
-        return cast(str, router.select(self.run.follow_up_count, self.run.follow_up_count))
+        return cast(str, router.select(self.run.follow_up_count))
 
     def _record_subtask_state(self) -> None:
         if self.role != "sidekick":
@@ -1056,6 +1117,19 @@ class ExecutionLane:
         if tool_results:
             self._append_tool_results(tool_results)
             self.pending_tool_calls = []
+        error_cap = self.coordinator.sidekick_max_consecutive_errors
+        if (
+            self.role == "sidekick"
+            and error_cap > 0
+            and _trailing_error_streak(self.messages) >= error_cap
+        ):
+            self.exhausted = True
+            self.report = (
+                f"ESCALATE_TO_MAIN: sidekick hit {error_cap} consecutive "
+                "failed tool results"
+            )
+            self.complete = True
+            return self._status(status="completed", report=self.report)
         if (
             self.coordinator.sidekick_max_tool_rounds > 0
             and self.tool_rounds >= self.coordinator.sidekick_max_tool_rounds
@@ -1091,6 +1165,7 @@ class ExecutionLane:
             self.run.budget.consume_turn()
         if getattr(serve_config._history_context, "active_run", None) is not self.run:
             self.run.add_usage(usage, model=slot)
+            self.run._add_role_usage(self.role, slot, usage)
         self.run.record_activity(
             "execution_lane_turn",
             lane=self.lane_id,
@@ -1191,7 +1266,7 @@ class FusionRun(NativeRun):
         brief: str = "",
         tools: list[dict[str, Any]] | None = None,
         messages: list[dict[str, Any]] | None = None,
-        delegation_mode: str = "forced",
+        delegation_mode: str = "available",
         worker_profiles: list[FusionWorkerProfile] | None = None,
         budget: FusionRunBudget | None = None,
         tool_options: FusionToolOptions | None = None,
@@ -1199,7 +1274,7 @@ class FusionRun(NativeRun):
         super().__init__(run_id)
         self.kind = "fusion"
         self.brief = brief
-        mode = delegation_mode if delegation_mode in DELEGATION_MODES else "forced"
+        mode = delegation_mode if delegation_mode in DELEGATION_MODES else "available"
         self.delegation_mode = mode
         self.worker_profiles = {p.name: p for p in (worker_profiles or [])}
         self.tool_options = tool_options or FusionToolOptions()
@@ -1211,12 +1286,13 @@ class FusionRun(NativeRun):
         coordinator = FusionCoordinator()
         budget_values = budget.model_dump() if budget is not None else {}
         budget_values.setdefault("max_turns", coordinator.run_max_turns)
-        self.budget = FusionBudgetGuard(**budget_values)
+        self.budget: FusionBudgetGuard | None = FusionBudgetGuard(**budget_values)
         # Keep the slots with the run so status/trace responses remain stable
         # if the catalog is changed while a run is in progress.
         self.main_slot = coordinator.main_slot
         self.sidekick_slot = coordinator.sidekick_slot
         self.sidekick_max_tool_rounds = coordinator.sidekick_max_tool_rounds
+        self.sidekick_max_consecutive_errors = coordinator.sidekick_max_consecutive_errors
         self.sidekick_max_follow_ups = coordinator.sidekick_max_follow_ups
         self.run_max_turns = coordinator.run_max_turns
         self.main_router = coordinator.main_router
@@ -1274,13 +1350,14 @@ class FusionRun(NativeRun):
         self.completed_via: str = ""
         self._resume_allows_answer = False
         self.turns: list[dict[str, Any]] = []
+        self.role_usage: dict[str, dict[str, dict[str, int]]] = {}
         self.structured_plan: FusionPlan | None = None
         self.server_tool_names: set[str] = set()
         self.main_lane: ExecutionLane | None = None
         self.sidekick_lanes: list[ExecutionLane] = []
         self.sidekick_reports: list[str] = []
         self.pending_user_messages: list[str] = []
-        self.trace_cursors: dict[str, int] = {}
+        self.trace_cursors: dict[str, Any] = {}
         self.status = "main_planning"
 
     def __setstate__(self, state: dict[str, Any]) -> None:
@@ -1309,8 +1386,10 @@ class FusionRun(NativeRun):
             # 0 means unlimited sidekick tool rounds; the run-level guard is the
             # only ceiling, so restored runs must not inherit an old cap.
             "sidekick_max_tool_rounds": 0,
+            "sidekick_max_consecutive_errors": 3,
             "sidekick_max_follow_ups": 2,
             "run_max_turns": 64,
+            "role_usage": {},
             "server_tool_names": set(),
             "active_role": "main",
             "main_slot": "gpt-5_6-sol",
@@ -1378,7 +1457,6 @@ class FusionRun(NativeRun):
         prompt: str | None = None,
         tools: list[dict[str, Any]] | None = None,
         *,
-        turn_index: int = 0,
         escalation_count: int | None = None,
         slot_override: str | None = None,
     ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
@@ -1388,13 +1466,13 @@ class FusionRun(NativeRun):
             slot = slot_override
         elif role == "main":
             slot = self.main_compaction_slot or (
-                self.main_router.select(turn_index, esc)
+                self.main_router.select(esc)
                 if self.main_router is not None
                 else self.main_slot
             )
         else:
             slot = self.sidekick_compaction_slot or (
-                self.sidekick_router.select(turn_index, esc)
+                self.sidekick_router.select(esc)
                 if self.sidekick_router is not None
                 else self.sidekick_slot
             )
@@ -1427,6 +1505,7 @@ class FusionRun(NativeRun):
         calls = message.get("tool_calls") or []
         if getattr(serve_config._history_context, "active_run", None) is not self:
             self.add_usage(usage, model=slot)
+            self._add_role_usage(role, slot, usage)
         self.record_activity(
             f"{role}_turn",
             role=role,
@@ -1455,6 +1534,40 @@ class FusionRun(NativeRun):
             return isinstance(cached, int) and cached > 0
         return False
 
+    def _add_role_usage(self, role: str, slot: str, usage: dict[str, Any]) -> None:
+        """Accumulate per-role, per-model token usage for cost reporting."""
+        if not isinstance(usage, dict):
+            return
+        models = self.role_usage.setdefault(role, {})
+        tokens = models.setdefault(slot, {"prompt_tokens": 0, "completion_tokens": 0})
+        for key in ("prompt_tokens", "completion_tokens"):
+            value = usage.get(key)
+            if isinstance(value, int) and value >= 0:
+                tokens[key] += value
+
+    def _fusion_savings_usd(self) -> float | None:
+        """Estimate savings: sidekick tokens priced at the main slot's rates."""
+        sidekick = self.role_usage.get("sidekick") or {}
+        if not sidekick:
+            return None
+        prices = providers._price_map()
+        main_key = providers._price_key(self.main_slot, prices)
+        if main_key is None:
+            return None
+        main_input, main_output = prices[main_key]
+        actual = 0.0
+        counterfactual = 0.0
+        for model, tokens in sidekick.items():
+            cost = providers._model_cost(model, tokens, prices)
+            if cost is None:
+                return None
+            actual += cost
+            counterfactual += (
+                int(tokens.get("prompt_tokens", 0)) * main_input
+                + int(tokens.get("completion_tokens", 0)) * main_output
+            )
+        return round(counterfactual - actual, 6)
+
     def _reroute_after_compaction(self, role: str, previous: str, cache_warm: bool = False) -> None:
         if role == "main" and self.structured and self.structured_plan is None:
             self.main_compaction_pending = previous
@@ -1463,10 +1576,12 @@ class FusionRun(NativeRun):
         if router is None:
             return
         complexity = self.structured_plan.complexity if self.structured_plan else 1.0
+        lane_messages = self.main_messages if role == "main" else self.sidekick_messages
+        failures = max(self.follow_up_count, _trailing_error_streak(lane_messages))
         selected = router.select_at_compaction(
             complexity,
             previous,
-            self.follow_up_count,
+            failures,
             cache_warm=cache_warm,
         )
         if selected == previous:
@@ -1762,6 +1877,7 @@ class FusionRun(NativeRun):
             "usage": self.usage,
             "usage_models": self.usage_models,
             "cost": providers._usage_cost(self.usage_models),
+            "fusion_savings_usd": self._fusion_savings_usd(),
             "follow_up_count": self.follow_up_count,
             "follow_up_capped": self.follow_up_capped,
             "activity": self._activity,
@@ -1781,6 +1897,7 @@ class FusionRun(NativeRun):
             "usage": self.usage,
             "usage_models": self.usage_models,
             "cost": providers._usage_cost(self.usage_models),
+            "fusion_savings_usd": self._fusion_savings_usd(),
             "follow_up_count": self.follow_up_count,
             "follow_up_capped": self.follow_up_capped,
             "activity": self._activity,
@@ -2008,14 +2125,26 @@ class FusionRun(NativeRun):
 
     def _legacy_sidekick_step(self, coordinator: FusionCoordinator) -> bool:
         self.active_role = "sidekick"
-        at_budget = (
-            coordinator.sidekick_max_tool_rounds > 0
-            and self.subtask_rounds >= coordinator.sidekick_max_tool_rounds
-        )
-        tools = None if at_budget else self.tools
-        sidekick_text, sidekick_calls, _ = self._call_lane(
-            coordinator, "sidekick", tools=tools
-        )
+        error_cap = coordinator.sidekick_max_consecutive_errors
+        if (
+            error_cap > 0
+            and _trailing_error_streak(self.sidekick_messages) >= error_cap
+        ):
+            sidekick_text = (
+                f"ESCALATE_TO_MAIN: sidekick hit {error_cap} consecutive "
+                "failed tool results"
+            )
+            sidekick_calls: list[dict[str, Any]] = []
+            at_budget = False
+        else:
+            at_budget = (
+                coordinator.sidekick_max_tool_rounds > 0
+                and self.subtask_rounds >= coordinator.sidekick_max_tool_rounds
+            )
+            tools = None if at_budget else self.tools
+            sidekick_text, sidekick_calls, _ = self._call_lane(
+                coordinator, "sidekick", tools=tools
+            )
         if sidekick_calls and at_budget:
             sidekick_text, sidekick_calls, _ = self._call_lane(
                 coordinator,
@@ -2215,9 +2344,22 @@ class FusionRun(NativeRun):
                     coordinator,
                     FusionSidekickAssignment(task=feedback),
                     lane.profile,
+                    shared_messages=self._carryover_messages(coordinator, lane),
                 )
             lanes.append(lane)
         self.sidekick_lanes = lanes
+
+    def _carryover_messages(
+        self,
+        coordinator: FusionCoordinator,
+        lane: ExecutionLane,
+    ) -> list[dict[str, Any]]:
+        """Trim a lane's transcript so its replacement keeps the context."""
+        prior = lane.messages[1:] if lane.messages else []
+        if prior and prior[0].get("role") == "system":
+            prior = prior[1:]
+        budget = max(1, coordinator.context_window // 8)
+        return coordinator._trim_messages(prior, budget)
 
     def _advance_structured(
         self,
@@ -2558,7 +2700,7 @@ def create_fusion_run(
     brief: str,
     tools: list[dict[str, Any]] | None = None,
     messages: list[dict[str, Any]] | None = None,
-    delegation_mode: str = "forced",
+    delegation_mode: str = "available",
     worker_profiles: list[FusionWorkerProfile] | None = None,
     budget: FusionRunBudget | None = None,
     tool_options: FusionToolOptions | None = None,

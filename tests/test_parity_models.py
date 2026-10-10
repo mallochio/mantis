@@ -69,5 +69,3 @@ def test_supported_parameters_accepted_by_chat_request(client):
         "web_search_options",
     }
     assert set(_models(client)[0]["supported_parameters"]) == expected
-
-

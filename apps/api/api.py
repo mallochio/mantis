@@ -1236,6 +1236,7 @@ class FusionResponse(BaseModel):
     request_id: str | None = None
     usage_models: dict[str, Any] = Field(default_factory=dict)
     cost: float | None = None
+    fusion_savings_usd: float | None = None
     follow_up_count: int = 0
     follow_up_capped: bool = False
 

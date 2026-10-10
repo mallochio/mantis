@@ -15,6 +15,8 @@ from fusion_types import FusionRoutingConfig
 from model_catalog import catalog_path
 from model_catalog_schema import BaseRoute, load_base_route
 
+_BASE_ROUTE_CACHE: dict[tuple[str, int, int], BaseRoute | None] = {}
+
 
 class FusionRouter:
     """Pick a virtual route or concrete model spec for one Fusion lane."""
@@ -37,7 +39,8 @@ class FusionRouter:
         Defaults to the active catalog resolved from ``AI_ROUTING_CONFIG`` /
         ``MANTIS_CATALOG_PATH`` so production callers keep working without
         changes, while tests can inject a hermetic catalog path instead of
-        depending on ``~/`` state.
+        depending on ``~/`` state. Parsed routes are cached per file identity
+        so per-lane router construction stays cheap.
         """
         if catalog is not None:
             path = Path(catalog).expanduser()
@@ -46,13 +49,21 @@ class FusionRouter:
         if not path.is_file():
             return None
         try:
-            with path.open("rb") as handle:
-                root = tomllib.load(handle)
-            if root.get("version") != 1:
-                return None
-            return load_base_route(root)
-        except (OSError, tomllib.TOMLDecodeError, ValueError):
+            stat = path.stat()
+        except OSError:
             return None
+        key = (str(path), stat.st_mtime_ns, stat.st_size)
+        if key not in _BASE_ROUTE_CACHE:
+            route: BaseRoute | None = None
+            try:
+                with path.open("rb") as handle:
+                    root = tomllib.load(handle)
+                if root.get("version") == 1:
+                    route = load_base_route(root)
+            except (OSError, tomllib.TOMLDecodeError, ValueError):
+                route = None
+            _BASE_ROUTE_CACHE[key] = route
+        return _BASE_ROUTE_CACHE[key]
 
     @classmethod
     def from_config(
@@ -63,13 +74,12 @@ class FusionRouter:
     ) -> FusionRouter:
         return cls(config, role, cls._load_base_route(catalog))
 
-    def select(self, turn_index: int = 0, escalation_count: int = 0) -> str:
-        """Return a provider-executable spec for this turn.
+    def select(self, escalation_count: int = 0) -> str:
+        """Return a provider-executable spec for this escalation level.
 
-        ``turn_index`` counts sidekick iterations; ``escalation_count`` counts
-        times the sidekick escalated or failed. When ``fallback_on_escalate``
-        is set and a pool is configured, each escalation promotes to the next
-        slot in the pool.
+        ``escalation_count`` counts times the sidekick escalated or failed.
+        When ``fallback_on_escalate`` is set and a pool is configured, each
+        escalation promotes to the next slot in the pool.
 
         Pool ordering is cheapest-first for every role, so a higher index is
         always a stronger, costlier slot. Escalation therefore always promotes
@@ -77,7 +87,7 @@ class FusionRouter:
         """
         pool: str | list[str] = self.config.main if self.role == "main" else self.config.sidekick
         if isinstance(pool, str):
-            return self._resolve(pool, escalation_count)
+            return self._resolve(pool)
 
         if not pool:
             raise ValueError(f"fusion {self.role} pool is empty")
@@ -85,16 +95,16 @@ class FusionRouter:
         index = 0
         if self.config.fallback_on_escalate:
             index = min(escalation_count, len(pool) - 1)
-        return self._resolve(pool[index], turn_index + escalation_count)
+        return self._resolve(pool[index])
 
     def strongest(self) -> str:
         """Return the strongest, costliest slot in this role's pool."""
         pool: str | list[str] = self.config.main if self.role == "main" else self.config.sidekick
         if isinstance(pool, str):
-            return self._resolve(pool, 0)
+            return self._resolve(pool)
         if not pool:
             raise ValueError(f"fusion {self.role} pool is empty")
-        return self._resolve(pool[-1], 0)
+        return self._resolve(pool[-1])
 
     def select_at_compaction(
         self,
@@ -105,32 +115,33 @@ class FusionRouter:
     ) -> str:
         """Reroute only where compaction already forces a cache miss.
 
-        When ``cache_warm`` is True the previous model still has a warm
-        provider prompt cache. Switching models would bust the cache for no
-        quality gain, so we prefer staying on the current model unless the
-        task is stuck (``failure_count > 0``) or the complexity clearly
-        demands a stronger model.
+        A warm cache keeps the previous model unless the lane is stuck
+        (``failure_count > 0``). On a cold cache the main role drops to the
+        cheapest slot for low-complexity work, holds at least the second slot
+        for high-complexity work, and never lands on a slot weaker than the
+        one it already runs; any role promotes one slot per failure.
         """
         pool: str | list[str] = self.config.main if self.role == "main" else self.config.sidekick
         if isinstance(pool, str):
-            return self._resolve(pool, failure_count)
+            return self._resolve(pool)
         if not pool:
             raise ValueError(f"fusion {self.role} pool is empty")
-        # Cache-aware heuristic: if the cache is warm and the task is not
-        # stuck, stay on the current model to avoid a costly cache miss.
+        resolved = [self._resolve(candidate) for candidate in pool]
+        current = resolved.index(previous) if previous in resolved else 0
         if cache_warm and failure_count == 0:
             return previous
-        if self.role == "main":
+        if failure_count > 0:
+            index = min(current + 1, len(pool) - 1)
+        elif self.role == "main":
             if complexity < 0.85 and len(pool) > 1:
                 index = 0
             else:
-                resolved = [self._resolve(candidate, 0) for candidate in pool]
-                index = resolved.index(previous) if previous in resolved else len(pool) - 1
+                index = max(current, 1) if len(pool) > 1 else current
         else:
-            index = min(1 if failure_count > 0 else 0, len(pool) - 1)
-        return self._resolve(pool[index], failure_count)
+            index = current
+        return resolved[index]
 
-    def _resolve(self, value: Any, offset: int) -> str:
+    def _resolve(self, value: Any) -> str:
         spec = str(value).strip()
         if not spec:
             raise ValueError(f"fusion {self.role} slot is empty")
@@ -166,6 +177,8 @@ class FusionRouter:
                 f"fusion {self.role} requested base route but no [base] "
                 "section is configured in the catalog"
             )
+        if role not in ("efficient", "capable"):
+            raise ValueError(f"unknown base route role {role!r} for fusion {self.role}")
         target = self.base_route.efficient if role == "efficient" else self.base_route.capable
         spec = f"{target.provider}/{target.upstream_model}"
         if target.reasoning_effort:
