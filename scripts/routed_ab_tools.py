@@ -4,9 +4,15 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
+
+import httpx
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api"
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -168,3 +174,76 @@ def execute_tool_call(call: dict[str, Any], workspace: Path) -> str:
         return _search(args, workspace)
     except (OSError, ValueError) as error:
         return f"tool error: {error}"
+
+
+def openrouter_headers() -> dict[str, str]:
+    """Return per-request auth headers for the direct OpenRouter transport."""
+    key = os.environ.get("OPENROUTER_API_KEY", "")
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
+def request_body(plan: dict[str, Any], messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build the chat request body for one variant plan."""
+    body: dict[str, Any] = {"model": plan["model"], "messages": messages, "tools": TOOL_SCHEMAS}
+    for key in ("tool_options", "worker_profiles"):
+        if plan.get(key) is not None:
+            body[key] = plan[key]
+    if plan.get("reasoning_effort") and plan["reasoning_effort"] != "none":
+        body["reasoning_effort"] = plan["reasoning_effort"]
+    return body
+
+
+def usage_totals(payloads: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate per-round usage and upstream cost for direct-transport runs."""
+    prompt = completion = cached = 0
+    cost = 0.0
+    for usage in [p.get("usage") or {} for p in payloads]:
+        prompt += int(usage.get("prompt_tokens") or 0)
+        completion += int(usage.get("completion_tokens") or 0)
+        details = usage.get("prompt_tokens_details")
+        cached += details.get("cached_tokens", 0) if isinstance(details, dict) else 0
+        details = usage.get("cost_details")
+        cost += details.get("upstream_inference_cost", 0.0) if isinstance(details, dict) else 0.0
+    return {
+        "usage": {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "prompt_tokens_details": {"cached_tokens": cached},
+        },
+        "cost": round(cost, 6),
+    }
+
+
+def case_observation(
+    plan: dict[str, Any],
+    payloads: list[dict[str, Any]],
+    message: dict[str, Any],
+    tool_rounds: int,
+    started: float,
+) -> dict[str, Any]:
+    """Assemble the observation envelope for one completed case."""
+    payload = payloads[-1] if payloads else {}
+    event = payload.get("mantis_event") or (usage_totals(payloads) if plan.get("base_url") else {})
+    return {
+        "content": str(message.get("content") or ""),
+        "event": event,
+        "response": payload,
+        "tool_rounds": int(tool_rounds),
+        "wall_time_s": time.monotonic() - started,
+    }
+
+
+def post_round(
+    client: httpx.Client,
+    base_url: str,
+    body: dict[str, Any],
+    headers: dict[str, str],
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Post one chat round and return the payload plus continuation headers."""
+    response = client.post(f"{base_url}/v1/chat/completions", json=body, headers=headers)
+    response.raise_for_status()
+    payload = response.json()
+    run_id = response.headers.get("x-mantis-run-id", "")
+    if run_id:
+        headers["X-Mantis-Run-Id"] = run_id
+    return payload, headers

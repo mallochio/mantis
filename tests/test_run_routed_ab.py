@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 import run_routed_ab as runner
 from evaluate_routed_harness import EvalCase, _validate_record, aggregate_records
+from routed_ab_tools import OPENROUTER_BASE_URL, usage_totals
 
 
 def _catalog() -> dict[str, Any]:
@@ -28,9 +29,10 @@ def test_request_plan_maps_every_variant():
     catalog = _catalog()
     efficient = runner.request_plan("efficient-only", catalog)
     capable = runner.request_plan("capable-only", catalog)
-    assert efficient["model"] == "openrouter/~openai/gpt-sol-latest"
+    assert efficient["model"] == "~openai/gpt-sol-latest"
+    assert efficient["base_url"] == OPENROUTER_BASE_URL
     assert efficient["reasoning_effort"] == "medium"
-    assert capable["model"] == "openrouter/~openai/gpt-sol-latest"
+    assert capable["model"] == "~openai/gpt-sol-latest"
     assert capable["reasoning_effort"] == "high"
     assert runner.request_plan("mantis-base", catalog) == {"model": "mantis/base"}
     pinned = runner.request_plan("fusion-pinned", catalog)
@@ -149,3 +151,104 @@ def test_usage_numbers_falls_back_to_response_usage():
     }
     empty = runner.usage_numbers(None, {})
     assert empty["input_tokens"] == 0
+
+class _FakeResponse:
+    def __init__(self, payload: dict[str, Any]):
+        self._payload = payload
+
+    def raise_for_status(self) -> None:
+        pass
+
+    @property
+    def headers(self) -> dict[str, str]:
+        return {}
+
+    def json(self) -> dict[str, Any]:
+        return self._payload
+
+
+class _FakeClient:
+    def __init__(self, payloads: list[dict[str, Any]]):
+        self._iter = iter(payloads)
+
+    def post(self, *args: Any, **kwargs: Any) -> _FakeResponse:
+        return _FakeResponse(next(self._iter))
+
+
+def _usage_payload(prompt: int, completion: int, cost: float) -> dict[str, Any]:
+    return {
+        "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "done"}}],
+        "usage": {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "prompt_tokens_details": {"cached_tokens": 3},
+            "cost_details": {"upstream_inference_cost": cost},
+        },
+    }
+
+
+def test_usage_totals_sums_rounds_and_upstream_cost():
+    totals = usage_totals([_usage_payload(10, 2, 0.5), _usage_payload(7, 1, 0.25)])
+    assert totals["usage"]["prompt_tokens"] == 17
+    assert totals["usage"]["completion_tokens"] == 3
+    assert totals["usage"]["prompt_tokens_details"]["cached_tokens"] == 6
+    assert totals["cost"] == 0.75
+
+
+def test_drive_case_returns_budget_observation_instead_of_raising(tmp_path: Path):
+    plan = {"model": "~openai/gpt-sol-latest", "base_url": "https://example.invalid"}
+    tool_call = {
+        "choices": [
+            {
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "t1",
+                            "function": {
+                                "name": "bash",
+                                "arguments": json.dumps({"command": "true"}),
+                            },
+                        }
+                    ],
+                },
+            }
+        ],
+        "usage": {},
+    }
+    client = _FakeClient([tool_call, tool_call])
+    observation = runner.drive_case(client, "https://example.invalid", plan, "do it", tmp_path, 2)
+    assert observation["content"] == "EXCEEDED_TOOL_BUDGET"
+    assert observation["tool_rounds"] == 2
+
+
+def test_drive_case_sums_usage_across_direct_rounds(tmp_path: Path):
+    plan = {"model": "~openai/gpt-sol-latest", "base_url": "https://example.invalid"}
+    tool_call = {
+        "choices": [
+            {
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "t1",
+                            "function": {
+                                "name": "bash",
+                                "arguments": json.dumps({"command": "true"}),
+                            },
+                        }
+                    ],
+                },
+            }
+        ],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 1},
+    }
+    client = _FakeClient([tool_call, _usage_payload(10, 2, 0.5)])
+    observation = runner.drive_case(client, "https://example.invalid", plan, "do it", tmp_path, 4)
+    assert observation["content"] == "done"
+    assert observation["event"]["usage"]["prompt_tokens"] == 15
+    assert observation["event"]["cost"] == 0.5

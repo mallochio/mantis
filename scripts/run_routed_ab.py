@@ -17,7 +17,14 @@ from typing import Any
 
 import httpx
 from evaluate_routed_harness import VARIANTS, load_cases
-from routed_ab_tools import TOOL_SCHEMAS, execute_tool_call
+from routed_ab_tools import (
+    OPENROUTER_BASE_URL,
+    case_observation,
+    execute_tool_call,
+    openrouter_headers,
+    post_round,
+    request_body,
+)
 
 REPO = Path(__file__).resolve().parent.parent
 EVAL = REPO / "eval"
@@ -38,18 +45,20 @@ def base_target_spec(catalog: dict[str, Any], role: str) -> dict[str, str]:
     target = catalog["base"]["targets"][role]
     return {
         "model": f"{target['provider']}/{target['upstream_model']}",
+        "upstream_model": str(target["upstream_model"]),
         "reasoning_effort": str(target.get("reasoning_effort") or "none"),
     }
 
 
 def request_plan(variant: str, catalog: dict[str, Any]) -> dict[str, Any]:
     """Map one benchmark variant onto chat request fields."""
-    if variant == "efficient-only":
-        spec = base_target_spec(catalog, "efficient")
-        return {"model": spec["model"], "reasoning_effort": spec["reasoning_effort"]}
-    if variant == "capable-only":
-        spec = base_target_spec(catalog, "capable")
-        return {"model": spec["model"], "reasoning_effort": spec["reasoning_effort"]}
+    if variant in {"efficient-only", "capable-only"}:
+        spec = base_target_spec(catalog, variant.split("-")[0])
+        return {
+            "model": spec["upstream_model"],
+            "reasoning_effort": spec["reasoning_effort"],
+            "base_url": OPENROUTER_BASE_URL,
+        }
     if variant == "mantis-base":
         return {"model": "mantis/base"}
     if variant == "fusion-pinned":
@@ -102,22 +111,6 @@ def selected_models(event: dict[str, Any], plan: dict[str, Any]) -> list[str]:
     return [str(plan["model"])]
 
 
-def _post_round(
-    client: httpx.Client,
-    base_url: str,
-    body: dict[str, Any],
-    headers: dict[str, str],
-) -> tuple[dict[str, Any], dict[str, str]]:
-    """Post one chat round and return the payload plus continuation headers."""
-    response = client.post(f"{base_url}/v1/chat/completions", json=body, headers=headers)
-    response.raise_for_status()
-    payload = response.json()
-    run_id = response.headers.get("x-mantis-run-id", "")
-    if run_id:
-        headers["X-Mantis-Run-Id"] = run_id
-    return payload, headers
-
-
 def _apply_tool_results(
     message: dict[str, Any],
     workspace: Path,
@@ -135,20 +128,6 @@ def _apply_tool_results(
     )
 
 
-def _request_body(plan: dict[str, Any], messages: list[dict[str, Any]]) -> dict[str, Any]:
-    """Build the chat request body for one variant plan."""
-    body: dict[str, Any] = {
-        "model": plan["model"],
-        "messages": messages,
-        "tools": TOOL_SCHEMAS,
-        "tool_options": plan.get("tool_options"),
-        "worker_profiles": plan.get("worker_profiles"),
-    }
-    if plan.get("reasoning_effort") and plan["reasoning_effort"] != "none":
-        body["reasoning_effort"] = plan["reasoning_effort"]
-    return body
-
-
 def drive_case(
     client: httpx.Client,
     base_url: str,
@@ -156,28 +135,27 @@ def drive_case(
     prompt: str,
     workspace: Path,
     max_rounds: int,
+    plan_auth: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Run one case to completion and return the observation envelope."""
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
-    body = _request_body(plan, messages)
-    headers: dict[str, str] = {}
+    body = request_body(plan, messages)
+    headers: dict[str, str] = dict(plan_auth or {})
     rounds = 0
     started = time.monotonic()
+    payloads: list[dict[str, Any]] = []
     while rounds < max_rounds:
         rounds += 1
-        payload, headers = _post_round(client, base_url, body, headers)
+        payload, headers = post_round(client, base_url, body, headers)
+        payloads.append(payload)
         choices = payload.get("choices") or [{}]
         message = choices[0].get("message") or {}
         if choices[0].get("finish_reason") != "tool_calls":
-            return {
-                "content": str(message.get("content") or ""),
-                "event": payload.get("mantis_event") or {},
-                "response": payload,
-                "tool_rounds": rounds - 1,
-                "wall_time_s": time.monotonic() - started,
-            }
+            return case_observation(plan, payloads, message, rounds - 1, started)
         _apply_tool_results(message, workspace, messages)
-    raise RuntimeError("case exceeded the tool-round budget")
+    return case_observation(
+        plan, payloads, {"content": "EXCEEDED_TOOL_BUDGET"}, max_rounds, started
+    )
 
 
 def build_record(variant: str, case: Any, obs: dict, plan: dict) -> dict:
@@ -236,11 +214,15 @@ def run_variant(
 ) -> int:
     """Execute every case under one variant and append records."""
     plan = request_plan(variant, catalog)
+    plan_url = str(plan.get("base_url") or base_url)
+    plan_auth = openrouter_headers() if plan.get("base_url") else {}
     count = 0
     for case in cases:
         workspace = workspace_root / variant / case.case_id
         workspace.mkdir(parents=True, exist_ok=True)
-        observation = drive_case(client, base_url, plan, case.prompt, workspace, max_rounds)
+        observation = drive_case(
+            client, plan_url, plan, case.prompt, workspace, max_rounds, plan_auth
+        )
         record = build_record(variant, case, observation, plan)
         _persist_run(record, observation, case, out_path, transcripts_dir)
         count += 1
