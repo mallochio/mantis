@@ -351,6 +351,7 @@
     "scripts/retrain_conductor.py|noqa: e402#2": null,
     "scripts/retrain_conductor.py|noqa: e402#3": null,
     "scripts/retrain_router_pool.py|noqa: ble001": null,
+    "scripts/routed_ab_tools.py|noqa: s603 - reason: fixed bash -c shape with a workspace cwd jail": "reason: fixed bash -c shape with a workspace cwd jail",
     "tests/conftest.py|pragma: no cover - repo checkout always ships config/catalog.toml": "repo checkout always ships config/catalog.toml",
     "tests/test_fusion.py|noqa: s301": null,
     "tests/test_fusion.py|noqa: s301 - trusted local round-trip": "trusted local round-trip",
