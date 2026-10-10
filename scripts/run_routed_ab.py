@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import time
 import tomllib
 from pathlib import Path
@@ -31,6 +32,7 @@ REPO = Path(__file__).resolve().parent.parent
 EVAL = REPO / "eval"
 DEFAULT_CATALOG = REPO / "config" / "catalog.toml"
 DEFAULT_CASES = EVAL / "routed-harness-cases.jsonl"
+DEFAULT_FIXTURES = EVAL / "routed-harness-fixtures"
 DEFAULT_OUT = EVAL / "results-routed-ab.jsonl"
 DEFAULT_TRANSCRIPTS = EVAL / "runs" / "routed-ab"
 DEFAULT_PRICES = EVAL / "model_prices.json"
@@ -67,9 +69,7 @@ def request_plan(variant: str, catalog: dict[str, Any]) -> dict[str, Any]:
         return {
             "model": "mantis/fusion",
             "tool_options": {"enabled": ["workspace", "shell"], "server_execution": True},
-            "worker_profiles": [
-                {"name": "default", "model": str(catalog["fusion"]["main"])}
-            ],
+            "worker_profiles": [{"name": "default", "model": str(catalog["fusion"]["main"])}],
         }
     if variant == "fusion-routed":
         return {
@@ -219,6 +219,14 @@ def _persist_run(
     )
 
 
+def seed_workspace(case_id: str, workspace: Path, fixtures_root: Path) -> Path:
+    """Copy one case's fixture files into its arm workspace before the run."""
+    fixture_dir = fixtures_root / case_id
+    if fixture_dir.is_dir():
+        shutil.copytree(fixture_dir, workspace, dirs_exist_ok=True)
+    return workspace
+
+
 def run_variant(
     client: httpx.Client,
     base_url: str,
@@ -228,6 +236,7 @@ def run_variant(
     out_path: Path,
     transcripts_dir: Path,
     workspace_root: Path,
+    fixtures_root: Path,
     max_rounds: int,
     prices: dict[str, Any] | None = None,
 ) -> int:
@@ -239,6 +248,7 @@ def run_variant(
     for case in cases:
         workspace = workspace_root / variant / case.case_id
         workspace.mkdir(parents=True, exist_ok=True)
+        seed_workspace(case.case_id, workspace, fixtures_root)
         observation = drive_case(
             client, plan_url, plan, case.prompt, workspace, max_rounds, plan_auth
         )
@@ -262,6 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
     base_url = os.environ.get("MANTIS_BASE_URL", "http://127.0.0.1:8000")
     parser.add_argument("--base-url", default=base_url)
     parser.add_argument("--cases", type=Path, default=DEFAULT_CASES)
+    parser.add_argument("--fixtures", type=Path, default=DEFAULT_FIXTURES)
     parser.add_argument("--catalog", type=Path, default=DEFAULT_CATALOG)
     parser.add_argument("--variants", default=",".join(VARIANTS))
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
@@ -299,6 +310,7 @@ def main(argv: list[str] | None = None) -> int:
                 out_path,
                 args.transcripts_dir,
                 args.workspace_root,
+                args.fixtures,
                 args.max_rounds,
                 prices,
             )

@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
 import run_routed_ab as runner
-from evaluate_routed_harness import EvalCase, _validate_record, aggregate_records
+from evaluate_routed_harness import (
+    REQUIRED_GROUPS,
+    EvalCase,
+    _validate_record,
+    aggregate_records,
+    load_cases,
+)
 from routed_ab_tools import OPENROUTER_BASE_URL, priced_cost, usage_totals
 
 
@@ -32,7 +40,7 @@ def test_request_plan_maps_every_variant():
     assert efficient["model"] == "~openai/gpt-sol-latest"
     assert efficient["base_url"] == OPENROUTER_BASE_URL
     assert efficient["reasoning_effort"] == "medium"
-    assert capable["model"] == "openai/gpt-6.1-sol"
+    assert capable["model"] == "~openai/gpt-sol-latest"
     assert capable["reasoning_effort"] == "high"
     assert runner.request_plan("mantis-base", catalog) == {"model": "mantis/base"}
     pinned = runner.request_plan("fusion-pinned", catalog)
@@ -153,6 +161,7 @@ def test_usage_numbers_falls_back_to_response_usage():
     empty = runner.usage_numbers(None, {})
     assert empty["input_tokens"] == 0
 
+
 class _FakeResponse:
     def __init__(self, payload: dict[str, Any]):
         self._payload = payload
@@ -254,6 +263,7 @@ def test_drive_case_sums_usage_across_direct_rounds(tmp_path: Path):
     assert observation["event"]["usage"]["prompt_tokens"] == 15
     assert observation["event"]["cost"] == 0.5
 
+
 def test_priced_cost_uses_rate_card_and_strips_effort_suffix():
     prices = {
         "models": {
@@ -285,3 +295,108 @@ def test_auto_judge_accepts_fusion_answer_prefix():
     assert runner.auto_judge("no-tool-chat", "ANSWER:\nROUTING_OK", 0) is True
     assert runner.auto_judge("no-tool-chat", "ROUTING_OK", 0) is True
     assert runner.auto_judge("no-tool-chat", "ANSWER:\nSomething else", 0) is False
+
+
+def _seed_workspace(case_id: str, root: Path) -> Path:
+    workspace = root / case_id
+    workspace.mkdir(parents=True)
+    return runner.seed_workspace(case_id, workspace, runner.DEFAULT_FIXTURES)
+
+
+def _run_in(workspace: Path, *command: str) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, *command], cwd=workspace, capture_output=True, text=True)
+
+
+def test_case_corpus_loads_with_every_required_group():
+    cases = load_cases(runner.DEFAULT_CASES)
+    assert {case.case_id for case in cases} == {
+        "easy-mechanical-edit",
+        "slow-test-execution",
+        "upstream-reuse",
+        "ambiguous-feature",
+        "error-recovery",
+        "no-tool-chat",
+    }
+    assert {case.group for case in cases} == REQUIRED_GROUPS
+
+
+def test_workspace_cases_name_their_seeded_files(tmp_path: Path):
+    for case in load_cases(runner.DEFAULT_CASES):
+        fixture_dir = runner.DEFAULT_FIXTURES / case.case_id
+        if not fixture_dir.is_dir():
+            continue
+        seeded = {
+            path.relative_to(fixture_dir).as_posix()
+            for path in fixture_dir.rglob("*")
+            if path.is_file() and "__pycache__" not in path.parts
+        }
+        assert seeded, case.case_id
+        assert any(name in case.prompt for name in seeded), case.case_id
+
+
+def test_seed_workspace_copies_fixtures_idempotently(tmp_path: Path):
+    workspace = _seed_workspace("upstream-reuse", tmp_path)
+    first = (workspace / "caller.py").read_text()
+    assert (workspace / "dispatch_helper.py").is_file()
+    assert (workspace / "tests" / "test_caller.py").is_file()
+    assert (workspace / "check_reuse.py").is_file()
+    runner.seed_workspace("upstream-reuse", workspace, runner.DEFAULT_FIXTURES)
+    assert (workspace / "caller.py").read_text() == first
+
+
+def test_seed_workspace_without_fixtures_leaves_workspace_empty(tmp_path: Path):
+    workspace = _seed_workspace("no-tool-chat", tmp_path)
+    assert list(workspace.rglob("*")) == []
+    workspace2 = tmp_path / "elsewhere"
+    workspace2.mkdir(parents=True)
+    assert runner.seed_workspace("no-tool-chat", workspace2, tmp_path / "absent") == workspace2
+    assert list(workspace2.rglob("*")) == []
+
+
+def test_easy_mechanical_edit_fixture_round_trips_checker(tmp_path: Path):
+    workspace = _seed_workspace("easy-mechanical-edit", tmp_path)
+    pristine = _run_in(workspace, "check_settings.py")
+    assert pristine.returncode != 0
+    settings = workspace / "settings.toml"
+    settings.write_text(settings.read_text().replace("legacy_dispatch", "routed_dispatch"))
+    renamed = _run_in(workspace, "check_settings.py")
+    assert renamed.returncode == 0
+    assert "CONFIG_OK" in renamed.stdout
+
+
+def test_upstream_reuse_checker_rejects_duplicate_and_accepts_reuse(tmp_path: Path):
+    workspace = _seed_workspace("upstream-reuse", tmp_path)
+    duplicate = _run_in(workspace, "check_reuse.py")
+    assert duplicate.returncode != 0
+    assert "REUSE_FAILED" in duplicate.stdout
+    workspace.joinpath("caller.py").write_text(
+        '"""Internal caller that routes requests through the shared helper."""\n\n'
+        "from dispatch_helper import routed_dispatch\n\n\n"
+        "def handle(request: dict) -> dict:\n"
+        '    """Serve one request through the shared dispatch helper."""\n'
+        "    return routed_dispatch(request)\n"
+    )
+    reused = _run_in(workspace, "check_reuse.py")
+    assert reused.returncode == 0
+    assert "REUSE_OK" in reused.stdout
+    suite = _run_in(workspace, "-m", "unittest", "discover", "-s", "tests", "-t", ".", "-v")
+    assert suite.returncode == 0
+
+
+def test_ambiguous_feature_fixture_passes_and_lacks_dry_run(tmp_path: Path):
+    workspace = _seed_workspace("ambiguous-feature", tmp_path)
+    suite = _run_in(workspace, "-m", "unittest", "discover", "-s", "tests", "-t", ".", "-v")
+    assert suite.returncode == 0
+    assert "OK" in suite.stderr
+    assert "dry_run" not in workspace.joinpath("tests/test_router.py").read_text()
+
+
+def test_slow_suite_and_error_probe_behave_as_prompted(tmp_path: Path):
+    workspace = _seed_workspace("slow-test-execution", tmp_path)
+    suite = _run_in(workspace, "-m", "unittest", "discover", "-s", "tests", "-t", ".", "-v")
+    assert suite.returncode == 0
+    assert "Ran 4 tests" in suite.stderr
+    probe_root = _seed_workspace("error-recovery", tmp_path)
+    probe = _run_in(probe_root, "upstream_check.py")
+    assert probe.returncode == 1
+    assert "UPSTREAM_TIMEOUT" in probe.stdout

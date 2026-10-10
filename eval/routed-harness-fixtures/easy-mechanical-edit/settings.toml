@@ -1,0 +1,9 @@
+[server]
+label = "legacy_dispatch"
+host = "127.0.0.1"
+port = 8080
+
+[worker]
+label = "legacy_worker"
+max_retries = 3
+timeout_s = 30
