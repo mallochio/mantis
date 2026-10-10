@@ -14,7 +14,7 @@ from contextlib import contextmanager, nullcontext, suppress
 from pathlib import Path
 from typing import Any, cast
 
-import base_proxy
+import direct_completion
 import litellm
 import model_catalog
 import providers
@@ -1076,17 +1076,12 @@ class FusionCoordinator:
         selected_model: str | None = None
         safe_tokens = output_tokens if output_tokens is not None else 4096
         if routed:
-            body = {
-                "model": "mantis/base",
-                "messages": fitted,
-                "temperature": 0.7,
-            }
-            if tools:
-                body["tools"] = tools
-            result = base_proxy.dispatch_routed(
-                body,
+            result = direct_completion._routed_result(
+                fitted,
+                0.7,
+                timeout_s,
                 getattr(serve_config._history_context, "fusion_route_session_id", None),
-                timeout_s=timeout_s,
+                tools,
             )
             data = result.body
             selected_model = result.selected_model

@@ -37,7 +37,7 @@
     "functions": [
       {
         "name": "FusionCoordinator::_call_worker",
-        "complexity": 29
+        "complexity": 27
       },
       {
         "name": "_extract_reasoning_trace",

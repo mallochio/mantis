@@ -996,6 +996,9 @@ def _provider_response(
     tools: list[dict[str, Any]] | None = None,
     timeout_s: float | None = None,
 ) -> dict[str, Any]:
+    """Return a worker response, reusing shared dispatch for the virtual route."""
+    if spec == "mantis/base":
+        return direct_completion._routed_response(messages, temperature, timeout_s, tools)
     run = getattr(serve_config._history_context, "active_run", None)
     tool_choice = getattr(run, "active_tool_choice", None)
     response_format = getattr(run, "active_response_format", None)
@@ -1025,7 +1028,6 @@ def _provider_response(
                 controls,
             )
             if timeout_s is not None:
-                # litellm respects timeout via kwargs; compute remaining
                 remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
                 if remaining is not None and remaining <= 0:
                     raise Timeout(
@@ -1053,9 +1055,9 @@ def _provider_response(
                 (RateLimitError, APIConnectionError, ServiceUnavailableError, Timeout, APIError),
             )
             status = getattr(error, "status_code", None)
-            if status is None and hasattr(error, "response"):
+            if status is None:
                 try:
-                    status = getattr(error.response, "status_code", None)
+                    status = getattr(getattr(error, "response", None), "status_code", None)
                 except Exception:
                     status = None
             if isinstance(error, RateLimitError) or (
@@ -1079,7 +1081,6 @@ def _provider_response(
                         f"{spec} failed on every pool worker: " + "; ".join(failures)
                     ) from error
                 continue
-            # fatal: surface immediately
             _emit_progress(
                 {
                     "type": "provider",
@@ -1134,7 +1135,6 @@ def _provider_response(
             else "Model call completed",
         }
     )
-    # strip internal helper key before returning to callers
     data.pop("_litellm_cost", None)
     return data
 

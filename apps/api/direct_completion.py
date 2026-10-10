@@ -9,20 +9,16 @@ import providers
 import serve_config
 
 
-def _routed_response(
+def _routed_result(
     messages: list[dict[str, Any]],
     temperature: float,
     timeout: float | None,
+    session: str | None,
     tools: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Dispatch through Switchyard with run identity and selected-model usage.
-
-    Output limits and reasoning effort belong to the selected catalog target,
-    not to the virtual route's caller.
-    """
+) -> base_proxy.RoutedResponse:
+    """Dispatch through Switchyard and retain the selected route metadata."""
     context = serve_config._history_context
     run = getattr(context, "active_run", None)
-    session = getattr(context, "fusion_route_session_id", None) or getattr(run, "run_id", None)
     body: dict[str, Any] = {
         "model": "mantis/base",
         "messages": messages,
@@ -30,13 +26,23 @@ def _routed_response(
     }
     if tools:
         body["tools"] = tools
-    result = base_proxy.dispatch_routed(
-        body,
-        session,
-        timeout_s=timeout,
-    )
+    result = base_proxy.dispatch_routed(body, session, timeout_s=timeout)
     if run is not None:
         run.add_usage(result.body.get("usage") or {}, model=result.selected_model or "mantis/base")
+    return result
+
+
+def _routed_response(
+    messages: list[dict[str, Any]],
+    temperature: float,
+    timeout: float | None,
+    tools: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Dispatch through Switchyard with run identity and selected-model usage."""
+    context = serve_config._history_context
+    run = getattr(context, "active_run", None)
+    session = getattr(context, "fusion_route_session_id", None) or getattr(run, "run_id", None)
+    result = _routed_result(messages, temperature, timeout, session, tools)
     return cast(dict[str, Any], result.body)
 
 
