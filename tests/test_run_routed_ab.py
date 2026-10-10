@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
 import run_routed_ab as runner
 from evaluate_routed_harness import EvalCase, _validate_record, aggregate_records
 
@@ -52,13 +51,23 @@ def test_auto_judge_only_decides_machine_checkable_cases():
 
 
 def test_execute_tool_call_round_trips_in_workspace(tmp_path: Path):
-    write = {"function": {"name": "write_file", "arguments": json.dumps({"path": "a.txt", "content": "hello"})}}
+    write = {
+        "function": {
+            "name": "write_file",
+            "arguments": json.dumps({"path": "a.txt", "content": "hello"}),
+        }
+    }
     assert runner.execute_tool_call(write, tmp_path) == "written"
     listing = {"function": {"name": "list_files", "arguments": "{}"}}
     assert "a.txt" in runner.execute_tool_call(listing, tmp_path)
     bash = {"function": {"name": "bash", "arguments": json.dumps({"command": "cat a.txt"})}}
     assert "hello" in runner.execute_tool_call(bash, tmp_path)
-    edit = {"function": {"name": "edit_file", "arguments": json.dumps({"path": "a.txt", "old": "hello", "new": "hi"})}}
+    edit = {
+        "function": {
+            "name": "edit_file",
+            "arguments": json.dumps({"path": "a.txt", "old": "hello", "new": "hi"}),
+        }
+    }
     assert runner.execute_tool_call(edit, tmp_path) == "edited"
     search = {"function": {"name": "search_files", "arguments": json.dumps({"query": "hi"})}}
     assert "a.txt" in runner.execute_tool_call(search, tmp_path)
@@ -109,7 +118,12 @@ def test_build_record_flags_review_for_judgment_cases():
         "wall_time_s": 9.0,
     }
     plan = {"model": "mantis/base"}
-    case = EvalCase("easy-mechanical-edit", "easy_mechanical_edit", "rename", {"description": "d", "checks": ["c"]})
+    case = EvalCase(
+        "easy-mechanical-edit",
+        "easy_mechanical_edit",
+        "rename",
+        {"description": "d", "checks": ["c"]},
+    )
     record = runner.build_record("mantis-base", case, observation, plan)
     assert record["passed"] is False
     assert record["needs_review"] is True

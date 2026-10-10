@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import re
@@ -52,6 +53,11 @@ FUSION_STATUS = frozenset(
     {"main_planning", "sidekick_pending", "awaiting_tools", "main_review", "completed", "error"}
 )
 
+_KEEPALIVE_PROMPT = "Reply with exactly OK."
+_KEEPALIVE_STOP: dict[str, threading.Event] = {}
+_KEEPALIVE_PINGS: collections.Counter[str] = collections.Counter()
+_KEEPALIVE_LOCK = threading.Lock()
+
 
 @contextmanager
 def _fusion_route_session(session_id: str):
@@ -67,6 +73,85 @@ def _fusion_route_session(session_id: str):
                 del context.fusion_route_session_id
         else:
             context.fusion_route_session_id = previous
+
+
+def _keepalive_enabled() -> bool:
+    """Return whether prompt-cache keepalive pings are enabled."""
+    return os.environ.get("MANTIS_CACHE_KEEPALIVE", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _keepalive_interval() -> float:
+    """Return the seconds to wait between keepalive pings."""
+    raw = os.environ.get("MANTIS_CACHE_KEEPALIVE_INTERVAL", "120").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return 120.0
+    return max(1.0, value)
+
+
+def _keepalive_max_pings() -> int:
+    """Return the per-run ceiling on keepalive pings."""
+    raw = os.environ.get("MANTIS_CACHE_KEEPALIVE_MAX_PINGS", "20").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 20
+    return max(0, value)
+
+
+def keepalive_ping_count(run_id: str) -> int:
+    """Return how many keepalive pings one run has sent."""
+    with _KEEPALIVE_LOCK:
+        return _KEEPALIVE_PINGS.get(run_id, 0)
+
+
+def stop_keepalive(run_id: str) -> None:
+    """Signal the keepalive loop for one run to exit before its next ping."""
+    with _KEEPALIVE_LOCK:
+        event = _KEEPALIVE_STOP.get(run_id)
+    if event is not None:
+        event.set()
+
+
+def start_keepalive(run_id: str) -> None:
+    """Refresh prompt caches in the background while the run awaits tools."""
+    if not _keepalive_enabled():
+        return
+    with _KEEPALIVE_LOCK:
+        if run_id in _KEEPALIVE_STOP:
+            return
+        stop_event = threading.Event()
+        _KEEPALIVE_STOP[run_id] = stop_event
+    threading.Thread(target=_keepalive_loop, args=(run_id, stop_event), daemon=True).start()
+
+
+def _keepalive_loop(run_id: str, stop_event: threading.Event) -> None:
+    """Ping warm lane prefixes until the run resumes or the cap is reached."""
+    try:
+        while not stop_event.wait(_keepalive_interval()):
+            if keepalive_ping_count(run_id) >= _keepalive_max_pings():
+                break
+            run = try_get_fusion_run(run_id)
+            if run is None or run.status != "awaiting_tools":
+                break
+            try:
+                pinged = run.cache_keepalive()
+            except Exception:  # noqa: BLE001 - reason: a failing ping must not crash the watcher
+                break
+            if not pinged:
+                break
+            with _KEEPALIVE_LOCK:
+                _KEEPALIVE_PINGS[run_id] += 1
+    finally:
+        with _KEEPALIVE_LOCK:
+            if _KEEPALIVE_STOP.get(run_id) is stop_event:
+                del _KEEPALIVE_STOP[run_id]
 
 
 MAIN_PREAMBLE = (
@@ -624,14 +709,10 @@ def _orchestration_preamble(run: FusionRun) -> str:
     return "\n".join(lines)
 
 
-def _orchestration_metadata(run: FusionRun) -> dict[str, Any]:
-    tool_count = sum(
-        len(msg.get("tool_calls") or [])
-        for msg in run.sidekick_messages
-        if msg.get("role") == "assistant"
-    )
+def _run_guard_remaining(run: FusionRun) -> dict[str, Any]:
+    """Return the run guard's remaining turn, token, and timeout budget."""
     guard = run.budget
-    run_remaining = {
+    return {
         "turns": (
             max(0, guard.max_turns - guard.turns)
             if guard is not None and guard.max_turns is not None
@@ -644,6 +725,14 @@ def _orchestration_metadata(run: FusionRun) -> dict[str, Any]:
         ),
         "timeout_ms": guard.timeout_ms if guard is not None else None,
     }
+
+
+def _orchestration_metadata(run: FusionRun) -> dict[str, Any]:
+    tool_count = sum(
+        len(msg.get("tool_calls") or [])
+        for msg in run.sidekick_messages
+        if msg.get("role") == "assistant"
+    )
     return {
         "run_id": run.run_id,
         "status": run.status,
@@ -660,7 +749,9 @@ def _orchestration_metadata(run: FusionRun) -> dict[str, Any]:
         "subtask_follow_ups_used": run.subtask_follow_ups,
         "subtask_follow_up_limit": run.sidekick_max_follow_ups,
         "fusion_savings_usd": run._fusion_savings_usd(),
-        "run_guard_remaining": run_remaining,
+        "handoff_history": list(getattr(run, "handoff_history", [])),
+        "cache_keepalive_pings": keepalive_ping_count(run.run_id),
+        "run_guard_remaining": _run_guard_remaining(run),
         "review": (
             "accepted"
             if run.status == "completed"
@@ -1108,6 +1199,41 @@ class ExecutionLane:
         self.run.subtask_rounds = self.tool_rounds
         self.run.subtask_follow_ups = self.follow_up_count
 
+    def _escalate_if_stuck(self) -> dict[str, Any] | None:
+        """Return a terminal status when the lane must hand back to main."""
+        error_cap = self.coordinator.sidekick_max_consecutive_errors
+        if (
+            self.role == "sidekick"
+            and error_cap > 0
+            and _trailing_error_streak(self.messages) >= error_cap
+        ):
+            return self._complete_escalation(
+                f"ESCALATE_TO_MAIN: sidekick hit {error_cap} consecutive "
+                "failed tool results",
+                "consecutive tool errors",
+            )
+        if (
+            self.coordinator.sidekick_max_tool_rounds > 0
+            and self.tool_rounds >= self.coordinator.sidekick_max_tool_rounds
+        ):
+            report = (
+                "ESCALATE_TO_MAIN: sidekick exceeded tool budget"
+                if self.role == "sidekick"
+                else "tool budget exceeded"
+            )
+            reason = "tool budget" if self.role == "sidekick" else None
+            return self._complete_escalation(report, reason)
+        return None
+
+    def _complete_escalation(self, report: str, reason: str | None) -> dict[str, Any]:
+        """Mark the lane exhausted and return its terminal escalation status."""
+        self.exhausted = True
+        self.report = report
+        if reason is not None:
+            self.run._record_handoff("escalate", lane=self.lane_id, reason=reason)
+        self.complete = True
+        return self._status(status="completed", report=self.report)
+
     def step(self, tool_results: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         self._record_subtask_state()
         if self.error:
@@ -1117,31 +1243,9 @@ class ExecutionLane:
         if tool_results:
             self._append_tool_results(tool_results)
             self.pending_tool_calls = []
-        error_cap = self.coordinator.sidekick_max_consecutive_errors
-        if (
-            self.role == "sidekick"
-            and error_cap > 0
-            and _trailing_error_streak(self.messages) >= error_cap
-        ):
-            self.exhausted = True
-            self.report = (
-                f"ESCALATE_TO_MAIN: sidekick hit {error_cap} consecutive "
-                "failed tool results"
-            )
-            self.complete = True
-            return self._status(status="completed", report=self.report)
-        if (
-            self.coordinator.sidekick_max_tool_rounds > 0
-            and self.tool_rounds >= self.coordinator.sidekick_max_tool_rounds
-        ):
-            self.exhausted = True
-            self.report = (
-                "ESCALATE_TO_MAIN: sidekick exceeded tool budget"
-                if self.role == "sidekick"
-                else "tool budget exceeded"
-            )
-            self.complete = True
-            return self._status(status="completed", report=self.report)
+        escalated = self._escalate_if_stuck()
+        if escalated is not None:
+            return escalated
 
         slot = self._select_slot()
         self.run._record_selected_slot(self.role, slot, primary=self.role == "main")
@@ -1356,14 +1460,16 @@ class FusionRun(NativeRun):
         self.main_lane: ExecutionLane | None = None
         self.sidekick_lanes: list[ExecutionLane] = []
         self.sidekick_reports: list[str] = []
+        self.sidekick_context_cache: dict[str, list[dict[str, Any]]] = {}
+        self.handoff_history: list[dict[str, Any]] = []
         self.pending_user_messages: list[str] = []
         self.trace_cursors: dict[str, Any] = {}
         self.status = "main_planning"
 
-    def __setstate__(self, state: dict[str, Any]) -> None:
-        super().__setstate__(state)
-        # Ensure new fields are present for forward compatibility.
-        default_fields: dict[str, Any] = {
+    @staticmethod
+    def _setstate_default_fields() -> dict[str, Any]:
+        """Return fields newer pickles may be missing, with safe defaults."""
+        return {
             "plan": "",
             "sidekick_brief": "",
             "follow_up_count": 0,
@@ -1400,8 +1506,6 @@ class FusionRun(NativeRun):
             "sidekick_compaction_slot": None,
             "main_compaction_pending": None,
             "delegation_mode": "forced",
-            "goal": getattr(self, "brief", "") or "",
-            "latest_user": getattr(self, "brief", "") or "",
             "completed_via": "",
             "_resume_allows_answer": False,
             "worker_profiles": {},
@@ -1412,12 +1516,21 @@ class FusionRun(NativeRun):
             "main_lane": None,
             "sidekick_lanes": [],
             "sidekick_reports": [],
+            "sidekick_context_cache": {},
+            "handoff_history": [],
             "pending_user_messages": [],
             "trace_cursors": {},
         }
-        for key, default_value in default_fields.items():
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        super().__setstate__(state)
+        # Ensure new fields are present for forward compatibility.
+        for key, default_value in self._setstate_default_fields().items():
             if not hasattr(self, key):
                 setattr(self, key, default_value)
+        for field in ("goal", "latest_user"):
+            if not hasattr(self, field):
+                setattr(self, field, getattr(self, "brief", "") or "")
         if not hasattr(self, "repeat_guard"):
             self.repeat_guard = utils.RepeatToolGuard()
 
@@ -1664,18 +1777,20 @@ class FusionRun(NativeRun):
         self.subtask_counter += 1
         self.active_subtask_index = self.subtask_counter
         self.active_subtask_id = f"subtask-{self.subtask_counter}"
+        self._record_handoff(
+            "delegate", subtask=self.active_subtask_id, summary=self.sidekick_brief[:200]
+        )
         self.subtask_rounds = 0
         self.subtask_follow_ups = 0
-        if self.active_subtask_id:
-            self.subtask_history.append(
-                {
-                    "id": self.active_subtask_id,
-                    "index": self.active_subtask_index,
-                    "rounds_used": self.subtask_rounds,
-                    "follow_ups_used": self.subtask_follow_ups,
-                    "report": self.subtask_report,
-                }
-            )
+        self.subtask_history.append(
+            {
+                "id": self.active_subtask_id,
+                "index": self.active_subtask_index,
+                "rounds_used": self.subtask_rounds,
+                "follow_ups_used": self.subtask_follow_ups,
+                "report": self.subtask_report,
+            }
+        )
         self.subtask_report = None
         self.sidekick_tool_rounds = 0
         self.status = "sidekick_pending"
@@ -1683,10 +1798,17 @@ class FusionRun(NativeRun):
     def _complete_answer(self, answer: str) -> None:
         self.report = answer
         self.completed_via = "answer"
+        self._record_handoff("answer", summary=answer[:200])
         self.status = "completed"
 
-    def _apply_user_message(self, message: str) -> None:
+    def _apply_user_message(
+        self,
+        message: str,
+        coordinator: FusionCoordinator | None = None,
+    ) -> None:
         """Reset turn state before planning a new live-run instruction."""
+        self._snapshot_sidekick_contexts(coordinator)
+        self._record_handoff("turn", summary=message[:200])
         self.latest_user = message
         self.main_messages.append({"role": "user", "content": message})
         self.pending_tool_calls = []
@@ -1710,14 +1832,17 @@ class FusionRun(NativeRun):
         self.status = "main_planning"
         self._resume_allows_answer = True
 
-    def _drain_pending_user_messages(self) -> None:
+    def _drain_pending_user_messages(
+        self,
+        coordinator: FusionCoordinator | None = None,
+    ) -> None:
         """Apply user messages queued while the run awaited tool results."""
         if not self.pending_user_messages:
             return
         queued = self.pending_user_messages
         self.pending_user_messages = []
         for text in queued:
-            self._apply_user_message(text)
+            self._apply_user_message(text, coordinator)
 
     def _synthesize_final_answer(
         self,
@@ -2163,6 +2288,7 @@ class FusionRun(NativeRun):
         reason = self._parse_sidekick_escalate(sidekick_text)
         if reason is not None:
             self.subtask_report = reason
+            self._record_handoff("escalate", summary=reason[:200])
             if self.subtask_follow_ups >= coordinator.sidekick_max_follow_ups:
                 self._redelegate_after_exhaustion(coordinator, reason)
                 return self.status == "completed"
@@ -2201,6 +2327,7 @@ class FusionRun(NativeRun):
         if accepted:
             self.report = self.sidekick_messages[-1].get("content", "")
             self.completed_via = "accept"
+            self._record_handoff("review", outcome="accept")
             self.status = "completed"
             return True
         if self.subtask_follow_ups >= coordinator.sidekick_max_follow_ups:
@@ -2208,6 +2335,7 @@ class FusionRun(NativeRun):
             return self.status == "completed"
         self.subtask_follow_ups += 1
         self.follow_up_count += 1
+        self._record_handoff("follow_up", summary=feedback[:200])
         self.sidekick_messages.append(
             {"role": "user", "content": _format_fusion_follow_up(feedback)}
         )
@@ -2232,7 +2360,7 @@ class FusionRun(NativeRun):
                 raise ValueError("message follow-up is invalid while awaiting_tools")
             if self.status == "error":
                 raise ValueError("cannot follow up an errored fusion run")
-            self._apply_user_message(message)
+            self._apply_user_message(message, coordinator)
 
         # Apply client tool results only when awaiting tools.
         if self.status == "awaiting_tools":
@@ -2243,7 +2371,7 @@ class FusionRun(NativeRun):
                 self.status = "main_planning" if not self.plan else "main_review"
             else:
                 self.status = "sidekick_pending"
-            self._drain_pending_user_messages()
+            self._drain_pending_user_messages(coordinator)
         elif tool_results:
             raise ValueError("tool_results are only valid when status is awaiting_tools")
 
@@ -2351,15 +2479,61 @@ class FusionRun(NativeRun):
 
     def _carryover_messages(
         self,
-        coordinator: FusionCoordinator,
+        coordinator: FusionCoordinator | None,
         lane: ExecutionLane,
     ) -> list[dict[str, Any]]:
         """Trim a lane's transcript so its replacement keeps the context."""
         prior = lane.messages[1:] if lane.messages else []
         if prior and prior[0].get("role") == "system":
             prior = prior[1:]
-        budget = max(1, coordinator.context_window // 8)
+        window = getattr(coordinator, "context_window", 0) or 16384
+        if coordinator is None:
+            return prior[-256:]
+        budget = max(1, window // 8)
         return coordinator._trim_messages(prior, budget)
+
+    def _snapshot_sidekick_contexts(
+        self,
+        coordinator: FusionCoordinator | None,
+    ) -> None:
+        """Cache healthy sidekick transcripts for the next user turn's lanes."""
+        cache: dict[str, list[dict[str, Any]]] = {}
+        for lane in self.sidekick_lanes:
+            if not lane.exhausted:
+                cache[lane.profile.name] = self._carryover_messages(coordinator, lane)
+        self.sidekick_context_cache = cache
+
+    def _record_handoff(self, kind: str, **fields: Any) -> None:
+        """Append one bounded entry to the structured handoff history."""
+        entry = {"kind": kind, "follow_up": self.follow_up_count, **fields}
+        self.handoff_history.append(entry)
+        del self.handoff_history[:-50]
+
+    def _keepalive_slot_for(self, lane: ExecutionLane) -> str | None:
+        """Return the concrete slot whose prefix this lane last warmed."""
+        for message in reversed(lane.messages):
+            model = message.get("_mantis_model")
+            if model:
+                return str(model)
+        slot = self.main_slot if lane.role == "main" else self.sidekick_slot
+        if not slot or slot == "mantis/base":
+            return None
+        return str(slot)
+
+    def cache_keepalive(self) -> bool:
+        """Re-send warm lane prefixes so provider caches survive tool waits."""
+        pinged = False
+        for lane in [self.main_lane, *self.sidekick_lanes]:
+            if lane is None or not lane.messages:
+                continue
+            slot = self._keepalive_slot_for(lane)
+            if slot is None:
+                continue
+            prefix = [*lane.messages, {"role": "user", "content": _KEEPALIVE_PROMPT}]
+            with _fusion_route_session(f"{self.run_id}:keepalive"):
+                providers._provider_response(slot, prefix, 4, 0.0, None)
+            pinged = True
+        return pinged
 
     def _advance_structured(
         self,
@@ -2380,7 +2554,7 @@ class FusionRun(NativeRun):
                 raise ValueError("message follow-up is invalid while awaiting_tools")
             if self.status == "error":
                 raise ValueError("cannot follow up an errored fusion run")
-            self._apply_user_message(message)
+            self._apply_user_message(message, coordinator)
 
         if self.budget is not None:
             self.budget.check_timeout()
@@ -2408,7 +2582,7 @@ class FusionRun(NativeRun):
             else:
                 self.pending_tool_calls = []
                 self.status = "sidekick_pending"
-            self._drain_pending_user_messages()
+            self._drain_pending_user_messages(coordinator)
         elif tool_results:
             raise ValueError("tool_results are only valid when status is awaiting_tools")
 
@@ -2464,8 +2638,12 @@ class FusionRun(NativeRun):
                     assignment,
                     profile,
                     role="sidekick",
+                    shared_messages=self.sidekick_context_cache.get(profile.name),
                 )
                 self.sidekick_lanes.append(lane)
+                self._record_handoff(
+                    "delegate", lane=lane.lane_id, profile=profile.name, task=assignment.task[:200]
+                )
             self.status = "sidekick_pending"
 
         # The FusionBudgetGuard is the hard run-level ceiling. This loop only
@@ -2581,6 +2759,7 @@ class FusionRun(NativeRun):
                         (r for r in self.sidekick_reports if r), review_text
                     )
                     self.completed_via = "accept"
+                    self._record_handoff("review", outcome="accept")
                     self.status = "completed"
                     return self._ok_event(request_id)
 
@@ -2595,10 +2774,12 @@ class FusionRun(NativeRun):
                         fallback=fallback,
                     )
                     self.completed_via = "capped"
+                    self._record_handoff("review", outcome="capped")
                     self.status = "completed"
                     return self._ok_event(request_id)
 
                 self.follow_up_count += 1
+                self._record_handoff("follow_up", summary=feedback[:200])
                 self._replace_exhausted_lanes(feedback, coordinator)
                 execution_lanes = (
                     [self.main_lane] if self.main_lane is not None else []
@@ -2653,6 +2834,26 @@ def _run_lock(run_id: str) -> Any:
     return nullcontext()
 
 
+def _record_fusion_completion(run: FusionRun, status: str) -> None:
+    """Write the terminal learning record for a finished Fusion run."""
+    if status == "error":
+        terminated_by = "fusion_error"
+    elif run.follow_up_capped:
+        terminated_by = "fusion_capped"
+    elif run.completed_via == "answer":
+        terminated_by = "fusion_answer"
+    else:
+        terminated_by = "fusion_accept"
+    _write_learning_record(
+        run,
+        {
+            "type": "error" if status == "error" else "completed",
+            "terminated_by": terminated_by,
+            "error": run.error,
+        },
+    )
+
+
 def advance_fusion_run(
     run_id: str,
     request_id: str | None = None,
@@ -2664,6 +2865,7 @@ def advance_fusion_run(
         run = get_run(run_id)
         if not isinstance(run, FusionRun):
             raise TypeError(f"run {run_id} is not a FusionRun")
+        stop_keepalive(run_id)
         run.in_flight += 1
         _put_run(run)
         try:
@@ -2671,23 +2873,9 @@ def advance_fusion_run(
             coordinator = FusionCoordinator()
             event = run.advance_idempotent(tool_results, request_id, message, coordinator)
             if event.get("status") in ("completed", "error"):
-                status = str(event["status"])
-                if status == "error":
-                    terminated_by = "fusion_error"
-                elif run.follow_up_capped:
-                    terminated_by = "fusion_capped"
-                elif run.completed_via == "answer":
-                    terminated_by = "fusion_answer"
-                else:
-                    terminated_by = "fusion_accept"
-                _write_learning_record(
-                    run,
-                    {
-                        "type": "error" if status == "error" else "completed",
-                        "terminated_by": terminated_by,
-                        "error": run.error,
-                    },
-                )
+                _record_fusion_completion(run, str(event["status"]))
+            if event.get("status") == "awaiting_tools":
+                start_keepalive(run_id)
             return event
         finally:
             serve_config._history_context.active_run = None

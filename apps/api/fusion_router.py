@@ -7,6 +7,7 @@ still resolve to concrete provider specs, as do ordinary worker slots.
 
 from __future__ import annotations
 
+import os
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,19 @@ from model_catalog import catalog_path
 from model_catalog_schema import BaseRoute, load_base_route
 
 _BASE_ROUTE_CACHE: dict[tuple[str, int, int], BaseRoute | None] = {}
+_DEFAULT_COMPACTION_CUTOFF = 0.85
+
+
+def _compaction_cutoff() -> float:
+    """Return the complexity cutoff for post-compaction main demotion."""
+    raw = os.environ.get("MANTIS_COMPACTION_CUTOFF", "").strip()
+    try:
+        value = float(raw) if raw else _DEFAULT_COMPACTION_CUTOFF
+    except ValueError:
+        return _DEFAULT_COMPACTION_CUTOFF
+    if 0.0 < value <= 1.0:
+        return value
+    return _DEFAULT_COMPACTION_CUTOFF
 
 
 class FusionRouter:
@@ -133,7 +147,7 @@ class FusionRouter:
         if failure_count > 0:
             index = min(current + 1, len(pool) - 1)
         elif self.role == "main":
-            if complexity < 0.85 and len(pool) > 1:
+            if complexity < _compaction_cutoff() and len(pool) > 1:
                 index = 0
             else:
                 index = max(current, 1) if len(pool) > 1 else current

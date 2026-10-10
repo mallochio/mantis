@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-
 from evaluate_routed_harness import VARIANTS, load_cases
 from routed_ab_tools import TOOL_SCHEMAS, execute_tool_call
 
@@ -26,8 +25,6 @@ DEFAULT_CATALOG = REPO / "config" / "catalog.toml"
 DEFAULT_CASES = EVAL / "routed-harness-cases.jsonl"
 DEFAULT_OUT = EVAL / "results-routed-ab.jsonl"
 DEFAULT_TRANSCRIPTS = EVAL / "runs" / "routed-ab"
-
-
 
 
 def load_catalog(path: Path) -> dict[str, Any]:
@@ -128,14 +125,14 @@ def _apply_tool_results(
 ) -> None:
     """Execute pending calls and append their results to the transcript."""
     messages.append({"role": "assistant", "content": "", "tool_calls": message["tool_calls"]})
-    for call in message["tool_calls"]:
-        messages.append(
-            {
-                "role": "tool",
-                "tool_call_id": call.get("id", ""),
-                "content": execute_tool_call(call, workspace),
-            }
-        )
+    messages.extend(
+        {
+            "role": "tool",
+            "tool_call_id": call.get("id", ""),
+            "content": execute_tool_call(call, workspace),
+        }
+        for call in message["tool_calls"]
+    )
 
 
 def _request_body(plan: dict[str, Any], messages: list[dict[str, Any]]) -> dict[str, Any]:
@@ -183,20 +180,20 @@ def drive_case(
     raise RuntimeError("case exceeded the tool-round budget")
 
 
-def build_record(variant: str, case: Any, observation: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+def build_record(variant: str, case: Any, obs: dict, plan: dict) -> dict:
     """Assemble one summarize-compatible run record."""
-    event = observation["event"]
-    verdict = auto_judge(case.case_id, observation["content"], observation["tool_rounds"])
+    event = obs["event"]
+    verdict = auto_judge(case.case_id, obs["content"], obs["tool_rounds"])
     record = {
         "variant": variant,
         "case_id": case.case_id,
         "passed": bool(verdict) if verdict is not None else False,
         "needs_review": verdict is None,
         "selected_models": selected_models(event, plan),
-        **usage_numbers(event, observation["response"]),
-        "tool_rounds": int(observation["tool_rounds"]),
-        "wall_time_s": round(float(observation["wall_time_s"]), 6),
-        "report": observation["content"],
+        **usage_numbers(event, obs["response"]),
+        "tool_rounds": int(obs["tool_rounds"]),
+        "wall_time_s": round(float(obs["wall_time_s"]), 6),
+        "report": obs["content"],
     }
     if isinstance(event, dict):
         for key in ("fusion_savings_usd", "main_model", "sidekick_model"):
@@ -254,7 +251,8 @@ def run_variant(
 def build_parser() -> argparse.ArgumentParser:
     """Return the runner CLI parser."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-url", default=os.environ.get("MANTIS_BASE_URL", "http://127.0.0.1:8000"))
+    base_url = os.environ.get("MANTIS_BASE_URL", "http://127.0.0.1:8000")
+    parser.add_argument("--base-url", default=base_url)
     parser.add_argument("--cases", type=Path, default=DEFAULT_CASES)
     parser.add_argument("--catalog", type=Path, default=DEFAULT_CATALOG)
     parser.add_argument("--variants", default=",".join(VARIANTS))
