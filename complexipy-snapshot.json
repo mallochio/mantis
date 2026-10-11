@@ -9,7 +9,7 @@
       },
       {
         "name": "_run_fusion_chat",
-        "complexity": 30
+        "complexity": 22
       },
       {
         "name": "_fusion_run_id_from_messages",

@@ -17,7 +17,7 @@ def test_active_request_records_role_usage_without_doubling_totals(monkeypatch, 
         run.add_usage(usage, model=slot)
         return {"content": "ok", "_mantis_model": "wire-model"}, usage
 
-    def advance(_results, _request_id, _message, active_coordinator):
+    def advance(_results, _request_id, _message, active_coordinator, **_extra):
         run._call_lane(active_coordinator, role, slot_override="test-slot")
         return {"status": "main_review"}
 

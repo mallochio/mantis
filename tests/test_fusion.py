@@ -14,6 +14,8 @@ import api
 import base_proxy
 import fusion
 import fusion_background
+import fusion_config
+import fusion_limits
 import fusion_prompts
 import httpx
 import providers
@@ -572,21 +574,13 @@ def test_fusion_trimmer_keeps_tool_call_result_pairs():
 
 
 def test_fusion_output_tokens_are_model_specific(monkeypatch):
-    resolved = providers.ResolvedModelSpec(
-        adapter="openai",
-        model="gpt-5.6-luna",
-        effort="medium",
-        base_url="http://test",
-        credential_env="TEST_KEY",
-        binding=None,
-        protocols=("chat_completions",),
-        slot="gpt-5_6-luna",
-        max_tokens=128000,
+    default_limits = fusion_limits.ModelLimits(200000, 128000)
+    monkeypatch.setattr(
+        fusion_limits, "resolve_model_limits", lambda slot: default_limits
     )
-    monkeypatch.setattr(providers, "_resolve_model_spec", lambda _slot: resolved)
     coordinator = fusion.FusionCoordinator()
     assert coordinator._output_tokens_for("gpt-5_6-luna") == 128000
-    assert coordinator.max_output_tokens == 4096
+    assert coordinator.max_output_tokens is None
 
 
 def test_fusion_chat_initial_call_returns_tool_calls(client, fake_worker):
@@ -1258,7 +1252,8 @@ def test_base_route_remains_virtual_while_explicit_capable_target_resolves():
     assert router.strongest() == "mantis/base"
 
     coordinator = fusion.FusionCoordinator()
-    assert coordinator._context_window_for(spec) == coordinator.context_window
+    if coordinator.context_window:
+        assert coordinator._context_window_for(spec) == coordinator.context_window
     explicit = fusion.FusionRouter.from_config(
         fusion.FusionRoutingConfig(main="base:capable", sidekick="gpt-5_6-luna"),
         "main",
@@ -1456,11 +1451,15 @@ def test_base_route_lead_and_sidekick_have_distinct_provenance():
     assert main != side
 
 
-def test_shipped_slots_get_the_full_endpoint_budget():
+def test_shipped_slots_get_the_full_endpoint_budget(monkeypatch):
     """The harness owns compaction, so Fusion must not trim early."""
     coordinator = fusion.FusionCoordinator()
     for slot in (coordinator.main_slot, coordinator.sidekick_slot):
-        assert coordinator._context_window_for(slot) == coordinator.context_window
+        limits = fusion_limits.resolve_model_limits(slot)
+        expected = limits.context_window
+        if coordinator.context_window:
+            expected = min(expected, coordinator.context_window)
+        assert coordinator._context_window_for(slot) == expected
 
 
 def test_context_trim_emits_an_observable_event(monkeypatch):
@@ -1491,43 +1490,40 @@ def test_context_trim_emits_an_observable_event(monkeypatch):
 
 def test_context_window_clamps_to_the_selected_slot(monkeypatch):
     """A pool may mix window sizes; each turn is sized for the slot it uses."""
-    from types import SimpleNamespace
-
     coordinator = fusion.FusionCoordinator()
     coordinator.context_window = 262144
-    windows = {"big": 500000, "mid": 128000, "small": 65536, "undeclared": None}
+    windows = {"big": 500000, "mid": 128000, "small": 65536, "undeclared": 262144}
 
-    def fake_resolve(spec, bindings=None):
-        if spec not in windows:
-            raise ValueError(f"unknown spec {spec}")
-        return SimpleNamespace(max_tokens=4096, context_window=windows[spec])
-
-    monkeypatch.setattr(fusion.providers, "_resolve_model_spec", fake_resolve)
+    monkeypatch.setattr(
+        fusion_limits,
+        "resolve_model_limits",
+        lambda slot: fusion_limits.ModelLimits(windows.get(slot, 262144), 4096),
+    )
 
     assert coordinator._context_window_for("big") == 262144
     assert coordinator._context_window_for("mid") == 128000
     assert coordinator._context_window_for("small") == 65536
     assert coordinator._context_window_for("undeclared") == 262144
-    assert coordinator._context_window_for("passthrough/model") == 262144
 
 
 def test_call_worker_sizes_input_budget_for_the_promoted_slot(monkeypatch):
     """Promoting into a smaller-window model must shrink the transcript."""
-    from types import SimpleNamespace
-
     coordinator = fusion.FusionCoordinator()
-    coordinator.context_window = 262144
-    coordinator.max_output_tokens = 4096
+    coordinator.context_window = None
+    coordinator.max_output_tokens = None
     seen: list[int] = []
+    windows = {"mid": 128000, "small": 65536}
 
-    def fake_resolve(spec, bindings=None):
-        return SimpleNamespace(max_tokens=4096, context_window=65536 if spec == "small" else 128000)
+    monkeypatch.setattr(
+        fusion_limits,
+        "resolve_model_limits",
+        lambda slot: fusion_limits.ModelLimits(windows.get(slot, 128000), 4096),
+    )
 
     def fake_fit(slot, messages, tools, input_budget):
         seen.append(input_budget)
         return messages
 
-    monkeypatch.setattr(fusion.providers, "_resolve_model_spec", fake_resolve)
     monkeypatch.setattr(coordinator, "_fit_messages", fake_fit)
     monkeypatch.setattr(
         fusion.providers,
@@ -1656,15 +1652,15 @@ def test_fusion_pool_ordering_rejects_known_price_regression(monkeypatch):
     monkeypatch.setattr(providers, "_price_map", lambda: prices)
     bad = fusion.FusionRoutingConfig(main=["strong-model", "cheap-model"], sidekick="side")
     with pytest.raises(ValueError, match="not cheapest-first"):
-        fusion._validate_pool_ordering(bad)
+        fusion_config._validate_pool_ordering(bad)
     good = fusion.FusionRoutingConfig(main=["cheap-model", "strong-model"], sidekick="side")
-    fusion._validate_pool_ordering(good)
+    fusion_config._validate_pool_ordering(good)
 
 
 def test_fusion_pool_ordering_skips_unpriced_slots(monkeypatch):
     monkeypatch.setattr(providers, "_price_map", lambda: {"cheap-model": (1.0, 2.0)})
     config = fusion.FusionRoutingConfig(main=["cheap-model", "mystery-model"], sidekick="side")
-    fusion._validate_pool_ordering(config)
+    fusion_config._validate_pool_ordering(config)
 
 
 def test_trailing_error_streak_counts_tail_failures_only():

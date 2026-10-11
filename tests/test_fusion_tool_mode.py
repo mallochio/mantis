@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 import fusion
+import fusion_limits
 import fusion_prompts
 import pytest
 import runs
@@ -66,6 +67,9 @@ def use_tool_catalog(monkeypatch, tmp_path):
         "sidekick_max_tool_rounds = 8\nrun_max_turns = 32\n"
     )
     monkeypatch.setattr(fusion, "_FUSION_CONFIG", fusion.FusionConfig(path))
+    monkeypatch.setattr(
+        fusion_limits, "resolve_model_limits", lambda spec: fusion_limits.ModelLimits(200000, 8000)
+    )
     monkeypatch.setenv("MANTIS_FUSION_WORKSPACE_ROOT", str(tmp_path / "sandboxes"))
     monkeypatch.setenv("MANTIS_RUN_DIR", str(tmp_path / "runs"))
     return path

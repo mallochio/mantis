@@ -18,6 +18,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import base_proxy
+import fusion_limits
 import httpx
 import pytest
 
@@ -92,8 +94,6 @@ def _block_external_provider_calls(monkeypatch: pytest.MonkeyPatch):
 
     # base_proxy caches the parsed [base] route per process; drop it so one
     # test's catalog override cannot leak into the next.
-    import base_proxy
-
     base_proxy._load_base_route.cache_clear()
 
     def blocked_post(*_args, **_kwargs):
@@ -117,4 +117,26 @@ def _block_external_provider_calls(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(serve._provider_client, "post", blocked_post)
     monkeypatch.setattr(serve._provider_client, "stream", blocked_stream)
     monkeypatch.setattr(serve.httpx, "get", blocked_get)
+    yield
+
+@pytest.fixture(autouse=True)
+def _fixed_fusion_model_limits(monkeypatch, request):
+    """Fall back to fixed trustworthy limits when tests cannot discover them.
+
+    Provider metadata is network-fetched and tests block the network, so the
+    real resolver may raise; dedicated resolver tests stub internals directly.
+    """
+    if request.module.__name__.endswith("test_fusion_limits"):
+        yield
+        return
+    real_resolver = fusion_limits.resolve_model_limits
+    fixed = fusion_limits.ModelLimits(200000, 8000)
+
+    def resolver_or_fixed(spec):
+        try:
+            return real_resolver(spec)
+        except fusion_limits.ModelLimitsError:
+            return fixed
+
+    monkeypatch.setattr(fusion_limits, "resolve_model_limits", resolver_or_fixed)
     yield

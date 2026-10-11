@@ -160,6 +160,7 @@ def _lead_loop(
 ) -> dict[str, Any]:
     """Alternate lead turns and tool resolution until the lead answers or must wait."""
     manager = _manager(run)
+    checkpoint_pending = True
     for _ in range(run.run_max_turns):
         if run.budget is not None:
             run.budget.check_timeout()
@@ -170,6 +171,9 @@ def _lead_loop(
                 return run._ok_event(request_id)
             background.flush_lead_results(manager, run)
             _drain_user_messages(run)
+        if checkpoint_pending:
+            run.fusion_public_checkpoint = len(run.main_messages)
+            checkpoint_pending = False
         manager.take_completion_notification(run)
         text, calls = _lead_turn(run, coordinator, background.lead_tools(manager, run))
         if not calls:

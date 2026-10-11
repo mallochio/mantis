@@ -4,31 +4,26 @@ from __future__ import annotations
 
 import json
 import os
-import threading
-import tomllib
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext, suppress
-from pathlib import Path
 from typing import Any, cast
 
 import direct_completion
 import fusion_background
+import fusion_history
 import fusion_lead
+import fusion_limits
 import fusion_provider_hooks as hooks
 import litellm
-import model_catalog
 import providers
 import serve_config
 import utils
 from fusion_budget import FusionBudgetExceededError, FusionBudgetGuard
+from fusion_config import FusionConfig
 from fusion_prompts import sidekick_system_prompt
 from fusion_router import FusionRouter
-from fusion_types import (
-    FusionRoutingConfig,
-    FusionRunBudget,
-    FusionToolOptions,
-)
+from fusion_types import FusionRoutingConfig, FusionRunBudget, FusionToolOptions
 from runs import (
     RUN_STORE,
     NativeRun,
@@ -40,7 +35,15 @@ from runs import (
     get_run,
 )
 
-__all__ = ["FusionCoordinator", "FusionRun", "advance_fusion_run", "FUSION_STATUS"]
+__all__ = [
+    "FusionConfig",
+    "FusionCoordinator",
+    "FusionRouter",
+    "FusionRoutingConfig",
+    "FusionRun",
+    "FUSION_STATUS",
+    "advance_fusion_run",
+]
 
 FUSION_STATUS = frozenset({"main_planning", "awaiting_tools", "completed", "error"})
 
@@ -92,27 +95,6 @@ def _trailing_error_streak(messages: list[dict[str, Any]]) -> int:
     return streak
 
 
-def _validate_pool_ordering(config: FusionRoutingConfig) -> None:
-    """Reject role pools whose known prices are not cheapest-first."""
-    prices = providers._price_map()
-    if not prices:
-        return
-    for role in ("main", "sidekick"):
-        pool = getattr(config, role)
-        if not isinstance(pool, list) or len(pool) < 2:
-            continue
-        raw_keys = [providers._price_key(str(slot), prices) for slot in pool]
-        keys = [key for key in raw_keys if key is not None]
-        if len(keys) != len(raw_keys):
-            continue
-        for earlier, later in zip(keys, keys[1:], strict=False):
-            if prices[later][0] < prices[earlier][0]:
-                raise ValueError(
-                    f"fusion {role} pool is not cheapest-first: {later} is cheaper "
-                    f"than {earlier} before it"
-                )
-
-
 TERMINAL_SYNTHESIS_PROMPT = (
     "The Fusion run guard is exhausted; no further sidekick work or review is "
     "possible. Write the final user-facing answer now from "
@@ -120,126 +102,6 @@ TERMINAL_SYNTHESIS_PROMPT = (
     "clearly what remains unfinished or unverified. "
     "Return a plain assistant answer.\n"
 )
-
-
-class FusionConfig:
-    """Runtime fusion settings loaded from the shared catalog."""
-
-    def __init__(self, path: Path | None = None) -> None:
-        self.path = path or model_catalog.catalog_path()[0]
-        self._raw: dict[str, Any] | None = None
-        self._lock = threading.Lock()
-
-    def __getstate__(self) -> dict[str, Any]:
-        return {"path": self.path, "_raw": self._raw}
-
-    def __setstate__(self, state: dict[str, Any]) -> None:
-        self.path = state["path"]
-        self._raw = state.get("_raw")
-        self._lock = threading.Lock()
-
-    def _load(self) -> dict[str, Any]:
-        if self._raw is not None:
-            return self._raw
-        with self._lock:
-            if self._raw is not None:
-                return self._raw
-            if not self.path.exists():
-                self._raw = {}
-            else:
-                with self.path.open("rb") as handle:
-                    root = tomllib.load(handle)
-                self._raw = root.get("fusion", {})
-            self._reject_removed_controls()
-            return self._raw
-
-    def _reject_removed_controls(self) -> None:
-        """Reject obsolete marker and multi-lane catalog controls."""
-        removed = {
-            "delegation",
-            "main_tools",
-            "max_follow_ups",
-            "sidekick_max_follow_ups",
-            "worker_profiles",
-        }
-        unsupported = removed.intersection(self._raw or {})
-        if unsupported:
-            self._raw = None
-            raise ValueError(f"unsupported Fusion settings: {', '.join(sorted(unsupported))}")
-
-    def main_slot(self) -> str:
-        return self._load().get("main") or "gpt-5_6-sol"
-
-    def sidekick_slot(self) -> str:
-        return self._load().get("sidekick") or "gpt-5_6-luna"
-
-    def sidekick_max_tool_rounds(self) -> int:
-        raw = self._load().get("sidekick_max_tool_rounds")
-        if raw is None or raw == "":
-            return 0
-        try:
-            value = int(raw)
-        except (TypeError, ValueError):
-            return 0
-        return max(0, value)
-
-    def sidekick_max_consecutive_errors(self) -> int:
-        raw = self._load().get("sidekick_max_consecutive_errors")
-        if raw is None or raw == "":
-            return 3
-        try:
-            return max(0, int(raw))
-        except (TypeError, ValueError):
-            return 3
-
-    def run_max_turns(self) -> int:
-        raw = self._load().get("run_max_turns") or "64"
-        try:
-            value = int(raw)
-        except (TypeError, ValueError):
-            return 64
-        return max(1, value)
-
-    def context_window(self) -> int:
-        raw = (
-            self._load().get("context_window")
-            or self._load().get("context_token_limit")
-            or os.environ.get("MANTIS_CONTEXT_LENGTH", "262144")
-        )
-        try:
-            return int(raw)
-        except (TypeError, ValueError):
-            return 262144
-
-    def max_output_tokens(self) -> int:
-        raw = self._load().get("max_output_tokens") or "4096"
-        try:
-            return int(raw)
-        except (TypeError, ValueError):
-            return 4096
-
-    def main_routing(self) -> FusionRoutingConfig:
-        fields = FusionRoutingConfig.model_fields
-        data = {k: v for k, v in (self._load() or {}).items() if k in fields}
-        config = cast(FusionRoutingConfig, FusionRoutingConfig.model_validate(data))
-        _validate_pool_ordering(config)
-        return config
-
-    def main_router(self) -> FusionRouter:
-        return FusionRouter.from_config(self.main_routing(), "main")
-
-    def sidekick_router(self) -> FusionRouter:
-        return FusionRouter.from_config(self.main_routing(), "sidekick")
-
-    def default_budget(self) -> FusionRunBudget:
-        raw_budget = self._load().get("budget") or {}
-        payload = dict(raw_budget) if isinstance(raw_budget, dict) else {}
-        return cast(FusionRunBudget, FusionRunBudget.model_validate(payload))
-
-    def tool_options(self) -> FusionToolOptions:
-        raw_tools = self._load().get("tool_options") or self._load().get("tools") or {}
-        payload = dict(raw_tools) if isinstance(raw_tools, dict) else {}
-        return cast(FusionToolOptions, FusionToolOptions.model_validate(payload))
 
 
 _MAIN_TRACE_MAX_CHARS = 8192
@@ -692,12 +554,15 @@ class FusionCoordinator:
         return self._drop_old_groups(pruned, max_input_tokens)
 
     def _output_tokens_for(self, slot: str) -> int:
-        """Return the model-specific output token cap from the catalog."""
-        try:
-            resolved = providers._resolve_model_spec(slot)
-        except (RuntimeError, ValueError):
-            return 4096
-        return resolved.max_tokens or 4096
+        """Return the slot's authoritative output cap capped by request and config."""
+        limits = fusion_limits.resolve_model_limits(slot)
+        output = limits.max_output_tokens
+        caps = [
+            value
+            for value in (self.max_output_tokens, fusion_history.requested_output(self, slot))
+            if value
+        ]
+        return min(output, *caps) if caps else output
 
     def _upstream_model_for(self, slot: str) -> str:
         """Return the upstream model name a slot resolves to, or the slot itself."""
@@ -707,15 +572,10 @@ class FusionCoordinator:
             return slot
 
     def _context_window_for(self, slot: str) -> int:
-        """Return the smaller of the Fusion context budget and the slot's window."""
-        try:
-            resolved = providers._resolve_model_spec(slot)
-        except (RuntimeError, ValueError):
-            return self.context_window
-        window = getattr(resolved, "context_window", None)
-        if not isinstance(window, int) or window <= 0:
-            return self.context_window
-        return min(self.context_window, window)
+        """Return the slot's authoritative window capped by any explicit budget."""
+        limits = fusion_limits.resolve_model_limits(slot)
+        window = limits.context_window
+        return min(window, self.context_window) if self.context_window else window
 
     def _call_worker(
         self,
@@ -739,8 +599,7 @@ class FusionCoordinator:
             fitted = messages
             output_tokens = None
         else:
-            model_cap = self._output_tokens_for(slot)
-            output_tokens = min(self.max_output_tokens, model_cap)
+            output_tokens = self._output_tokens_for(slot)
             input_budget = max(0, self._context_window_for(slot) - output_tokens)
             before_tokens = self._token_sum(messages)
             fitted = self._fit_messages(slot, messages, tools, input_budget)
@@ -809,6 +668,7 @@ class FusionRun(NativeRun):
     handoffs: fusion_lead.HandoffManager | None = None
     fusion_session_id: str | None = None
     fusion_lead_prompt_base: str | None = None
+    fusion_public_checkpoint: int | None = None
 
     def __init__(
         self,
@@ -1120,6 +980,7 @@ class FusionRun(NativeRun):
         return cast(list[dict[str, Any]], validated)
 
     def _error_event(self, exc: Exception, request_id: str | None) -> dict[str, Any]:
+        """Close the run on an unexpected failure and return its error event."""
         self.status = "error"
         self.error = str(exc)
         self.record_activity(
@@ -1244,15 +1105,20 @@ class FusionRun(NativeRun):
         request_id: str | None = None,
         message: str | None = None,
         coordinator: FusionCoordinator | None = None,
+        client_history: list[dict[str, Any]] | None = None,
+        client_tool_ids: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         if request_id is None:
-            return self.advance(tool_results, request_id, message, coordinator)
+            with self.request_lock:
+                self._rebase_client_history(client_history, client_tool_ids)
+                return self.advance(tool_results, request_id, message, coordinator)
         if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
             raise ValueError("request_id must be a string of at most 128 characters")
         with self.request_lock:
             cached = self.request_events.get(request_id)
             if cached is not None:
                 return cast(dict[str, Any], cached)
+            self._rebase_client_history(client_history, client_tool_ids)
             event = cast(
                 dict[str, Any],
                 self.advance(tool_results, request_id, message, coordinator),
@@ -1261,6 +1127,15 @@ class FusionRun(NativeRun):
             while len(self.request_events) > 64:
                 self.request_events.pop(next(iter(self.request_events)))
             return event
+
+    def _rebase_client_history(
+        self,
+        client_history: list[dict[str, Any]] | None,
+        client_tool_ids: dict[str, str] | None,
+    ) -> None:
+        """Apply the harness's authoritative transcript when one is supplied."""
+        if client_history is not None:
+            fusion_history.rebase(self, client_history, client_tool_ids or {})
 
 
 def _put_run(run: NativeRun) -> None:
@@ -1307,6 +1182,8 @@ def advance_fusion_run(
     request_id: str | None = None,
     tool_results: list[dict[str, Any]] | None = None,
     message: str | None = None,
+    client_history: list[dict[str, Any]] | None = None,
+    client_tool_ids: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Load, advance, and save a FusionRun with the same locking as advance_run."""
     with _run_lock(run_id):
@@ -1316,17 +1193,38 @@ def advance_fusion_run(
         run.in_flight += 1
         _put_run(run)
         try:
-            serve_config._history_context.active_run = run
-            coordinator = FusionCoordinator()
-            event = run.advance_idempotent(tool_results, request_id, message, coordinator)
-            if event.get("status") in ("completed", "error"):
-                _record_fusion_completion(run, str(event["status"]))
-            return event
+            return _advance_locked_run(
+                run, request_id, tool_results, message, client_history, client_tool_ids
+            )
         finally:
             serve_config._history_context.active_run = None
             run.in_flight -= 1
             run.touch()
             _put_run(run)
+
+
+def _advance_locked_run(
+    run: FusionRun,
+    request_id: str | None,
+    tool_results: list[dict[str, Any]] | None,
+    message: str | None,
+    client_history: list[dict[str, Any]] | None,
+    client_tool_ids: dict[str, str] | None,
+) -> dict[str, Any]:
+    """Advance an in-flight loaded run and record its terminal learning event."""
+    serve_config._history_context.active_run = run
+    coordinator = FusionCoordinator()
+    event = run.advance_idempotent(
+        tool_results,
+        request_id,
+        message,
+        coordinator,
+        client_history=client_history,
+        client_tool_ids=client_tool_ids,
+    )
+    if event.get("status") in ("completed", "error"):
+        _record_fusion_completion(run, str(event["status"]))
+    return event
 
 
 def create_fusion_run(

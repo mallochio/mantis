@@ -22,6 +22,7 @@ import fusion_api_context
 import fusion_api_ids
 import fusion_api_live
 import fusion_api_response
+import fusion_limits
 import fusion_stream
 import httpx
 import model_catalog
@@ -249,6 +250,7 @@ app.add_middleware(BodyLimitMiddleware, max_bytes=_MAX_BODY_BYTES)
 
 
 def _error(status: int, message: str, error_type: str) -> JSONResponse:
+    """Return an OpenAI-style error response."""
     return JSONResponse(
         status_code=status, content={"error": {"message": message, "type": error_type}}
     )
@@ -640,12 +642,14 @@ def _stream(
 
 @app.exception_handler(RequestValidationError)
 def validation_error(_request: Any, error: RequestValidationError) -> JSONResponse:
+    """Convert request validation failures into OpenAI-style 400 errors."""
     message = "; ".join(str(item.get("msg", "invalid request")) for item in error.errors())
     return _error(400, message, "invalid_request_error")
 
 
 @app.exception_handler(HTTPException)
 def http_error(_request: Any, error: HTTPException) -> JSONResponse:
+    """Convert HTTP exceptions into OpenAI-style error responses."""
     error_type = "authentication_error" if error.status_code == 401 else "invalid_request_error"
     if error.status_code == 429:
         error_type = "rate_limit_error"
@@ -969,36 +973,17 @@ def _run_fusion_chat(
     headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Resume or start a Fusion run from an OpenAI-style chat request."""
-    # Find a trailing block of tool messages; if present, this is a tool follow-up.
-    tool_results: list[dict[str, Any]] = []
-    run_id: str | None = None
-    i = len(request.messages) - 1
-    while i >= 0 and request.messages[i].role == "tool":
-        tool_msg = request.messages[i]
-        try:
-            rid, original_id = _decode_fusion_tool_call_id(tool_msg.tool_call_id or "")
-        except ValueError:
-            break
-        if run_id is None:
-            run_id = rid
-        elif run_id != rid:
-            break
-        tool_results.insert(
-            0,
-            {
-                "tool_call_id": original_id,
-                "content": _content_to_str(tool_msg.content),
-                "is_error": False,
-            },
-        )
-        i -= 1
-
+    tool_results, client_tool_ids, run_id = fusion_api_context.trailing_tool_results(
+        request, _decode_fusion_tool_call_id, _content_to_str
+    )
     if run_id is not None and tool_results:
         fusion_api_context.refresh_request_controls(run_id, request)
         event = fusion.advance_fusion_run(
             run_id,
             request_id=request_id,
             tool_results=tool_results,
+            client_history=[msg.model_dump(exclude_none=True) for msg in request.messages],
+            client_tool_ids=client_tool_ids,
         )
     else:
         brief = ""
@@ -1027,6 +1012,7 @@ def _run_fusion_chat(
                 resumed.run_id,
                 request_id=request_id,
                 message=brief,
+                client_history=[msg.model_dump(exclude_none=True) for msg in request.messages],
             )
         else:
             request = _resolve_fusion_workspace(request, headers)
@@ -1092,8 +1078,7 @@ def _experimental_gate(request: ChatRequest) -> JSONResponse | None:
     )
 
 
-@app.get("/v1/models", dependencies=[Depends(_authorize)])
-def models() -> dict[str, Any]:
+def _model_descriptor() -> dict[str, Any]:
     descriptor = {
         "object": "model",
         "owned_by": "mantis",
@@ -1103,6 +1088,21 @@ def models() -> dict[str, Any]:
         "supported_parameters": _SUPPORTED_PARAMETERS,
         "pricing": {"prompt": "0", "completion": "0"},
     }
+    return descriptor
+
+
+def _fusion_entry(descriptor: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": "mantis/fusion",
+        "status": "stable",
+        **descriptor,
+        **fusion_limits.fusion_model_descriptor(fusion._fusion_config()),
+    }
+
+
+@app.get("/v1/models", dependencies=[Depends(_authorize)])
+def models() -> dict[str, Any]:
+    descriptor = _model_descriptor()
     basic = {
         **descriptor,
         "context_length": descriptor["context_length"],
@@ -1110,7 +1110,7 @@ def models() -> dict[str, Any]:
     }
     data = [
         {"id": _BASIC_MODEL, "status": "stable", **basic},
-        {"id": "mantis/fusion", "status": "stable", **descriptor},
+        _fusion_entry(descriptor),
     ]
     if _experimental_modes_enabled():
         data[1:1] = [

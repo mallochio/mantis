@@ -1,6 +1,7 @@
 """OpenRouter-style /v1/models descriptor tests."""
 
 import api
+import fusion_limits
 import pytest
 from fastapi.testclient import TestClient
 
@@ -10,6 +11,13 @@ def client(monkeypatch):
     monkeypatch.setenv("MANTIS_API_KEY", "test-key")
     monkeypatch.delenv("MANTIS_CONTEXT_LENGTH", raising=False)
     monkeypatch.delenv("MANTIS_MAX_COMPLETION_TOKENS", raising=False)
+    monkeypatch.setattr(
+        fusion_limits,
+        "resolve_model_limits",
+        lambda spec: fusion_limits.ModelLimits(900000, 120000),
+    )
+    monkeypatch.setattr(api.fusion._fusion_config(), "context_window", lambda: None)
+    monkeypatch.setattr(api.fusion._fusion_config(), "max_output_tokens", lambda: None)
     return TestClient(api.app)
 
 
@@ -28,8 +36,11 @@ def test_descriptor_fields_and_defaults(client):
         assert entry["owned_by"] == "mantis"
         assert isinstance(entry["id"], str)
         assert isinstance(entry["created"], int) and entry["created"] > 0
-        assert entry["context_length"] == 262144
-        if entry["id"] == "mantis/base":
+        expected_context = 900000 if entry["id"] == "mantis/fusion" else 262144
+        assert entry["context_length"] == expected_context
+        if entry["id"] == "mantis/fusion":
+            assert entry["max_completion_tokens"] == 120000
+        elif entry["id"] == "mantis/base":
             assert entry["max_completion_tokens"] == 131072
         else:
             assert entry["max_completion_tokens"] == 32768
@@ -41,8 +52,11 @@ def test_env_overrides(client, monkeypatch):
     monkeypatch.setenv("MANTIS_CONTEXT_LENGTH", "65536")
     monkeypatch.setenv("MANTIS_MAX_COMPLETION_TOKENS", "4096")
     for entry in _models(client):
-        assert entry["context_length"] == 65536
-        if entry["id"] == "mantis/base":
+        expected_context = 900000 if entry["id"] == "mantis/fusion" else 65536
+        assert entry["context_length"] == expected_context
+        if entry["id"] == "mantis/fusion":
+            assert entry["max_completion_tokens"] == 120000
+        elif entry["id"] == "mantis/base":
             assert entry["max_completion_tokens"] == 131072
         else:
             assert entry["max_completion_tokens"] == 4096

@@ -76,11 +76,13 @@ def apply_request_controls(run: Any, request: Any) -> None:
     """Store each HTTP turn's tool constraints on the existing native run fields."""
     choice = request.tool_choice
     run.tool_choice = choice.model_dump() if hasattr(choice, "model_dump") else choice
-    run.controls = (
-        {"parallel_tool_calls": request.parallel_tool_calls}
-        if request.parallel_tool_calls is not None
-        else {}
-    )
+    controls: dict[str, Any] = {}
+    if request.parallel_tool_calls is not None:
+        controls["parallel_tool_calls"] = request.parallel_tool_calls
+    requested_output = request.max_completion_tokens or request.max_tokens
+    if requested_output is not None:
+        controls["max_output_tokens"] = requested_output
+    run.controls = controls
     fusion._put_run(run)
 
 
@@ -102,3 +104,40 @@ def hidden_tool_names(request: Any, run_id: str | None) -> set[str]:
         else [tool.model_dump() for tool in request.tools or []]
     )
     return set(fusion_harness.effective_delegation_names(client_tools or []).values())
+
+def trailing_tool_results(
+    request: Any,
+    decode_tool_id: Callable[[str], tuple[str, str]],
+    content_to_str: Callable[[Any], str],
+) -> tuple[list[dict[str, Any]], dict[str, str], str | None]:
+    """Decode one trailing block of client tool results, if the request ends in one."""
+    tool_results: list[dict[str, Any]] = []
+    client_tool_ids: dict[str, str] = {}
+    run_id: str | None = None
+    index = len(request.messages) - 1
+    while index >= 0 and request.messages[index].role == "tool":
+        tool_msg = request.messages[index]
+        try:
+            rid, original_id = decode_tool_id(tool_msg.tool_call_id or "")
+        except ValueError:
+            break
+        if run_id is None:
+            run_id = rid
+        elif run_id != rid:
+            break
+        client_tool_ids[str(tool_msg.tool_call_id)] = original_id
+        result = _tool_result_entry(tool_msg, original_id, content_to_str)
+        tool_results.insert(0, result)
+        index -= 1
+    return tool_results, client_tool_ids, run_id
+
+
+def _tool_result_entry(
+    tool_msg: Any, original_id: str, content_to_str: Callable[[Any], str]
+) -> dict[str, Any]:
+    """Build one decoded tool-result entry."""
+    return {
+        "tool_call_id": original_id,
+        "content": content_to_str(tool_msg.content),
+        "is_error": False,
+    }

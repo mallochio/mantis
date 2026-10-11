@@ -162,5 +162,3 @@ fallback_on_escalate = true
 sidekick_max_tool_rounds = 0
 # Hard Fusion run guard, enforced through FusionBudgetGuard.
 run_max_turns = 64
-context_token_limit = 262144
-max_output_tokens = 4096
