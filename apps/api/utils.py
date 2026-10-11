@@ -530,43 +530,4 @@ def _filter_tools_by_options(tools: list[dict[str, Any]], options: Any) -> list[
     return [t for t in (tools or []) if str(t.get("function", {}).get("name", "")) in allowed_names]
 
 
-def _load_skill_profile(name: str) -> Any | None:
-    """Load a Mantis skill as a Fusion worker profile, if present."""
-    for root in (
-        Path.home() / ".agents" / "skills",
-        Path.home() / ".devin" / "skills",
-        Path(__file__).resolve().parent.parent.parent / ".agents" / "skills",
-    ):
-        path = root / name / "SKILL.md"
-        if not path.is_file():
-            continue
-        try:
-            text = path.read_text()
-            lines = text.splitlines()
-            title = lines[0].lstrip("# ").strip() if lines else name
-            description = ""
-            instructions = ""
-            for i, line in enumerate(lines[1:], start=2):
-                if line.lower().startswith("## description"):
-                    description = "\n".join(
-                        ln.strip() for ln in lines[i:] if ln.strip() and not ln.startswith("##")
-                    ).split("\n\n")[0]
-                elif line.lower().startswith("## instructions") or line.lower().startswith(
-                    "## prompt"
-                ):
-                    instructions = "\n".join(
-                        ln.strip() for ln in lines[i:] if ln.strip() and not ln.startswith("##")
-                    ).split("\n\n")[0]
-            from fusion_types import FusionWorkerProfile
-
-            return FusionWorkerProfile(
-                name=name,
-                description=description or title,
-                instructions=instructions or text[:4000],
-            )
-        except OSError:
-            continue
-    return None
-
-
 __all__ = [k for k in globals() if not k.startswith("__")]

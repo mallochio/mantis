@@ -7,7 +7,6 @@ from typing import Any
 
 import api
 import fusion
-import fusion_prompts
 import fusion_types
 import pydantic
 import pytest
@@ -108,7 +107,7 @@ def test_api_rejects_workspace_outside_allowlist(client, workspace, tmp_path):
         json={
             "model": "mantis/fusion",
             "messages": [{"role": "user", "content": "hi"}],
-            "tool_options": {"delegation": "tool", "workspace": str(tmp_path)},
+            "tool_options": {"workspace": str(tmp_path)},
         },
     )
     assert response.status_code == 400
@@ -150,7 +149,7 @@ def _chat(client, messages: list[dict[str, Any]]) -> dict[str, Any]:
             "model": "mantis/fusion",
             "messages": messages,
             "tools": [BASH_TOOL],
-            "tool_options": {"delegation": "tool"},
+            "tool_options": {},
         },
     )
     assert response.status_code == 200, response.text
@@ -181,45 +180,6 @@ def test_chat_hides_delegation_from_client_and_default_trace(client, monkeypatch
     event = second["mantis_event"]
     assert event["trace_scope"] == "main"
     assert any(entry["kind"] == "handoff" for entry in event["handoff_history"])
-
-
-def test_catalog_delegation_selects_mode(monkeypatch, tool_catalog):
-    tool_catalog.write_text(tool_catalog.read_text() + 'delegation = "tool"\n')
-    monkeypatch.setattr(fusion, "_FUSION_CONFIG", fusion.FusionConfig(tool_catalog))
-    install(monkeypatch, [reply("tool answer")], [])
-
-    run = fusion.FusionRun("catalog", "hello")
-    assert run.advance()["report"] == "tool answer"
-    assert run.handoffs is not None
-
-    marker = fusion.FusionRun(
-        "override", "hello", tool_options=fusion.FusionToolOptions(delegation="marker")
-    )
-    assert not fusion.fusion_lead.uses_tool_delegation(marker, fusion.FusionCoordinator())
-    assert marker.handoffs is None
-
-
-def test_invalid_delegation_values_are_rejected(monkeypatch, tool_catalog):
-    with pytest.raises(pydantic.ValidationError):
-        fusion.FusionToolOptions(delegation="markers")
-    tool_catalog.write_text(tool_catalog.read_text() + 'delegation = "bogus"\n')
-    with pytest.raises(ValueError, match="'marker' or 'tool'"):
-        fusion.FusionConfig(tool_catalog).delegation()
-
-
-def test_marker_mode_is_the_default(monkeypatch):
-    def legacy(_coordinator, slot, messages, tools):
-        assert messages[0]["content"].startswith(fusion.MAIN_PREAMBLE)
-        assert not any(t["function"]["name"] == "sidekick" for t in tools or [])
-        return reply("ANSWER: direct reply"), {}
-
-    monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", legacy)
-    run = fusion.FusionRun("marker", "hello", tools=[BASH_TOOL])
-
-    assert fusion.FusionConfig(fusion._FUSION_CONFIG.path).delegation() == "marker"
-    assert run.advance()["report"] == "direct reply"
-    assert run.handoffs is None
-    assert fusion_prompts.LEAD_DELEGATION_POLICY not in str(run.main_messages)
 
 
 def test_visible_lead_messages_drop_only_delegation_calls():

@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-import collections
 import json
 import os
-import re
 import threading
 import tomllib
 import uuid
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext, suppress
 from pathlib import Path
 from typing import Any, cast
@@ -23,18 +20,14 @@ import litellm
 import model_catalog
 import providers
 import serve_config
-import tool_exec
 import utils
 from fusion_budget import FusionBudgetExceededError, FusionBudgetGuard
+from fusion_prompts import sidekick_system_prompt
 from fusion_router import FusionRouter
 from fusion_types import (
-    FusionPlan,
     FusionRoutingConfig,
     FusionRunBudget,
-    FusionSidekickAssignment,
     FusionToolOptions,
-    FusionWorkerProfile,
-    parse_delegation,
 )
 from runs import (
     RUN_STORE,
@@ -49,14 +42,7 @@ from runs import (
 
 __all__ = ["FusionCoordinator", "FusionRun", "advance_fusion_run", "FUSION_STATUS"]
 
-FUSION_STATUS = frozenset(
-    {"main_planning", "sidekick_pending", "awaiting_tools", "main_review", "completed", "error"}
-)
-
-_KEEPALIVE_PROMPT = "Reply with exactly OK."
-_KEEPALIVE_STOP: dict[str, threading.Event] = {}
-_KEEPALIVE_PINGS: collections.Counter[str] = collections.Counter()
-_KEEPALIVE_LOCK = threading.Lock()
+FUSION_STATUS = frozenset({"main_planning", "awaiting_tools", "completed", "error"})
 
 
 @contextmanager
@@ -73,177 +59,6 @@ def _fusion_route_session(session_id: str):
                 del context.fusion_route_session_id
         else:
             context.fusion_route_session_id = previous
-
-
-def _keepalive_enabled() -> bool:
-    """Return whether prompt-cache keepalive pings are enabled."""
-    return os.environ.get("MANTIS_CACHE_KEEPALIVE", "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _keepalive_interval() -> float:
-    """Return the seconds to wait between keepalive pings."""
-    raw = os.environ.get("MANTIS_CACHE_KEEPALIVE_INTERVAL", "120").strip()
-    try:
-        value = float(raw)
-    except ValueError:
-        return 120.0
-    return max(1.0, value)
-
-
-def _keepalive_max_pings() -> int:
-    """Return the per-run ceiling on keepalive pings."""
-    raw = os.environ.get("MANTIS_CACHE_KEEPALIVE_MAX_PINGS", "20").strip()
-    try:
-        value = int(raw)
-    except ValueError:
-        return 20
-    return max(0, value)
-
-
-def keepalive_ping_count(run_id: str) -> int:
-    """Return how many keepalive pings one run has sent."""
-    with _KEEPALIVE_LOCK:
-        return _KEEPALIVE_PINGS.get(run_id, 0)
-
-
-def stop_keepalive(run_id: str) -> None:
-    """Signal the keepalive loop for one run to exit before its next ping."""
-    with _KEEPALIVE_LOCK:
-        event = _KEEPALIVE_STOP.get(run_id)
-    if event is not None:
-        event.set()
-
-
-def start_keepalive(run_id: str) -> None:
-    """Refresh prompt caches in the background while the run awaits tools."""
-    if not _keepalive_enabled():
-        return
-    with _KEEPALIVE_LOCK:
-        if run_id in _KEEPALIVE_STOP:
-            return
-        stop_event = threading.Event()
-        _KEEPALIVE_STOP[run_id] = stop_event
-    threading.Thread(target=_keepalive_loop, args=(run_id, stop_event), daemon=True).start()
-
-
-def _keepalive_loop(run_id: str, stop_event: threading.Event) -> None:
-    """Ping warm lane prefixes until the run resumes or the cap is reached."""
-    try:
-        while not stop_event.wait(_keepalive_interval()):
-            if keepalive_ping_count(run_id) >= _keepalive_max_pings():
-                break
-            run = try_get_fusion_run(run_id)
-            if run is None or run.status != "awaiting_tools":
-                break
-            try:
-                pinged = run.cache_keepalive()
-            except Exception:  # noqa: BLE001 - reason: a failing ping must not crash the watcher
-                break
-            if not pinged:
-                break
-            with _KEEPALIVE_LOCK:
-                _KEEPALIVE_PINGS[run_id] += 1
-    finally:
-        with _KEEPALIVE_LOCK:
-            if _KEEPALIVE_STOP.get(run_id) is stop_event:
-                del _KEEPALIVE_STOP[run_id]
-
-
-MAIN_PREAMBLE = (
-    "You are the lead engineer on a software task, paired with a cheap coding "
-    "sidekick whose turns cost a small fraction of yours. Plan the work, "
-    "delegate implementation and its verification to the sidekick by default, "
-    "and review the sidekick's output. Implement a step yourself only when it "
-    "is trivially small (1-2 turns), when authoring or checking it is "
-    "correctness-critical (data analysis, measurement, eval harnesses), or "
-    "when it needs complex rendered-browser work; otherwise hand it to the "
-    "sidekick, because a good brief protects quality while the sidekick's "
-    "cheaper turns carry the cost. "
-    "When you can fully resolve the user request without code changes or tool use "
-    "(clarifications, trivia, nothing-to-do, or answers already in context), reply with "
-    "exactly one section: 'ANSWER:' followed by the user-facing reply and nothing else. "
-    "Otherwise respond with exactly two sections: 'PLAN:' containing the high-level plan, "
-    "and 'BRIEF:' containing a self-contained brief for the sidekick. The brief must state "
-    "the goal, the files to touch, hard constraints and edge cases, and the exact "
-    "verification commands to run; specify the change as code (a snippet when that is "
-    "clearest), never as prose the sidekick must interpret, and never leave alternatives "
-    "for the sidekick to pick between; keep open questions and lead-only actions (user "
-    "messages, approvals, commits) out of the brief, because the sidekick cannot "
-    "perform them and silently drops them; reserve a full test-suite run for at most "
-    "one final gate instead of re-gating unchanged work. Require the sidekick to report "
-    "the changes made, the commands it ran, and their results. When reviewing a sidekick "
-    "report, reply exactly 'ACCEPT' if the report is satisfactory. Otherwise reply "
-    "'FOLLOW_UP:' followed by concise, specific feedback that covers every issue you "
-    "found, so one revision round fixes all of them. After an escalation from the "
-    "sidekick, reply with 'ANSWER:' or a new 'PLAN:' and 'BRIEF:'."
-)
-
-SIDEKICK_PREAMBLE = (
-    "You are a fast, cheap coding sidekick. Implement, test, and lint according to "
-    "the brief you are given. Treat 'goal:' as the stable task anchor and 'latest_user:' "
-    "as the current narrowing ask; obey 'brief:' for what to do. Do not redesign the "
-    "work. If the brief is impossible, needs frontier judgment, or you are over budget, "
-    "reply with exactly 'ESCALATE_TO_MAIN:' followed by a concise reason and stop. "
-    "After two or three failed attempts at the same failure without a clear next step, "
-    "escalate with what you tried and your best diagnosis instead of retrying. "
-    "You may use the provided tools. When finished successfully, return a concise final "
-    "report listing the changes made, the verification commands you ran with their real "
-    "output, and any remaining issues."
-)
-
-STRUCTURED_PLANNING_SUFFIX = (
-    " You plan with structured output. The main agent will execute the core "
-    "integration task with tools; delegate bounded research, tests, and mechanical "
-    "edits to sidekick lanes. Assign the 'frontier' profile (the strongest model) "
-    "to a sidekick task that needs it."
-)
-
-
-def _main_preamble(
-    structured: bool,
-    run_profiles: dict[str, FusionWorkerProfile],
-    catalog_profiles: dict[str, FusionWorkerProfile],
-) -> str:
-    if not structured:
-        return MAIN_PREAMBLE
-    suffix = STRUCTURED_PLANNING_SUFFIX
-    profiles = {**catalog_profiles, **run_profiles}
-    if profiles:
-        roster = "\n".join(
-            f"- {p.name}: {p.description or (p.instructions.splitlines() or ['custom worker'])[0]}"
-            for p in profiles.values()
-        )
-        suffix += (
-            "\nAvailable sidekick profiles (assign only when the specialization fits):\n" + roster
-        )
-    return MAIN_PREAMBLE + suffix
-
-
-FUSION_BRIEF_OPEN = "<fusion-brief>"
-FUSION_BRIEF_CLOSE = "</fusion-brief>"
-FUSION_FOLLOW_UP_OPEN = "<fusion-follow-up>"
-FUSION_FOLLOW_UP_CLOSE = "</fusion-follow-up>"
-DELEGATION_MODES = frozenset({"available", "forced"})
-
-
-def _format_fusion_brief(goal: str, latest_user: str, plan: str, brief: str) -> str:
-    return (
-        f"{FUSION_BRIEF_OPEN}\n"
-        f"goal: {goal}\n"
-        f"latest_user: {latest_user}\n"
-        f"plan: {plan}\n"
-        f"brief: {brief}\n"
-        f"{FUSION_BRIEF_CLOSE}"
-    )
-
-
-def _format_fusion_follow_up(feedback: str) -> str:
-    return f"{FUSION_FOLLOW_UP_OPEN}\n{feedback}\n{FUSION_FOLLOW_UP_CLOSE}"
 
 
 def _user_message_texts(messages: list[dict[str, Any]] | None, brief: str) -> tuple[str, str]:
@@ -298,129 +113,13 @@ def _validate_pool_ordering(config: FusionRoutingConfig) -> None:
                 )
 
 
-REVIEW_PROMPT = (
-    "The sidekick produced the following report. Review it. If it is satisfactory, "
-    "reply exactly 'ACCEPT'. Otherwise reply 'FOLLOW_UP:' followed by concise, specific "
-    "feedback that covers every issue you found, so the sidekick can fix all of them "
-    "in one revision round.\n\nReport:\n"
-)
-
-ESCALATE_PROMPT = (
-    "The sidekick escalated back to you. Reply with exactly 'ANSWER:' and a "
-    "user-facing reply, or with 'PLAN:' and 'BRIEF:' to redelegate. "
-    "Do not call tools.\n\nEscalation:\n"
-)
-
 TERMINAL_SYNTHESIS_PROMPT = (
     "The Fusion run guard is exhausted; no further sidekick work or review is "
     "possible. Write the final user-facing answer now from "
     "the material below: give the best verified result available, and state "
     "clearly what remains unfinished or unverified. "
-    "Reply with exactly 'ANSWER:' followed by the answer.\n"
+    "Return a plain assistant answer.\n"
 )
-
-PLAN_REMINDER_PROMPT = (
-    "Your previous response did not contain the required sections. "
-    "Reply with exactly two sections and nothing else: "
-    "'PLAN:' containing the high-level plan, and "
-    "'BRIEF:' containing a self-contained brief for the sidekick. "
-    "Do not include commentary, markdown, or tool calls."
-)
-
-AVAILABLE_REMINDER_PROMPT = (
-    "Your previous response was not valid. Reply with exactly 'ANSWER:' followed by "
-    "a user-facing reply, or with exactly two sections 'PLAN:' and 'BRIEF:'. "
-    "Do not include commentary, markdown, or tool calls."
-)
-
-FORCED_ANSWER_REMINDER_PROMPT = (
-    "Direct ANSWER is not allowed for this forced-delegation run. "
-    "Reply with exactly two sections and nothing else: "
-    "'PLAN:' containing the high-level plan, and "
-    "'BRIEF:' containing a self-contained brief for the sidekick."
-)
-
-PLAN_TOOL_BUDGET_PROMPT = (
-    "You have already used the allowed planning tool budget. "
-    "Stop calling tools and reply with exactly two sections: "
-    "'PLAN:' and 'BRIEF:'. No other text or tool calls."
-)
-
-SIDEKICK_TOOL_BUDGET_PROMPT = (
-    "You have used the allowed sidekick tool-round limit for this delegated subtask. "
-    "Stop calling tools. Either finish with a concise final report, or reply with "
-    "exactly 'ESCALATE_TO_MAIN:' followed by a concise reason."
-)
-
-REDELEGATE_PROMPT = (
-    "The delegated subtask reached its local follow-up or tool-round limit. "
-    "Do not stop the overall run. "
-    "Narrow the work to the smallest unfinished unit and reply with exactly 'PLAN:' "
-    "and 'BRIEF:' for a fresh sidekick subtask, or reply with exactly 'ANSWER:' if "
-    "you can finish from the verified material. Broad multi-item work must be split "
-    "into small delegations.\n\nReason:\n"
-)
-
-PLAN_UNKNOWN_TOOL_PROMPT = (
-    "You tried to call tools that are not available for planning: {names}. "
-    "Stop calling tools and reply with exactly two sections: "
-    "'PLAN:' and 'BRIEF:'. No other text or tool calls."
-)
-
-MAIN_STRAY_TOOL_PROMPT = (
-    "Tools are not available to the main model in this phase, so these calls "
-    "were not executed: {names}. Do not call tools again. Continue with the "
-    "information you already have and reply in the required format."
-)
-
-PLAN_RESPONSE_FORMAT = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "fusion_plan",
-        "schema": {
-            "type": "object",
-            "required": [
-                "complexity",
-                "main_task",
-                "sidekick_assignments",
-                "verification_commands",
-            ],
-            "additionalProperties": False,
-            "properties": {
-                "complexity": {
-                    "type": "number",
-                    "minimum": 0,
-                    "maximum": 1,
-                    "description": "Estimated difficulty of the user request.",
-                },
-                "main_task": {
-                    "type": "string",
-                    "description": "The core integration task the main agent will execute.",
-                },
-                "sidekick_assignments": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "required": ["task", "profile"],
-                        "additionalProperties": False,
-                        "properties": {
-                            "task": {"type": "string"},
-                            "profile": {
-                                "type": "string",
-                                "description": (
-                                    "Sidekick profile name; use an empty "
-                                    "string for the default profile."
-                                ),
-                            },
-                        },
-                    },
-                },
-                "verification_commands": {"type": "array", "items": {"type": "string"}},
-            },
-        },
-        "strict": True,
-    },
-}
 
 
 class FusionConfig:
@@ -451,28 +150,28 @@ class FusionConfig:
                 with self.path.open("rb") as handle:
                     root = tomllib.load(handle)
                 self._raw = root.get("fusion", {})
+            self._reject_removed_controls()
             return self._raw
+
+    def _reject_removed_controls(self) -> None:
+        """Reject obsolete marker and multi-lane catalog controls."""
+        removed = {
+            "delegation",
+            "main_tools",
+            "max_follow_ups",
+            "sidekick_max_follow_ups",
+            "worker_profiles",
+        }
+        unsupported = removed.intersection(self._raw or {})
+        if unsupported:
+            self._raw = None
+            raise ValueError(f"unsupported Fusion settings: {', '.join(sorted(unsupported))}")
 
     def main_slot(self) -> str:
         return self._load().get("main") or "gpt-5_6-sol"
 
     def sidekick_slot(self) -> str:
         return self._load().get("sidekick") or "gpt-5_6-luna"
-
-    def delegation(self) -> str:
-        """Return the catalog delegation kind: "marker" (default) or "tool"."""
-        return parse_delegation(self._load().get("delegation"))
-
-    def main_tools(self) -> str:
-        raw = str(self._load().get("main_tools") or "none").strip().lower()
-        return raw if raw in {"none", "plan", "review", "plan+review"} else "none"
-
-    def max_follow_ups(self) -> int:
-        raw = self._load().get("max_follow_ups") or "3"
-        try:
-            return int(raw)
-        except (TypeError, ValueError):
-            return 3
 
     def sidekick_max_tool_rounds(self) -> int:
         raw = self._load().get("sidekick_max_tool_rounds")
@@ -492,16 +191,6 @@ class FusionConfig:
             return max(0, int(raw))
         except (TypeError, ValueError):
             return 3
-
-    def sidekick_max_follow_ups(self) -> int:
-        raw = self._load().get("sidekick_max_follow_ups")
-        if raw is None:
-            raw = self._load().get("max_follow_ups") or "2"
-        try:
-            value = int(raw)
-        except (TypeError, ValueError):
-            return self.max_follow_ups()
-        return max(0, value)
 
     def run_max_turns(self) -> int:
         raw = self._load().get("run_max_turns") or "64"
@@ -541,12 +230,6 @@ class FusionConfig:
 
     def sidekick_router(self) -> FusionRouter:
         return FusionRouter.from_config(self.main_routing(), "sidekick")
-
-    def worker_profiles(self) -> list[FusionWorkerProfile]:
-        raw = self._load().get("worker_profiles") or []
-        if not isinstance(raw, list):
-            return []
-        return [FusionWorkerProfile.model_validate(item) for item in raw]
 
     def default_budget(self) -> FusionRunBudget:
         raw_budget = self._load().get("budget") or {}
@@ -655,9 +338,6 @@ def _sidekick_trace_delta(run: FusionRun) -> str:
     run.trace_cursors["sidekick"] = len(run.sidekick_messages)
     if reasoning:
         return reasoning
-    if run.sidekick_brief and not run.trace_cursors.get("brief"):
-        run.trace_cursors["brief"] = 1
-        return run.sidekick_brief
     return ""
 
 
@@ -684,29 +364,6 @@ def _orchestration_provider_delta(run: FusionRun) -> str:
     cursor["main"] = len(run.main_messages)
     cursor["sidekick"] = len(run.sidekick_messages)
     return provider
-
-
-def _orchestration_preamble(run: FusionRun) -> str:
-    cursor = _orchestration_positions(run)
-    if cursor["preamble"] or not (run.plan or run.sidekick_brief):
-        return ""
-    cursor["preamble"] = 1
-    main_slot = getattr(run, "main_slot", "gpt-5_6-sol")
-    sidekick_slot = getattr(run, "sidekick_slot", "gpt-5_6-luna")
-    lines = [f"Fusion · Planning · {_model_label(main_slot)}"]
-    if run.plan:
-        lines.extend(["", "Plan:", run.plan])
-    if run.sidekick_brief:
-        lines.extend(
-            [
-                "",
-                f"Delegated to sidekick · {_model_label(sidekick_slot)}",
-                "",
-                "Brief:",
-                run.sidekick_brief,
-            ]
-        )
-    return "\n".join(lines)
 
 
 def _run_guard_remaining(run: FusionRun) -> dict[str, Any]:
@@ -781,19 +438,10 @@ def _orchestration_metadata(run: FusionRun) -> dict[str, Any]:
         "status": run.status,
         "main_model": _model_label(getattr(run, "main_slot", "gpt-5_6-sol")),
         "sidekick_model": _model_label(getattr(run, "sidekick_slot", "gpt-5_6-luna")),
-        "plan": run.plan or None,
-        "sidekick_brief": run.sidekick_brief or None,
         "tool_count": tool_count,
         "tool_results": sum(msg.get("role") == "tool" for msg in run.sidekick_messages),
-        "active_subtask_id": run.active_subtask_id or None,
-        "subtask_index": run.active_subtask_index or None,
-        "subtask_rounds_used": run.subtask_rounds,
-        "subtask_round_limit": run.sidekick_max_tool_rounds or None,
-        "subtask_follow_ups_used": run.subtask_follow_ups,
-        "subtask_follow_up_limit": run.sidekick_max_follow_ups,
         "fusion_savings_usd": run._fusion_savings_usd(),
         "handoff_history": list(getattr(run, "handoff_history", [])),
-        "cache_keepalive_pings": keepalive_ping_count(run.run_id),
         "run_guard_remaining": _run_guard_remaining(run),
         "review": (
             "accepted"
@@ -861,11 +509,7 @@ def _orchestration_trace(
         return _main_trace_delta(run)
     if trace_scope == "sidekick":
         return _sidekick_trace_delta(run)
-    parts = [
-        part
-        for part in (_orchestration_preamble(run), _orchestration_provider_delta(run))
-        if part
-    ]
+    parts = [part for part in (_orchestration_provider_delta(run),) if part]
     if include_reasoning and not parts:
         return ""
     return "\n\n".join(parts)
@@ -880,14 +524,11 @@ class FusionCoordinator:
         self.sidekick_router = self.config.sidekick_router()
         self.main_slot = self.select("main")
         self.sidekick_slot = self.select("sidekick")
-        self.max_follow_ups = self.config.max_follow_ups()
         self.sidekick_max_tool_rounds = self.config.sidekick_max_tool_rounds()
         self.sidekick_max_consecutive_errors = self.config.sidekick_max_consecutive_errors()
-        self.sidekick_max_follow_ups = self.config.sidekick_max_follow_ups()
         self.run_max_turns = self.config.run_max_turns()
         self.context_window = self.config.context_window()
         self.max_output_tokens = self.config.max_output_tokens()
-        self.worker_profiles = {p.name: p for p in self.config.worker_profiles()}
         self.default_tool_options = self.config.tool_options()
         self.default_budget = self.config.default_budget()
 
@@ -1031,8 +672,8 @@ class FusionCoordinator:
         Tool-pairing is preserved and the newest review/follow-up
         prompt always survives fitting so the live contract reaches the model.
         """
-        # Clear older reasoning traces before budget fitting so that stale
-        # thinking blocks do not consume context or break prompt-cache hits.
+        if self._token_sum(messages, tools) <= max_input_tokens:
+            return messages
         cleared = providers._clear_thinking(messages, keep=2)
         pruned = self._prune_for_budget(cleared, max_input_tokens)
         if self._token_sum(pruned, tools) <= max_input_tokens:
@@ -1162,279 +803,6 @@ class FusionCoordinator:
         return msg, usage
 
 
-MAIN_EXEC_PREAMBLE = (
-    "You are the authoritative coding agent. Make careful, integrated changes, "
-    "verify them, and complete the assigned main task independently using the "
-    "available tools. Do not delegate the work to a sidekick. Do not output a plan; "
-    "when the task is finished, output a concise final report describing what was "
-    "done and the verified result."
-)
-
-
-class ExecutionLane:
-    """One resumable execution lane for the structured Fusion path."""
-
-    def __init__(
-        self,
-        lane_id: str,
-        run: FusionRun,
-        coordinator: FusionCoordinator,
-        assignment: FusionSidekickAssignment,
-        profile: FusionWorkerProfile,
-        *,
-        role: str = "sidekick",
-        shared_messages: list[dict[str, Any]] | None = None,
-    ) -> None:
-        self.lane_id = lane_id
-        self.run = run
-        self.coordinator = coordinator
-        self.assignment = assignment
-        self.profile = profile
-        self.role = role
-        self.shared_messages = shared_messages
-        self.tool_rounds = 0
-        self.follow_up_count = 0
-        self.exhausted = False
-        self.pending_tool_calls: list[dict[str, Any]] = []
-        self.report: str | None = None
-        self.error: str | None = None
-        self.complete = False
-        self.messages = self._build_messages()
-
-    def _build_messages(self) -> list[dict[str, Any]]:
-        if self.role == "main":
-            instructions = MAIN_EXEC_PREAMBLE
-            if self.profile.instructions:
-                instructions += "\n\n" + self.profile.instructions
-            messages = self.shared_messages or self.run.main_messages
-            self.shared_messages = messages
-            messages.append(
-                {
-                    "role": "user",
-                    "content": f"{instructions}\n\nTask: {self.assignment.task}",
-                }
-            )
-            return messages
-        system = SIDEKICK_PREAMBLE
-        if self.profile.instructions:
-            system += "\n\n" + self.profile.instructions
-        plan = self.run.structured_plan.main_task if self.run.structured_plan else ""
-        brief = _format_fusion_brief(
-            self.run.goal,
-            self.run.latest_user,
-            plan,
-            self.assignment.task,
-        )
-        messages = list(self.shared_messages or [])
-        messages.append({"role": "user", "content": brief})
-        return [{"role": "system", "content": system}, *messages]
-
-    def _tools_for_lane(self) -> list[dict[str, Any]] | None:
-        tools = list(self.run.tools or [])
-        if self.profile.tools:
-            names = set(self.profile.tools)
-            tools = [t for t in tools if str(t.get("function", {}).get("name", "")) in names]
-        return tools or None
-
-    def _select_slot(self) -> str:
-        if self.profile.model:
-            config: FusionRoutingConfig
-            base_route: Any
-            if self.role == "main":
-                config = FusionRoutingConfig(main=self.profile.model)
-                base_route = self.coordinator.main_router.base_route
-            else:
-                config = FusionRoutingConfig(sidekick=self.profile.model)
-                base_route = self.coordinator.sidekick_router.base_route
-            router = FusionRouter(config, self.role, base_route)
-            return cast(str, router.select(self.run.follow_up_count))
-        compaction_slot = (
-            self.run.main_compaction_slot
-            if self.role == "main"
-            else self.run.sidekick_compaction_slot
-        )
-        if compaction_slot is not None:
-            return compaction_slot
-        router = (
-            self.coordinator.main_router
-            if self.role == "main"
-            else self.coordinator.sidekick_router
-        )
-        return cast(str, router.select(self.run.follow_up_count))
-
-    def _record_subtask_state(self) -> None:
-        if self.role != "sidekick":
-            return
-        self.run.active_subtask_id = self.lane_id
-        self.run.active_subtask_index = next(
-            (index + 1 for index, lane in enumerate(self.run.sidekick_lanes) if lane is self),
-            0,
-        )
-        self.run.subtask_rounds = self.tool_rounds
-        self.run.subtask_follow_ups = self.follow_up_count
-
-    def _escalate_if_stuck(self) -> dict[str, Any] | None:
-        """Return a terminal status when the lane must hand back to main."""
-        error_cap = self.coordinator.sidekick_max_consecutive_errors
-        if (
-            self.role == "sidekick"
-            and error_cap > 0
-            and _trailing_error_streak(self.messages) >= error_cap
-        ):
-            return self._complete_escalation(
-                f"ESCALATE_TO_MAIN: sidekick hit {error_cap} consecutive "
-                "failed tool results",
-                "consecutive tool errors",
-            )
-        if (
-            self.coordinator.sidekick_max_tool_rounds > 0
-            and self.tool_rounds >= self.coordinator.sidekick_max_tool_rounds
-        ):
-            report = (
-                "ESCALATE_TO_MAIN: sidekick exceeded tool budget"
-                if self.role == "sidekick"
-                else "tool budget exceeded"
-            )
-            reason = "tool budget" if self.role == "sidekick" else None
-            return self._complete_escalation(report, reason)
-        return None
-
-    def _complete_escalation(self, report: str, reason: str | None) -> dict[str, Any]:
-        """Mark the lane exhausted and return its terminal escalation status."""
-        self.exhausted = True
-        self.report = report
-        if reason is not None:
-            self.run._record_handoff("escalate", lane=self.lane_id, reason=reason)
-        self.complete = True
-        return self._status(status="completed", report=self.report)
-
-    def step(self, tool_results: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-        self._record_subtask_state()
-        if self.error:
-            return self._status()
-        if self.complete:
-            return self._status(status="completed")
-        if tool_results:
-            self._append_tool_results(tool_results)
-            self.pending_tool_calls = []
-        escalated = self._escalate_if_stuck()
-        if escalated is not None:
-            return escalated
-
-        slot = self._select_slot()
-        self.run._record_selected_slot(self.role, slot, primary=self.role == "main")
-        tools = self._tools_for_lane()
-        with _fusion_route_session(f"{self.run.run_id}:{self.lane_id}"):
-            message, usage = self.coordinator._call_worker(slot, self.messages, tools)
-        selected = getattr(serve_config._history_context, "fusion_selected_model", None)
-        self.run._record_selected_slot(
-            self.role, str(selected or message.get("_mantis_model") or slot), primary=False
-        )
-        if self.profile.model is None and getattr(
-            serve_config._history_context, "fusion_compacted", False
-        ):
-            self.run._reroute_after_compaction(
-                self.role,
-                slot,
-                cache_warm=self.run._has_cache_hits(usage),
-            )
-        if self.run.budget is not None:
-            self.run.budget.consume_tokens(usage)
-            self.run.budget.consume_turn()
-        if getattr(serve_config._history_context, "active_run", None) is not self.run:
-            self.run.add_usage(usage, model=slot)
-        self.run._add_role_usage(self.role, slot, usage)
-        self.run.record_activity(
-            "execution_lane_turn",
-            lane=self.lane_id,
-            role=self.role,
-            model=slot,
-            status="completed",
-        )
-        providers._emit_progress(
-            {
-                "type": "task.completed",
-                "role": self.role,
-                "lane": self.lane_id,
-                "model": slot,
-                "task": self.assignment.task,
-            }
-        )
-
-        text = str(message.get("content") or "")
-        calls = message.get("tool_calls") or []
-        self.messages.append(message)
-        if calls:
-            self.tool_rounds += 1
-            for call in calls:
-                call["id"] = f"{self.lane_id}:{call['id']}"
-            self.pending_tool_calls = calls
-            return self._status(status="awaiting_tools", pending=calls)
-
-        escalate = self._parse_escalate(text)
-        if escalate is not None:
-            self.report = escalate
-            self.complete = True
-            return self._status(status="completed", report=escalate)
-
-        self.report = text
-        self.complete = True
-        return self._status(status="completed", report=text)
-
-    def _parse_escalate(self, text: str) -> str | None:
-        match = re.match(
-            r"^\s*ESCALATE_TO_MAIN:\s*(.*)\s*$",
-            text.strip(),
-            re.DOTALL | re.IGNORECASE,
-        )
-        if not match:
-            return None
-        return match.group(1).strip() or "sidekick requested escalation"
-
-    def _append_tool_results(self, tool_results: list[dict[str, Any]]) -> None:
-        pending = {"asst": {"tool_calls": [dict(call) for call in self.pending_tool_calls]}}
-        self.run.record_tool_results(pending, tool_results)
-        for result in tool_results:
-            raw_content = str(result.get("content", ""))
-            self.messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": result["tool_call_id"],
-                    "content": raw_content[: utils.RUN_MAX_MSG_BYTES],
-                    "is_error": bool(result.get("is_error", False)),
-                }
-            )
-
-    def _status(
-        self,
-        status: str | None = None,
-        pending: list[dict[str, Any]] | None = None,
-        report: str | None = None,
-    ) -> dict[str, Any]:
-        if status is None:
-            status = "error" if self.error else "completed" if self.complete else "in_progress"
-        return {
-            "lane_id": self.lane_id,
-            "status": status,
-            "pending_tool_calls": pending or [],
-            "report": report or self.report,
-            "error": self.error,
-        }
-
-    def apply_follow_up(self, feedback: str) -> bool:
-        """Continue only when this lane still has local follow-up budget."""
-        if not self.complete or self.error or self.exhausted:
-            return False
-        if self.follow_up_count >= self.coordinator.sidekick_max_follow_ups:
-            self.exhausted = True
-            return False
-        self.follow_up_count += 1
-        self.complete = False
-        self.report = None
-        self.messages.append({"role": "user", "content": _format_fusion_follow_up(feedback)})
-        return True
-
-
 class FusionRun(NativeRun):
     """A resumable lead/sidekick run whose roles are bound by the catalog."""
 
@@ -1448,17 +816,12 @@ class FusionRun(NativeRun):
         brief: str = "",
         tools: list[dict[str, Any]] | None = None,
         messages: list[dict[str, Any]] | None = None,
-        delegation_mode: str = "available",
-        worker_profiles: list[FusionWorkerProfile] | None = None,
         budget: FusionRunBudget | None = None,
         tool_options: FusionToolOptions | None = None,
     ) -> None:
         super().__init__(run_id)
         self.kind = "fusion"
         self.brief = brief
-        mode = delegation_mode if delegation_mode in DELEGATION_MODES else "available"
-        self.delegation_mode = mode
-        self.worker_profiles = {p.name: p for p in (worker_profiles or [])}
         self.tool_options = tool_options or FusionToolOptions()
         goal, latest_user = _user_message_texts(messages, brief)
         self.goal = goal
@@ -1475,29 +838,14 @@ class FusionRun(NativeRun):
         self.sidekick_slot = coordinator.sidekick_slot
         self.sidekick_max_tool_rounds = coordinator.sidekick_max_tool_rounds
         self.sidekick_max_consecutive_errors = coordinator.sidekick_max_consecutive_errors
-        self.sidekick_max_follow_ups = coordinator.sidekick_max_follow_ups
         self.run_max_turns = coordinator.run_max_turns
         self.main_router = coordinator.main_router
         self.sidekick_router = coordinator.sidekick_router
         self.main_compaction_slot: str | None = None
         self.sidekick_compaction_slot: str | None = None
-        self.main_compaction_pending: str | None = None
         self.slot_models = [self.main_slot, self.sidekick_slot]
-        policy = coordinator.config.main_tools()
-        self.main_tools_policy = frozenset(
-            {"plan", "review"} if policy == "plan+review" else {policy} - {"none"}
-        )
         self.tools = utils._convert_tools(tools)
-        self.structured = (
-            bool(self.worker_profiles)
-            or bool(self.tool_options.enabled)
-            or self.tool_options.server_execution
-            or budget is not None
-            or bool(coordinator.worker_profiles)
-        )
-        preamble = _main_preamble(
-            self.structured, self.worker_profiles, coordinator.worker_profiles
-        )
+        preamble = ""
         if messages:
             self.main_messages: list[dict[str, Any]] = [
                 {"role": "system", "content": preamble},
@@ -1509,103 +857,29 @@ class FusionRun(NativeRun):
                 {"role": "user", "content": brief},
             ]
         self.sidekick_messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SIDEKICK_PREAMBLE},
+            {"role": "system", "content": sidekick_system_prompt()},
         ]
         self.active_role: str = "main"
         self.pending_tool_calls: list[dict[str, Any]] = []
-        self.planning_tool_rounds = 0
         self.sidekick_tool_rounds = 0
-        self.subtask_counter = 0
-        self.active_subtask_id = ""
-        self.active_subtask_index = 0
-        self.subtask_rounds = 0
-        self.subtask_follow_ups = 0
         self.subtask_report: str | None = None
-        self.subtask_history: list[dict[str, Any]] = []
         self.repeat_guard = utils.RepeatToolGuard()
         self.report: str | None = None
-        self.plan: str = ""
-        self.sidekick_brief: str = ""
         self.error: str | None = None
         self.follow_up_count = 0
         self.follow_up_capped = False
         self.completed_via: str = ""
-        self._resume_allows_answer = False
         self.turns: list[dict[str, Any]] = []
         self.role_usage: dict[str, dict[str, dict[str, int]]] = {}
-        self.structured_plan: FusionPlan | None = None
-        self.server_tool_names: set[str] = set()
-        self.main_lane: ExecutionLane | None = None
-        self.sidekick_lanes: list[ExecutionLane] = []
-        self.sidekick_reports: list[str] = []
         self.sidekick_context_cache: dict[str, list[dict[str, Any]]] = {}
         self.handoff_history: list[dict[str, Any]] = []
         self.pending_user_messages: list[str] = []
         self.trace_cursors: dict[str, Any] = {}
         self.status = "main_planning"
 
-    @staticmethod
-    def _setstate_default_fields() -> dict[str, Any]:
-        """Return fields newer pickles may be missing, with safe defaults."""
-        return {
-            "plan": "",
-            "sidekick_brief": "",
-            "follow_up_count": 0,
-            "follow_up_capped": False,
-            # Old pickles predate the config gate and allowed lead tools in
-            # both phases; keep that behavior for restored runs.
-            "main_tools_policy": frozenset({"plan", "review"}),
-            "query": "",
-            "slot_models": [],
-            "turns": [],
-            "planning_tool_rounds": 0,
-            "sidekick_tool_rounds": 0,
-            "subtask_counter": 0,
-            "active_subtask_id": "",
-            "active_subtask_index": 0,
-            "subtask_rounds": 0,
-            "subtask_follow_ups": 0,
-            "subtask_report": None,
-            "subtask_history": [],
-            # 0 means unlimited sidekick tool rounds; the run-level guard is the
-            # only ceiling, so restored runs must not inherit an old cap.
-            "sidekick_max_tool_rounds": 0,
-            "sidekick_max_consecutive_errors": 3,
-            "sidekick_max_follow_ups": 2,
-            "run_max_turns": 64,
-            "role_usage": {},
-            "server_tool_names": set(),
-            "active_role": "main",
-            "main_slot": "gpt-5_6-sol",
-            "sidekick_slot": "gpt-5_6-luna",
-            "main_router": None,
-            "sidekick_router": None,
-            "main_compaction_slot": None,
-            "sidekick_compaction_slot": None,
-            "main_compaction_pending": None,
-            "delegation_mode": "forced",
-            "completed_via": "",
-            "_resume_allows_answer": False,
-            "worker_profiles": {},
-            "budget": None,
-            "tool_options": FusionToolOptions(),
-            "structured": False,
-            "structured_plan": None,
-            "main_lane": None,
-            "sidekick_lanes": [],
-            "sidekick_reports": [],
-            "sidekick_context_cache": {},
-            "handoff_history": [],
-            "pending_user_messages": [],
-            "trace_cursors": {},
-        }
-
     def __setstate__(self, state: dict[str, Any]) -> None:
         super().__setstate__(state)
         # Ensure new fields are present for forward compatibility.
-        for key, default_value in self._setstate_default_fields().items():
-            if not hasattr(self, key):
-                setattr(self, key, default_value)
         for field in ("goal", "latest_user"):
             if not hasattr(self, field):
                 setattr(self, field, getattr(self, "brief", "") or "")
@@ -1657,9 +931,7 @@ class FusionRun(NativeRun):
             slot = slot_override
         elif role == "main":
             slot = self.main_compaction_slot or (
-                self.main_router.select(esc)
-                if self.main_router is not None
-                else self.main_slot
+                self.main_router.select(esc) if self.main_router is not None else self.main_slot
             )
         else:
             slot = self.sidekick_compaction_slot or (
@@ -1766,13 +1038,10 @@ class FusionRun(NativeRun):
         return round(counterfactual - actual, 6)
 
     def _reroute_after_compaction(self, role: str, previous: str, cache_warm: bool = False) -> None:
-        if role == "main" and self.structured and self.structured_plan is None:
-            self.main_compaction_pending = previous
-            return
         router = self.main_router if role == "main" else self.sidekick_router
         if router is None:
             return
-        complexity = self.structured_plan.complexity if self.structured_plan else 1.0
+        complexity = 1.0
         lane_messages = self.main_messages if role == "main" else self.sidekick_messages
         failures = max(self.follow_up_count, _trailing_error_streak(lane_messages))
         selected = router.select_at_compaction(
@@ -1798,135 +1067,11 @@ class FusionRun(NativeRun):
             summary=f"Rerouted {role} after context compaction",
         )
 
-    def _parse_main_answer(self, text: str) -> str | None:
-        stripped = text.strip()
-        match = re.match(r"^\s*ANSWER:\s*(.*)\s*$", stripped, re.DOTALL | re.IGNORECASE)
-        if match:
-            answer = match.group(1).strip()
-            return answer or None
-        # Heuristic fallback: if the output is not a PLAN/BRIEF/ESCALATE/FOLLOW_UP
-        # or tool call, treat direct user-facing answers as valid direct answers.
-        control_pattern = r"^\s*(PLAN|BRIEF|ESCALATE_TO_MAIN|FOLLOW_UP):"
-        if not re.search(control_pattern, stripped, re.MULTILINE | re.IGNORECASE):
-            return stripped or None
-        return None
-
-    def _parse_main_plan(self, text: str) -> tuple[str, str]:
-        plan_match = re.search(r"PLAN:(.*?)(?:BRIEF:|$)", text, re.DOTALL)
-        brief_match = re.search(r"BRIEF:(.*)", text, re.DOTALL)
-        if not plan_match or not brief_match:
-            raise ValueError("main did not produce both PLAN and BRIEF sections")
-        plan = plan_match.group(1).strip()
-        sidekick_brief = brief_match.group(1).strip()
-        if not plan or not sidekick_brief:
-            raise ValueError("main produced empty PLAN or BRIEF")
-        return plan, sidekick_brief
-
-    def _parse_sidekick_escalate(self, text: str) -> str | None:
-        match = re.match(
-            r"^\s*ESCALATE_TO_MAIN:\s*(.*)\s*$", text.strip(), re.DOTALL | re.IGNORECASE
-        )
-        if not match:
-            return None
-        reason = match.group(1).strip()
-        return reason or "sidekick requested escalation"
-
-    def _parse_main_review(self, text: str) -> tuple[bool, str]:
-        stripped = text.strip()
-        if stripped.upper().startswith("ACCEPT") or re.search(
-            r"^\s*ACCEPT\b", stripped, re.IGNORECASE
-        ):
-            return True, ""
-        follow_match = re.search(r"\bFOLLOW_UP:\s*(.*)", stripped, re.DOTALL | re.IGNORECASE)
-        if follow_match:
-            feedback = follow_match.group(1).strip()
-            if feedback:
-                return False, feedback
-        if stripped.upper().startswith("REJECT"):
-            return False, stripped
-        raise ValueError(
-            "main review did not output a valid decision "
-            f"('ACCEPT' or 'FOLLOW_UP: <feedback>'), got: {stripped[:120]!r}"
-        )
-
-    def _queue_sidekick_brief(self) -> None:
-        self.sidekick_messages.append(
-            {
-                "role": "user",
-                "content": _format_fusion_brief(
-                    self.goal, self.latest_user, self.plan, self.sidekick_brief
-                ),
-            }
-        )
-        self.subtask_counter += 1
-        self.active_subtask_index = self.subtask_counter
-        self.active_subtask_id = f"subtask-{self.subtask_counter}"
-        self._record_handoff(
-            "delegate", subtask=self.active_subtask_id, summary=self.sidekick_brief[:200]
-        )
-        self.subtask_rounds = 0
-        self.subtask_follow_ups = 0
-        self.subtask_history.append(
-            {
-                "id": self.active_subtask_id,
-                "index": self.active_subtask_index,
-                "rounds_used": self.subtask_rounds,
-                "follow_ups_used": self.subtask_follow_ups,
-                "report": self.subtask_report,
-            }
-        )
-        self.subtask_report = None
-        self.sidekick_tool_rounds = 0
-        self.status = "sidekick_pending"
-
     def _complete_answer(self, answer: str) -> None:
         self.report = answer
         self.completed_via = "answer"
         self._record_handoff("answer", summary=answer[:200])
         self.status = "completed"
-
-    def _apply_user_message(
-        self,
-        message: str,
-        coordinator: FusionCoordinator | None = None,
-    ) -> None:
-        """Reset turn state before planning a new live-run instruction."""
-        self._snapshot_sidekick_contexts(coordinator)
-        self._record_handoff("turn", summary=message[:200])
-        self.latest_user = message
-        self.main_messages.append({"role": "user", "content": message})
-        self.pending_tool_calls = []
-        self.planning_tool_rounds = 0
-        self.report = None
-        self.completed_via = ""
-        self.follow_up_capped = False
-        self.plan = ""
-        self.sidekick_brief = ""
-        self.structured_plan = None
-        self.main_lane = None
-        self.sidekick_lanes = []
-        self.sidekick_reports = []
-        self.sidekick_messages = [{"role": "system", "content": SIDEKICK_PREAMBLE}]
-        self.sidekick_tool_rounds = 0
-        self.follow_up_count = 0
-        self.main_compaction_slot = None
-        self.sidekick_compaction_slot = None
-        self.main_compaction_pending = None
-        self.active_role = "main"
-        self.status = "main_planning"
-        self._resume_allows_answer = True
-
-    def _drain_pending_user_messages(
-        self,
-        coordinator: FusionCoordinator | None = None,
-    ) -> None:
-        """Apply user messages queued while the run awaited tool results."""
-        if not self.pending_user_messages:
-            return
-        queued = self.pending_user_messages
-        self.pending_user_messages = []
-        for text in queued:
-            self._apply_user_message(text, coordinator)
 
     def _synthesize_final_answer(
         self,
@@ -1943,108 +1088,14 @@ class FusionRun(NativeRun):
         self.main_messages.append({"role": "user", "content": context})
         try:
             text, calls, _ = self._call_lane(coordinator, "main", tools=None)
-            if calls:
-                text = self._retry_main_without_tools(coordinator, calls)
-            answer = self._parse_main_answer(text)
+            answer = text.strip() if not calls else None
         except Exception:  # noqa: BLE001 - terminal synthesis must not lose the run
             return fallback
         return answer or fallback
 
     def _synthesis_context(self, label: str, material: str) -> str:
-        return (
-            f"{TERMINAL_SYNTHESIS_PROMPT}\n\n"
-            f"Goal:\n{self.goal}\n\n"
-            f"{label}:\n{material}\n\n"
-            f"Sidekick tool activity:\n{self._summarize_sidekick_tool_history()}"
-        )
-
-    def _handle_main_planning_text(
-        self,
-        coordinator: FusionCoordinator,
-        main_text: str,
-        *,
-        allow_retry: bool,
-        allow_answer: bool | None = None,
-    ) -> None:
-        """Parse ANSWER or PLAN/BRIEF from main; may issue one reminder retry."""
-        answer_ok = self.delegation_mode == "available" if allow_answer is None else allow_answer
-        answer = self._parse_main_answer(main_text)
-        if answer is not None:
-            if not answer_ok:
-                if not allow_retry:
-                    raise ValueError("main emitted ANSWER on a forced-delegation run")
-                main_text, main_calls, _ = self._call_lane(
-                    coordinator, "main", prompt=FORCED_ANSWER_REMINDER_PROMPT, tools=None
-                )
-                if main_calls:
-                    raise ValueError("main called tools instead of producing a plan")
-                self._handle_main_planning_text(
-                    coordinator,
-                    main_text,
-                    allow_retry=False,
-                    allow_answer=False,
-                )
-                return
-            self._complete_answer(answer)
-            return
-
-        try:
-            self.plan, self.sidekick_brief = self._parse_main_plan(main_text)
-        except ValueError:
-            if not allow_retry:
-                raise
-            reminder = AVAILABLE_REMINDER_PROMPT if answer_ok else PLAN_REMINDER_PROMPT
-            main_text, main_calls, _ = self._call_lane(
-                coordinator, "main", prompt=reminder, tools=None
-            )
-            if main_calls:
-                raise ValueError("main called tools instead of producing a plan") from None
-            self._handle_main_planning_text(
-                coordinator,
-                main_text,
-                allow_retry=False,
-                allow_answer=answer_ok,
-            )
-            return
-        self._queue_sidekick_brief()
-
-    def _retry_main_without_tools(
-        self,
-        coordinator: FusionCoordinator,
-        calls: list[dict[str, Any]],
-        *,
-        response_format: dict[str, Any] | None = None,
-    ) -> str:
-        """Pair stray main tool calls, then re-ask the main lane once with no tools."""
-        names = ", ".join(
-            sorted({str((call.get("function") or {}).get("name", "")) for call in calls})
-        )
-        for call in calls:
-            self.main_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": str(call.get("id", "")),
-                    "content": "Tool unavailable to the main model in this phase.",
-                    "is_error": True,
-                }
-            )
-        previous_format: dict[str, Any] | None = getattr(self, "active_response_format", None)
-        self.active_response_format = response_format
-        try:
-            text, retry_calls, _ = self._call_lane(
-                coordinator,
-                "main",
-                prompt=MAIN_STRAY_TOOL_PROMPT.format(names=names),
-                tools=None,
-            )
-        finally:
-            self.active_response_format = previous_format
-        if retry_calls:
-            retry_names = ", ".join(
-                sorted({str((call.get("function") or {}).get("name", "")) for call in retry_calls})
-            )
-            raise ValueError(f"main kept calling tools after they were withheld: {retry_names}")
-        return text
+        """Describe a terminal run guard without legacy protocol metadata."""
+        return f"{TERMINAL_SYNTHESIS_PROMPT}\n\nGoal:\n{self.goal}\n\n{label}:\n{material}"
 
     def _record_selected_slot(self, role: str, slot: str, *, primary: bool = True) -> None:
         """Keep the reported slot in step with the slot that actually ran."""
@@ -2115,92 +1166,6 @@ class FusionRun(NativeRun):
             self.request_events[request_id] = event
         return event
 
-    def _resolve_profile(
-        self,
-        name: str | None,
-        coordinator: FusionCoordinator,
-    ) -> FusionWorkerProfile:
-        """Return a worker profile by name, falling back to catalog or skills."""
-        if not name:
-            return FusionWorkerProfile(name="default")
-        if name in self.worker_profiles:
-            return self.worker_profiles[name]
-        if name in coordinator.worker_profiles:
-            return coordinator.worker_profiles[name]
-        if name == "frontier":
-            # Built-in main-lane equivalent: the strongest slot as a lane.
-            model = self.main_slot
-            if self.main_router is not None:
-                try:
-                    model = self.main_router.strongest()
-                except ValueError:
-                    model = self.main_slot
-            return FusionWorkerProfile(name="frontier", model=model)
-        skill = utils._load_skill_profile(name)
-        if skill is not None:
-            return cast(FusionWorkerProfile, skill)
-        return FusionWorkerProfile(name=name)
-
-    def _filter_tools(self) -> list[dict[str, Any]]:
-        """Apply tool_options and profile filtering to the tool list."""
-        tools = utils._filter_tools_by_options(self.tools, self.tool_options)
-        self.server_tool_names = set()
-        if self.tool_options.server_execution:
-            present = {str(t.get("function", {}).get("name", "")) for t in tools}
-            injected = [
-                schema
-                for schema in tool_exec.server_tool_schemas(self.tool_options.enabled)
-                if schema["function"]["name"] not in present
-            ]
-            self.server_tool_names = {str(schema["function"]["name"]) for schema in injected}
-            tools.extend(injected)
-        return cast(list[dict[str, Any]], tools)
-
-    def _can_execute_server_side(self, calls: list[dict[str, Any]]) -> bool:
-        allowed = self.server_tool_names
-        return (
-            bool(calls)
-            and self.tool_options.server_execution
-            and bool(allowed)
-            and all(str((call.get("function") or {}).get("name", "")) in allowed for call in calls)
-        )
-
-    def _server_tool_results(self, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        workspace = tool_exec.workspace_for(self.run_id)
-        return cast(list[dict[str, Any]], tool_exec.execute_calls(calls, workspace))
-
-    def _parse_plan_text(self, text: str) -> FusionPlan | None:
-        """Parse a structured FusionPlan from JSON or legacy PLAN:/BRIEF: text."""
-        with suppress(ValueError, json.JSONDecodeError):
-            return cast(FusionPlan, FusionPlan.model_validate_json(text))
-        answer = self._parse_main_answer(text)
-        if answer is not None:
-            return FusionPlan(
-                complexity=0.0,
-                main_task=answer,
-                sidekick_assignments=[],
-            )
-        try:
-            plan, brief = self._parse_main_plan(text)
-            return FusionPlan(
-                complexity=0.5,
-                main_task=plan,
-                sidekick_assignments=[FusionSidekickAssignment(task=brief)],
-            )
-        except ValueError:
-            return None
-
-    def _distribute_tool_results(
-        self, tool_results: list[dict[str, Any]]
-    ) -> dict[str, list[dict[str, Any]]]:
-        """Map each tool result to the sidekick lane it belongs to."""
-        by_lane: dict[str, list[dict[str, Any]]] = {}
-        for result in tool_results:
-            tc_id = str(result.get("tool_call_id", ""))
-            prefix = tc_id.split(":", 1)[0] if ":" in tc_id else ""
-            by_lane.setdefault(prefix, []).append(result)
-        return by_lane
-
     def _advance(
         self,
         tool_results: list[dict[str, Any]],
@@ -2208,11 +1173,9 @@ class FusionRun(NativeRun):
         message: str | None,
         coordinator: FusionCoordinator,
     ) -> dict[str, Any]:
-        if fusion_lead.uses_tool_delegation(self, coordinator):
-            return fusion_lead.advance(self, tool_results, request_id, message, coordinator)
-        if self.structured:
-            return self._advance_structured(tool_results, request_id, message, coordinator)
-        return self._advance_legacy(tool_results, request_id, message, coordinator)
+        if self.handoffs is None:
+            fusion_lead.prepare_run(self)
+        return fusion_lead.advance(self, tool_results, request_id, message, coordinator)
 
     def _finish_run_budget(
         self,
@@ -2260,333 +1223,12 @@ class FusionRun(NativeRun):
         except Exception as exc:  # noqa: BLE001 - catch-all guard for worker/state errors
             return self._error_event(exc, request_id)
 
-    def _summarize_sidekick_tool_history(self) -> str:
-        lines: list[str] = []
-        total_calls = 0
-        error_count = 0
-        latest_user = max(
-            (
-                index
-                for index, msg in enumerate(self.sidekick_messages)
-                if msg.get("role") == "user"
-            ),
-            default=-1,
-        )
-        for msg in self.sidekick_messages[latest_user + 1 :]:
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                for call in msg["tool_calls"]:
-                    total_calls += 1
-                    fn = call.get("function", {})
-                    name = fn.get("name", "")
-                    args = fn.get("arguments", "")
-                    lines.append(f"- Tool call: {name}({args[:120]})")
-            elif msg.get("role") == "tool":
-                content = str(msg.get("content", ""))
-                is_err = bool(msg.get("is_error"))
-                if is_err:
-                    error_count += 1
-                status = "ERROR" if is_err else "OK"
-                lines.append(f"  Result [{status}]: {content[:200]}")
-        if not lines:
-            return "None (sidekick used no tools)"
-        summary_header = f"Total tool invocations: {total_calls} (Errors: {error_count})\n"
-        return summary_header + "\n".join(lines)
-
-    def _queue_review_prompt(self, review_prompt: str) -> None:
-        """Queue a fresh review request as the live transcript tail.
-
-        A previous review turn is only cleared when nothing but its own
-        assistant/tool transcript follows it. Resumed runs append client turns
-        and new plans after the old review; those are live context and must
-        never be discarded.
-        """
-        previous_index = next(
-            (
-                index
-                for index in range(len(self.main_messages) - 1, -1, -1)
-                if self.main_messages[index].get("role") == "user"
-                and REVIEW_PROMPT in str(self.main_messages[index].get("content", ""))
-            ),
-            None,
-        )
-        if previous_index is not None:
-            suffix = self.main_messages[previous_index + 1 :]
-            if not any(msg.get("role") == "user" for msg in suffix):
-                # Stale suffix is only the old review transcript (e.g. its
-                # FOLLOW_UP response); drop it so the new prompt is the tail.
-                del self.main_messages[previous_index:]
-        self.main_messages.append({"role": "user", "content": review_prompt})
-
-    def _redelegate_after_exhaustion(
-        self,
-        coordinator: FusionCoordinator,
-        reason: str,
-    ) -> None:
-        self.main_messages.append({"role": "user", "content": f"{REDELEGATE_PROMPT}{reason}"})
-        self.active_role = "main"
-        main_text, main_calls, _ = self._call_lane(coordinator, "main", tools=None)
-        if main_calls:
-            main_text = self._retry_main_without_tools(coordinator, main_calls)
-        self._handle_main_planning_text(
-            coordinator,
-            main_text,
-            allow_retry=True,
-            allow_answer=True,
-        )
-
-    def _legacy_sidekick_step(self, coordinator: FusionCoordinator) -> bool:
-        self.active_role = "sidekick"
-        error_cap = coordinator.sidekick_max_consecutive_errors
-        if (
-            error_cap > 0
-            and _trailing_error_streak(self.sidekick_messages) >= error_cap
-        ):
-            sidekick_text = (
-                f"ESCALATE_TO_MAIN: sidekick hit {error_cap} consecutive "
-                "failed tool results"
-            )
-            sidekick_calls: list[dict[str, Any]] = []
-            at_budget = False
-        else:
-            at_budget = (
-                coordinator.sidekick_max_tool_rounds > 0
-                and self.subtask_rounds >= coordinator.sidekick_max_tool_rounds
-            )
-            tools = None if at_budget else self.tools
-            sidekick_text, sidekick_calls, _ = self._call_lane(
-                coordinator, "sidekick", tools=tools
-            )
-        if sidekick_calls and at_budget:
-            sidekick_text, sidekick_calls, _ = self._call_lane(
-                coordinator,
-                "sidekick",
-                prompt=SIDEKICK_TOOL_BUDGET_PROMPT,
-                tools=None,
-            )
-            if sidekick_calls:
-                sidekick_text = "ESCALATE_TO_MAIN: sidekick kept calling tools after budget"
-        elif sidekick_calls:
-            self.subtask_rounds += 1
-            self.sidekick_tool_rounds = self.subtask_rounds
-            self.pending_tool_calls = sidekick_calls
-            self.status = "awaiting_tools"
-            return True
-        reason = self._parse_sidekick_escalate(sidekick_text)
-        if reason is not None:
-            self.subtask_report = reason
-            self._record_handoff("escalate", summary=reason[:200])
-            if self.subtask_follow_ups >= coordinator.sidekick_max_follow_ups:
-                self._redelegate_after_exhaustion(coordinator, reason)
-                return self.status == "completed"
-            self.subtask_follow_ups += 1
-            self.follow_up_count += 1
-            self.main_messages.append({"role": "user", "content": f"{ESCALATE_PROMPT}{reason}"})
-            self.active_role = "main"
-            text, calls, _ = self._call_lane(coordinator, "main", tools=None)
-            if calls:
-                text = self._retry_main_without_tools(coordinator, calls)
-            self._handle_main_planning_text(coordinator, text, allow_retry=True, allow_answer=True)
-            return self.status == "completed"
-        self.subtask_report = sidekick_text
-        remaining = coordinator.sidekick_max_follow_ups - self.subtask_follow_ups
-        review_prompt = (
-            f"{REVIEW_PROMPT}Tool Activity by Sidekick:\n"
-            f"{self._summarize_sidekick_tool_history()}\n\nReport:\n{sidekick_text}\n\n"
-            f"Follow-up budget remaining: {remaining} of {coordinator.sidekick_max_follow_ups}."
-        )
-        self._queue_review_prompt(review_prompt)
-        self.status = "main_review"
-        return False
-
-    def _legacy_review_step(self, coordinator: FusionCoordinator) -> bool:
-        self.active_role = "main"
-        review_text, review_calls, _ = self._call_lane(
-            coordinator,
-            "main",
-            tools=self.tools if "review" in self.main_tools_policy else None,
-        )
-        if review_calls:
-            self.pending_tool_calls = review_calls
-            self.status = "awaiting_tools"
-            return True
-        accepted, feedback = self._parse_main_review(review_text)
-        if accepted:
-            self.report = self.sidekick_messages[-1].get("content", "")
-            self.completed_via = "accept"
-            self._record_handoff("review", outcome="accept")
-            self.status = "completed"
-            return True
-        if self.subtask_follow_ups >= coordinator.sidekick_max_follow_ups:
-            self._redelegate_after_exhaustion(coordinator, feedback)
-            return self.status == "completed"
-        self.subtask_follow_ups += 1
-        self.follow_up_count += 1
-        self._record_handoff("follow_up", summary=feedback[:200])
-        self.sidekick_messages.append(
-            {"role": "user", "content": _format_fusion_follow_up(feedback)}
-        )
-        self.status = "sidekick_pending"
-        return False
-
-    def _advance_legacy(
-        self,
-        tool_results: list[dict[str, Any]],
-        request_id: str | None,
-        message: str | None,
-        coordinator: FusionCoordinator,
-    ) -> dict[str, Any]:
-        if self.cancelled:
-            raise RuntimeError("run is cancelled")
-
-        if message is not None and tool_results:
-            raise ValueError("cannot combine message follow-up with tool_results")
-
-        if message is not None:
-            if self.status == "awaiting_tools":
-                raise ValueError("message follow-up is invalid while awaiting_tools")
-            if self.status == "error":
-                raise ValueError("cannot follow up an errored fusion run")
-            self._apply_user_message(message, coordinator)
-
-        # Apply client tool results only when awaiting tools.
-        if self.status == "awaiting_tools":
-            validated = self._validate_tool_results(tool_results)
-            self._append_tool_results(validated)
-            self.pending_tool_calls = []
-            if self.active_role == "main":
-                self.status = "main_planning" if not self.plan else "main_review"
-            else:
-                self.status = "sidekick_pending"
-            self._drain_pending_user_messages(coordinator)
-        elif tool_results:
-            raise ValueError("tool_results are only valid when status is awaiting_tools")
-
-        # Main planning on a fresh run, textual resume, or resumed planning.
-        if self.status == "main_planning":
-            self.active_role = "main"
-            available_tools = (
-                self.tools
-                if "plan" in self.main_tools_policy and self.planning_tool_rounds < 2 and self.tools
-                else None
-            )
-            main_text, main_calls, _ = self._call_lane(coordinator, "main", tools=available_tools)
-
-            # The main model may only call tools it was actually offered ("plan"
-            # policy, max two rounds). Stray calls when no tools were offered,
-            # unknown tools, or budget exhaustion force it back to text.
-            if main_calls:
-                allowed_names = {
-                    t.get("function", {}).get("name") for t in self.tools if t.get("function")
-                }
-                unknown = [
-                    c for c in main_calls if c.get("function", {}).get("name") not in allowed_names
-                ]
-                if unknown or available_tools is None or self.planning_tool_rounds >= 2:
-                    if unknown:
-                        unknown_names = {
-                            str(c.get("function", {}).get("name", "")) for c in unknown
-                        }
-                        names = ", ".join(sorted(unknown_names))
-                        reminder = PLAN_UNKNOWN_TOOL_PROMPT.format(names=names)
-                    else:
-                        reminder = PLAN_TOOL_BUDGET_PROMPT
-                    # The rejected assistant tool-call message is already in
-                    # history. Pair every call before retrying or strict
-                    # providers reject the transcript as malformed.
-                    for call in main_calls:
-                        self.main_messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": str(call.get("id", "")),
-                                "content": "Tool unavailable during Fusion planning.",
-                                "is_error": True,
-                            }
-                        )
-                    main_text, main_calls, _ = self._call_lane(
-                        coordinator, "main", prompt=reminder, tools=None
-                    )
-                    if main_calls:
-                        call_names = {
-                            str(c.get("function", {}).get("name", "")) for c in main_calls
-                        }
-                        names = ", ".join(sorted(call_names))
-                        raise ValueError(
-                            f"main kept calling tools when a plan was required: {names}"
-                        )
-                else:
-                    self.planning_tool_rounds += 1
-                    self.pending_tool_calls = main_calls
-                    self.status = "awaiting_tools"
-                    return self._ok_event(request_id)
-
-            self._handle_main_planning_text(
-                coordinator,
-                main_text,
-                allow_retry=True,
-                allow_answer=True if self._resume_allows_answer else None,
-            )
-            self._resume_allows_answer = False
-            if self.status == "completed":
-                return self._ok_event(request_id)
-
-        # Bounded sidekick-main loop.
-        for _ in range(coordinator.run_max_turns):
-            if self.status == "sidekick_pending":
-                if self._legacy_sidekick_step(coordinator):
-                    break
-                continue
-            if self.status == "main_review":
-                if self._legacy_review_step(coordinator):
-                    break
-                continue
-            if self.status in ("completed", "awaiting_tools", "error"):
-                break
-
-        return self._ok_event(request_id)
-
-    def _replace_exhausted_lanes(
-        self,
-        feedback: str,
-        coordinator: FusionCoordinator,
-    ) -> None:
-        lanes: list[ExecutionLane] = []
-        for lane in self.sidekick_lanes:
-            if lane.exhausted or not lane.apply_follow_up(feedback):
-                lane = ExecutionLane(
-                    f"{lane.lane_id}-narrowed",
-                    self,
-                    coordinator,
-                    FusionSidekickAssignment(task=feedback),
-                    lane.profile,
-                    shared_messages=self._carryover_messages(coordinator, lane),
-                )
-            lanes.append(lane)
-        self.sidekick_lanes = lanes
-
-    def _carryover_messages(
-        self,
-        coordinator: FusionCoordinator | None,
-        lane: ExecutionLane,
-    ) -> list[dict[str, Any]]:
-        """Trim a lane's transcript so its replacement keeps the context."""
-        prior = lane.messages[1:] if lane.messages else []
-        if prior and prior[0].get("role") == "system":
-            prior = prior[1:]
-        window = getattr(coordinator, "context_window", 0) or 16384
-        if coordinator is None:
-            return prior[-256:]
-        budget = max(1, window // 8)
-        return coordinator._trim_messages(prior, budget)
-
     def _snapshot_sidekick_contexts(
         self,
         coordinator: FusionCoordinator | None,
     ) -> None:
         """Cache healthy sidekick transcripts for the next user turn's lanes."""
         cache: dict[str, list[dict[str, Any]]] = {}
-        for lane in self.sidekick_lanes:
-            if not lane.exhausted:
-                cache[lane.profile.name] = self._carryover_messages(coordinator, lane)
         hooks.cache_sidekick_history(self, coordinator, cache)
         self.sidekick_context_cache = cache
 
@@ -2595,289 +1237,6 @@ class FusionRun(NativeRun):
         entry = {"kind": kind, "follow_up": self.follow_up_count, **fields}
         self.handoff_history.append(entry)
         del self.handoff_history[:-50]
-
-    def _keepalive_slot_for(self, lane: ExecutionLane) -> str | None:
-        """Return the concrete slot whose prefix this lane last warmed."""
-        for message in reversed(lane.messages):
-            model = message.get("_mantis_model")
-            if model:
-                return str(model)
-        slot = self.main_slot if lane.role == "main" else self.sidekick_slot
-        if not slot or slot == "mantis/base":
-            return None
-        return str(slot)
-
-    def cache_keepalive(self) -> bool:
-        """Re-send warm lane prefixes so provider caches survive tool waits."""
-        pinged = False
-        for lane in [self.main_lane, *self.sidekick_lanes]:
-            if lane is None or not lane.messages:
-                continue
-            slot = self._keepalive_slot_for(lane)
-            if slot is None:
-                continue
-            prefix = [*lane.messages, {"role": "user", "content": _KEEPALIVE_PROMPT}]
-            with _fusion_route_session(f"{self.run_id}:keepalive"):
-                providers._provider_response(slot, prefix, 4, 0.0, None)
-            pinged = True
-        return pinged
-
-    def _advance_structured(
-        self,
-        tool_results: list[dict[str, Any]],
-        request_id: str | None,
-        message: str | None,
-        coordinator: FusionCoordinator,
-    ) -> dict[str, Any]:
-        """Run the structured main/sidekick swarm state machine."""
-        if self.cancelled:
-            raise RuntimeError("run is cancelled")
-
-        if message is not None and tool_results:
-            raise ValueError("cannot combine message follow-up with tool_results")
-
-        if message is not None:
-            if self.status == "awaiting_tools":
-                raise ValueError("message follow-up is invalid while awaiting_tools")
-            if self.status == "error":
-                raise ValueError("cannot follow up an errored fusion run")
-            self._apply_user_message(message, coordinator)
-
-        if self.budget is not None:
-            self.budget.check_timeout()
-
-        # Apply client tool results to the lanes that requested them.
-        if self.status == "awaiting_tools":
-            by_lane = self._distribute_tool_results(tool_results)
-            if self.main_lane is not None:
-                main_exec_results = by_lane.get(self.main_lane.lane_id, [])
-                if main_exec_results:
-                    self.main_lane.step(main_exec_results)
-            for lane in self.sidekick_lanes:
-                lane_tool_results = by_lane.get(lane.lane_id, [])
-                if lane_tool_results:
-                    lane.step(lane_tool_results)
-            # Also allow main-lane tool results if main is reviewing with tools.
-            if self.active_role == "main" and self.pending_tool_calls:
-                main_results = (
-                    by_lane.get("main", []) + by_lane.get("main_exec", []) + by_lane.get("", [])
-                )
-                validated = self._validate_tool_results(main_results)
-                self._append_tool_results(validated)
-                self.pending_tool_calls = []
-                self.status = "main_review"
-            else:
-                self.pending_tool_calls = []
-                self.status = "sidekick_pending"
-            self._drain_pending_user_messages(coordinator)
-        elif tool_results:
-            raise ValueError("tool_results are only valid when status is awaiting_tools")
-
-        # Main planning with a structured JSON plan.
-        if self.status == "main_planning":
-            self.active_role = "main"
-            self.active_response_format = PLAN_RESPONSE_FORMAT
-            try:
-                main_text, main_calls, _ = self._call_lane(coordinator, "main", tools=None)
-            finally:
-                self.active_response_format = None
-
-            if main_calls:
-                main_text = self._retry_main_without_tools(
-                    coordinator, main_calls, response_format=PLAN_RESPONSE_FORMAT
-                )
-
-            plan = self._parse_plan_text(main_text)
-            if plan is None:
-                raise ValueError("main did not produce a valid FusionPlan")
-            self.structured_plan = plan
-            if self.main_compaction_pending is not None:
-                previous = self.main_compaction_pending
-                self.main_compaction_pending = None
-                self._reroute_after_compaction("main", previous)
-
-            providers._emit_progress(
-                {
-                    "type": "plan.completed",
-                    "role": "main",
-                    "complexity": plan.complexity,
-                    "assignments": len(plan.sidekick_assignments),
-                }
-            )
-
-            self.tools = self._filter_tools()
-            main_profile = FusionWorkerProfile(name="main")
-            self.main_lane = ExecutionLane(
-                "main_exec",
-                self,
-                coordinator,
-                FusionSidekickAssignment(task=plan.main_task),
-                main_profile,
-                role="main",
-                shared_messages=self.main_messages,
-            )
-            for i, assignment in enumerate(plan.sidekick_assignments):
-                profile = self._resolve_profile(assignment.profile, coordinator)
-                lane = ExecutionLane(
-                    f"lane{i}",
-                    self,
-                    coordinator,
-                    assignment,
-                    profile,
-                    role="sidekick",
-                    shared_messages=self.sidekick_context_cache.get(profile.name),
-                )
-                self.sidekick_lanes.append(lane)
-                self._record_handoff(
-                    "delegate", lane=lane.lane_id, profile=profile.name, task=assignment.task[:200]
-                )
-            self.status = "sidekick_pending"
-
-        # The FusionBudgetGuard is the hard run-level ceiling. This loop only
-        # prevents a malformed state from spinning without consuming a turn.
-        execution_lanes = (
-            [self.main_lane] if self.main_lane is not None else []
-        ) + self.sidekick_lanes
-        for _ in range(coordinator.run_max_turns):
-            if self.budget is not None:
-                self.budget.check_timeout()
-
-            if self.status == "sidekick_pending":
-                self.active_role = "sidekick"
-                all_pending: list[dict[str, Any]] = []
-                runnable = [
-                    lane
-                    for lane in execution_lanes
-                    if lane is not None
-                    and not lane.complete
-                    and not lane.error
-                    and not lane.pending_tool_calls
-                ]
-                # ponytail: one pool per batch; keep it until profiling justifies a persistent pool.
-                # _history_context is thread-local, so hand the sink to lane
-                # threads or their progress events vanish.
-                sink = getattr(serve_config._history_context, "event_sink", None)
-                active_run = getattr(serve_config._history_context, "active_run", None)
-
-                def _step(
-                    lane: ExecutionLane,
-                    event_sink: Any = sink,
-                    run_context: Any = active_run,
-                ) -> dict[str, Any]:
-                    if event_sink is not None:
-                        serve_config._history_context.event_sink = event_sink
-                    if run_context is not None:
-                        serve_config._history_context.active_run = run_context
-                    return lane.step()
-
-                if runnable:
-                    with ThreadPoolExecutor(max_workers=len(runnable)) as executor:
-                        list(executor.map(_step, runnable))
-                # Collect from every lane, not just freshly stepped ones: a lane
-                # stepped inline via server-side execution may already hold its
-                # next batch of pending calls.
-                for lane in execution_lanes:
-                    if lane is not None and lane.pending_tool_calls:
-                        all_pending.extend(lane.pending_tool_calls)
-
-                if all_pending:
-                    if self._can_execute_server_side(all_pending):
-                        by_lane = self._distribute_tool_results(
-                            self._server_tool_results(all_pending)
-                        )
-                        for lane in execution_lanes:
-                            if lane is None:
-                                continue
-                            results = by_lane.get(lane.lane_id, [])
-                            if results:
-                                lane.step(results)
-                        self.status = "sidekick_pending"
-                        continue
-                    self.pending_tool_calls = all_pending
-                    self.status = "awaiting_tools"
-                    return self._ok_event(request_id)
-
-                self.sidekick_reports = [
-                    lane.report
-                    for lane in self.sidekick_lanes
-                    if lane.complete and not lane.error and lane.report is not None
-                ]
-                assert self.structured_plan is not None
-                self.sidekick_messages = [
-                    {"role": "user", "content": self.structured_plan.main_task}
-                ]
-                self.status = "main_review"
-                continue
-
-            if self.status == "main_review":
-                self.active_role = "main"
-                main_result = (
-                    self.main_lane.report
-                    if self.main_lane is not None
-                    and self.main_lane.complete
-                    and not self.main_lane.error
-                    else None
-                )
-                report_parts = []
-                if main_result:
-                    report_parts.append(f"Main result:\n{main_result}")
-                for i, report in enumerate(self.sidekick_reports, start=1):
-                    if report:
-                        report_parts.append(f"Sidekick {i}:\n{report}")
-                reports = "\n\n".join(report_parts)
-                review_prompt = f"{REVIEW_PROMPT}{reports}"
-                review_text, review_calls, _ = self._call_lane(
-                    coordinator,
-                    "main",
-                    prompt=review_prompt,
-                    tools=self.tools,
-                )
-
-                if review_calls:
-                    for call in review_calls:
-                        call["id"] = f"main:{call['id']}"
-                    self.pending_tool_calls = review_calls
-                    self.status = "awaiting_tools"
-                    return self._ok_event(request_id)
-
-                accepted, feedback = self._parse_main_review(review_text)
-                if accepted:
-                    self.report = main_result or next(
-                        (r for r in self.sidekick_reports if r), review_text
-                    )
-                    self.completed_via = "accept"
-                    self._record_handoff("review", outcome="accept")
-                    self.status = "completed"
-                    return self._ok_event(request_id)
-
-                if self.follow_up_count >= coordinator.max_follow_ups:
-                    self.follow_up_capped = True
-                    fallback = main_result or next(
-                        (r for r in self.sidekick_reports if r), review_text
-                    )
-                    self.report = self._synthesize_final_answer(
-                        coordinator,
-                        context=self._synthesis_context("Worker reports", reports),
-                        fallback=fallback,
-                    )
-                    self.completed_via = "capped"
-                    self._record_handoff("review", outcome="capped")
-                    self.status = "completed"
-                    return self._ok_event(request_id)
-
-                self.follow_up_count += 1
-                self._record_handoff("follow_up", summary=feedback[:200])
-                self._replace_exhausted_lanes(feedback, coordinator)
-                execution_lanes = (
-                    [self.main_lane] if self.main_lane is not None else []
-                ) + self.sidekick_lanes
-                self.status = "sidekick_pending"
-                continue
-
-            if self.status in ("completed", "awaiting_tools", "error"):
-                break
-
-        return self._ok_event(request_id)
 
     def advance_idempotent(
         self,
@@ -2954,7 +1313,6 @@ def advance_fusion_run(
         run = get_run(run_id)
         if not isinstance(run, FusionRun):
             raise TypeError(f"run {run_id} is not a FusionRun")
-        stop_keepalive(run_id)
         run.in_flight += 1
         _put_run(run)
         try:
@@ -2963,8 +1321,6 @@ def advance_fusion_run(
             event = run.advance_idempotent(tool_results, request_id, message, coordinator)
             if event.get("status") in ("completed", "error"):
                 _record_fusion_completion(run, str(event["status"]))
-            if event.get("status") == "awaiting_tools":
-                start_keepalive(run_id)
             return event
         finally:
             serve_config._history_context.active_run = None
@@ -2977,8 +1333,6 @@ def create_fusion_run(
     brief: str,
     tools: list[dict[str, Any]] | None = None,
     messages: list[dict[str, Any]] | None = None,
-    delegation_mode: str = "available",
-    worker_profiles: list[FusionWorkerProfile] | None = None,
     budget: FusionRunBudget | None = None,
     tool_options: FusionToolOptions | None = None,
 ) -> FusionRun:
@@ -2988,8 +1342,6 @@ def create_fusion_run(
         brief,
         tools,
         messages=messages,
-        delegation_mode=delegation_mode,
-        worker_profiles=worker_profiles,
         budget=budget,
         tool_options=tool_options,
     )

@@ -46,14 +46,6 @@
       {
         "name": "_extract_reasoning_trace",
         "complexity": 56
-      },
-      {
-        "name": "FusionRun::_advance_legacy",
-        "complexity": 73
-      },
-      {
-        "name": "FusionRun::_advance_structured",
-        "complexity": 123
       }
     ]
   },

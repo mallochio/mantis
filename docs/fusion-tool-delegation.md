@@ -4,23 +4,13 @@ Fusion is an optional built-in lead/sidekick loop behind `mantis/fusion`. It use
 same OpenAI Chat Completions endpoint as Base. A client does not need a Fusion-specific
 agent runtime.
 
-## Enable it
+## Configuration
 
-Tool delegation is opt-in. In the existing `[fusion]` table in `config/catalog.toml`,
-set:
-
-```toml
-[fusion]
-delegation = "tool"
-```
-
-Restart the stack after changing runtime configuration. If `delegation` is absent,
-Fusion keeps the legacy `"marker"` protocol. A request can override the catalog with
-`tool_options.delegation`, set to `"tool"` or `"marker"`. The choice stays fixed once a
-run starts. Do not add a second `[fusion]` table.
-
-This changes orchestration, not model selection. Keep models, provider bindings,
-reasoning effort, routing pools, and budgets in the catalog; no new model name is needed.
+Fusion has one lead and one persistent sidekick. The lead delegates through private
+server-resolved tools; there is no delegation-mode switch or multi-lane worker engine.
+Keep models, provider bindings, reasoning effort, routing pools, and budgets in the
+existing `[fusion]` table in `config/catalog.toml`. Restart the stack after changing
+runtime configuration; no new model name is needed.
 
 ## Who executes which tools
 
@@ -70,7 +60,7 @@ resolves paths, including symlinks, and requires the directory to be under an
 allowlisted root. With no roots configured, no shared workspace is allowed. Prefer
 a narrow project root rather than your whole home directory.
 
-For new tool-delegation chat runs, workspace selection uses this precedence:
+For new Fusion chat runs, workspace selection uses this precedence:
 
 1. Explicit `tool_options.workspace`.
 2. `X-Mantis-Workspace` request header.
@@ -127,7 +117,6 @@ response = client.chat.completions.create(
     }],
     extra_body={
         "tool_options": {
-            "delegation": "tool",
             "workspace": "/absolute/path/to/project",
             "enabled": ["files", "shell"],
         },
@@ -153,9 +142,9 @@ prime-agent --mode text --provider mantis --model fusion --no-session \
   -p 'Fix the failing test, run focused checks, and report the diff and output.'
 ```
 
-Enable tool delegation in the catalog and allowlist that directory on the API before
-starting. A prime-agent-style system prompt containing `Working directory:` is
-recognized without a private client extension. For session reuse, the transport
+Allowlist that directory on the API before starting. A prime-agent-style system
+prompt containing `Working directory:` is recognized without a private client
+extension. For session reuse, the transport
 must send a stable `x-mantis-session-id` or `metadata.session_id`; do not assume a
 local harness session automatically supplies that identity.
 
@@ -175,8 +164,7 @@ A compatible transport can send this shape with its real tool schemas:
     }, "required": ["command"]}
   }}],
   "stream": true,
-  "parallel_tool_calls": true,
-  "tool_options": {"delegation": "tool"}
+  "parallel_tool_calls": true
 }
 ```
 
@@ -196,13 +184,12 @@ reasoning fields, and ordinary tool-result messages. Directory context can use:
     {"role": "user", "content": [{"type": "text", "text": "Fix the failing test."}]}
   ],
   "metadata": {"session_id": "project-fix-1"},
-  "tool_options": {"delegation": "tool"},
   "stream": true
 }
 ```
 
-If the client cannot send extra body fields, use catalog opt-in and prompt discovery,
-or have its transport add `X-Mantis-Workspace`. Use `x-mantis-session-id` explicitly
+If the client cannot send extra body fields, use prompt discovery or have its
+transport add `X-Mantis-Workspace`. Use `x-mantis-session-id` explicitly
 for Fusion; Base's `x-opencode-session` alias is not a Fusion session contract.
 These shapes describe API compatibility, not an end-to-end test of a client version.
 
@@ -256,8 +243,8 @@ workspace and any long-running processes before retrying.
 `scripts/run_routed_ab.py` runs live cases and writes observations. It makes provider
 calls and executes local commands. Use trusted fixtures in a dedicated workspace,
 review the configured checks first, and approve the provider spend separately.
-For a legacy-versus-tool comparison, leave the server catalog in marker mode:
-`fusion-tool` explicitly opts in, while the other Fusion arms inherit the catalog.
+The current Fusion arm is `fusion-tool`. Historical Fusion arm labels remain in
+saved records for review, but the live runner no longer selects them.
 
 Export the workspace allowlist **in the API process's environment**, then start or
 restart the API. Run the CLI from the repository with the project environment:
@@ -266,7 +253,7 @@ restart the API. Run the CLI from the repository with the project environment:
 export MANTIS_FUSION_WORKSPACE_ROOTS="$PWD/.scratch/routed-ab"
 uv run python scripts/run_routed_ab.py \
   --base-url http://127.0.0.1:8088 \
-  --variants fusion-pinned,fusion-tool \
+  --variants mantis-base,fusion-tool \
   --seeds 3 \
   --checks eval/routed-harness-checks.json \
   --workspace-root "$PWD/.scratch/routed-ab" \
@@ -274,7 +261,7 @@ uv run python scripts/run_routed_ab.py \
   --transcripts-dir eval/runs/routed-ab
 ```
 
-Other arms are `efficient-only`, `capable-only`, `mantis-base`, and `fusion-routed`.
+Other current arms are `efficient-only`, `capable-only`, and `mantis-base`.
 Direct arms use provider credentials independently of `MANTIS_API_KEY`. Seeds label
 repetitions, not deterministic provider seeds. Inspect actual selected models.
 
@@ -295,4 +282,6 @@ comparison, choose new output, transcript, and workspace paths.
 
 `scripts/ab_report.py` summarizes cost, tokens, rounds, check rates, and optional
 assessments with mean/stdev and same-seed paired deltas. Observations alone do not
-establish a production default or quality/cost claim. No live test is claimed here.
+establish a quality/cost claim or end-to-end parity with another harness. Tool-only
+delegation is the current runtime, not a benchmark conclusion. No live test is
+claimed here.

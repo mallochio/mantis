@@ -15,8 +15,7 @@ def _resolve_fusion_workspace(
 ) -> Any:
     """Apply an allowlisted workspace discovered from request and harness context."""
     options = request.tool_options or FusionToolOptions()
-    mode = options.delegation or fusion._fusion_config().delegation()
-    if mode != "tool" or options.workspace is not None:
+    if options.workspace is not None:
         return request
     header = next(
         (value for key, value in (headers or {}).items() if key.lower() == "x-mantis-workspace"),
@@ -65,8 +64,6 @@ def create_chat_run(request: Any, brief: str, session_id: str | None) -> Any:
         brief,
         tools,
         messages=messages,
-        delegation_mode="available",
-        worker_profiles=request.worker_profiles,
         budget=request.budget,
         tool_options=request.tool_options,
     )

@@ -7,8 +7,12 @@ from typing import Any
 
 import api
 import fusion
+import fusion_prompts
 import pytest
+import serve_config
 from fastapi.testclient import TestClient
+
+from tests.test_fusion_tool_mode import call, reply
 
 USAGE = {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}
 
@@ -41,8 +45,6 @@ def _clear_run_store():
 
     Without this, later memory-mode tests hit the run capacity guard.
     """
-    import serve_config
-
     serve_config._runs.clear()
     yield
     serve_config._runs.clear()
@@ -62,8 +64,6 @@ def plan_tools_config(monkeypatch, tmp_path):
         "[fusion]\n"
         'main = "gpt-5_6-sol"\n'
         'sidekick = "deepseek-v4-flash"\n'
-        'main_tools = "plan"\n'
-        "max_follow_ups = 2\n"
         "sidekick_max_tool_rounds = 16\n"
         "run_max_turns = 64\n"
     )
@@ -73,52 +73,26 @@ def plan_tools_config(monkeypatch, tmp_path):
 
 
 class SingleModelWorker:
-    """Main lane reasons and calls tools; the sidekick drafts and reports."""
+    """Lead uses a client tool, delegates work, and answers plainly."""
 
-    def __init__(self) -> None:
+    def __init__(self):
         self.main_calls = 0
         self.sidekick_calls = 0
 
-    @staticmethod
-    def _message(
-        content: str,
-        tool_calls: list[dict[str, Any]] | None = None,
-        reasoning: str | None = None,
-    ) -> dict[str, Any]:
-        message: dict[str, Any] = {"role": "assistant", "content": content}
-        if tool_calls:
-            message["tool_calls"] = tool_calls
-        if reasoning:
-            message["reasoning"] = reasoning
-        return message
-
-    def __call__(
-        self,
-        slot: str,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        first_content = messages[0].get("content", "")
-        if first_content.startswith((fusion.MAIN_PREAMBLE, fusion.MAIN_EXEC_PREAMBLE)):
-            self.main_calls += 1
-            is_review = any(
-                msg.get("role") == "user" and fusion.REVIEW_PROMPT in str(msg.get("content", ""))
-                for msg in messages
-            )
-            if is_review:
-                return self._message("ACCEPT", reasoning=MAIN_REVIEW_REASONING), USAGE
-            if any(msg.get("role") == "tool" for msg in messages):
-                return self._message(PLAN_TEXT, reasoning=MAIN_POST_TOOL_REASONING), USAGE
-            return (
-                self._message(
-                    "",
-                    tool_calls=[dict(READ_FILE_CALL)],
-                    reasoning=MAIN_PLANNING_REASONING,
-                ),
-                USAGE,
-            )
-        self.sidekick_calls += 1
-        return self._message(SIDEKICK_REPORT, reasoning=SIDEKICK_REASONING), USAGE
+    def __call__(self, slot, messages, tools):
+        if messages[0]["content"] == fusion_prompts.SIDEKICK_POLICY:
+            self.sidekick_calls += 1
+            return reply(SIDEKICK_REPORT, reasoning=SIDEKICK_REASONING), USAGE
+        self.main_calls += 1
+        if self.main_calls == 1:
+            return reply("", READ_FILE_CALL, reasoning=MAIN_PLANNING_REASONING), USAGE
+        if self.main_calls == 2:
+            return reply(
+                "",
+                call("delegate", "sidekick", message="edit config.py"),
+                reasoning=MAIN_POST_TOOL_REASONING,
+            ), USAGE
+        return reply(SIDEKICK_REPORT, reasoning=MAIN_REVIEW_REASONING), USAGE
 
 
 def _headers():
@@ -209,6 +183,7 @@ def test_default_scope_shows_main_lane_only(client, plan_tools_config, monkeypat
 def test_default_streaming_scope_matches_non_streaming(client, plan_tools_config, monkeypatch):
     worker = SingleModelWorker()
     monkeypatch.setattr(fusion.FusionCoordinator, "_call_worker", worker)
+    monkeypatch.setattr(api, "_uses_live_fusion_stream", lambda request: False)
     headers = _headers()
     first = client.post("/v1/chat/completions", headers=headers, json=_payload(stream=True))
     assert first.status_code == 200
@@ -241,16 +216,10 @@ def test_full_scope_still_exposes_everything(client, plan_tools_config, monkeypa
 
     second_reasoning = second_body["choices"][0]["message"]["reasoning"]
     assert SIDEKICK_REASONING in second_reasoning
-    assert "Fusion · Planning" in second_reasoning
-    assert "Plan:\ninspected config, now edit" in second_reasoning
-    assert "Delegated to sidekick" in second_reasoning
-    assert "Brief:\nedit config.py" in second_reasoning
     assert second_body["mantis_event"]["trace_scope"] == "orchestration"
 
 
-def test_ab_consumed_metadata_is_identical_across_scopes(
-    client, plan_tools_config, monkeypatch
-):
+def test_ab_consumed_metadata_is_identical_across_scopes(client, plan_tools_config, monkeypatch):
     events = {}
     for scope in ("main", "orchestration"):
         worker = SingleModelWorker()
@@ -264,8 +233,6 @@ def test_ab_consumed_metadata_is_identical_across_scopes(
         "usage_models",
         "main_model",
         "sidekick_model",
-        "plan",
-        "sidekick_brief",
         "tool_count",
         "tool_results",
         "fusion_savings_usd",

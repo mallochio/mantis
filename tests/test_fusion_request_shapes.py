@@ -14,7 +14,7 @@ def test_stream_choices_and_parallel_tool_calls_are_accepted():
                 tool_choice=choice,
                 stream=stream,
                 parallel_tool_calls=True,
-                tool_options={"delegation": "tool"},
+                tool_options={},
             )
             assert request.stream is stream
             assert request.parallel_tool_calls is True
@@ -37,7 +37,7 @@ def test_replayed_messages_keep_multiple_prompts_reasoning_and_content_parts():
             {"role": "tool", "tool_call_id": "tool-1", "content": [{"type": "text", "text": "ok"}]},
             {"role": "user", "content": "continue"},
         ],
-        tool_options={"delegation": "tool"},
+        tool_options={},
     )
     dumped = [message.model_dump(exclude_none=True) for message in replay.messages]
 

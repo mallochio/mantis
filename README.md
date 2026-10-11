@@ -15,7 +15,7 @@ No service binds publicly by default. Provider credentials remain on this machin
 | `mantis/base` | Direct | NVIDIA NeMo Switchyard stage-router picks an efficient or capable model (LiteLLM-routed). |
 | `mantis/trinity` | Trinity | Multi-agent coordination over Worker, Thinker, and Verifier roles. |
 | `mantis/ultra` | Ultra | Conductor plans and executes a bounded workflow DAG over the worker pool. |
-| `mantis/fusion` | Fusion | Lead/sidekick orchestration. Legacy marker delegation remains the default; opt in to private tool delegation with `[fusion] delegation = "tool"`. Ordinary lead tools remain client-owned. Resume a run with `X-Mantis-Run-Id` or returned Fusion tool-call IDs. |
+| `mantis/fusion` | Fusion | One lead and one persistent sidekick using private delegation tools. Ordinary lead tools remain client-owned. Resume a run with `X-Mantis-Run-Id` or returned Fusion tool-call IDs. |
 
 Mantis never switches among these four modes automatically. Base and Fusion are available in normal mode; Trinity and Ultra are experimental and require starting the stack with `--experimental`.
 
@@ -154,10 +154,9 @@ prime-agent --mode text --provider mantis --model base --no-session \
 
 ## Fusion tool delegation
 
-Tool delegation is opt-in: set `delegation = "tool"` in the existing `[fusion]`
-table in `config/catalog.toml`, then restart the stack. Omit it or use `"marker"`
-to keep the legacy protocol. A request can override this with
-`tool_options.delegation`. Model/provider and reasoning controls stay in the catalog.
+Fusion uses one lead and one persistent sidekick through private delegation tools.
+No delegation-mode switch is needed. Model/provider and reasoning controls stay in
+`[fusion]` in `config/catalog.toml`; restart the stack after catalog changes.
 
 The lead uses normal client tools and private server-resolved delegation tools.
 The client still executes ordinary lead tool calls. A delegated sidekick can use
@@ -221,9 +220,9 @@ response = client.chat.completions.create(
 )
 ```
 
-`mantis/fusion` remains the optional built-in lead/sidekick orchestration harness. When a Fusion lane is configured as `mantis/base`, it uses the same Switchyard boundary with a separate stable session per lane; concrete Fusion slots and explicit fallback pools remain pinned provider paths. Fusion assigns `sidekick_max_tool_rounds` (default 0, unlimited; positive values cap one subtask) and `sidekick_max_follow_ups` (default 2, inherited from `max_follow_ups`) per delegated subtask, while `run_max_turns` (default 64) is the hard run guard.
+`mantis/fusion` uses one lead and one persistent sidekick. When either role is configured as `mantis/base`, it uses the same Switchyard boundary with a separate stable session per role; concrete role models and explicit fallback pools remain pinned provider paths. `sidekick_max_tool_rounds` (default 0, unlimited; positive values cap one subtask) limits delegated tool rounds, while `run_max_turns` (default 64) is the hard run guard.
 
-Comparative live results are not claimed here. `scripts/run_routed_ab.py` runs trusted fixtures against a live server, supports multi-seed repeats, records independent checks, and retains per-seed workspaces and observations for review. `scripts/evaluate_routed_harness.py` only validates the non-executable manifest and summarizes records. See the [A/B run guide](docs/fusion-tool-delegation.md#multi-seed-ab-runs) for allowlisting, retention, and resume behavior. Records are observations, not trusted proof; they do not establish a quality/cost claim or change production defaults.
+Comparative live results are not claimed here. `scripts/run_routed_ab.py` runs trusted fixtures against a live server, supports multi-seed repeats, records independent checks, and retains per-seed workspaces and observations for review. `scripts/evaluate_routed_harness.py` only validates the non-executable manifest and summarizes records. See the [A/B run guide](docs/fusion-tool-delegation.md#multi-seed-ab-runs) for allowlisting, retention, and resume behavior. Records are observations, not trusted proof; they do not establish a quality/cost claim or end-to-end harness parity. Tool-only delegation is the current runtime, not a benchmark conclusion.
 
 See the [Switchyard stage-router docs](https://github.com/NVIDIA-NeMo/Switchyard/blob/main/docs/routing_algorithms/stage_router_routing.md) for signal details.
 

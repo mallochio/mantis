@@ -91,6 +91,7 @@ def test_provider_response_uses_streaming_request_when_callback_is_present(monke
     monkeypatch.setattr(providers, "_failover_attempts", lambda _spec, _bindings: ["mock-slot"])
     monkeypatch.setattr(providers, "_resolve_model_spec", lambda _spec, _bindings: resolved)
     monkeypatch.setattr(providers, "_litellm_kwargs", lambda *_args: {})
+
     def completion(**kwargs):
         captured.update(kwargs)
         return [{"choices": [{"delta": {"content": "live"}, "finish_reason": "stop"}]}]
@@ -100,9 +101,8 @@ def test_provider_response_uses_streaming_request_when_callback_is_present(monke
     assert captured["stream"] is True
     assert captured["stream_options"] == {"include_usage": True}
     assert result["choices"][0]["message"]["content"] == "live"
-    assert emitted == [
-        {"_mantis_turn_start": True}, {"content": "live"}, {"_mantis_turn_end": True}
-    ]
+    expected = [{"_mantis_turn_start": True}, {"content": "live"}, {"_mantis_turn_end": True}]
+    assert emitted == expected
 
 
 def test_reasoning_details_are_replayed_only_for_the_producing_model():
@@ -136,9 +136,7 @@ def test_tool_lead_replays_reasoning_details_on_its_next_turn(monkeypatch):
         },
         {"role": "assistant", "content": "done", "_mantis_model": "wire-model"},
     ]
-    run = fusion.FusionRun(
-        "reasoning-continuity", "goal", tool_options=fusion.FusionToolOptions(delegation="tool")
-    )
+    run = fusion.FusionRun("reasoning-continuity", "goal", tool_options=fusion.FusionToolOptions())
     run.handoffs = fusion_lead.HandoffManager(None)
     coordinator = fusion.FusionCoordinator()
     monkeypatch.setattr(coordinator, "_call_worker", lambda *_args, **_kwargs: (replies.pop(0), {}))
@@ -202,7 +200,7 @@ def test_effective_delegation_name_filter_preserves_client_sidekick_tool():
         messages=[{"role": "user", "content": "work"}],
         tools=[schema],
         stream=True,
-        tool_options={"delegation": "tool"},
+        tool_options={},
     )
     assert api._fusion_hidden_tool_names(request, {}) == set(names.values())
     internal = {

@@ -64,12 +64,15 @@ def provider_reply(name, call_id, arguments):
     return [
         {"choices": [{"delta": {"tool_calls": [first_call]}}]},
         {
-            "choices": [{
-                "delta": {"tool_calls": [next_call]},
-                "finish_reason": "tool_calls",
-            }]
+            "choices": [
+                {
+                    "delta": {"tool_calls": [next_call]},
+                    "finish_reason": "tool_calls",
+                }
+            ]
         },
     ]
+
 
 class Capacity:
     def release(self):
@@ -83,7 +86,7 @@ def _install_handoff_stream(monkeypatch):
         tools=[
             {"type": "function", "function": {"name": "bash"}},
         ],
-        tool_options=fusion.FusionToolOptions(delegation="tool"),
+        tool_options=fusion.FusionToolOptions(),
     )
     turns = [
         provider_reply("sidekick", "delegate", '{"message":"private brief"}'),

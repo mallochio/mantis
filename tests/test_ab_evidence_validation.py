@@ -52,14 +52,13 @@ def _seed_workspace(case_id: str, root: Path) -> Path:
     return runner.seed_workspace(case_id, workspace, runner.DEFAULT_FIXTURES)
 
 
-def test_fusion_arms_send_explicit_delegation_modes():
+def test_live_runner_uses_only_tool_fusion():
     catalog = runner.load_catalog(runner.DEFAULT_CATALOG)
-    pinned = runner.request_plan("fusion-pinned", catalog)
-    routed = runner.request_plan("fusion-routed", catalog)
     tool = runner.request_plan("fusion-tool", catalog, Path.cwd())
-    assert pinned["tool_options"]["delegation"] == "marker"
-    assert routed["tool_options"]["delegation"] == "marker"
-    assert tool["tool_options"]["delegation"] == "tool"
+    assert "worker_profiles" not in tool
+    assert "delegation" not in tool["tool_options"]
+    assert "fusion-pinned" not in runner.LIVE_VARIANTS
+    assert "fusion-routed" not in runner.LIVE_VARIANTS
 
 
 def _prepare_force_run(

@@ -95,7 +95,7 @@ def test_api_discovers_workspace_from_header_then_system_prompt(monkeypatch, tmp
             {"role": "developer", "content": "Additional rules."},
             {"role": "user", "content": "inspect"},
         ],
-        tool_options={"delegation": "tool"},
+        tool_options={},
     )
 
     selected = api._resolve_fusion_workspace(request, {"X-Mantis-Workspace": str(header_path)})
@@ -115,7 +115,7 @@ def test_session_identity_uses_only_explicit_ids():
     request = api.ChatRequest(
         model="mantis/fusion",
         messages=[{"role": "user", "content": "hello"}],
-        tool_options={"delegation": "tool"},
+        tool_options={},
     )
     assert api._fusion_session_id({"X-Mantis-Session-Id": "session-1"}, request) == "session-1"
     assert api._fusion_session_id(None, request) is None
@@ -212,14 +212,14 @@ def test_required_and_named_tool_choice_accepts_fusion_delegation_tools():
         model="mantis/fusion",
         messages=[{"role": "user", "content": "delegate"}],
         tool_choice="required",
-        tool_options={"delegation": "tool"},
+        tool_options={},
     )
     named = api.ChatRequest(
         model="mantis/fusion",
         messages=[{"role": "user", "content": "look up"}],
         tools=[{"type": "function", "function": {"name": "lookup", "parameters": {}}}],
         tool_choice={"type": "function", "function": {"name": "lookup"}},
-        tool_options={"delegation": "tool"},
+        tool_options={},
     )
 
     assert request.tools is None
@@ -236,7 +236,7 @@ def test_large_tool_schemas_and_empty_client_tool_lists_are_accepted():
         model="mantis/fusion",
         messages=[{"role": "user", "content": "use available tools"}],
         tools=[large_tool],
-        tool_options={"delegation": "tool"},
+        tool_options={},
     )
     assert len(request.tools[0].function.parameters["properties"]) == 1500
     run = tool_run(tools=[request.tools[0].model_dump()])
@@ -248,7 +248,7 @@ def test_public_tool_ids_survive_common_sanitizing_and_decode_legacy_ids(monkeyp
     monkeypatch.setattr(runs, "RUN_STORE", "memory")
     serve_config._runs.clear()
     run_id = "0123456789abcdef0123456789abcdef"
-    run = fusion.FusionRun(run_id, "test", tool_options=fusion.FusionToolOptions(delegation="tool"))
+    run = fusion.FusionRun(run_id, "test", tool_options=fusion.FusionToolOptions())
     run.pending_tool_calls = [{"id": "sidekick:provider-call:!@#"}]
     fusion._put_run(run)
 

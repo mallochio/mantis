@@ -19,7 +19,7 @@ def _prepared_run():
         "abcdef0123456789abcdef0123456789",
         "task",
         tools=[first],
-        tool_options=fusion.FusionToolOptions(delegation="tool"),
+        tool_options=fusion.FusionToolOptions(),
     )
     fusion_lead.prepare_run(run)
     return run, run.handoffs, updated, run.main_messages[0]["content"]

@@ -244,11 +244,8 @@ def append_results(
             run.active_role = previous_role
 
 
-def report_text(run: Any, text: str) -> str:
+def report_text(text: str) -> str:
     """Return sidekick final text, marking escalations for the lead."""
-    reason = run._parse_sidekick_escalate(text)
-    if reason is not None:
-        return f"ESCALATE_TO_MAIN: {reason}"
     return text.strip() or "The sidekick finished without a report."
 
 

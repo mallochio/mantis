@@ -153,19 +153,14 @@ reasoning_effort = "high"
 protocols = ["chat_completions"]
 
 [fusion]
-delegation = "tool"
 main = "openrouter/~openai/gpt-astra-latest"
 main_reasoning = "low"
 sidekick = "openrouter/~openai/gpt-luna-latest"
 sidekick_reasoning = "high"
 fallback_on_escalate = true
-max_follow_ups = 2
-# Per-delegated-subtask follow-up cap; defaults to max_follow_ups when omitted.
-sidekick_max_follow_ups = 2
 # Per-delegated-subtask tool-round limit; 0 means unlimited.
 sidekick_max_tool_rounds = 0
 # Hard Fusion run guard, enforced through FusionBudgetGuard.
 run_max_turns = 64
-main_tools = "none"
 context_token_limit = 262144
 max_output_tokens = 4096

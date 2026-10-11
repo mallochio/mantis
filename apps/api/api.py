@@ -30,7 +30,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi import Request as HttpRequest
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
-from fusion_types import FusionRunBudget, FusionToolOptions, FusionWorkerProfile
+from fusion_types import FusionRunBudget, FusionToolOptions
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
@@ -155,7 +155,6 @@ class ChatRequest(BaseModel):
     reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] | None = None
     web_search_options: dict[str, Any] | None = None
     # Fusion-specific orchestration controls.
-    worker_profiles: list[FusionWorkerProfile] | None = None
     budget: FusionRunBudget | None = None
     tool_options: FusionToolOptions | None = None
     # Session identity accepted from the body so conversations can reach
@@ -164,13 +163,17 @@ class ChatRequest(BaseModel):
     user: str | None = None
     metadata: dict[str, Any] | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_worker_profiles(cls, data: Any) -> Any:
+        """Reject the removed Fusion multi-lane request control."""
+        if isinstance(data, dict) and "worker_profiles" in data:
+            raise ValueError("worker_profiles is no longer supported")
+        return data
+
     @model_validator(mode="after")
     def validate_tools(self) -> ChatRequest:
-        delegation = getattr(self.tool_options, "delegation", None)
-        tool_mode = self.model == "mantis/fusion" and (
-            delegation == "tool"
-            or (delegation is None and fusion._fusion_config().delegation() == "tool")
-        )
+        tool_mode = self.model == "mantis/fusion"
         if self.tool_choice not in (None, "none") and not self.tools and not tool_mode:
             raise ValueError("tool_choice requires tools")
         if isinstance(self.tool_choice, NamedToolChoice):
@@ -791,8 +794,7 @@ def _build_fusion_chat_response(
 
 def _uses_live_fusion_stream(request: ChatRequest) -> bool:
     """Return whether tool-delegation streaming can use the provider delta path."""
-    override = getattr(request.tool_options, "delegation", None)
-    return bool(request.stream and (override or fusion._fusion_config().delegation()) == "tool")
+    return request.stream
 
 
 def _iter_fusion_chat_stream(
@@ -1187,11 +1189,12 @@ def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Respons
 
 
 class FusionDelegateRequest(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    """Start a single lead and persistent sidekick run."""
+
+    model_config = ConfigDict(extra="forbid")
 
     brief: str = Field(min_length=1)
     tools: list[FunctionTool] | None = None
-    worker_profiles: list[FusionWorkerProfile] | None = None
     budget: FusionRunBudget | None = None
     tool_options: FusionToolOptions | None = None
 
@@ -1224,9 +1227,7 @@ class FusionResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     run_id: str
-    status: Literal[
-        "main_planning", "sidekick_pending", "awaiting_tools", "main_review", "completed", "error"
-    ]
+    status: Literal["main_planning", "awaiting_tools", "completed", "error"]
     report: str | None
     pending_tool_calls: list[dict[str, Any]] | None
     usage: dict[str, Any]
@@ -1248,7 +1249,6 @@ def fusion_delegate(request: FusionDelegateRequest) -> JSONResponse:
         run = fusion.create_fusion_run(
             request.brief,
             tools,
-            worker_profiles=request.worker_profiles,
             budget=request.budget,
             tool_options=request.tool_options,
         )

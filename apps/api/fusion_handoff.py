@@ -131,7 +131,7 @@ class HandoffManager:
             if stop is not None:
                 return self._finish(run, handoff, f"{ESCALATION_PREFIX} {stop}")
             if not calls and not self._inject_interrupts(run):
-                return self._finish(run, handoff, background.report_text(run, text))
+                return self._finish(run, handoff, background.report_text(text))
             if calls:
                 self.tool_rounds += 1
                 if not self._execute(run, calls):

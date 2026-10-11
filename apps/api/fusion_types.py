@@ -1,4 +1,4 @@
-"""Shared request and plan types for mantis-fusion.
+"""Shared request and routing types for mantis-fusion.
 
 These types are used by both the public API (Pydantic validation) and the
 internal orchestrator (converted to plain dicts when needed).
@@ -8,20 +8,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-FusionDelegation = Literal["marker", "tool"]
 WORKSPACE_ROOTS_ENV = "MANTIS_FUSION_WORKSPACE_ROOTS"
-
-
-def parse_delegation(value: object) -> str:
-    """Return a valid delegation kind, defaulting to "marker" when unset."""
-    kind = str(value or "marker").strip().lower()
-    if kind not in get_args(FusionDelegation):
-        raise ValueError(f"fusion delegation must be 'marker' or 'tool', got {kind!r}")
-    return kind
 
 
 def allowed_workspace(value: str) -> str:
@@ -39,18 +29,6 @@ def allowed_workspace(value: str) -> str:
     return str(resolved)
 
 
-class FusionWorkerProfile(BaseModel):
-    """A specialist sidekick profile the planner may assign to a task."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    name: str = Field(min_length=1)
-    instructions: str = ""
-    description: str = ""
-    model: str | None = None  # overrides the default sidekick slot
-    tools: list[str] | None = None  # allowed tool names, or None for all
-
-
 class FusionRunBudget(BaseModel):
     """Run-level token/turn/wall-time budget for a Fusion run."""
 
@@ -64,11 +42,10 @@ class FusionRunBudget(BaseModel):
 class FusionToolOptions(BaseModel):
     """Capability bundles that filter the tool set available to workers."""
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="forbid")
 
     enabled: list[str] = Field(default_factory=list)
     server_execution: bool = False
-    delegation: FusionDelegation | None = None
     workspace: str | None = None
 
     @field_validator("workspace")
@@ -76,26 +53,6 @@ class FusionToolOptions(BaseModel):
     def _check_workspace(cls, value: str | None) -> str | None:
         """Accept only workspaces under the configured allowlist roots."""
         return None if value is None else allowed_workspace(value)
-
-
-class FusionSidekickAssignment(BaseModel):
-    """One sidekick task assigned by the planner."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    task: str = Field(min_length=1)
-    profile: str | None = None
-
-
-class FusionPlan(BaseModel):
-    """Structured output from the main planning phase."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    complexity: float = Field(default=0.5, ge=0.0, le=1.0)
-    main_task: str = Field(min_length=1)
-    sidekick_assignments: list[FusionSidekickAssignment] = Field(default_factory=list)
-    verification_commands: list[str] = Field(default_factory=list)
 
 
 class FusionRoutingConfig(BaseModel):

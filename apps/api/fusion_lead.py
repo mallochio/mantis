@@ -20,12 +20,12 @@ from fusion_harness import (
     effective_delegation_names,
     lead_prompt_with_names,
 )
-from fusion_prompts import lead_system_prompt, lead_turn_reminder, sidekick_system_prompt
+from fusion_prompts import lead_system_prompt, sidekick_system_prompt
 
 if TYPE_CHECKING:
     from fusion import FusionCoordinator, FusionRun
 
-__all__ = ["HandoffManager", "advance", "uses_tool_delegation", "visible_lead_messages"]
+__all__ = ["HandoffManager", "advance", "visible_lead_messages"]
 
 BUDGET_STOP = "Not run: the run budget is exhausted."
 
@@ -33,8 +33,6 @@ BUDGET_STOP = "Not run: the run budget is exhausted."
 def set_tool_schemas(run: FusionRun, tools: list[dict[str, Any]]) -> None:
     """Replace one run's schemas and refresh tool-delegation aliases."""
     run.tools = utils._convert_tools(tools)
-    if run.structured and run.structured_plan is not None:
-        run.tools = run._filter_tools()
     if run.handoffs is not None:
         refresh_tool_names(run)
 
@@ -61,20 +59,8 @@ def visible_lead_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]
     return visible
 
 
-def uses_tool_delegation(run: FusionRun, coordinator: FusionCoordinator) -> bool:
-    """Return True for tool-delegation runs, fixing the mode on a run's first advance."""
-    if run.handoffs is not None:
-        return True
-    if run.turns or run.status != "main_planning":
-        return False
-    if (run.tool_options.delegation or coordinator.config.delegation()) != "tool":
-        return False
-    prepare_run(run)
-    return True
-
-
 def prepare_run(run: FusionRun) -> None:
-    """Replace the marker-protocol prompts with the lead and sidekick policy prompts."""
+    """Initialize the lead and persistent sidekick policy prompts."""
     history = run.main_messages[1:]
     base_parts: list[str] = []
     while history and history[0].get("role") == "system":
@@ -197,27 +183,9 @@ def _lead_loop(
 def _lead_turn(
     run: FusionRun, coordinator: FusionCoordinator, tools: list[dict[str, Any]]
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Call the lead with the per-turn reminder at the tail of its context.
-
-    The reminder is removed after the call so it never accumulates: the stored history,
-    and so the cacheable prefix of the next turn, contains only real turns.
-    """
-    reminder = lead_turn_reminder()
-    run.main_messages.append({"role": "user", "content": reminder})
-    try:
-        text, calls, _ = run._call_lane(coordinator, "main", tools=tools)
-    finally:
-        _drop_last_user_message(run.main_messages, reminder)
+    """Call the lead with stable system guidance and append-only conversation history."""
+    text, calls, _ = run._call_lane(coordinator, "main", tools=tools)
     return text, calls
-
-
-def _drop_last_user_message(messages: list[dict[str, Any]], content: str) -> None:
-    """Remove the newest user message with exactly this content."""
-    for index in range(len(messages) - 1, -1, -1):
-        message = messages[index]
-        if message.get("role") == "user" and message.get("content") == content:
-            del messages[index]
-            return
 
 
 def _drain_user_messages(run: FusionRun) -> None:

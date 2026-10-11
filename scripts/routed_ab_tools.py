@@ -190,9 +190,8 @@ def openrouter_headers() -> dict[str, str]:
 def request_body(plan: dict[str, Any], messages: list[dict[str, Any]]) -> dict[str, Any]:
     """Build the chat request body for one variant plan."""
     body: dict[str, Any] = {"model": plan["model"], "messages": messages, "tools": TOOL_SCHEMAS}
-    for key in ("tool_options", "worker_profiles"):
-        if plan.get(key) is not None:
-            body[key] = plan[key]
+    if plan.get("tool_options") is not None:
+        body["tool_options"] = plan["tool_options"]
     if plan.get("reasoning_effort") and plan["reasoning_effort"] != "none":
         body["reasoning_effort"] = plan["reasoning_effort"]
     return body

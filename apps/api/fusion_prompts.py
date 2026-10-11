@@ -34,6 +34,8 @@ LEAD_DELEGATION_POLICY = _JOIN_SECTIONS(
         "Avoid briefing implementation before the ask and design are settled. Do not state "
         "unverified claims as facts or promote a delegated hypothesis into a confirmed "
         "conclusion.",
+        "Request independent tool calls together as parallel tool calls. "
+        "Make edits with their verification in the same response.",
         "The user interacts with one agent. Never mention or distinguish the sidekick unless "
         "asked. Describe all work in first person, as your own decisions and actions.",
     )
@@ -128,13 +130,3 @@ def lead_system_prompt(base: str | None) -> str:
 def sidekick_system_prompt() -> str:
     """Return the sidekick's operating policy."""
     return SIDEKICK_POLICY
-
-
-def lead_turn_reminder() -> str:
-    """Return concise per-turn delegation and tool-call guidance."""
-    return (
-        "<delegation_guidance>Delegate bounded mechanical implementation and verification by "
-        "default; retain planning, review, user-facing decisions, and correctness-critical "
-        "authoring. Request all independent tool calls in one response as parallel tool calls. "
-        "Make edits with their verification in the same response.</delegation_guidance>"
-    )

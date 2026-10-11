@@ -22,7 +22,7 @@ from ab_run import (
     usage_numbers,
 )
 from ab_seeds import DEFAULT_CHECKS, completed_runs
-from evaluate_routed_harness import VARIANTS, load_cases
+from evaluate_routed_harness import load_cases
 from routed_ab_tools import (
     OPENROUTER_BASE_URL,
     execute_tool_call,
@@ -40,6 +40,7 @@ DEFAULT_FIXTURES = EVAL / "routed-harness-fixtures"
 DEFAULT_OUT = EVAL / "results-routed-ab.jsonl"
 DEFAULT_TRANSCRIPTS = EVAL / "runs" / "routed-ab"
 DEFAULT_PRICES = EVAL / "model_prices.json"
+LIVE_VARIANTS = ("efficient-only", "capable-only", "mantis-base", "fusion-tool")
 __all__ = [
     "OPENROUTER_BASE_URL", "auto_judge", "base_target_spec", "build_record", "drive_case",
     "execute_tool_call", "load_catalog", "load_prices", "openrouter_headers", "post_round",
@@ -58,7 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fixtures", type=Path, default=DEFAULT_FIXTURES)
     parser.add_argument("--checks", type=Path, default=DEFAULT_CHECKS)
     parser.add_argument("--catalog", type=Path, default=DEFAULT_CATALOG)
-    parser.add_argument("--variants", default=",".join(VARIANTS))
+    parser.add_argument("--variants", default=",".join(LIVE_VARIANTS))
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--transcripts-dir", type=Path, default=DEFAULT_TRANSCRIPTS)
     parser.add_argument("--prices", type=Path, default=DEFAULT_PRICES)
@@ -76,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.seeds < 1:
         raise SystemExit("--seeds must be at least 1")
     variants = [item.strip() for item in args.variants.split(",") if item.strip()]
-    unknown = [item for item in variants if item not in VARIANTS]
+    unknown = [item for item in variants if item not in LIVE_VARIANTS]
     if unknown:
         raise SystemExit(f"unknown variants: {', '.join(unknown)}")
     cases = load_cases(args.cases)

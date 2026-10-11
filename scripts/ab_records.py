@@ -30,24 +30,20 @@ def base_target_spec(catalog: dict[str, Any], role: str) -> dict[str, str]:
     }
 
 
-def _fusion_plan(variant: str, catalog: dict[str, Any], workspace: Path | None) -> dict[str, Any]:
-    """Build a fusion request using the catalog's configured worker model."""
-    if variant not in {"fusion-pinned", "fusion-tool", "fusion-routed"}:
-        raise ValueError(f"unknown variant {variant!r}")
-    options: dict[str, Any] = {
-        "enabled": ["workspace", "shell"],
-        "server_execution": True,
-        "delegation": "marker",
+def _fusion_plan(variant: str, workspace: Path | None) -> dict[str, Any]:
+    """Build a tool-delegation request with an isolated shared workspace."""
+    if variant != "fusion-tool":
+        raise ValueError(f"unsupported live variant {variant!r}; use 'fusion-tool'")
+    if workspace is None:
+        raise ValueError("fusion-tool requires its per-run workspace path")
+    return {
+        "model": "mantis/fusion",
+        "tool_options": {
+            "enabled": ["workspace", "shell"],
+            "server_execution": True,
+            "workspace": str(workspace.resolve()),
+        },
     }
-    profiles = [{"name": "default", "model": str(catalog["fusion"]["main"])}]
-    if variant == "fusion-tool":
-        if workspace is None:
-            raise ValueError("fusion-tool requires its per-run workspace path")
-        options.update({"delegation": "tool", "workspace": str(workspace.resolve())})
-    plan: dict[str, Any] = {"model": "mantis/fusion", "tool_options": options}
-    if variant != "fusion-routed":
-        plan["worker_profiles"] = profiles
-    return plan
 
 
 def request_plan(
@@ -63,7 +59,7 @@ def request_plan(
         }
     if variant == "mantis-base":
         return {"model": "mantis/base"}
-    return _fusion_plan(variant, catalog, workspace)
+    return _fusion_plan(variant, workspace)
 
 
 def auto_judge(

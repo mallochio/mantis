@@ -96,7 +96,7 @@ def tool_run(run_id: str, *, server_execution: bool = True, tools=None, workspac
         "do the task",
         tools=tools,
         tool_options=fusion.FusionToolOptions(
-            delegation="tool", server_execution=server_execution, workspace=workspace
+            server_execution=server_execution, workspace=workspace
         ),
     )
 

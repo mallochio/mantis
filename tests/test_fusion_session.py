@@ -33,7 +33,7 @@ def _post_chat(client, messages, session_id):
         json={
             "model": "mantis/fusion",
             "messages": messages,
-            "tool_options": {"delegation": "tool"},
+            "tool_options": {},
         },
     )
 

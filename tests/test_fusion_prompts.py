@@ -9,14 +9,13 @@ from apps.api.fusion_prompts import (
     SIDEKICK_POLICY,
     SIDEKICK_TOOL,
     lead_system_prompt,
-    lead_turn_reminder,
     sidekick_system_prompt,
 )
 
 SENTENCE_STARTERS = {
     "After", "Answer", "Ask", "At", "Avoid", "Blocking", "Calling", "Delegate", "Describe",
     "Do", "For", "Include", "Follow", "Leave", "Make", "Never", "Own", "Pass", "Report",
-    "Review", "Stop", "Take", "The", "This", "Use", "When", "Write", "You",
+    "Request", "Review", "Stop", "Take", "The", "This", "Use", "When", "Write", "You",
 }
 
 
@@ -53,15 +52,12 @@ def test_sidekick_policy_preserves_limits_and_escalation() -> None:
     assert "ESCALATE_TO_MAIN:" in sidekick_system_prompt()
 
 
-def test_lead_prompt_and_turn_reminder_join_sections() -> None:
+def test_lead_prompt_keeps_guidance_in_stable_system_section() -> None:
     prompt = lead_system_prompt("base instructions")
-    reminder = lead_turn_reminder()
     assert prompt.startswith("base instructions")
     assert LEAD_DELEGATION_POLICY in prompt
-    assert "<delegation_guidance>" in reminder
-    assert "</delegation_guidance>" in reminder
-    assert "parallel tool calls" in reminder
-    assert "same response" in reminder
+    assert "parallel tool calls" in prompt
+    assert "same response" in prompt
 
 
 def _assert_function_schema(schema: dict[str, Any], expected_name: str) -> None:

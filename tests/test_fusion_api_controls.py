@@ -39,7 +39,7 @@ def post(client, messages=None, headers=None, **controls):
             "model": "mantis/fusion",
             "messages": messages or [{"role": "user", "content": "work"}],
             "tools": [BASH_TOOL],
-            "tool_options": {"delegation": "tool"},
+            "tool_options": {},
             **controls,
         },
     )
@@ -127,9 +127,12 @@ def test_sidekick_does_not_inherit_forced_client_tool_choice(provider_api, choic
     client, captured, responses = provider_api
     responses.append(reply("report"))
     request = api.ChatRequest(
-        model="mantis/fusion", messages=[{"role": "user", "content": "work"}],
-        tools=[BASH_TOOL], tool_options={"delegation": "tool"},
-        tool_choice=choice, parallel_tool_calls=False,
+        model="mantis/fusion",
+        messages=[{"role": "user", "content": "work"}],
+        tools=[BASH_TOOL],
+        tool_options={},
+        tool_choice=choice,
+        parallel_tool_calls=False,
     )
     run = fusion_api_context.create_chat_run(request, "work", None)
     coordinator = fusion.FusionCoordinator()

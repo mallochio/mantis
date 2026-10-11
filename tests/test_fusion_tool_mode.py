@@ -85,7 +85,7 @@ def tool_run(run_id: str = "tool", tools: list[dict[str, Any]] | None = None, **
         run_id,
         "build the feature",
         tools=tools,
-        tool_options=fusion.FusionToolOptions(delegation="tool", **options),
+        tool_options=fusion.FusionToolOptions(**options),
     )
 
 
@@ -115,7 +115,7 @@ def test_lead_calls_sidekick_then_answers(monkeypatch):
     assert event["report"] == "X is done."
     first_messages, first_tools = worker.seen["lead"][0]
     assert first_messages[0]["content"] == fusion_prompts.lead_system_prompt(None)
-    assert first_messages[-1]["content"] == fusion_prompts.lead_turn_reminder()
+    assert first_messages[-1]["content"] == "build the feature"
     names = [tool["function"]["name"] for tool in first_tools]
     assert names == ["bash", "sidekick", "read_subagent"]
     second_messages, _ = worker.seen["lead"][1]
@@ -123,7 +123,7 @@ def test_lead_calls_sidekick_then_answers(monkeypatch):
     sidekick_messages, _ = worker.seen["sidekick"][0]
     assert [m["role"] for m in sidekick_messages] == ["system", "user"]
     assert sidekick_messages[1]["content"] == "implement X"
-    assert all(m.get("content") != fusion_prompts.lead_turn_reminder() for m in run.main_messages)
+    assert second_messages[: len(first_messages)] == first_messages
     handoff = next(e for e in run.handoff_history if e["kind"] == "handoff")
     assert handoff["message"] == "implement X"
     assert handoff["report"] == "Report: implemented X, tests pass."
@@ -140,13 +140,13 @@ def test_client_system_prompt_becomes_lead_base(monkeypatch):
             {"role": "system", "content": "Client rules."},
             {"role": "user", "content": "hi"},
         ],
-        tool_options=fusion.FusionToolOptions(delegation="tool"),
+        tool_options=fusion.FusionToolOptions(),
     )
 
     assert run.advance()["report"] == "hi"
     messages, _ = worker.seen["lead"][0]
     assert messages[0]["content"] == fusion_prompts.lead_system_prompt("Client rules.")
-    assert [m["role"] for m in messages] == ["system", "user", "user"]
+    assert [m["role"] for m in messages] == ["system", "user"]
 
 
 def test_mixed_client_tool_and_sidekick_merge_on_resume(monkeypatch):
@@ -276,7 +276,7 @@ def test_budget_exhaustion_synthesizes_and_pairs_calls(monkeypatch):
     install(
         monkeypatch,
         [reply("", call(f"c{i}", "sidekick", message="loop")) for i in range(3)]
-        + [reply("ANSWER: partial result")],
+        + [reply("partial result")],
         [reply("report")] * 3,
     )
     run = tool_run()
