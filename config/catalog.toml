@@ -153,6 +153,7 @@ reasoning_effort = "high"
 protocols = ["chat_completions"]
 
 [fusion]
+delegation = "tool"
 main = "openrouter/~openai/gpt-astra-latest"
 main_reasoning = "low"
 sidekick = "openrouter/~openai/gpt-luna-latest"

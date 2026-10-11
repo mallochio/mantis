@@ -39,4 +39,3 @@ def test_request_plan_maps_tool_delegation_variant():
         runner.request_plan("fusion-tool", catalog)
     with pytest.raises(ValueError):
         runner.request_plan("unknown-variant", catalog)
-
