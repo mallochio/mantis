@@ -10,11 +10,13 @@ from pathlib import Path
 from typing import Any, cast
 
 import httpx
+from ab_evidence import tool_records
 
 DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions"
 MODEL = "typesafe/jev-1.13"
 REPO = Path(__file__).resolve().parent.parent
 TRANSCRIPTS = REPO / "eval" / "runs" / "routed-ab"
+MAX_TOOL_TRANSCRIPT_CHARS = 24_000
 ANSWER_CONVENTION = (
     "The orchestration system prefixes its final answers with 'ANSWER:'. "
     "The prefix is presentation, not part of the requested response."
@@ -46,32 +48,104 @@ def load_cases(path: Path) -> dict[str, dict[str, Any]]:
 
 
 def compact_handoffs(event: dict[str, Any]) -> list[dict[str, Any]]:
-    """Reduce handoff history entries to kind, task, outcome, and follow-up."""
+    """Keep bounded handoff task, outcome, message, report, and status details."""
     compact = []
-    for entry in event.get("handoff_history") or []:
-        item = {"kind": entry.get("kind")}
-        for key in ("task", "outcome", "follow_up"):
+    entries = event.get("handoff_history") or []
+    for entry in entries[:20]:
+        if not isinstance(entry, dict):
+            continue
+        item = {"kind": _bounded_text(entry.get("kind"), 200)}
+        for key in ("task", "outcome", "follow_up", "message", "report", "status"):
             if entry.get(key) is not None:
-                item[key] = entry[key]
+                value = entry[key]
+                item[key] = _bounded_text(value, 2_000) if isinstance(value, str) else value
         compact.append(item)
     return compact
 
 
-def build_state(record: dict[str, Any], case: dict[str, Any]) -> dict[str, Any]:
-    """Assemble the decision state from a record, its transcript, and the case."""
-    transcript_path = TRANSCRIPTS / f"{record['variant']}--{record['case_id']}.json"
-    transcript = json.loads(transcript_path.read_text()) if transcript_path.is_file() else {}
+def _transcript_path(record: dict[str, Any], transcripts_dir: Path) -> tuple[Path, int]:
+    """Select a seed transcript, permitting old names only for seedless rows."""
+    seed_value = record.get("seed")
+    seed = int(seed_value) if seed_value is not None else 1
+    transcript_file = record.get("transcript_file")
+    if isinstance(transcript_file, str) and transcript_file:
+        return transcripts_dir / Path(transcript_file).name, seed
+    stem = f"{record['variant']}--{record['case_id']}"
+    if seed_value is not None:
+        return transcripts_dir / f"{stem}--s{seed}.json", seed
+    legacy = transcripts_dir / f"{stem}.json"
+    seeded = transcripts_dir / f"{stem}--s1.json"
+    return (legacy if legacy.is_file() else seeded), seed
+
+
+def _bounded_json(value: Any) -> str:
+    """Serialize evidence within the decision service context budget."""
+    text = json.dumps(value, ensure_ascii=False, default=str, sort_keys=True)
+    marker = "...[truncated]"
+    if len(text) <= MAX_TOOL_TRANSCRIPT_CHARS:
+        return text
+    return text[: MAX_TOOL_TRANSCRIPT_CHARS - len(marker)] + marker
+
+
+def _bounded_text(value: Any, limit: int = 4_000) -> str:
+    """Bound independent check output while preserving its leading evidence."""
+    text = str(value or "")
+    marker = "...[truncated]"
+    return text if len(text) <= limit else text[: limit - len(marker)] + marker
+
+
+def _tool_transcript(transcript: dict[str, Any]) -> str:
+    """Return bounded client and server tool evidence for independent review."""
+    return _bounded_json(
+        {
+            "messages": transcript.get("messages"),
+            "response_payloads": transcript.get("response_payloads"),
+            "tool_records": tool_records(transcript),
+            "server_run_details": transcript.get("server_run_details"),
+        }
+    )
+
+
+def _agent_state(
+    record: dict[str, Any],
+    seed: int,
+    final_answer: str,
+    event: dict[str, Any],
+    transcript: dict[str, Any],
+) -> dict[str, Any]:
+    """Assemble bounded agent status and independent transcript evidence."""
+    return {
+        "variant": record["variant"],
+        "seed": seed,
+        "final_answer": final_answer,
+        "tool_rounds": record.get("tool_rounds"),
+        "wall_time_s": round(record.get("wall_time_s") or 0.0, 1),
+        "check_passed": record.get("check_passed"),
+        "check_output": _bounded_text(record.get("check_output")),
+        "check_command": record.get("check_command"),
+        "evidence_rule": (
+            "Recorded tool results and independent checks are evidence; claims alone are not proof."
+        ),
+        "handoffs": compact_handoffs(event),
+        "tool_transcript": _tool_transcript(transcript),
+    }
+
+
+def build_state(
+    record: dict[str, Any], case: dict[str, Any], transcripts_dir: Path | None = None
+) -> dict[str, Any]:
+    """Assemble task, independent checks, and bounded transcript evidence."""
+    transcript_dir = transcripts_dir or TRANSCRIPTS
+    path, seed = _transcript_path(record, transcript_dir)
+    transcript = json.loads(path.read_text()) if path.is_file() else {}
+    answer = transcript.get("content") or record.get("report") or record.get("content") or ""
+    event = dict(transcript.get("server_run_details") or {})
+    event.update(transcript.get("event") or {})
     return {
         "answer_convention": ANSWER_CONVENTION,
         "task": case["prompt"],
         "expected": case["expected"],
-        "agent": {
-            "variant": record["variant"],
-            "final_answer": transcript.get("content") or record.get("content") or "",
-            "tool_rounds": record.get("tool_rounds"),
-            "wall_time_s": round(record.get("wall_time_s") or 0.0, 1),
-            "handoffs": compact_handoffs(transcript.get("event") or {}),
-        },
+        "agent": _agent_state(record, seed, answer, event, transcript),
     }
 
 
@@ -117,6 +191,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--records", type=Path, default=eval_dir / "results-routed-ab.jsonl")
     parser.add_argument("--cases", type=Path, default=eval_dir / "routed-harness-cases.jsonl")
     parser.add_argument("--out", type=Path, default=eval_dir / "results-jev-assessment.jsonl")
+    parser.add_argument("--transcripts", type=Path, default=TRANSCRIPTS)
     return parser.parse_args()
 
 
@@ -124,17 +199,19 @@ def assessment_entry(
     client: httpx.Client,
     record: dict[str, Any],
     case: dict[str, Any],
+    transcripts_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Assess one record and return the JSONL entry for it."""
     body = {
         "model": MODEL,
-        "state": build_state(record, case),
+        "state": build_state(record, case, transcripts_dir),
         "questions": questions_for(case),
     }
     payload = assess(client, body)
     return {
         "variant": record["variant"],
         "case_id": record["case_id"],
+        "seed": int(record.get("seed", 1)),
         "provider_cost": record["provider_cost"],
         "tool_rounds": record.get("tool_rounds"),
         "answers": payload.get("answers"),
@@ -155,7 +232,7 @@ def main() -> None:
         args.out.open("w") as sink,
     ):
         for record in records:
-            entry = assessment_entry(client, record, cases[record["case_id"]])
+            entry = assessment_entry(client, record, cases[record["case_id"]], args.transcripts)
             sink.write(json.dumps(entry) + "\n")
             sink.flush()
             assessed += 1

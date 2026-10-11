@@ -9,12 +9,16 @@ import re
 import threading
 import tomllib
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext, suppress
 from pathlib import Path
 from typing import Any, cast
 
 import direct_completion
+import fusion_background
+import fusion_lead
+import fusion_provider_hooks as hooks
 import litellm
 import model_catalog
 import providers
@@ -30,6 +34,7 @@ from fusion_types import (
     FusionSidekickAssignment,
     FusionToolOptions,
     FusionWorkerProfile,
+    parse_delegation,
 )
 from runs import (
     RUN_STORE,
@@ -42,12 +47,7 @@ from runs import (
     get_run,
 )
 
-__all__ = [
-    "FusionCoordinator",
-    "FusionRun",
-    "advance_fusion_run",
-    "FUSION_STATUS",
-]
+__all__ = ["FusionCoordinator", "FusionRun", "advance_fusion_run", "FUSION_STATUS"]
 
 FUSION_STATUS = frozenset(
     {"main_planning", "sidekick_pending", "awaiting_tools", "main_review", "completed", "error"}
@@ -415,10 +415,7 @@ PLAN_RESPONSE_FORMAT = {
                         },
                     },
                 },
-                "verification_commands": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                },
+                "verification_commands": {"type": "array", "items": {"type": "string"}},
             },
         },
         "strict": True,
@@ -461,6 +458,10 @@ class FusionConfig:
 
     def sidekick_slot(self) -> str:
         return self._load().get("sidekick") or "gpt-5_6-luna"
+
+    def delegation(self) -> str:
+        """Return the catalog delegation kind: "marker" (default) or "tool"."""
+        return parse_delegation(self._load().get("delegation"))
 
     def main_tools(self) -> str:
         raw = str(self._load().get("main_tools") or "none").strip().lower()
@@ -570,11 +571,7 @@ def _fusion_config() -> FusionConfig:
 
 
 def _return_reasoning_by_default() -> bool:
-    return os.environ.get("MANTIS_FUSION_RETURN_REASONING", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
+    return os.environ.get("MANTIS_FUSION_RETURN_REASONING", "0").lower() in ("1", "true", "yes")
 
 
 def _extract_reasoning_trace(
@@ -813,7 +810,7 @@ def _main_trace_delta(run: FusionRun) -> str:
     cursor = run.trace_cursors.get("main", 0)
     if not isinstance(cursor, int) or cursor < 0 or cursor > len(run.main_messages):
         cursor = 0
-    delta = run.main_messages[cursor:]
+    delta = fusion_lead.visible_lead_messages(run.main_messages[cursor:])
     run.trace_cursors["main"] = len(run.main_messages)
     parts: list[str] = []
     length = 0
@@ -1084,6 +1081,7 @@ class FusionCoordinator:
         slot: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
+        on_delta: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Call a worker slot and return (assistant_message, usage).
 
@@ -1136,11 +1134,9 @@ class FusionCoordinator:
             )
             data = result.body
             selected_model = result.selected_model
-        elif timeout_s is None:
-            data = providers._provider_response(slot, fitted, safe_tokens, 0.7, tools)
         else:
-            data = providers._provider_response(
-                slot, fitted, safe_tokens, 0.7, tools, timeout_s=timeout_s
+            data = hooks.call_provider(
+                providers._provider_response, slot, fitted, safe_tokens, tools, timeout_s, on_delta
             )
         msg = dict(data["choices"][0]["message"])
         msg.setdefault("role", "assistant")
@@ -1157,18 +1153,7 @@ class FusionCoordinator:
             else:
                 msg.pop("tool_calls", None)
             return msg, data.get("usage") or {}
-        calls: list[dict[str, Any]] = []
-        for tc in tcs:
-            fn = tc.get("function", {})
-            raw_args = fn.get("arguments") or ""
-            if not isinstance(raw_args, str):
-                raw_args = json.dumps(raw_args)
-            call = {
-                "id": str(tc.get("id", f"call_{len(calls)}")),
-                "type": "function",
-                "function": {"name": str(fn.get("name", "")), "arguments": raw_args},
-            }
-            calls.append(call)
+        calls = hooks.normalize_tool_calls(tcs)
         if calls:
             msg["tool_calls"] = calls
         else:
@@ -1358,7 +1343,7 @@ class ExecutionLane:
             self.run.budget.consume_turn()
         if getattr(serve_config._history_context, "active_run", None) is not self.run:
             self.run.add_usage(usage, model=slot)
-            self.run._add_role_usage(self.role, slot, usage)
+        self.run._add_role_usage(self.role, slot, usage)
         self.run.record_activity(
             "execution_lane_turn",
             lane=self.lane_id,
@@ -1452,6 +1437,10 @@ class ExecutionLane:
 
 class FusionRun(NativeRun):
     """A resumable lead/sidekick run whose roles are bound by the catalog."""
+
+    handoffs: fusion_lead.HandoffManager | None = None
+    fusion_session_id: str | None = None
+    fusion_lead_prompt_base: str | None = None
 
     def __init__(
         self,
@@ -1688,7 +1677,7 @@ class FusionRun(NativeRun):
         if self.budget is not None:
             self.budget.check_timeout()
         with _fusion_route_session(f"{self.run_id}:{role}"):
-            message, usage = coordinator._call_worker(slot, messages, tools)
+            message, usage = hooks.call_lane(self, coordinator, role, slot, messages, tools)
         selected = getattr(serve_config._history_context, "fusion_selected_model", None)
         self._record_selected_slot(
             role, str(selected or message.get("_mantis_model") or slot), primary=False
@@ -1707,7 +1696,7 @@ class FusionRun(NativeRun):
         calls = message.get("tool_calls") or []
         if getattr(serve_config._history_context, "active_run", None) is not self:
             self.add_usage(usage, model=slot)
-            self._add_role_usage(role, slot, usage)
+        self._add_role_usage(role, slot, usage)
         self.record_activity(
             f"{role}_turn",
             role=role,
@@ -2219,6 +2208,8 @@ class FusionRun(NativeRun):
         message: str | None,
         coordinator: FusionCoordinator,
     ) -> dict[str, Any]:
+        if fusion_lead.uses_tool_delegation(self, coordinator):
+            return fusion_lead.advance(self, tool_results, request_id, message, coordinator)
         if self.structured:
             return self._advance_structured(tool_results, request_id, message, coordinator)
         return self._advance_legacy(tool_results, request_id, message, coordinator)
@@ -2596,6 +2587,7 @@ class FusionRun(NativeRun):
         for lane in self.sidekick_lanes:
             if not lane.exhausted:
                 cache[lane.profile.name] = self._carryover_messages(coordinator, lane)
+        hooks.cache_sidekick_history(self, coordinator, cache)
         self.sidekick_context_cache = cache
 
     def _record_handoff(self, kind: str, **fields: Any) -> None:
@@ -2913,6 +2905,8 @@ class FusionRun(NativeRun):
 
 
 def _put_run(run: NativeRun) -> None:
+    if isinstance(run, FusionRun):
+        fusion_background.sync_run(run)
     if RUN_STORE == "redis":
         _redis_put(run)
     elif RUN_STORE == "file":
@@ -3004,13 +2998,18 @@ def create_fusion_run(
 
 
 def refresh_fusion_run_tools(run: FusionRun, tools: list[dict[str, Any]]) -> None:
-    """Replace a live run's tool schemas with the ones the client just sent."""
-    converted = utils._convert_tools(tools)
-    if run.structured and run.structured_plan is not None:
-        run.tools = converted
-        run.tools = run._filter_tools()
-    else:
-        run.tools = converted
+    """Replace live schemas under the run lock and persist the matching delegation aliases."""
+    with _run_lock(run.run_id):
+        target, persisted = run, False
+        with suppress(KeyError):
+            stored = get_run(run.run_id)
+            if isinstance(stored, FusionRun):
+                target, persisted = stored, True
+        fusion_lead.set_tool_schemas(target, tools)
+        if persisted:
+            _put_run(target)
+        if target is not run:
+            fusion_lead.copy_refreshed_tool_state(run, target)
 
 
 def try_get_fusion_run(run_id: str) -> FusionRun | None:

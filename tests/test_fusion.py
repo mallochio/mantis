@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import pickle
+import re
 import threading
 import time
 import uuid
@@ -712,23 +713,13 @@ def test_fusion_output_tokens_are_model_specific(monkeypatch):
 
 
 def test_fusion_chat_initial_call_returns_tool_calls(client, fake_worker):
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "description": "run a shell command",
-                "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
-            },
-        }
-    ]
     response = client.post(
         "/v1/chat/completions",
         headers=_headers(),
         json={
             "model": "mantis/fusion",
             "messages": [{"role": "user", "content": "write a hello world script"}],
-            "tools": tools,
+            "tools": [BASH_TOOL],
         },
     )
     assert response.status_code == 200
@@ -741,8 +732,12 @@ def test_fusion_chat_initial_call_returns_tool_calls(client, fake_worker):
     assert len(message["tool_calls"]) == 1
     assert message["tool_calls"][0]["function"]["name"] == "bash"
     tool_call_id = message["tool_calls"][0]["id"]
-    assert tool_call_id.startswith("f")
-    assert "~" in tool_call_id
+    assert len(tool_call_id) <= 40
+    assert re.fullmatch(r"[A-Za-z0-9_-]+", tool_call_id)
+    run_id, original_id = api._decode_fusion_tool_call_id(tool_call_id)
+    assert run_id == response.headers["x-mantis-run-id"]
+    assert original_id in {"call_bash_1", "lead:call_bash_1"}
+    assert ":" not in tool_call_id
     assert fake_worker.main_calls == 1
     assert fake_worker.sidekick_calls == 1
 

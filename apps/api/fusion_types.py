@@ -6,7 +6,37 @@ internal orchestrator (converted to plain dicts when needed).
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+import os
+from pathlib import Path
+from typing import Literal, get_args
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+FusionDelegation = Literal["marker", "tool"]
+WORKSPACE_ROOTS_ENV = "MANTIS_FUSION_WORKSPACE_ROOTS"
+
+
+def parse_delegation(value: object) -> str:
+    """Return a valid delegation kind, defaulting to "marker" when unset."""
+    kind = str(value or "marker").strip().lower()
+    if kind not in get_args(FusionDelegation):
+        raise ValueError(f"fusion delegation must be 'marker' or 'tool', got {kind!r}")
+    return kind
+
+
+def allowed_workspace(value: str) -> str:
+    """Resolve a client workspace path and require it under an allowlisted root."""
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise ValueError("tool_options.workspace must be an absolute path")
+    resolved = path.resolve()
+    raw_roots = os.environ.get(WORKSPACE_ROOTS_ENV, "").split(os.pathsep)
+    roots = [Path(root).expanduser().resolve() for root in raw_roots if root.strip()]
+    if not any(resolved == root or root in resolved.parents for root in roots):
+        raise ValueError(f"tool_options.workspace {resolved} is not under {WORKSPACE_ROOTS_ENV}")
+    if not resolved.is_dir():
+        raise ValueError(f"tool_options.workspace {resolved} is not a directory")
+    return str(resolved)
 
 
 class FusionWorkerProfile(BaseModel):
@@ -38,6 +68,14 @@ class FusionToolOptions(BaseModel):
 
     enabled: list[str] = Field(default_factory=list)
     server_execution: bool = False
+    delegation: FusionDelegation | None = None
+    workspace: str | None = None
+
+    @field_validator("workspace")
+    @classmethod
+    def _check_workspace(cls, value: str | None) -> str | None:
+        """Accept only workspaces under the configured allowlist roots."""
+        return None if value is None else allowed_workspace(value)
 
 
 class FusionSidekickAssignment(BaseModel):

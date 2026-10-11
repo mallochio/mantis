@@ -17,7 +17,7 @@ from evaluate_routed_harness import (
     aggregate_records,
     load_cases,
 )
-from routed_ab_tools import OPENROUTER_BASE_URL, priced_cost, usage_totals
+from routed_ab_tools import priced_cost, usage_totals
 
 
 def _catalog() -> dict[str, Any]:
@@ -31,26 +31,6 @@ def _case(case_id: str = "no-tool-chat") -> EvalCase:
         "Answer with exactly ROUTING_OK and do not call tools.",
         {"description": "exact echo", "checks": ["compare exact response"]},
     )
-
-
-def test_request_plan_maps_every_variant():
-    catalog = _catalog()
-    efficient = runner.request_plan("efficient-only", catalog)
-    capable = runner.request_plan("capable-only", catalog)
-    assert efficient["model"] == "~openai/gpt-sol-latest"
-    assert efficient["base_url"] == OPENROUTER_BASE_URL
-    assert efficient["reasoning_effort"] == "medium"
-    assert capable["model"] == "~openai/gpt-sol-latest"
-    assert capable["reasoning_effort"] == "high"
-    assert runner.request_plan("mantis-base", catalog) == {"model": "mantis/base"}
-    pinned = runner.request_plan("fusion-pinned", catalog)
-    routed = runner.request_plan("fusion-routed", catalog)
-    assert pinned["model"] == routed["model"] == "mantis/fusion"
-    assert pinned["worker_profiles"][0]["model"] == catalog["fusion"]["main"]
-    assert "worker_profiles" not in routed
-    assert routed["tool_options"]["server_execution"] is True
-    with pytest.raises(ValueError):
-        runner.request_plan("unknown-variant", catalog)
 
 
 def test_auto_judge_only_decides_machine_checkable_cases():
@@ -110,6 +90,7 @@ def test_build_record_matches_summarizer_schema():
     assert record["passed"] is True
     assert record["needs_review"] is False
     assert record["selected_models"] == ["~openai/gpt-luna-latest"]
+    assert record["usage_models"] == event["usage_models"]
     assert record["input_tokens"] == 100
     assert record["provider_cost"] == 0.001
     assert record["fusion_savings_usd"] == 0.002

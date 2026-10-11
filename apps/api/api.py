@@ -12,15 +12,20 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
+from functools import partial
 from typing import Any, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import base_proxy
 import fusion
+import fusion_api_context
+import fusion_api_ids
+import fusion_api_live
+import fusion_api_response
+import fusion_stream
 import httpx
 import model_catalog
 import serve
-import utils
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi import Request as HttpRequest
 from fastapi.exceptions import RequestValidationError
@@ -139,6 +144,7 @@ class ChatRequest(BaseModel):
     messages: list[Message] = Field(min_length=1)
     tools: list[FunctionTool] | None = None
     tool_choice: Literal["auto", "none", "required"] | NamedToolChoice | None = None
+    parallel_tool_calls: bool | None = None
     stream: bool = False
     stream_options: StreamOptions | None = None
     response_format: JsonSchemaFormat | JsonObjectFormat | None = None
@@ -160,7 +166,12 @@ class ChatRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_tools(self) -> ChatRequest:
-        if self.tool_choice not in (None, "none") and not self.tools:
+        delegation = getattr(self.tool_options, "delegation", None)
+        tool_mode = self.model == "mantis/fusion" and (
+            delegation == "tool"
+            or (delegation is None and fusion._fusion_config().delegation() == "tool")
+        )
+        if self.tool_choice not in (None, "none") and not self.tools and not tool_mode:
             raise ValueError("tool_choice requires tools")
         if isinstance(self.tool_choice, NamedToolChoice):
             names = {tool.function.name for tool in self.tools or []}
@@ -294,7 +305,7 @@ def _fusion_return_reasoning(headers: dict[str, str] | None) -> bool:
         return True
     if value == "false":
         return False
-    return fusion._return_reasoning_by_default()
+    return bool(fusion._return_reasoning_by_default())
 
 
 def _fusion_trace_scope(headers: dict[str, str] | None) -> str:
@@ -745,21 +756,14 @@ def _router_client() -> httpx.Client:
     return base_proxy.router_client()
 
 
-_FUSION_TOOL_ID_PREFIX = "f"
-_FUSION_TOOL_ID_SEP = "~"
-
-
 def _encode_fusion_tool_call_id(run_id: str, call_id: str) -> str:
-    return f"{_FUSION_TOOL_ID_PREFIX}{run_id}{_FUSION_TOOL_ID_SEP}{call_id}"
+    """Encode a public ID while retaining its original call ID on the run."""
+    return fusion_api_ids._encode_fusion_tool_call_id(run_id, call_id)
 
 
 def _decode_fusion_tool_call_id(encoded: str) -> tuple[str, str]:
-    if not encoded.startswith(_FUSION_TOOL_ID_PREFIX) or _FUSION_TOOL_ID_SEP not in encoded:
-        raise ValueError("invalid fusion tool_call_id")
-    parts = encoded[1:].split(_FUSION_TOOL_ID_SEP, 1)
-    if len(parts) != 2:
-        raise ValueError("invalid fusion tool_call_id")
-    return parts[0], parts[1]
+    """Decode current indexed IDs and previously issued full call IDs."""
+    return fusion_api_ids._decode_fusion_tool_call_id(encoded)
 
 
 def _content_to_str(content: str | list[TextPart | ImagePart] | None) -> str:
@@ -773,74 +777,107 @@ def _content_to_str(content: str | list[TextPart | ImagePart] | None) -> str:
 
 
 def _build_fusion_chat_response(
-    request_id: str,
-    model: str,
-    event: dict[str, Any],
-    request: ChatRequest,
+    request_id: str, model: str, event: dict[str, Any], request: ChatRequest
 ) -> JSONResponse:
-    status = event.get("status")
-    messages = [msg.model_dump(exclude_none=True) for msg in request.messages]
-    run_id = str(event.get("run_id") or "")
-    if status == "completed":
-        content = event.get("report") or ""
-        message: dict[str, Any] = {
-            "role": "assistant",
-            "content": content,
-        }
-        finish = "stop"
-        completion_text = content
-    elif status == "awaiting_tools":
-        pending = event.get("pending_tool_calls") or []
-        tool_calls = [
-            {
-                "id": _encode_fusion_tool_call_id(run_id, call.get("id", "")),
-                "type": call.get("type", "function"),
-                "function": call.get("function", {}),
-            }
-            for call in pending
-        ]
-        message = {"role": "assistant", "content": "", "tool_calls": tool_calls}
-        finish = "tool_calls"
-        completion_text = "".join(
-            f"{call['function'].get('name', '')}:{call['function'].get('arguments', '')}"
-            for call in tool_calls
-        )
-    else:
-        return _error(
-            500,
-            event.get("report") or f"fusion run failed with status {status}",
-            "upstream_error",
-        )
-    reasoning_trace = event.get("reasoning_trace")
-    if reasoning_trace:
-        message["reasoning"] = reasoning_trace
-    fusion_event = event.get("mantis_event")
-    usage = utils._request_usage(messages, completion_text)
-    headers = {"X-Request-Id": request_id}
+    """Build an OpenAI chat completion for a completed Fusion event."""
+    return fusion_api_response.build_chat_response(
+        request_id,
+        model,
+        event,
+        [msg.model_dump(exclude_none=True) for msg in request.messages],
+        _encode_fusion_tool_call_id,
+    )
+
+
+def _uses_live_fusion_stream(request: ChatRequest) -> bool:
+    """Return whether tool-delegation streaming can use the provider delta path."""
+    override = getattr(request.tool_options, "delegation", None)
+    return bool(request.stream and (override or fusion._fusion_config().delegation()) == "tool")
+
+
+def _iter_fusion_chat_stream(
+    request: ChatRequest, request_id: str, headers: dict[str, str] | None
+) -> Iterator[bytes]:
+    """Run tool-based Fusion in the background and stream its lead deltas."""
+    callbacks = fusion_api_live.LiveChatCallbacks(
+        compute=partial(
+            _run_fusion_chat,
+            request,
+            request_id,
+            return_reasoning=_fusion_return_reasoning(headers),
+            headers=headers,
+        ),
+        release=_capacity.release,
+        completed=partial(_iter_fusion_chat_event, request, request_id, release_capacity=False),
+        encode_delta=partial(_encode_fusion_deltas, headers=headers),
+        encode_tool_id=_encode_fusion_tool_call_id,
+    )
+    yield from fusion_api_live.iter_chat_stream(
+        request,
+        fusion_api_response.stream_base(request_id, _MODEL_CREATED),
+        callbacks,
+        _fusion_hidden_tool_names(request, headers),
+        _KEEPALIVE_SECONDS,
+        _fusion_return_reasoning(headers)
+        and _fusion_trace_scope(headers) in {"main", "orchestration"},
+    )
+
+
+def _live_fusion_response(
+    request: ChatRequest, request_id: str, headers: dict[str, str]
+) -> StreamingResponse:
+    """Build the live-stream HTTP response with known continuation headers."""
+    stream_headers = {"X-Request-Id": request_id}
+    run_id = _fusion_run_id_from_headers(headers) or _fusion_run_id_from_messages(request.messages)
     if run_id:
-        headers["X-Mantis-Run-Id"] = run_id
-    slot_models = event.get("usage_models")
-    if isinstance(slot_models, dict) and slot_models:
-        headers["x-route-model"] = list(slot_models.keys())[-1]
-    elif isinstance(slot_models, list) and slot_models:
-        headers["x-route-model"] = str(slot_models[-1])
-    return JSONResponse(
-        {
-            "id": request_id,
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": message,
-                    "finish_reason": finish,
-                }
-            ],
-            "usage": usage,
-            **({"mantis_event": fusion_event} if fusion_event else {}),
-        },
-        headers=headers,
+        stream_headers["X-Mantis-Run-Id"] = run_id
+    return StreamingResponse(
+        _iter_fusion_chat_stream(request, request_id, headers),
+        media_type="text/event-stream",
+        headers=stream_headers,
+    )
+
+
+def _fusion_hidden_tool_names(request: ChatRequest, headers: dict[str, str] | None) -> set[str]:
+    """Return effective server tool names for this request or its stored run."""
+    run_id = _fusion_run_id_from_headers(headers)
+    if run_id is None and request.messages[-1].role == "tool":
+        run_id = _fusion_run_id_from_messages(request.messages)
+    return fusion_api_context.hidden_tool_names(request, run_id)
+
+
+def _encode_fusion_deltas(
+    encoder: fusion_stream.DeltaEncoder,
+    run_id: str,
+    delta: dict[str, Any],
+    headers: dict[str, str] | None,
+) -> list[dict[str, Any]]:
+    """Filter reasoning according to the established trace opt-in and scope."""
+    include_reasoning = _fusion_return_reasoning(headers) and _fusion_trace_scope(headers) in {
+        "main",
+        "orchestration",
+    }
+    return fusion_api_response.encode_deltas(
+        encoder, run_id, delta, include_reasoning, _encode_fusion_tool_call_id
+    )
+
+
+def _fusion_stream_keepalive() -> bytes:
+    """Return a standards-compliant SSE comment keepalive."""
+    return fusion_api_response._fusion_stream_keepalive()
+
+
+def _fusion_stream_chunk(base: dict[str, Any], delta: dict[str, Any], finish: str | None) -> bytes:
+    """Encode one Fusion chat-completion stream chunk."""
+    return fusion_api_response._fusion_stream_chunk(base, delta, finish)
+
+
+def _missing_fusion_tool_calls(
+    event: dict[str, Any], run_id: str, encoder: fusion_stream.DeltaEncoder
+) -> list[dict[str, Any]]:
+    """Add pending client calls that were not emitted by the streamed lead."""
+    return fusion_api_response._missing_fusion_tool_calls(
+        event, run_id, encoder, _encode_fusion_tool_call_id
     )
 
 
@@ -848,75 +885,21 @@ def _iter_fusion_chat_event(
     request: ChatRequest,
     request_id: str,
     event: dict[str, Any],
+    *,
+    release_capacity: bool = True,
 ) -> Iterator[bytes]:
     """Yield SSE chunks for an already-computed Fusion chat event."""
-    base = {
-        "id": request_id,
-        "object": "chat.completion.chunk",
-        "created": _MODEL_CREATED,
-        "model": "mantis/fusion",
-    }
-    fusion_event = event.get("mantis_event")
-    if fusion_event:
-        base["mantis_event"] = fusion_event
     try:
-        status = event.get("status")
-
-        def _chunk(delta: dict[str, Any], finish: str | None) -> bytes:
-            return (
-                "data: "
-                + json.dumps(
-                    {
-                        **base,
-                        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
-                    }
-                )
-                + "\n\n"
-            ).encode()
-
-        if status == "completed":
-            report = event.get("report") or ""
-            reasoning_trace = event.get("reasoning_trace")
-            yield _chunk({"role": "assistant"}, None)
-            if reasoning_trace:
-                yield _chunk({"reasoning": reasoning_trace}, None)
-            yield _chunk({"content": report}, "stop")
-            completion_text = report
-        elif status == "awaiting_tools":
-            run_id = event["run_id"]
-            pending = event.get("pending_tool_calls") or []
-            tool_calls = [
-                {
-                    "index": i,
-                    "id": _encode_fusion_tool_call_id(run_id, call.get("id", "")),
-                    "type": call.get("type", "function"),
-                    "function": call.get("function", {}),
-                }
-                for i, call in enumerate(pending)
-            ]
-            reasoning_trace = event.get("reasoning_trace")
-            yield _chunk({"role": "assistant"}, None)
-            if reasoning_trace:
-                yield _chunk({"reasoning": reasoning_trace}, None)
-            yield _chunk({"tool_calls": tool_calls}, "tool_calls")
-            completion_text = "".join(
-                f"{call['function'].get('name', '')}:{call['function'].get('arguments', '')}"
-                for call in tool_calls
-            )
-        else:
-            msg = event.get("report") or f"fusion run failed with status {status}"
-            yield _chunk({"role": "assistant"}, None)
-            yield _chunk({"content": msg}, "stop")
-            completion_text = msg
-        include_usage = bool(request.stream_options and request.stream_options.include_usage)
-        if include_usage:
-            usage = utils._request_usage(
-                [msg.model_dump(exclude_none=True) for msg in request.messages],
-                completion_text,
-            )
-            yield f"data: {json.dumps({**base, 'choices': [], 'usage': usage})}\n\n".encode()
+        yield from fusion_api_response.iter_chat_event(
+            fusion_api_response.stream_base(request_id, _MODEL_CREATED),
+            event,
+            [msg.model_dump(exclude_none=True) for msg in request.messages],
+            bool(request.stream_options and request.stream_options.include_usage),
+            _encode_fusion_tool_call_id,
+        )
     finally:
-        _capacity.release()
+        if release_capacity:
+            _capacity.release()
     yield b"data: [DONE]\n\n"
 
 
@@ -964,6 +947,19 @@ def _fusion_run_id_from_messages(messages: list[Any]) -> str | None:
     return found
 
 
+def _resolve_fusion_workspace(request: ChatRequest, headers: dict[str, str] | None) -> ChatRequest:
+    """Apply an allowlisted workspace discovered from request and harness context."""
+    return cast(
+        ChatRequest,
+        fusion_api_context._resolve_fusion_workspace(request, headers, _content_to_str),
+    )
+
+
+def _fusion_session_id(headers: dict[str, str] | None, request: ChatRequest) -> str | None:
+    """Return an explicit session identity for the Fusion run."""
+    return fusion_api_context._fusion_session_id(headers, request)
+
+
 def _run_fusion_chat(
     request: ChatRequest,
     request_id: str,
@@ -996,6 +992,7 @@ def _run_fusion_chat(
         i -= 1
 
     if run_id is not None and tool_results:
+        fusion_api_context.refresh_request_controls(run_id, request)
         event = fusion.advance_fusion_run(
             run_id,
             request_id=request_id,
@@ -1017,6 +1014,7 @@ def _run_fusion_chat(
         resume_id = _fusion_run_id_from_headers(headers)
         resumed = fusion.try_get_fusion_run(resume_id) if resume_id else None
         if resumed is not None:
+            fusion_api_context.apply_request_controls(resumed, request)
             # A live run owns the session: when it is awaiting_tools the
             # message is queued on the run rather than forking a new one.
             if request.tools is not None:
@@ -1029,21 +1027,14 @@ def _run_fusion_chat(
                 message=brief,
             )
         else:
-            tools = [tool.model_dump() for tool in (request.tools or [])]
-            messages = [msg.model_dump(exclude_none=True) for msg in request.messages]
-            run = fusion.create_fusion_run(
-                brief,
-                tools,
-                messages=messages,
-                delegation_mode="available",
-                worker_profiles=request.worker_profiles,
-                budget=request.budget,
-                tool_options=request.tool_options,
+            request = _resolve_fusion_workspace(request, headers)
+            run = fusion_api_context.create_chat_run(
+                request, brief, _fusion_session_id(headers, request)
             )
             event = fusion.advance_fusion_run(run.run_id, request_id=request_id)
 
     _attach_fusion_trace(event, return_reasoning, headers)
-    return event
+    return cast(dict[str, Any], event)
 
 
 def _attach_fusion_trace(
@@ -1139,13 +1130,11 @@ def chat(request: ChatRequest, response: Response, http: HttpRequest) -> Respons
     if not _capacity.acquire(blocking=False):
         return _error(429, "Mantis is at capacity", "rate_limit_error")
     if request.model == "mantis/fusion":
-        return_reasoning = _fusion_return_reasoning(headers)
+        if _uses_live_fusion_stream(request):
+            return _live_fusion_response(request, request_id, headers)
         try:
             event = _run_fusion_chat(
-                request,
-                request_id,
-                return_reasoning=return_reasoning,
-                headers=headers,
+                request, request_id, _fusion_return_reasoning(headers), headers
             )
         except Exception as exc:  # noqa: BLE001 - chat adapter error boundary
             _capacity.release()

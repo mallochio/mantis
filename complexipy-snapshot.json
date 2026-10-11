@@ -8,12 +8,12 @@
         "complexity": 21
       },
       {
-        "name": "_fusion_run_id_from_messages",
-        "complexity": 35
+        "name": "_run_fusion_chat",
+        "complexity": 30
       },
       {
-        "name": "_run_fusion_chat",
-        "complexity": 37
+        "name": "_fusion_run_id_from_messages",
+        "complexity": 35
       },
       {
         "name": "_stream",
@@ -36,12 +36,12 @@
     "file_name": "fusion.py",
     "functions": [
       {
-        "name": "_main_trace_delta",
-        "complexity": 24
+        "name": "FusionCoordinator::_call_worker",
+        "complexity": 22
       },
       {
-        "name": "FusionCoordinator::_call_worker",
-        "complexity": 27
+        "name": "_main_trace_delta",
+        "complexity": 24
       },
       {
         "name": "_extract_reasoning_trace",
@@ -105,11 +105,11 @@
       },
       {
         "name": "_provider_response",
-        "complexity": 67
+        "complexity": 66
       },
       {
         "name": "_sanitize_messages",
-        "complexity": 75
+        "complexity": 74
       },
       {
         "name": "_response_to_dict",

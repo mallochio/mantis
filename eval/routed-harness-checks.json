@@ -1,0 +1,35 @@
+{
+  "easy-mechanical-edit": [
+    {
+      "command": "python check_settings.py",
+      "expected_exit_status": 0,
+      "expected_marker": "CONFIG_OK"
+    }
+  ],
+  "slow-test-execution": [
+    {
+      "command": "python -m unittest discover -s tests -t . -v",
+      "expected_exit_status": 0,
+      "expected_marker": "Ran 4 tests"
+    }
+  ],
+  "upstream-reuse": [
+    {
+      "command": "python check_reuse.py",
+      "expected_exit_status": 0,
+      "expected_marker": "REUSE_OK"
+    },
+    {
+      "command": "python -m unittest discover -s tests -t . -v",
+      "expected_exit_status": 0,
+      "expected_marker": "OK"
+    }
+  ],
+  "ambiguous-feature": [
+    {
+      "command": "python -m unittest discover -s tests -t . -v",
+      "expected_exit_status": 0,
+      "expected_marker": "OK"
+    }
+  ]
+}

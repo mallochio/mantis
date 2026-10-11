@@ -17,7 +17,7 @@ def _record() -> dict:
 
 
 def test_build_state_includes_convention_and_final_answer(tmp_path):
-    transcript = tmp_path / "fusion-pinned--no-tool-chat.json"
+    transcript = tmp_path / "fusion-pinned--no-tool-chat--s1.json"
     payload = {
         "content": "ANSWER: ROUTING_OK",
         "event": {"handoff_history": [{"kind": "answer", "follow_up": 0}]},

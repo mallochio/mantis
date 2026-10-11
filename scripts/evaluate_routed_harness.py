@@ -31,6 +31,7 @@ VARIANTS = (
     "mantis-base",
     "fusion-pinned",
     "fusion-routed",
+    "fusion-tool",
 )
 METRICS = (
     "input_tokens",

@@ -114,4 +114,5 @@ def test_declared_variants_are_fixed():
         "mantis-base",
         "fusion-pinned",
         "fusion-routed",
+        "fusion-tool",
     )

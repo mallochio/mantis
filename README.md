@@ -15,7 +15,7 @@ No service binds publicly by default. Provider credentials remain on this machin
 | `mantis/base` | Direct | NVIDIA NeMo Switchyard stage-router picks an efficient or capable model (LiteLLM-routed). |
 | `mantis/trinity` | Trinity | Multi-agent coordination over Worker, Thinker, and Verifier roles. |
 | `mantis/ultra` | Ultra | Conductor plans and executes a bounded workflow DAG over the worker pool. |
-| `mantis/fusion` | Fusion | Lead/sidekick orchestration with tool-use follow-ups and a review loop. Chat uses available mode (main may `ANSWER` without a sidekick); native `/v1/fusion/delegate` stays forced. Resume chat turns with `X-Mantis-Run-Id` or prior Fusion-encoded tool call ids. |
+| `mantis/fusion` | Fusion | Lead/sidekick orchestration. Legacy marker delegation remains the default; opt in to private tool delegation with `[fusion] delegation = "tool"`. Ordinary lead tools remain client-owned. Resume a run with `X-Mantis-Run-Id` or returned Fusion tool-call IDs. |
 
 Mantis never switches among these four modes automatically. Base and Fusion are available in normal mode; Trinity and Ultra are experimental and require starting the stack with `--experimental`.
 
@@ -152,6 +152,25 @@ prime-agent --mode text --provider mantis --model base --no-session \
   -p 'Inspect this repository, implement the requested change, run tests, and fix failures.'
 ```
 
+## Fusion tool delegation
+
+Tool delegation is opt-in: set `delegation = "tool"` in the existing `[fusion]`
+table in `config/catalog.toml`, then restart the stack. Omit it or use `"marker"`
+to keep the legacy protocol. A request can override this with
+`tool_options.delegation`. Model/provider and reasoning controls stay in the catalog.
+
+The lead uses normal client tools and private server-resolved delegation tools.
+The client still executes ordinary lead tool calls. A delegated sidekick can use
+built-in tools in a shared local workspace selected from `tool_options.workspace`,
+`X-Mantis-Workspace`, harness directory context, or a configured default. The API
+must allowlist that directory with `MANTIS_FUSION_WORKSPACE_ROOTS` before startup.
+**The local executor is trusted execution, not a security sandbox.**
+
+Use a stable `x-mantis-session-id` for bounded sidekick context reuse across new runs
+in the same API process. This cache does not survive restart. For examples covering
+prime-agent, OpenCode-compatible requests, streaming, limits, and multi-seed A/B
+runs, see [Fusion tool delegation](docs/fusion-tool-delegation.md).
+
 ## Switching models and providers
 
 `config/catalog.toml` is the only place that names Base models and the provider they ride on. Edit `[base.targets.efficient]` / `[base.targets.capable]` (or the `[providers.*]` they reference), then restart the stack. Launch regenerates Switchyard's `routes.toml` from that catalog. The Switchyard route id is `mantis/base`, so the API forwards the public model name without rewriting it.
@@ -204,7 +223,7 @@ response = client.chat.completions.create(
 
 `mantis/fusion` remains the optional built-in lead/sidekick orchestration harness. When a Fusion lane is configured as `mantis/base`, it uses the same Switchyard boundary with a separate stable session per lane; concrete Fusion slots and explicit fallback pools remain pinned provider paths. Fusion assigns `sidekick_max_tool_rounds` (default 0, unlimited; positive values cap one subtask) and `sidekick_max_follow_ups` (default 2, inherited from `max_follow_ups`) per delegated subtask, while `run_max_turns` (default 64) is the hard run guard.
 
-Comparative live evaluation is deferred. `scripts/evaluate_routed_harness.py` only validates the non-executable case manifest and summarizes externally produced records. Those records are observations, not trusted proof; no quality/cost claim or production default change is based on them.
+Comparative live results are not claimed here. `scripts/run_routed_ab.py` runs trusted fixtures against a live server, supports multi-seed repeats, records independent checks, and retains per-seed workspaces and observations for review. `scripts/evaluate_routed_harness.py` only validates the non-executable manifest and summarizes records. See the [A/B run guide](docs/fusion-tool-delegation.md#multi-seed-ab-runs) for allowlisting, retention, and resume behavior. Records are observations, not trusted proof; they do not establish a quality/cost claim or change production defaults.
 
 See the [Switchyard stage-router docs](https://github.com/NVIDIA-NeMo/Switchyard/blob/main/docs/routing_algorithms/stage_router_routing.md) for signal details.
 
@@ -220,3 +239,5 @@ uv run pytest tests -q
 ## Security
 
 All services bind to loopback by default. Keep local API keys and provider credentials out of Git, protect `~/.zshrc` and runtime config files with mode `0600`, and do not expose ports 8080, 5500, or 8088 without TLS and non-default credentials.
+
+Fusion server-side tools are for trusted local callers. A workspace allowlist and working directory do not isolate shell or Python execution from the host. The sidekick commit/push deny regex supports lead-only policy; it is not a secure containment boundary. Use OS/container isolation for untrusted execution. See the [trust boundary](docs/fusion-tool-delegation.md#trust-boundary).

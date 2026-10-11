@@ -10,11 +10,13 @@ import json
 import os
 import sys
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+import fusion_provider_hooks
 import litellm
 from litellm.exceptions import (
     APIConnectionError,
@@ -350,23 +352,7 @@ _REASONING_DOWNGRADE_MAX_CHARS = 2048
 
 def _portable_reasoning_details(msg: dict[str, Any]) -> None:
     """Drop reasoning items that are bound to the endpoint that produced them."""
-    details = msg.get("reasoning_details")
-    if not isinstance(details, list):
-        return
-    portable = [
-        detail
-        for detail in details
-        if not isinstance(detail, dict)
-        or not any(
-            marker in str(detail.get(key, "")).lower()
-            for key in ("type", "format")
-            for marker in _ENDPOINT_BOUND_MARKERS
-        )
-    ]
-    if portable:
-        msg["reasoning_details"] = portable
-    else:
-        msg.pop("reasoning_details", None)
+    fusion_provider_hooks.portable_reasoning_details(msg, _ENDPOINT_BOUND_MARKERS)
 
 
 def _extract_portable_reasoning_text(msg: dict[str, Any]) -> str:
@@ -465,9 +451,9 @@ def _sanitize_messages(
                         if isinstance(p, dict)
                         and p.get("type") not in ("thinking", "reasoning", "reasoning_content")
                     ]
-            if keep_reasoning:
-                _portable_reasoning_details(msg)
-            else:
+            if not fusion_provider_hooks.normalize_reasoning(
+                msg, keep_reasoning, same_model, _portable_reasoning_details
+            ):
                 # Downgrade: extract portable text before stripping fields.
                 downgraded = _extract_portable_reasoning_text(msg)
                 dropped_fields = [k for k in _REASONING_FIELDS if k in msg]
@@ -775,7 +761,7 @@ def _litellm_kwargs(
     if response_format is not None:
         kwargs["response_format"] = response_format
     # litellm extra controls
-    for k in ("web_search_options", "reasoning", "reasoning_effort"):
+    for k in ("web_search_options", "reasoning", "reasoning_effort", "parallel_tool_calls"):
         if k in controls:
             kwargs[k] = controls[k]
     return kwargs
@@ -995,14 +981,14 @@ def _provider_response(
     temperature: float,
     tools: list[dict[str, Any]] | None = None,
     timeout_s: float | None = None,
+    on_delta: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Return a worker response, reusing shared dispatch for the virtual route."""
     if spec == "mantis/base":
         return direct_completion._routed_response(messages, temperature, timeout_s, tools)
     run = getattr(serve_config._history_context, "active_run", None)
-    tool_choice = getattr(run, "active_tool_choice", None)
+    tool_choice, controls = fusion_provider_hooks.request_controls(run)
     response_format = getattr(run, "active_response_format", None)
-    controls = getattr(run, "active_controls", None) or {}
     failures: list[str] = []
     bindings = _runtime_bindings()
     deadline = time.monotonic() + timeout_s if timeout_s is not None else None
@@ -1045,8 +1031,9 @@ def _provider_response(
                     "summary": "Calling a model",
                 }
             )
-            resp = _litellm_completion(**kwargs)
-            data = _response_to_dict(resp)
+            data = fusion_provider_hooks.complete_provider(
+                kwargs, on_delta, _litellm_completion, _response_to_dict, _check_client_connected
+            )
             break
         except Exception as error:  # noqa: BLE001
             # classify transient vs fatal
@@ -1115,9 +1102,7 @@ def _provider_response(
                 if message.get(key) is not None
             }
     prompt_details = usage.get("prompt_tokens_details")
-    cached_tokens = (
-        prompt_details.get("cached_tokens", 0) if isinstance(prompt_details, dict) else 0
-    )
+    cached_tokens = prompt_details.get("cached_tokens", 0) if isinstance(prompt_details, dict) else 0
     _emit_progress(
         {
             "type": "provider",

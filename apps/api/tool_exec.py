@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -30,6 +31,27 @@ SERVER_TOOL_NAMES = frozenset(
         "run_code",
     }
 )
+_LEAD_ONLY_COMMAND = re.compile(
+    r"\bgit\b(?:\s+-[cC]\s+\S+|\s+--?[\w-]+(?:=\S+)?)*\s+(?:commit|push)\b"
+    r"|\bgh\s+(?:pr|release)\b"
+)
+
+
+def lead_only_command_error(arguments: str | dict[str, Any]) -> str | None:
+    """Return a tool error when a shell command commits, pushes, or publishes."""
+    try:
+        args = json.loads(arguments or "{}") if isinstance(arguments, str) else arguments
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(args, dict):
+        return None
+    match = _LEAD_ONLY_COMMAND.search(_text(args, "command", "cmd", "script"))
+    if match is None:
+        return None
+    return (
+        f"Denied: '{match.group(0)}' is reserved for the lead. Do not commit, push, or open "
+        "pull requests or releases; finish the work and report back to the lead instead."
+    )
 
 
 def workspace_for(run_id: str, root: Path | None = None) -> Path:

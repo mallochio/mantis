@@ -109,7 +109,7 @@ def parse_arguments(call: dict[str, Any]) -> dict[str, Any]:
 
 def _run_bash(args: dict[str, Any], workspace: Path) -> str:
     """Run one sandboxed shell command inside the workspace."""
-    completed = subprocess.run(  # noqa: S603 - reason: fixed bash -c shape with a workspace cwd jail
+    completed = subprocess.run(
         ["bash", "-c", str(args.get("command") or "")],
         cwd=workspace,
         capture_output=True,
