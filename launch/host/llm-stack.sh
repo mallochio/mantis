@@ -116,8 +116,11 @@ bootout_job() {
   local name="$1" port="$2" pidfile="$3"
   launchd_loaded "$name" || return 0
   launchctl bootout "$(launchd_target "$name")" || return 1
-  for _ in $(seq 1 100); do
-    if [ -z "$(pid_on_port "$port")" ]; then rm -f "$pidfile"; return 0; fi
+  for _ in $(seq 1 600); do
+    if ! launchd_loaded "$name" && [ -z "$(pid_on_port "$port")" ]; then
+      rm -f "$pidfile"
+      return 0
+    fi
     sleep 0.1
   done
   fail "$name did not release port :$port after bootout"

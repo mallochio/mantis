@@ -82,3 +82,29 @@ def test_generated_jobs_have_private_permissions(tmp_path: Path) -> None:
         job = agents / f"com.mallochio.mantis.{name}.plist"
         assert stat.S_IMODE(job.stat().st_mode) == 0o600
     assert not (home / "Library/LaunchAgents").exists()
+
+
+def test_bootout_waits_for_job_removal_after_port_closes(tmp_path: Path) -> None:
+    controller = GENERATOR.parent / "llm-stack.sh"
+    source = controller.read_text()
+    start = source.index("bootout_job()")
+    function = source[start:source.index("\n}\n", start) + 3]
+    state = tmp_path / "attempts"
+    script = """
+launchd_target() { echo test/service; }
+launchd_loaded() {
+  count=$(cat "$STATE" 2>/dev/null || echo 0)
+  echo $((count + 1)) > "$STATE"
+  [ "$count" -lt 3 ]
+}
+launchctl() { return 0; }
+pid_on_port() { return 0; }
+sleep() { return 0; }
+fail() { echo "$*" >&2; }
+""" + function + '\nbootout_job test 1234 "$STATE.pid"'
+    result = subprocess.run(
+        ["/bin/bash", "-c", script],
+        env={"STATE": str(state)}, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert int(state.read_text()) >= 4
