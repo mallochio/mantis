@@ -23,6 +23,12 @@ if [ -f "$HOME/.zshrc" ]; then
     [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && export "$name=$value"
   done < <(/bin/zsh -lc 'source "$HOME/.zshrc" >/dev/null && env')
 fi
+if [[ "${1:-}" == "--foreground" && -f "$REPO_ROOT/.env" ]]; then
+  set -a
+  source "$REPO_ROOT/.env"
+  set +a
+fi
+
 # Mantis Bedrock: use static IAM keys in eu-central-1, not SSO (expired)
 unset AWS_PROFILE AWS_SESSION_TOKEN 2>/dev/null || true
 export AWS_REGION="eu-central-1"
@@ -86,6 +92,11 @@ fi
 if ! "$SWITCHYARD_BIN" --config "$CONFIG_OUT" --dry-run; then
   echo "ERROR: switchyard-server rejected $CONFIG_OUT" >&2
   exit 1
+fi
+
+if [[ "${1:-}" == "--foreground" ]]; then
+  exec "$SWITCHYARD_BIN" --config "$CONFIG_OUT" --host "$HOST" --port "$PORT" \
+    --routing-log-file "${SWITCHYARD_ROUTING_LOG:-$LOG_DIR/routing-log.jsonl}"
 fi
 
 echo "restarting Switchyard on :$PORT"

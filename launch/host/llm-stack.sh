@@ -69,29 +69,6 @@ health_ok()   { curl -fsS --max-time 3 "$1" >/dev/null 2>&1; }
 switchyard_ready() { health_ok "$ROUTER_URL"; }
 pid_on_port() { lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | head -n1 || true; }
 
-kill_all_listeners() {
-  local port="$1" pid
-  [ -n "$port" ] || return 0
-  for pid in $(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null); do
-    kill "$pid" 2>/dev/null || true
-  done
-  for _ in $(seq 1 50); do
-    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 || break
-    sleep 0.1
-  done
-  for pid in $(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null); do
-    kill -9 "$pid" 2>/dev/null || true
-  done
-  for _ in $(seq 1 50); do
-    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 || break
-    sleep 0.1
-  done
-}
-
-port_from_url() {
-  echo "$1" | awk -F: '{print $3}' | cut -d/ -f1
-}
-
 wait_ready() {
   local name="$1" url="$2" timeout_s="${3:-90}" pat="${4:-}" i=0
   while [ "$i" -lt "$timeout_s" ]; do
@@ -106,17 +83,45 @@ wait_ready() {
   return 1
 }
 
-start_one() {
-  local no="$1" name="$2" script="$3" url="$4" timeout_s="$5" pat="${6:-}"
-  local out
-  step "$no starting $name"
-  if [ ! -x "$script" ]; then fail "component script missing: $script"; return 1; fi
-  if ! out="$("$script" 2>&1)"; then
-    fail "$script failed"
-    printf '%s\n' "$out" >&2
+launchd_target() { printf 'gui/%s/com.mallochio.mantis.%s' "$(id -u)" "$1"; }
+launchd_plist() { printf '%s/.local/share/llm-stack/agents/com.mallochio.mantis.%s.plist' "$HOME" "$1"; }
+launchd_loaded() { launchctl print "$(launchd_target "$1")" >/dev/null 2>&1; }
+
+write_launchd_jobs() {
+  local args=(write --repo "$REPO_ROOT" --home "$HOME")
+  [ "$EXPERIMENTAL_MODES" = 1 ] && args+=(--experimental)
+  ( cd "$REPO_ROOT" && uv run --no-sync python launch/host/launchd_jobs.py "${args[@]}" >/dev/null )
+}
+
+legacy_listener() {
+  local port="$1" pidfile="$2" pid
+  pid=$(pid_on_port "$port")
+  if [ -n "$pid" ]; then
+    fail "port :$port is held by unmanaged PID $pid; stop it explicitly before migration"
     return 1
   fi
-  wait_ready "$name" "$url" "$timeout_s" "$pat" || return 1
+  rm -f "$pidfile"
+}
+
+bootstrap_job() {
+  local name="$1" port="$2" pidfile="$3" url="$4" timeout="$5"
+  if ! launchd_loaded "$name"; then
+    legacy_listener "$port" "$pidfile" || return 1
+    launchctl bootstrap "gui/$(id -u)" "$(launchd_plist "$name")" || return 1
+  fi
+  wait_ready "$name" "$url" "$timeout"
+}
+
+bootout_job() {
+  local name="$1" port="$2" pidfile="$3"
+  launchd_loaded "$name" || return 0
+  launchctl bootout "$(launchd_target "$name")" || return 1
+  for _ in $(seq 1 100); do
+    if [ -z "$(pid_on_port "$port")" ]; then rm -f "$pidfile"; return 0; fi
+    sleep 0.1
+  done
+  fail "$name did not release port :$port after bootout"
+  return 1
 }
 
 EXPERIMENTAL_MODES=0
@@ -140,21 +145,15 @@ cmd_start() {
   acquire_lock
   configure_runtime_mode
   printf '\n\033[1mStarting the local LLM stack (Switchyard -> Mantis API)\033[0m\n'
-  [ -f "$CATALOG" ] || warn "catalog missing: $CATALOG (required by Switchyard and the API)"
-  if switchyard_ready; then
-    ok "Switchyard already ready"
-  elif [ -n "$(pid_on_port 5500)" ] && wait_ready "existing Switchyard" "$ROUTER_URL" 30; then
-    :
-  else
-    start_one "1/2" "Switchyard" "$LIB_DIR/switchyard-local.sh" "$ROUTER_URL" 60 || return 1
-  fi
+  [ -f "$CATALOG" ] || { fail "catalog missing: $CATALOG"; return 1; }
+  write_launchd_jobs || return 1
+  bootstrap_job switchyard 5500 "$SWITCHYARD_PIDFILE" "$ROUTER_URL" 60 || return 1
   local desired_mode="normal"
   [ "$EXPERIMENTAL_MODES" = 1 ] && desired_mode="experimental"
-  if health_ok "$MANTIS_LOCAL_READY" && [ "$(api_runtime_mode)" = "$desired_mode" ]; then
-    ok "Mantis API already ready in $desired_mode mode"
-  else
-    start_one "2/2" "Mantis API" "$LIB_DIR/mantis-local.sh" "$MANTIS_LOCAL_READY" 180 || return 1
+  if launchd_loaded api && [ "$(api_runtime_mode)" != "$desired_mode" ]; then
+    bootout_job api 8088 "$HOME/.local/share/mantis/server.pid" || return 1
   fi
+  bootstrap_job api 8088 "$HOME/.local/share/mantis/server.pid" "$MANTIS_LOCAL_READY" 180 || return 1
   cmd_status
 }
 
@@ -162,31 +161,22 @@ cmd_restart() {
   acquire_lock
   configure_runtime_mode
   printf '\n\033[1mRestarting the whole local stack\033[0m\n'
-  start_one "1/2" "Switchyard" "$LIB_DIR/switchyard-local.sh" "$ROUTER_URL" 60 || return 1
-  start_one "2/2" "Mantis API" "$LIB_DIR/mantis-local.sh" "$MANTIS_LOCAL_READY" 180 || return 1
+  bootout_job api 8088 "$HOME/.local/share/mantis/server.pid" || return 1
+  bootout_job switchyard 5500 "$SWITCHYARD_PIDFILE" || return 1
+  write_launchd_jobs || return 1
+  bootstrap_job switchyard 5500 "$SWITCHYARD_PIDFILE" "$ROUTER_URL" 60 || return 1
+  bootstrap_job api 8088 "$HOME/.local/share/mantis/server.pid" "$MANTIS_LOCAL_READY" 180 || return 1
   cmd_status
 }
 
 cmd_stop() {
   acquire_lock
   printf '\n\033[1mStopping local stack (Mantis API -> Switchyard)\033[0m\n'
-  step "1/2 stopping Mantis API (:8088)"
-  kill_all_listeners "$(port_from_url "$MANTIS_LOCAL_READY")"
-  local mp="$HOME/.local/share/mantis/server.pid"
-  if [ -f "$mp" ]; then
-    local pid; pid=$(cat "$mp" 2>/dev/null || true)
-    if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null || true
-      for _ in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
-      kill -9 "$pid" 2>/dev/null || true
-    fi
-    rm -f "$mp"
-  fi
-  ok "Mantis API stopped"
-  step "2/2 stopping Switchyard (:5500)"
-  kill_all_listeners "$(port_from_url "$ROUTER_URL")"
-  rm -f "$SWITCHYARD_PIDFILE"
-  ok "Switchyard stopped"
+  bootout_job api 8088 "$HOME/.local/share/mantis/server.pid" || return 1
+  bootout_job switchyard 5500 "$SWITCHYARD_PIDFILE" || return 1
+  legacy_listener 8088 "$HOME/.local/share/mantis/server.pid" || return 1
+  legacy_listener 5500 "$SWITCHYARD_PIDFILE" || return 1
+  ok "Mantis API and Switchyard stopped"
 }
 
 print_model_config() {

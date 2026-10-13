@@ -94,7 +94,7 @@ Control the stack:
 ~/Startup/llm-stack.sh stop
 ```
 
-A bare StartupFolder invocation defaults to `start` in normal mode. The controller starts Switchyard and the API in dependency order and checks readiness. Trinity's Qwen coordinator remains lazy and is not loaded unless an experimental Trinity request is made; Ultra/Conductor also starts work only on an experimental request. Runtime state/logs live under `~/.local/share/mantis`.
+A bare StartupFolder invocation defaults to `start` in normal mode. The controller starts Switchyard and the API in dependency order and checks readiness. Trinity's Qwen coordinator remains lazy and is not loaded unless an experimental Trinity request is made; Ultra/Conductor also starts work only on an experimental request. Runtime state/logs live under `~/.local/share/mantis`. The services run as user `launchd` jobs, so closing Terminal does not stop them. `launchd` restarts an exited service with a 10-second throttle; `stop` removes both jobs so they stay stopped. Private job definitions live under `~/.local/share/llm-stack/agents`. They run only while you are logged in; this does not install a system daemon.
 
 You can also run only the Mantis API in the foreground for development:
 

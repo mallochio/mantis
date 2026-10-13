@@ -10,6 +10,10 @@ LOGFILE="$DATA_DIR/server.log"
 READY_URL="http://127.0.0.1:8088/ready"
 mkdir -p "$DATA_DIR"
 
+if [[ "${1:-}" == "--foreground" ]]; then
+    exec /bin/zsh -ic "cd '$REPO' && exec ./scripts/run_mantis_native.sh"
+fi
+
 if [[ -f "$PIDFILE" ]]; then
     pid=$(<"$PIDFILE")
     if kill -0 "$pid" 2>/dev/null; then

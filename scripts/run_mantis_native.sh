@@ -39,6 +39,9 @@ if [[ -f "$REPO_ROOT/.env" ]]; then
     source "$REPO_ROOT/.env"
     set +a
 fi
+if [[ -n "${MANTIS_LAUNCHD_MODE:-}" ]]; then
+    export MANTIS_EXPERIMENTAL_MODES="$MANTIS_LAUNCHD_MODE"
+fi
 
 # The shared routing catalog, when present, is the authoritative configuration.
 export PYTHONPATH="$REPO_ROOT/scripts${PYTHONPATH:+:$PYTHONPATH}"
