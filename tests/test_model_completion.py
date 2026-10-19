@@ -136,6 +136,7 @@ def routed_model_transport(monkeypatch):
     payload = _tool_response("checked", '{"path":"next.md"}')
     run = SimpleNamespace(run_id="run-1", add_usage=Mock())
     provider = Mock(side_effect=AssertionError("virtual routes must not use direct providers"))
+    monkeypatch.setenv("MANTIS_CACHE_BREAKPOINTS", "0")
 
     async def handler(request):
         seen.append(request)
@@ -182,6 +183,7 @@ def test_model_completion_replays_tool_history_through_shared_transport(routed_m
         "messages": expected_messages,
         "temperature": 0.7,
         "tools": tools,
+        "session_id": "run-1:worker",
     }
     assert messages == original
     run.add_usage.assert_called_once_with({"prompt_tokens": 20}, model="provider/chosen")

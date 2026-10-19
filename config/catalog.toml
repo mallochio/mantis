@@ -1,4 +1,4 @@
-version = 1
+ version = 1
 
 [providers.openrouter]
 adapter = "openrouter"
@@ -59,21 +59,21 @@ protocols = ["chat_completions"]
 # Swap efficient/capable models or their providers here; launch regenerates routes.toml.
 # Identical upstream_model ids across the tiers are fine; the routes.toml
 # renderer disambiguates them without changing what the upstream resolves.
-revision = "gpt-sol-latest-medium-high-2026-10-10"
+revision = "2026-10-16"
 picker = "efficient_first"
 confidence_threshold = 0.5
 recent_turn_window = 3
 
 [base.targets.efficient]
-provider = "openrouter"
 reasoning_effort = "medium"
 max_tokens = 128000
+provider = "openrouter"
 upstream_model = "~openai/gpt-sol-latest"
 
 [base.targets.capable]
-provider = "openrouter"
 reasoning_effort = "high"
 max_tokens = 128000
+provider = "openrouter"
 upstream_model = "~openai/gpt-sol-latest"
 
 [mantis]
@@ -153,9 +153,9 @@ reasoning_effort = "high"
 protocols = ["chat_completions"]
 
 [fusion]
-main = "openrouter/~openai/gpt-astra-latest"
-main_reasoning = "low"
-sidekick = "openrouter/~openai/gpt-luna-latest"
+main = "openrouter/~anthropic/claude-opus-latest"
+main_reasoning = "medium"
+sidekick = "openrouter/~anthropic/claude-haiku-latest"
 sidekick_reasoning = "high"
 fallback_on_escalate = true
 # Per-delegated-subtask tool-round limit; 0 means unlimited.

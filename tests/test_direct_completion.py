@@ -108,7 +108,6 @@ def test_routed_completion_uses_shared_transport_hygiene(monkeypatch):
             json=_response().body,
             headers={base_proxy.SWITCHYARD_SELECTED_MODEL_HEADER: "provider/chosen"},
         )
-
     monkeypatch.setenv("MANTIS_ROUTER_KEY", "router-key")
     monkeypatch.setattr(
         base_proxy,
@@ -125,6 +124,7 @@ def test_routed_completion_uses_shared_transport_hygiene(monkeypatch):
         "model": "mantis/base",
         "messages": [{"role": "user", "content": "hi"}],
         "temperature": 0.7,
+        "session_id": "run-1:planner",
     }
     assert headers[base_proxy.SWITCHYARD_SESSION_HEADER] == "run-1:planner"
     assert headers["authorization"] == "Bearer router-key"

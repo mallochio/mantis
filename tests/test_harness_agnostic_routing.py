@@ -266,7 +266,7 @@ def test_catalog_model_swap_changes_route_without_changing_client_request(tmp_pa
     second_path = tmp_path / "second.toml"
     first_path.write_text(source)
     second_path.write_text(
-        source.replace("openai/gpt-sol-latest", "vendor/replacement-efficient", 1)
+        source.replace("anthropic/claude-opus-latest", "vendor/replacement-efficient", 1)
     )
 
     def efficient_model(path: Path) -> str:

@@ -165,7 +165,8 @@ def test_router_headers_omit_session_without_identity(monkeypatch):
 # -- Body hygiene: catalog supremacy + stable prefix ---------------------------
 
 
-def test_router_body_preserves_openai_tool_trajectory():
+def test_router_body_preserves_openai_tool_trajectory(monkeypatch):
+    monkeypatch.setenv("MANTIS_CACHE_BREAKPOINTS", "0")
     trajectory = _tool_trajectory()
     body = base_proxy.router_body(
         _make_request(
@@ -505,7 +506,8 @@ def test_forward_preserves_upstream_tool_calls_byte_for_byte():
     assert "x-upstream-private" not in response.headers
 
 
-def test_dispatch_routed_returns_tool_calls_and_route_diagnostics():
+def test_dispatch_routed_returns_tool_calls_and_route_diagnostics(monkeypatch):
+    monkeypatch.setenv("MANTIS_CACHE_BREAKPOINTS", "0")
     trajectory = _tool_trajectory()
     seen: dict = {}
 
@@ -528,10 +530,8 @@ def test_dispatch_routed_returns_tool_calls_and_route_diagnostics():
         lambda: _async_switchyard_client(handler),
     )
 
-    assert seen == {
-        "body": {"model": "mantis/base", **trajectory},
-        "session": "run-1:main",
-    }
+    assert seen["body"] == {"model": "mantis/base", "session_id": "run-1:main", **trajectory}
+    assert seen["session"] == "run-1:main"
     assert (
         result.body["choices"][0]["message"]["tool_calls"]
         == trajectory["messages"][1]["tool_calls"]
@@ -548,7 +548,7 @@ def test_dispatch_routed_strips_render_tag_from_selected_model():
             200,
             json={"id": "routed", "choices": [{"message": {"content": "ok"}}]},
             headers={
-                base_proxy.SWITCHYARD_SELECTED_MODEL_HEADER: "~openai/gpt-sol-latest:capable"
+                base_proxy.SWITCHYARD_SELECTED_MODEL_HEADER: "~anthropic/claude-opus-latest:capable"
             },
         )
 
@@ -557,7 +557,7 @@ def test_dispatch_routed_strips_render_tag_from_selected_model():
         None,
         lambda: _async_switchyard_client(handler),
     )
-    assert result.selected_model == "~openai/gpt-sol-latest"
+    assert result.selected_model == "~anthropic/claude-opus-latest"
 
 
 def test_router_response_headers_strips_render_tag():
@@ -730,14 +730,14 @@ def test_apply_base_cache_markers_leaves_grok_glm_messages_untouched(monkeypatch
     assert out["messages"] == body["messages"]
 
 
-def test_shipped_catalog_routes_gpt_sol_latest_low_high(monkeypatch):
+def test_shipped_catalog_routes_claude_opus_latest_medium_high(monkeypatch):
     route = base_proxy._load_base_route()
     assert route is not None
     assert route.efficient.provider == "openrouter"
-    assert route.efficient.upstream_model == "~openai/gpt-sol-latest"
+    assert route.efficient.upstream_model == "~anthropic/claude-opus-latest"
     assert route.efficient.reasoning_effort == "medium"
     assert route.capable.provider == "openrouter"
-    assert route.capable.upstream_model == "~openai/gpt-sol-latest"
+    assert route.capable.upstream_model == "~anthropic/claude-opus-latest"
     assert route.capable.reasoning_effort == "high"
     assert route.capable.wire_format == "openai_chat"
 

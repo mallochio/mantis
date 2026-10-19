@@ -204,10 +204,10 @@ def _model_cache_family(model: str) -> str | None:
 def _apply_litellm_cache_markers(
     messages: list[dict[str, Any]], resolved: ResolvedModelSpec, is_anthropic: bool
 ) -> list[dict[str, Any]]:
-    """Add explicit markers for the resolved model family when enabled."""
+    """Apply explicit markers; Claude via OpenRouter needs per-block markers too."""
     if not _cache_breakpoints_enabled():
         return messages
-    if is_anthropic:
+    if is_anthropic or _model_cache_family(resolved.model) == "anthropic":
         return _with_cache_breakpoints(messages)
     if _model_cache_family(resolved.model) == "openai":
         return _with_openai_cache_breakpoints(messages)

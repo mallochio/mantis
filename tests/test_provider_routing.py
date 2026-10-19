@@ -90,6 +90,7 @@ def test_provider_seam_uses_shared_transport_and_usage(routed_transport, direct_
         "messages": [{"role": "user", "content": "read"}],
         "temperature": 0.2,
         "tools": tools,
+        "session_id": "run-1:worker",
     }
     assert request.extensions["timeout"] == dict.fromkeys(
         ["connect", "read", "write", "pool"], 1.25

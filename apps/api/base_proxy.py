@@ -2,24 +2,13 @@
 
 Switchyard is the only complexity router. It scores tool-trajectory signals
 (severity, spinning, exploring, production intensity), de-escalates settled
-turns, and falls open to ``efficient_first``. This module never picks a tier:
-it forwards the chat body, a stable session id, and hygiene edits that keep
-the reusable prefix identical across turns.
-
-Body hygiene (catalog supremacy + prefix stability):
-
-* harness ``reasoning`` / ``reasoning_effort`` are dropped so the catalog
-  tier governs effort via Switchyard per-target ``extra_body`` (Switchyard
-  ``merge_extra_body`` uses ``or_insert``: request fields would win).
-* endpoint-bound encrypted reasoning is stripped; message history is
-  otherwise forwarded verbatim so the reusable prefix stays identical
-  across turns and prompt-cache hits survive.
-* provider-native prompt-cache markers are applied for explicit dialects.
-
-The efficient tier rides the self-hosted Modal GLM-5.3-Flash endpoint at
-high reasoning effort and the capable tier rides Modal Kimi-K3 at max
-effort, both over the ``openai_chat`` wire format. Both tiers are
-Switchyard-servable, so there are no direct LiteLLM legs.
+turns, and falls open to ``efficient_first``. This module never picks a
+tier: it forwards the chat body plus hygiene edits that keep the reusable
+prefix identical across turns, drops harness reasoning controls so the
+catalog tier governs effort, strips endpoint-bound reasoning state, applies
+provider-native prompt-cache markers for explicit dialects, and pins the
+stable session id on the body so OpenRouter provider stickiness survives
+compaction.
 """
 
 from __future__ import annotations
@@ -141,6 +130,7 @@ def dispatch_routed(
 ) -> RoutedResponse:
     """Send one non-streaming OpenAI chat body through Switchyard."""
     body = sanitize_routed_body(body)
+    _attach_sticky_session(body, session)
     headers: dict[str, str] = {}
     key = os.environ.get("MANTIS_ROUTER_KEY")
     if key:
@@ -204,6 +194,13 @@ def router_headers(headers: dict[str, str], body: BaseChatRequest) -> dict[str, 
     if session:
         out[SWITCHYARD_SESSION_HEADER] = session
     return out
+
+
+def _attach_sticky_session(body: dict[str, Any], session: str | None) -> dict[str, Any]:
+    """Pin OpenRouter provider stickiness; the derived key dies on compaction."""
+    if session:
+        body.setdefault("session_id", str(session)[:256])
+    return body
 
 
 def _drop_client_reasoning(body: dict[str, Any]) -> dict[str, Any]:
@@ -521,9 +518,9 @@ def forward(
     the turn to the ``mantis/base`` stage router. Returns
     ``(response, handed_off)``; ``handed_off`` is True for live streams.
     """
-    outbound_body = router_body(request)
     outbound_headers = router_headers(headers, request)
     stable_session = outbound_headers.get(SWITCHYARD_SESSION_HEADER)
+    outbound_body = _attach_sticky_session(router_body(request), stable_session)
     client = client_factory()
     url = os.environ.get("MANTIS_ROUTER_URL", DEFAULT_ROUTER_URL) + "/chat/completions"
     if request.stream:

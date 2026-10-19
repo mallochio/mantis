@@ -1220,7 +1220,7 @@ def test_fusion_role_reasoning_keeps_base_target_effort():
         main="base:capable", main_reasoning="low", sidekick="gpt-5_6-luna"
     )
     router = fusion.FusionRouter.from_config(config, "main", catalog=catalog)
-    assert router.select() == "openrouter/~openai/gpt-sol-latest|high"
+    assert router.select() == "openrouter/~anthropic/claude-opus-latest|high"
 
 
 def test_record_selected_slot_tracks_promotions():
@@ -1259,10 +1259,11 @@ def test_base_route_remains_virtual_while_explicit_capable_target_resolves():
         "main",
         catalog=catalog,
     )
-    assert explicit.select(escalation_count=0) == "openrouter/~openai/gpt-sol-latest|high"
+    assert explicit.select(escalation_count=0) == "openrouter/~anthropic/claude-opus-latest|high"
 
 
 def test_virtual_worker_dispatches_complete_tool_trajectory_to_switchyard(monkeypatch):
+    monkeypatch.setenv("MANTIS_CACHE_BREAKPOINTS", "0")
     trajectory = {
         "messages": [
             {"role": "user", "content": "inspect"},
@@ -1311,7 +1312,6 @@ def test_virtual_worker_dispatches_complete_tool_trajectory_to_switchyard(monkey
         first, _ = coordinator._call_worker(
             "mantis/base", trajectory["messages"], trajectory["tools"]
         )
-    with fusion._fusion_route_session("run-1:main"):
         coordinator._call_worker("mantis/base", trajectory["messages"], trajectory["tools"])
     with fusion._fusion_route_session("run-1:sidekick"):
         coordinator._call_worker("mantis/base", trajectory["messages"], trajectory["tools"])
