@@ -575,9 +575,7 @@ def test_fusion_trimmer_keeps_tool_call_result_pairs():
 
 def test_fusion_output_tokens_are_model_specific(monkeypatch):
     default_limits = fusion_limits.ModelLimits(200000, 128000)
-    monkeypatch.setattr(
-        fusion_limits, "resolve_model_limits", lambda slot: default_limits
-    )
+    monkeypatch.setattr(fusion_limits, "resolve_model_limits", lambda slot: default_limits)
     coordinator = fusion.FusionCoordinator()
     assert coordinator._output_tokens_for("gpt-5_6-luna") == 128000
     assert coordinator.max_output_tokens is None
@@ -1220,7 +1218,7 @@ def test_fusion_role_reasoning_keeps_base_target_effort():
         main="base:capable", main_reasoning="low", sidekick="gpt-5_6-luna"
     )
     router = fusion.FusionRouter.from_config(config, "main", catalog=catalog)
-    assert router.select() == "openrouter/~anthropic/claude-opus-latest|high"
+    assert router.select() == "openrouter/~openai/gpt-sol-latest|high"
 
 
 def test_record_selected_slot_tracks_promotions():
@@ -1259,7 +1257,7 @@ def test_base_route_remains_virtual_while_explicit_capable_target_resolves():
         "main",
         catalog=catalog,
     )
-    assert explicit.select(escalation_count=0) == "openrouter/~anthropic/claude-opus-latest|high"
+    assert explicit.select(escalation_count=0) == "openrouter/~openai/gpt-sol-latest|high"
 
 
 def test_virtual_worker_dispatches_complete_tool_trajectory_to_switchyard(monkeypatch):

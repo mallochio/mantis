@@ -55,9 +55,7 @@ def routed_client(monkeypatch):
                 "object": "chat.completion",
                 "created": 1,
                 "model": "mantis/base",
-                "choices": [
-                    {"index": 0, "message": message, "finish_reason": finish_reason}
-                ],
+                "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
             },
             headers={base_proxy.SWITCHYARD_SELECTED_MODEL_HEADER: "provider/routed"},
@@ -266,7 +264,7 @@ def test_catalog_model_swap_changes_route_without_changing_client_request(tmp_pa
     second_path = tmp_path / "second.toml"
     first_path.write_text(source)
     second_path.write_text(
-        source.replace("anthropic/claude-opus-latest", "vendor/replacement-efficient", 1)
+        source.replace("~openai/gpt-sol-latest", "vendor/replacement-efficient", 1)
     )
 
     def efficient_model(path: Path) -> str:

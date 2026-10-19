@@ -11,6 +11,10 @@ These autouse guards make any missed mock fail fast and visibly instead:
 
 Individual tests that explicitly monkeypatch ``serve._provider_client`` or
 ``serve.httpx.get`` replace these guards as usual.
+
+Tests also default to the legacy single-request routed shape by setting
+``MANTIS_TIER_EFFORT=0``; the tier-effort preflight has dedicated
+coverage in ``test_base_effort.py``, which opts back in per test.
 """
 
 from __future__ import annotations
@@ -51,6 +55,8 @@ for _name in (
     "AI_GATEWAY_API_KEY",
 ):
     os.environ.pop(_name, None)
+
+os.environ.setdefault("MANTIS_TIER_EFFORT", "0")
 
 
 @pytest.fixture(autouse=True)
@@ -118,6 +124,7 @@ def _block_external_provider_calls(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(serve._provider_client, "stream", blocked_stream)
     monkeypatch.setattr(serve.httpx, "get", blocked_get)
     yield
+
 
 @pytest.fixture(autouse=True)
 def _fixed_fusion_model_limits(monkeypatch, request):

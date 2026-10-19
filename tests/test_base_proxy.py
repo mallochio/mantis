@@ -730,14 +730,14 @@ def test_apply_base_cache_markers_leaves_grok_glm_messages_untouched(monkeypatch
     assert out["messages"] == body["messages"]
 
 
-def test_shipped_catalog_routes_claude_opus_latest_medium_high(monkeypatch):
+def test_shipped_catalog_routes_gpt_sol_latest_medium_high(monkeypatch):
     route = base_proxy._load_base_route()
     assert route is not None
     assert route.efficient.provider == "openrouter"
-    assert route.efficient.upstream_model == "~anthropic/claude-opus-latest"
+    assert route.efficient.upstream_model == "~openai/gpt-sol-latest"
     assert route.efficient.reasoning_effort == "medium"
     assert route.capable.provider == "openrouter"
-    assert route.capable.upstream_model == "~anthropic/claude-opus-latest"
+    assert route.capable.upstream_model == "~openai/gpt-sol-latest"
     assert route.capable.reasoning_effort == "high"
     assert route.capable.wire_format == "openai_chat"
 
@@ -754,11 +754,7 @@ def test_router_body_preserves_old_reasoning_for_prefix_stability():
         {"role": "user", "content": "fourth"},
     ]
     body = base_proxy.router_body(_request(messages=[dict(m) for m in messages]))
-    kept = [
-        m.get("reasoning_content")
-        for m in body["messages"]
-        if m.get("role") == "assistant"
-    ]
+    kept = [m.get("reasoning_content") for m in body["messages"] if m.get("role") == "assistant"]
     assert kept == ["think-one", "think-two", "think-three"]
 
 

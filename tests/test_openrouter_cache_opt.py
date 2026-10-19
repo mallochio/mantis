@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 
+import base_effort
 import base_proxy
 import httpx
 import model_catalog
@@ -63,9 +64,7 @@ def test_litellm_claude_on_openrouter_gets_block_markers(monkeypatch):
     _setup_catalog(monkeypatch)
     resolved = providers._resolve_model_spec("claude-opus-5")
     assert resolved.binding == "openrouter"
-    kwargs = providers._litellm_kwargs(
-        resolved, _chat_messages(), 100, 0.7, None, None, None, {}
-    )
+    kwargs = providers._litellm_kwargs(resolved, _chat_messages(), 100, 0.7, None, None, None, {})
     dumped = json.dumps(kwargs["messages"])
     assert "cache_control" in dumped
     assert "prompt_cache_breakpoint" not in dumped
@@ -74,9 +73,7 @@ def test_litellm_claude_on_openrouter_gets_block_markers(monkeypatch):
 def test_litellm_openai_slot_keeps_breakpoint_dialect(monkeypatch):
     _setup_catalog(monkeypatch)
     resolved = providers._resolve_model_spec("gpt-5_6-sol")
-    kwargs = providers._litellm_kwargs(
-        resolved, _chat_messages(), 100, 0.7, None, None, None, {}
-    )
+    kwargs = providers._litellm_kwargs(resolved, _chat_messages(), 100, 0.7, None, None, None, {})
     dumped = json.dumps(kwargs["messages"])
     assert "prompt_cache_breakpoint" in dumped
     assert "cache_control" not in dumped
@@ -113,6 +110,6 @@ def test_forward_body_without_session_has_no_sticky_key():
 
 
 def test_sticky_session_is_capped_at_upstream_limit():
-    body = base_proxy._attach_sticky_session({}, "s" * 300)
+    body = base_effort.attach_sticky_session({}, "s" * 300)
     assert body["session_id"] == "s" * 256
-    assert base_proxy._attach_sticky_session({}, None) == {}
+    assert base_effort.attach_sticky_session({}, None) == {}

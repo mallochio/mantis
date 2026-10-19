@@ -13,10 +13,10 @@ def test_request_plan_maps_every_variant():
     catalog = runner.load_catalog(runner.DEFAULT_CATALOG)
     efficient = runner.request_plan("efficient-only", catalog)
     capable = runner.request_plan("capable-only", catalog)
-    assert efficient["model"] == "~anthropic/claude-opus-latest"
+    assert efficient["model"] == "~openai/gpt-sol-latest"
     assert efficient["base_url"] == OPENROUTER_BASE_URL
     assert efficient["reasoning_effort"] == "medium"
-    assert capable["model"] == "~anthropic/claude-opus-latest"
+    assert capable["model"] == "~openai/gpt-sol-latest"
     assert capable["reasoning_effort"] == "high"
     assert runner.request_plan("mantis-base", catalog) == {"model": "mantis/base"}
 

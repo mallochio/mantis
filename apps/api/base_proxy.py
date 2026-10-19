@@ -26,11 +26,16 @@ from typing import Any, Protocol
 
 import httpx
 import providers
+from base_effort import (
+    SWITCHYARD_SESSION_HEADER,
+    attach_sticky_session,
+    resolve_effort,
+    resolve_effort_async,
+)
 from fastapi.responses import JSONResponse, StreamingResponse
 
 logger = logging.getLogger("mantis.base_proxy")
 
-SWITCHYARD_SESSION_HEADER = "x-switchyard-session-id"
 SWITCHYARD_SELECTED_MODEL_HEADER = "x-model-router-selected-model"
 DEFAULT_ROUTER_URL = "http://127.0.0.1:5500/v1"
 
@@ -117,8 +122,10 @@ async def _post_routed_with_deadline(
 ) -> httpx.Response:
     """Post and fully read a routed response within one wall-clock budget."""
     url = os.environ.get("MANTIS_ROUTER_URL", DEFAULT_ROUTER_URL) + "/chat/completions"
-    async with (client_factory or routed_async_client)() as client:
+    factory = client_factory or routed_async_client
+    async with factory() as client:
         async with asyncio.timeout(timeout_s):
+            body = await resolve_effort_async(body, headers, factory, timeout_s)
             return await client.post(url, headers=headers, json=body, timeout=timeout_s)
 
 
@@ -130,7 +137,7 @@ def dispatch_routed(
 ) -> RoutedResponse:
     """Send one non-streaming OpenAI chat body through Switchyard."""
     body = sanitize_routed_body(body)
-    _attach_sticky_session(body, session)
+    attach_sticky_session(body, session)
     headers: dict[str, str] = {}
     key = os.environ.get("MANTIS_ROUTER_KEY")
     if key:
@@ -196,13 +203,6 @@ def router_headers(headers: dict[str, str], body: BaseChatRequest) -> dict[str, 
     return out
 
 
-def _attach_sticky_session(body: dict[str, Any], session: str | None) -> dict[str, Any]:
-    """Pin OpenRouter provider stickiness; the derived key dies on compaction."""
-    if session:
-        body.setdefault("session_id", str(session)[:256])
-    return body
-
-
 def _drop_client_reasoning(body: dict[str, Any]) -> dict[str, Any]:
     """Drop harness-supplied reasoning controls so the catalog tier governs.
 
@@ -236,6 +236,8 @@ def _coerce_max_completion_tokens(body: dict[str, Any]) -> dict[str, Any]:
 
 
 _DROP = object()
+
+
 def _metadata_key(key: str) -> str:
     return "".join(character for character in key.lower() if character.isalnum())
 
@@ -520,7 +522,7 @@ def forward(
     """
     outbound_headers = router_headers(headers, request)
     stable_session = outbound_headers.get(SWITCHYARD_SESSION_HEADER)
-    outbound_body = _attach_sticky_session(router_body(request), stable_session)
+    outbound_body = resolve_effort(router_body(request), outbound_headers, client_factory)
     client = client_factory()
     url = os.environ.get("MANTIS_ROUTER_URL", DEFAULT_ROUTER_URL) + "/chat/completions"
     if request.stream:
